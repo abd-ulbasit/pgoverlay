@@ -1,4 +1,4 @@
-.PHONY: build test it lint
+.PHONY: build test it k8s-it lint docker-build helm-test
 
 build:
 	go build -o bin/pgb ./cmd/pgb
@@ -10,5 +10,14 @@ test:
 it:
 	PGBRANCH_IT=1 go test ./... -count=1 -timeout 25m
 
+k8s-it:
+	PGBRANCH_K8S_IT=1 go test ./... -count=1 -timeout 30m
+
 lint:
 	go vet ./...
+
+docker-build:
+	docker build -t pgbranch/branchd:dev .
+
+helm-test:
+	hack/helm-test.sh

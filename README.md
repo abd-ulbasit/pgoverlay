@@ -120,6 +120,41 @@ pgb connect pr-42    # prints the direct-port URL and the :6432 proxy URL
 
 Honest caveat: the registry is SQLite, which is single-writer. Don't run local-mode CLI commands (no `--server`) against the same `PGBRANCH_HOME` while branchd is running — use server mode; that's the supported combination.
 
+## Run on Kubernetes
+
+branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm chart deploys the whole thing:
+
+```bash
+make docker-build                          # builds pgbranch/branchd:dev (push it, or `kind load` for local clusters)
+helm install pgbranch deploy/helm/pgbranch \
+  --namespace pgbranch-system --create-namespace \
+  --set node=<storage-node-name> \
+  --set token=$(openssl rand -hex 16)
+```
+
+Values that matter:
+
+- **`node` (required)** — the name of the **storage node** (`kubectl get nodes`). All CoW data lives under `dataRoot` (default `/var/lib/pgbranch`) on this one node as plain directories; branchd, every branch pod, and every helper pod are pinned there with `nodeName` + `hostPath`. This is the honest dev/test scope — one node's disk, no CSI; multi-node storage is future work.
+- **`token` / `existingSecret`** — the REST API bearer token. Either let the chart render a Secret from `token`, or point `existingSecret` at a pre-created Secret with key `token`.
+- **`proxy.service.type`** — set to `NodePort` (with `proxy.service.nodePort`) to reach branches from outside the cluster without a port-forward.
+
+The chart creates a single-replica Deployment (branchd's registry is SQLite — single writer, so one replica, `Recreate` strategy, state in `hostPath <dataRoot>/state` on the storage node), a namespace-scoped Role (pods create/delete/get/list/watch, pods/exec, pods/log — branchd manages pods only in its own namespace), and two Services: `pgbranch-api` (REST, :7070) and `pgbranch-proxy` (Postgres router, :6432). The branchd container runs as root for write access to its hostPath state dir; branch pods get `CAP_SYS_ADMIN` for their in-container overlay mount, same as on Docker.
+
+Using it is the same REST API as above; branch hosts are pod IPs, so connect via the proxy Service:
+
+```bash
+kubectl -n pgbranch-system port-forward svc/pgbranch-api 7070 &
+curl -H "$AUTH" -d '{"name":"main","host":"db.prod.internal","port":5432,
+  "user":"postgres","password":"secret"}' localhost:7070/v1/sources
+curl -H "$AUTH" -d '{"name":"pr-42","source":"main"}' localhost:7070/v1/branches
+
+# in-cluster: psql "host=pgbranch-proxy.pgbranch-system port=6432 dbname=postgres@pr-42 user=postgres"
+kubectl -n pgbranch-system port-forward svc/pgbranch-proxy 6432 &
+psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
+```
+
+`make helm-test` lints and grep-asserts the rendered chart; `make k8s-it` runs the full integration suite against a local [kind](https://kind.sigs.k8s.io) cluster (`hack/kind-up.sh` creates `pgbranch-test` and preloads images).
+
 ## How it works
 
 `pgb source add` runs `pg_basebackup` in a one-shot helper container, streaming the source cluster into a named Docker volume. That volume becomes the read-only **lower layer** for every branch.

@@ -1,0 +1,32 @@
+# branchd manages branch/helper pods in its own namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "pgbranch.fullname" . }}
+  labels:
+    {{- include "pgbranch.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "pgbranch.fullname" . }}
+  labels:
+    {{- include "pgbranch.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "pgbranch.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pgbranch.fullname" . }}
+    namespace: {{ .Release.Namespace }}

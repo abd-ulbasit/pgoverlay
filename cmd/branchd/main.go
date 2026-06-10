@@ -39,6 +39,11 @@ func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
 	reapInterval := flag.Duration("reap-interval", 30*time.Second, "TTL reaper tick interval")
+	runtimeName := flag.String("runtime", "docker", "container runtime: docker or kube")
+	kubeNamespace := flag.String("kube-namespace", "", `namespace for branch/helper pods (default: POD_NAMESPACE when in-cluster, else "pgbranch")`)
+	kubeNode := flag.String("kube-node", "", "storage node name (required with --runtime kube; all CoW data lives on this node)")
+	kubeDataRoot := flag.String("kube-data-root", "/var/lib/pgbranch", "CoW data root on the storage node")
+	kubeconfig := flag.String("kubeconfig", "", "kubeconfig path (default: in-cluster config, then KUBECONFIG / ~/.kube/config)")
 	flag.Parse()
 
 	token := os.Getenv("PGBRANCH_TOKEN")
@@ -58,9 +63,27 @@ func run() error {
 		return err
 	}
 	defer reg.Close()
-	drv, err := runtime.NewDockerDriver()
+	var drv runtime.Driver
+	switch *runtimeName {
+	case "docker":
+		drv, err = runtime.NewDockerDriver()
+	case "kube":
+		if *kubeNode == "" {
+			return errors.New("--kube-node is required with --runtime kube (the node that stores all branch data)")
+		}
+		ns := *kubeNamespace
+		if ns == "" {
+			ns = os.Getenv("POD_NAMESPACE")
+		}
+		if ns == "" {
+			ns = "pgbranch"
+		}
+		drv, err = runtime.NewKubeDriver(*kubeconfig, ns, *kubeNode, *kubeDataRoot)
+	default:
+		return fmt.Errorf("unknown --runtime %q (want docker or kube)", *runtimeName)
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("init %s runtime: %w", *runtimeName, err)
 	}
 	eng := engine.New(reg, drv, cfg.PostgresImage)
 

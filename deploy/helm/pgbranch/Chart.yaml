@@ -1,0 +1,6 @@
+apiVersion: v2
+name: pgbranch
+description: Copy-on-write Postgres branches on Kubernetes (branchd control plane)
+type: application
+version: 0.1.0
+appVersion: "0.3.0"

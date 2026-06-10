@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pgbranch.fullname" . }}
+  labels:
+    {{- include "pgbranch.labels" . | nindent 4 }}
+spec:
+  # sqlite registry = single writer; keep one replica and recreate on upgrade.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "pgbranch.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pgbranch.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "pgbranch.fullname" . }}
+      # Pin to the storage node: branchd's sqlite state shares the node (and
+      # data root) with the CoW volumes it manages.
+      nodeName: {{ required "set node to the storage node name (kubectl get nodes)" .Values.node }}
+      containers:
+        - name: branchd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --runtime=kube
+            - --kube-node={{ .Values.node }}
+            - --kube-data-root={{ .Values.dataRoot }}
+            - --api-addr=:{{ .Values.api.port }}
+            - --pg-addr=:{{ .Values.proxy.port }}
+            - --reap-interval={{ .Values.reapInterval }}
+          env:
+            - name: PGBRANCH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgbranch.tokenSecretName" . }}
+                  key: token
+            # sqlite registry on the storage node (mounted below)
+            - name: PGBRANCH_HOME
+              value: {{ .Values.dataRoot }}/state
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: api
+              containerPort: {{ .Values.api.port }}
+            - name: proxy
+              containerPort: {{ .Values.proxy.port }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+          securityContext:
+            # root for write access to the hostPath state dir (see values.yaml)
+            runAsUser: {{ .Values.runAsUser }}
+          volumeMounts:
+            - name: state
+              mountPath: {{ .Values.dataRoot }}/state
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: state
+          hostPath:
+            path: {{ .Values.dataRoot }}/state
+            type: DirectoryOrCreate

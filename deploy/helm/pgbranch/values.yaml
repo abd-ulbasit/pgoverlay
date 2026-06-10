@@ -1,0 +1,48 @@
+# pgbranch runs all CoW data on ONE designated storage node (dev/test scope;
+# multi-node via CSI is future work). branchd, its sqlite state, and every
+# branch/helper pod are pinned to this node via nodeName + hostPath.
+
+# REQUIRED: name of the storage node (kubectl get nodes).
+node: ""
+
+# Host directory on the storage node holding all CoW volumes. branchd's own
+# state (sqlite registry) lives under <dataRoot>/state.
+dataRoot: /var/lib/pgbranch
+
+image:
+  repository: pgbranch/branchd
+  tag: dev
+  # The dev tag is built locally (make docker-build) and side-loaded
+  # (e.g. `kind load`); change to Always for a pushed registry image.
+  pullPolicy: IfNotPresent
+
+# Bearer token for the REST API. Exactly one of these is required:
+#  - token: the chart renders a Secret holding it
+#  - existingSecret: name of a pre-created Secret with key "token"
+token: ""
+existingSecret: ""
+
+api:
+  port: 7070
+  service:
+    type: ClusterIP
+
+# Postgres wire-protocol router (connect with dbname@branch). Expose as
+# NodePort to reach branches from outside the cluster without port-forward.
+proxy:
+  port: 6432
+  service:
+    type: ClusterIP
+    nodePort: "" # set when type is NodePort, e.g. 30432
+
+# TTL reaper tick interval (branchd --reap-interval).
+reapInterval: 30s
+
+# branchd writes its sqlite registry to a hostPath on the storage node, so it
+# must run as root for write access to that directory (simplest correct
+# choice for the single-node scope; the branchd image has no other users).
+# Branch pods (created by branchd at runtime, not by this chart) additionally
+# get CAP_SYS_ADMIN for their in-container overlay mounts.
+runAsUser: 0
+
+resources: {}
