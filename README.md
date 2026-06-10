@@ -196,13 +196,15 @@ Postgres starts on the merged view and performs ordinary WAL crash recovery — 
 
 Host-side Go code is pure control plane: a SQLite registry with a journaled state machine, and create/destroy implemented as sagas (every step registers a compensation, so a failure mid-create leaves no orphan containers or volumes).
 
+For hosts that already run ZFS there is an **experimental zfs backend** (`branchd --cow zfs --zfs-dataset tank/pgbranch`): branches become `zfs snapshot` + `zfs clone` instead of overlay layers — block-level CoW, no whole-file copy-up. It is unit-tested with manual-verification instructions (no ZFS in this project's CI); see [docs/zfs.md](docs/zfs.md) before relying on it.
+
 ## Scope: what this is and isn't
 
 pgbranch is a **dev/test tool**. Branches are disposable Postgres instances for development, CI, PR review apps, and migration rehearsal.
 
 It is **not** a production database platform: no HA, no replication of branches, no backups, no connection pooling, and the branch container needs `CAP_SYS_ADMIN` (for the overlay mount) — fine for a dev box or CI runner, not something to expose to untrusted workloads. A branch is a point-in-time snapshot; it does not follow the source after seeding.
 
-Phase 1 also branches only from sources, not from other branches (layer-DAG branching is planned).
+pgbranch also branches only from sources, not from other branches (layer-DAG branching is future work).
 
 ## Comparison
 
@@ -220,7 +222,19 @@ Phase 1 also branches only from sources, not from other branches (layer-DAG bran
 
 - **Phase 2** ✅ — `pgproxy` wire-protocol router (one stable endpoint, route by branch name), REST API + auth (`branchd` daemon reusing the same engine), TTL reaper for abandoned branches, branch reset, source refresh with generations. Branch-from-branch moved to a later phase.
 - **Phase 3** ✅ — Kubernetes runtime driver (branch pods on a storage node), Helm chart, GitHub webhook service (a branch per PR, automatically).
-- **Phase 4** — data masking hooks, web UI, ZFS backend as an alternative CoW engine, branch-from-branch, published benchmarks, docs site.
+- **Phase 4** ✅ — data masking hooks, embedded web UI with per-branch disk usage, published benchmarks (with the copy-up fix they motivated), experimental ZFS backend, docs site.
+- **Future work** — branch-from-branch (layer DAG), multi-node/CSI storage, TLS for the router, a Postgres minor/major version test matrix.
+
+## Documentation
+
+`docs/` is a small MkDocs site — no hosting or CI, build it locally with `pip install mkdocs-material && mkdocs serve`:
+
+- [Quickstart](docs/quickstart.md) — Docker on a laptop: CLI, `branchd`, REST API, router, web UI.
+- [Kubernetes](docs/kubernetes.md) — Helm chart, the storage-node model.
+- [GitHub App](docs/github-app.md) — a database branch per pull request.
+- [Benchmarks](docs/benchmarks.md) — measured numbers, methodology, and the copy-up diagnosis.
+- [ZFS backend](docs/zfs.md) — experimental; requirements and manual verification walkthrough.
+- [Architecture](docs/architecture.md) — components, CoW mechanics, sagas, generations, routing — as built.
 
 ## Development
 

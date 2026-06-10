@@ -1,0 +1,31 @@
+# pgbranch docs site. No CI, no hosting — build locally:
+#   pip install mkdocs-material && mkdocs serve
+site_name: pgbranch
+site_description: "git branch for Postgres: instant copy-on-write database branches"
+repo_url: https://github.com/abd-ulbasit/pgbranch
+repo_name: abd-ulbasit/pgbranch
+edit_uri: ""
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: teal
+    accent: teal
+  features:
+    - navigation.sections
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Kubernetes: kubernetes.md
+  - GitHub App: github-app.md
+  - Benchmarks: benchmarks.md
+  - ZFS backend (experimental): zfs.md
+  - Architecture: architecture.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - pymdownx.superfences

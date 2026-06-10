@@ -1,6 +1,6 @@
 # Benchmarks
 
-Measured with [`hack/benchmark.sh`](../hack/benchmark.sh) on 2026-06-10, against
+Measured with [`hack/benchmark.sh`](https://github.com/abd-ulbasit/pgbranch/blob/main/hack/benchmark.sh) on 2026-06-10, against
 pgbranch's Docker runtime with the OverlayFS copy-on-write backend. All numbers
 are real, single-machine measurements — no extrapolation.
 
@@ -41,7 +41,7 @@ are configurable: `BENCH_SIZES_GIB="1 5 10" hack/benchmark.sh`.
 ## The fix
 
 One flag. The branch entrypoint
-([`internal/cow/entrypoint.sh`](../internal/cow/entrypoint.sh)) now hands off
+([`internal/cow/entrypoint.sh`](https://github.com/abd-ulbasit/pgbranch/blob/main/internal/cow/entrypoint.sh)) now hands off
 with:
 
 ```sh
