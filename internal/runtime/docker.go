@@ -151,8 +151,8 @@ func (d *DockerDriver) StartBranch(ctx context.Context, spec BranchSpec) (string
 	}
 	host := &container.HostConfig{
 		Mounts:        toMounts(spec.Mounts),
-		CapAdd:        []string{"SYS_ADMIN"},           // overlay mount inside container
-		SecurityOpt:   []string{"apparmor=unconfined"}, // no-op where AppArmor absent
+		CapAdd:        []string{"SYS_ADMIN"},                                          // overlay mount inside container
+		SecurityOpt:   []string{"apparmor=unconfined"},                                // no-op where AppArmor absent
 		PortBindings:  nat.PortMap{"5432/tcp": {{HostIP: "127.0.0.1", HostPort: ""}}}, // random host port
 		NetworkMode:   container.NetworkMode(spec.Network),
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyUnlessStopped},

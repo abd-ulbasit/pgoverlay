@@ -210,8 +210,8 @@ Phase 1 also branches only from sources, not from other branches (layer-DAG bran
 ## Roadmap
 
 - **Phase 2** ✅ — `pgproxy` wire-protocol router (one stable endpoint, route by branch name), REST API + auth (`branchd` daemon reusing the same engine), TTL reaper for abandoned branches, branch reset, source refresh with generations. Branch-from-branch moved to a later phase.
-- **Phase 3** — Kubernetes runtime driver, Helm chart, GitHub App (a branch per PR, automatically), branch-from-branch.
-- **Phase 4** — data masking hooks, web UI, ZFS backend as an alternative CoW engine, published benchmarks, docs site.
+- **Phase 3** ✅ — Kubernetes runtime driver (branch pods on a storage node), Helm chart, GitHub webhook service (a branch per PR, automatically).
+- **Phase 4** — data masking hooks, web UI, ZFS backend as an alternative CoW engine, branch-from-branch, published benchmarks, docs site.
 
 ## Development
 
