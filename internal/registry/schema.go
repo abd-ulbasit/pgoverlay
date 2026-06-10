@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -95,4 +95,20 @@ CREATE TABLE mask_scripts (
   sql TEXT NOT NULL,
   PRIMARY KEY (source_id, ord)
 );
+`
+
+// v5 (Phase 5): branch-from-branch. A freeze turns a parent branch's rw
+// volume into an immutable layer; layers form per-source chains (a DAG rooted
+// at the source volume). branches.base_layer_id points at the top of the
+// chain a branch was cloned from (NULL = directly off the source volume, as
+// before); parent_branch_name is display-only lineage.
+const migrateV5 = `
+CREATE TABLE layers (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  volume TEXT NOT NULL,
+  parent_layer_id TEXT NULL REFERENCES layers(id)
+);
+ALTER TABLE branches ADD COLUMN base_layer_id TEXT NULL;
+ALTER TABLE branches ADD COLUMN parent_branch_name TEXT NOT NULL DEFAULT '';
 `

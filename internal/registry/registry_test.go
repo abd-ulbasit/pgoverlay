@@ -164,8 +164,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 4 {
-		t.Fatalf("user_version=%d want 4", v)
+	if v != 5 {
+		t.Fatalf("user_version=%d want 5", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -200,6 +200,18 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	}
 	if ms, err := r.GetMaskScripts("src1"); err != nil || len(ms) != 1 {
 		t.Fatalf("mask scripts after upgrade: %v err=%v", ms, err)
+	}
+	// v5: pre-existing branches base directly on the source volume (no layer
+	// chain) and carry no display parent
+	if b.BaseLayerID != "" || b.ParentBranchName != "" {
+		t.Fatalf("v5 backfill: BaseLayerID=%q ParentBranchName=%q want empty", b.BaseLayerID, b.ParentBranchName)
+	}
+	if chain, err := r.LayerChain(b.ID); err != nil || len(chain) != 0 {
+		t.Fatalf("v5 chain of pre-existing branch: %v err=%v", chain, err)
+	}
+	// v5: layers table exists and is usable on the upgraded DB
+	if err := r.CreateLayer(&Layer{SourceID: "src1", Volume: "frozen-v"}); err != nil {
+		t.Fatalf("v5 layers unusable after upgrade: %v", err)
 	}
 	// re-opening an already-migrated DB is a no-op
 	r2, err := Open(path)
@@ -357,6 +369,12 @@ func TestBumpSourceGenerationAndCounts(t *testing.T) {
 	if n, _ := r.CountLiveBranchesByVolume("pgbranch-src-main-g2"); n != 0 {
 		t.Fatalf("live by g2 volume=%d want 0", n)
 	}
+	if n, _ := r.CountLiveBranchesByRWVolume("rw"); n != 1 {
+		t.Fatalf("live by rw volume=%d want 1", n)
+	}
+	if n, _ := r.CountLiveBranchesByRWVolume("pgbranch-src-main"); n != 0 {
+		t.Fatalf("live by rw volume (source vol)=%d want 0", n)
+	}
 	// destroyed branches don't count
 	if err := r.MarkBranchReady(b.ID, "c", "127.0.0.1", 1); err != nil {
 		t.Fatal(err)
@@ -447,6 +465,281 @@ func TestResettingTransitions(t *testing.T) {
 	}
 	if err := r.TransitionBranch(b.ID, BranchFailed, "boom"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// layerFixture builds source "main" with a two-deep layer chain:
+//
+//	source volume <- L1 <- L2
+//	b-src  bases on the source directly (no chain)
+//	b-l1   bases on L1 (chain [L1])
+//	b-l2   bases on L2 (chain [L2, L1])
+//
+// All branches are live (creating).
+func layerFixture(t *testing.T, r *Registry) (src *Source, l1, l2 *Layer, bSrc, bL1, bL2 *Branch) {
+	t.Helper()
+	src = &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	if err := r.CreateSource(src); err != nil {
+		t.Fatal(err)
+	}
+	l1 = &Layer{SourceID: src.ID, Volume: "pgbranch-br-p-rw"}
+	if err := r.CreateLayer(l1); err != nil {
+		t.Fatal(err)
+	}
+	l2 = &Layer{SourceID: src.ID, Volume: "pgbranch-br-p-rw-g2", ParentLayerID: l1.ID}
+	if err := r.CreateLayer(l2); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name, base string) *Branch {
+		b := &Branch{Name: name, SourceID: src.ID, RWVolume: name + "-rw", SourceVolume: src.Volume, BaseLayerID: base}
+		if err := r.CreateBranch(b); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	return src, l1, l2, mk("b-src", ""), mk("b-l1", l1.ID), mk("b-l2", l2.ID)
+}
+
+func TestLayerCRUDAndChain(t *testing.T) {
+	r := openTest(t)
+	_, l1, l2, bSrc, bL1, bL2 := layerFixture(t, r)
+	if l1.ID == "" || l2.ID == "" {
+		t.Fatalf("CreateLayer assigned no ID: %+v %+v", l1, l2)
+	}
+	got, err := r.GetLayer(l2.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Volume != "pgbranch-br-p-rw-g2" || got.ParentLayerID != l1.ID {
+		t.Fatalf("GetLayer: %+v", got)
+	}
+	if _, err := r.GetLayer("nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetLayer(nope) err=%v want ErrNotFound", err)
+	}
+
+	// chains, topmost (newest) first
+	if chain, err := r.LayerChain(bSrc.ID); err != nil || len(chain) != 0 {
+		t.Fatalf("chain(b-src)=%v err=%v want empty", chain, err)
+	}
+	chain, err := r.LayerChain(bL1.ID)
+	if err != nil || len(chain) != 1 || chain[0].ID != l1.ID {
+		t.Fatalf("chain(b-l1)=%v err=%v want [L1]", chain, err)
+	}
+	chain, err = r.LayerChain(bL2.ID)
+	if err != nil || len(chain) != 2 || chain[0].ID != l2.ID || chain[1].ID != l1.ID {
+		t.Fatalf("chain(b-l2)=%v err=%v want [L2, L1]", chain, err)
+	}
+	if _, err := r.LayerChain("nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LayerChain(nope) err=%v want ErrNotFound", err)
+	}
+
+	// delete: children before parents (FK)
+	if err := r.DeleteLayer(l1.ID); err == nil {
+		t.Fatal("deleting a layer still referenced by a child layer must fail (FK)")
+	}
+	if err := r.DeleteLayer(l2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DeleteLayer(l1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.GetLayer(l1.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("layer survives delete: %v", err)
+	}
+}
+
+func TestCountBranchesReferencingLayer(t *testing.T) {
+	r := openTest(t)
+	_, l1, l2, _, bL1, bL2 := layerFixture(t, r)
+
+	// L2 is referenced by b-l2 only; L1 by both b-l1 (directly) and b-l2
+	// (through L2's parent chain). b-src references no layer.
+	if n, err := r.CountBranchesReferencingLayer(l2.ID); err != nil || n != 1 {
+		t.Fatalf("refs(L2)=%d err=%v want 1", n, err)
+	}
+	if n, err := r.CountBranchesReferencingLayer(l1.ID); err != nil || n != 2 {
+		t.Fatalf("refs(L1)=%d err=%v want 2", n, err)
+	}
+	// destroyed branches do not count
+	destroy := func(b *Branch) {
+		t.Helper()
+		if err := r.TransitionBranch(b.ID, BranchFailed, "x"); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.TransitionBranch(b.ID, BranchDestroying, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.TransitionBranch(b.ID, BranchDestroyed, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	destroy(bL2)
+	if n, _ := r.CountBranchesReferencingLayer(l2.ID); n != 0 {
+		t.Fatalf("refs(L2) after destroy=%d want 0", n)
+	}
+	if n, _ := r.CountBranchesReferencingLayer(l1.ID); n != 1 {
+		t.Fatalf("refs(L1) after destroy=%d want 1", n)
+	}
+	destroy(bL1)
+	if n, _ := r.CountBranchesReferencingLayer(l1.ID); n != 0 {
+		t.Fatalf("refs(L1) after both destroyed=%d want 0", n)
+	}
+}
+
+func TestListLayersBySource(t *testing.T) {
+	r := openTest(t)
+	src, l1, l2, _, _, _ := layerFixture(t, r)
+	layers, err := r.ListLayersBySource(src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layers) != 2 {
+		t.Fatalf("layers=%v want 2", layers)
+	}
+	ids := map[string]bool{layers[0].ID: true, layers[1].ID: true}
+	if !ids[l1.ID] || !ids[l2.ID] {
+		t.Fatalf("layers=%v want L1+L2", layers)
+	}
+	if layers, _ := r.ListLayersBySource("nope"); len(layers) != 0 {
+		t.Fatalf("layers of unknown source=%v want none", layers)
+	}
+}
+
+// CommitFreeze is the registry half of the freeze saga: in one transaction
+// the parent's old rw volume becomes a new layer, the parent moves to a fresh
+// rw volume + new container (resetting -> ready), and the child branch bases
+// on the new layer.
+func TestCommitFreeze(t *testing.T) {
+	r := openTest(t)
+	src := &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	if err := r.CreateSource(src); err != nil {
+		t.Fatal(err)
+	}
+	parent := &Branch{Name: "p", SourceID: src.ID, RWVolume: "pgbranch-br-p-rw", SourceVolume: src.Volume}
+	if err := r.CreateBranch(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkBranchReady(parent.ID, "cid-p1", "127.0.0.1", 1001); err != nil {
+		t.Fatal(err)
+	}
+	child := &Branch{Name: "c", SourceID: src.ID, RWVolume: "pgbranch-br-c-rw", SourceVolume: src.Volume, ParentBranchName: "p"}
+	if err := r.CreateBranch(child); err != nil {
+		t.Fatal(err)
+	}
+
+	// freeze requires the parent mid-transition (resetting)
+	if _, err := r.CommitFreeze(parent.ID, child.ID, "pgbranch-br-p-rw", "pgbranch-br-p-rw-g2", "cid-p2", "127.0.0.1", 1002, "freeze for child c"); err == nil {
+		t.Fatal("CommitFreeze on a ready (not resetting) parent must fail")
+	}
+	if err := r.TransitionBranch(parent.ID, BranchResetting, "freeze for child c"); err != nil {
+		t.Fatal(err)
+	}
+	l, err := r.CommitFreeze(parent.ID, child.ID, "pgbranch-br-p-rw", "pgbranch-br-p-rw-g2", "cid-p2", "127.0.0.1", 1002, "freeze for child c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.ID == "" || l.SourceID != src.ID || l.Volume != "pgbranch-br-p-rw" || l.ParentLayerID != "" {
+		t.Fatalf("layer: %+v", l)
+	}
+	p, err := r.GetBranchByName("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.State != BranchReady || p.RWVolume != "pgbranch-br-p-rw-g2" || p.BaseLayerID != l.ID ||
+		p.ContainerID != "cid-p2" || p.Port != 1002 {
+		t.Fatalf("parent after freeze: %+v", p)
+	}
+	c, err := r.GetBranchByName("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.BaseLayerID != l.ID || c.State != BranchCreating {
+		t.Fatalf("child after freeze: %+v", c)
+	}
+	if chain, _ := r.LayerChain(c.ID); len(chain) != 1 || chain[0].ID != l.ID {
+		t.Fatalf("child chain: %v", chain)
+	}
+
+	// second freeze of the same parent chains the new layer onto the first
+	child2 := &Branch{Name: "c2", SourceID: src.ID, RWVolume: "pgbranch-br-c2-rw", SourceVolume: src.Volume, ParentBranchName: "p"}
+	if err := r.CreateBranch(child2); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(parent.ID, BranchResetting, "freeze for child c2"); err != nil {
+		t.Fatal(err)
+	}
+	l2, err := r.CommitFreeze(parent.ID, child2.ID, "pgbranch-br-p-rw-g2", "pgbranch-br-p-rw-g3", "cid-p3", "127.0.0.1", 1003, "freeze for child c2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.ParentLayerID != l.ID {
+		t.Fatalf("second layer parent=%q want %q", l2.ParentLayerID, l.ID)
+	}
+	if chain, _ := r.LayerChain(child2.ID); len(chain) != 2 || chain[0].ID != l2.ID || chain[1].ID != l.ID {
+		t.Fatalf("child2 chain: %v", chain)
+	}
+	if chain, _ := r.LayerChain(parent.ID); len(chain) != 2 || chain[0].ID != l2.ID {
+		t.Fatalf("parent chain after two freezes: %v", chain)
+	}
+	// the freeze transitions are journaled with the freeze reason
+	var n int
+	if err := r.db.QueryRow(`SELECT count(*) FROM transitions WHERE entity_id=? AND reason LIKE 'freeze for child%'`, parent.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 4 { // 2x ready->resetting + 2x resetting->ready
+		t.Fatalf("freeze transitions journaled=%d want >=4", n)
+	}
+	// unknown child rolls everything back
+	if err := r.TransitionBranch(parent.ID, BranchResetting, "freeze for child ghost"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CommitFreeze(parent.ID, "ghost", "x", "y", "cid", "127.0.0.1", 1, "r"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CommitFreeze(unknown child) err=%v want ErrNotFound", err)
+	}
+	if p, _ := r.GetBranchByName("p"); p.RWVolume != "pgbranch-br-p-rw-g3" {
+		t.Fatalf("failed CommitFreeze mutated parent: %+v", p)
+	}
+}
+
+func TestCreateBranchPersistsParentBranchName(t *testing.T) {
+	r := openTest(t)
+	src := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(src); err != nil {
+		t.Fatal(err)
+	}
+	b := &Branch{Name: "c", SourceID: src.ID, RWVolume: "rw", SourceVolume: "v", ParentBranchName: "p"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetBranchByName("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ParentBranchName != "p" {
+		t.Fatalf("ParentBranchName=%q want p", got.ParentBranchName)
+	}
+}
+
+func TestDeleteSourceRemovesLayers(t *testing.T) {
+	r := openTest(t)
+	src, l1, _, bSrc, bL1, bL2 := layerFixture(t, r)
+	for _, b := range []*Branch{bSrc, bL1, bL2} {
+		if err := r.TransitionBranch(b.ID, BranchFailed, "x"); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.TransitionBranch(b.ID, BranchDestroying, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.TransitionBranch(b.ID, BranchDestroyed, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// layer rows (a self-referencing chain) go with the source
+	if err := r.DeleteSource(src.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.GetLayer(l1.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("layer survives source delete: %v", err)
 	}
 }
 

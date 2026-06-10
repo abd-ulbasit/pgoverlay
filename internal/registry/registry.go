@@ -66,9 +66,18 @@ type Branch struct {
 	SourceVolume                              string // source volume the branch was created from
 	ExpiresAt                                 string // RFC3339, "" = never
 	Host                                      string // address the instance listens on (127.0.0.1 for docker, pod IP for k8s)
+	BaseLayerID                               string // top of the layer chain the branch bases on; "" = the source volume directly
+	ParentBranchName                          string // display-only: branch this one was created from ("" = created from the source)
 	Port                                      int
 	State                                     BranchState
 	CreatedAt                                 string
+}
+
+// Layer is a frozen branch rw volume: an immutable overlay layer between the
+// source volume and the branches cloned from that branch. Layers chain via
+// ParentLayerID ("" = the layer sits directly on the source volume).
+type Layer struct {
+	ID, SourceID, Volume, ParentLayerID string
 }
 
 type Registry struct{ db *sql.DB }
@@ -205,10 +214,18 @@ var legalBranch = map[BranchState][]BranchState{
 	BranchDestroying: {BranchDestroyed},
 }
 
+// nullable maps "" to SQL NULL (for nullable FK columns like parent_layer_id).
+func nullable(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 func (r *Registry) CreateBranch(b *Branch) error {
 	b.ID, b.State = newID(), BranchCreating
-	_, err := r.db.Exec(`INSERT INTO branches (id,name,source_id,state,rw_volume,source_volume,expires_at) VALUES (?,?,?,?,?,?,?)`,
-		b.ID, b.Name, b.SourceID, b.State, b.RWVolume, b.SourceVolume, b.ExpiresAt)
+	_, err := r.db.Exec(`INSERT INTO branches (id,name,source_id,state,rw_volume,source_volume,expires_at,base_layer_id,parent_branch_name) VALUES (?,?,?,?,?,?,?,?,?)`,
+		b.ID, b.Name, b.SourceID, b.State, b.RWVolume, b.SourceVolume, b.ExpiresAt, nullable(b.BaseLayerID), b.ParentBranchName)
 	if err != nil {
 		return fmt.Errorf("create branch %q: %w", b.Name, err)
 	}
@@ -235,15 +252,17 @@ func (r *Registry) MarkBranchReady(id, containerID, host string, port int) error
 	return r.TransitionBranch(id, BranchReady, "instance running")
 }
 
-const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,host,port,created_at`
+const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,host,base_layer_id,parent_branch_name,port,created_at`
 
 func scanBranch(row interface{ Scan(...any) error }) (*Branch, error) {
 	b := &Branch{}
+	var baseLayer sql.NullString
 	err := row.Scan(&b.ID, &b.Name, &b.SourceID, &b.State, &b.ContainerID, &b.RWVolume,
-		&b.SourceVolume, &b.ExpiresAt, &b.Host, &b.Port, &b.CreatedAt)
+		&b.SourceVolume, &b.ExpiresAt, &b.Host, &baseLayer, &b.ParentBranchName, &b.Port, &b.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
+	b.BaseLayerID = baseLayer.String
 	return b, err
 }
 
@@ -355,6 +374,169 @@ func (r *Registry) CountLiveBranchesByVolume(volume string) (int, error) {
 	return n, err
 }
 
+// CountLiveBranchesByRWVolume counts live branches whose writable layer is
+// the given volume/dataset. Used as a GC guard: a volume that is some live
+// branch's rw layer must never be removed as an orphaned source layer (zfs
+// children record their parent's clone dataset as their SourceVolume).
+func (r *Registry) CountLiveBranchesByRWVolume(volume string) (int, error) {
+	var n int
+	err := r.db.QueryRow(`SELECT count(*) FROM branches WHERE rw_volume=? AND state!='destroyed'`, volume).Scan(&n)
+	return n, err
+}
+
+// CreateLayer records a frozen layer (assigns its ID).
+func (r *Registry) CreateLayer(l *Layer) error {
+	l.ID = newID()
+	_, err := r.db.Exec(`INSERT INTO layers (id,source_id,volume,parent_layer_id) VALUES (?,?,?,?)`,
+		l.ID, l.SourceID, l.Volume, nullable(l.ParentLayerID))
+	if err != nil {
+		return fmt.Errorf("create layer for volume %q: %w", l.Volume, err)
+	}
+	return nil
+}
+
+func scanLayer(row interface{ Scan(...any) error }) (*Layer, error) {
+	l := &Layer{}
+	var parent sql.NullString
+	err := row.Scan(&l.ID, &l.SourceID, &l.Volume, &parent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	l.ParentLayerID = parent.String
+	return l, err
+}
+
+const layerCols = `id,source_id,volume,parent_layer_id`
+
+func (r *Registry) GetLayer(id string) (*Layer, error) {
+	return scanLayer(r.db.QueryRow(`SELECT `+layerCols+` FROM layers WHERE id=?`, id))
+}
+
+// DeleteLayer removes a layer row. Fails (FK) while a child layer still
+// chains onto it — callers GC topmost-first.
+func (r *Registry) DeleteLayer(id string) error {
+	res, err := r.db.Exec(`DELETE FROM layers WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListLayersBySource returns every layer frozen under the given source.
+func (r *Registry) ListLayersBySource(sourceID string) ([]*Layer, error) {
+	rows, err := r.db.Query(`SELECT `+layerCols+` FROM layers WHERE source_id=?`, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Layer
+	for rows.Next() {
+		l, err := scanLayer(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// LayerChain resolves a branch's layer chain, topmost (newest) layer first.
+// Empty for branches based directly on the source volume. The full overlay
+// stack is: chain[0], chain[1], …, source volume.
+func (r *Registry) LayerChain(branchID string) ([]Layer, error) {
+	b, err := r.getBranch(`id=?`, branchID)
+	if err != nil {
+		return nil, err
+	}
+	var out []Layer
+	for id := b.BaseLayerID; id != ""; {
+		l, err := r.GetLayer(id)
+		if err != nil {
+			return nil, fmt.Errorf("layer chain of branch %q: layer %q: %w", b.Name, id, err)
+		}
+		out = append(out, *l)
+		id = l.ParentLayerID
+	}
+	return out, nil
+}
+
+// CountBranchesReferencingLayer computes a layer's refcount: the number of
+// live branches whose layer chain contains it (directly or via descendants).
+// Refcounts are derived, never stored.
+func (r *Registry) CountBranchesReferencingLayer(layerID string) (int, error) {
+	var n int
+	err := r.db.QueryRow(`
+		WITH RECURSIVE refs(branch_id, layer_id) AS (
+			SELECT id, base_layer_id FROM branches
+				WHERE state != 'destroyed' AND base_layer_id IS NOT NULL
+			UNION
+			SELECT refs.branch_id, layers.parent_layer_id FROM refs
+				JOIN layers ON layers.id = refs.layer_id
+				WHERE layers.parent_layer_id IS NOT NULL
+		)
+		SELECT count(DISTINCT branch_id) FROM refs WHERE layer_id = ?`, layerID).Scan(&n)
+	return n, err
+}
+
+// CommitFreeze atomically records a completed freeze, once the parent is
+// running on its fresh rw volume and the child instance is up:
+//
+//   - the parent's old rw volume becomes a new immutable layer (chained onto
+//     the parent's previous base layer, if any),
+//   - the parent row swaps to the fresh rw volume + new container/host/port
+//     and transitions resetting -> ready,
+//   - the child branch bases on the new layer.
+//
+// The parent must be mid-freeze (resetting); all of it commits or none does.
+func (r *Registry) CommitFreeze(parentID, childID, layerVolume, newParentRW, containerID, host string, port int, reason string) (*Layer, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var state, sourceID string
+	var prevBase sql.NullString
+	err = tx.QueryRow(`SELECT state, source_id, base_layer_id FROM branches WHERE id=?`, parentID).Scan(&state, &sourceID, &prevBase)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if BranchState(state) != BranchResetting {
+		return nil, fmt.Errorf("illegal branch transition %s -> %s (freeze commit requires a resetting parent)", state, BranchReady)
+	}
+	l := &Layer{ID: newID(), SourceID: sourceID, Volume: layerVolume, ParentLayerID: prevBase.String}
+	if _, err := tx.Exec(`INSERT INTO layers (id,source_id,volume,parent_layer_id) VALUES (?,?,?,?)`,
+		l.ID, l.SourceID, l.Volume, nullable(l.ParentLayerID)); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`UPDATE branches SET rw_volume=?, base_layer_id=?, container_id=?, host=?, port=?, state=?,
+		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
+		newParentRW, l.ID, containerID, host, port, BranchReady, parentID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason) VALUES (?,?,?,?,?)`,
+		"branch", parentID, state, string(BranchReady), reason); err != nil {
+		return nil, err
+	}
+	res, err := tx.Exec(`UPDATE branches SET base_layer_id=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, l.ID, childID)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		return nil, fmt.Errorf("freeze child branch: %w", ErrNotFound)
+	}
+	return l, tx.Commit()
+}
+
 // DeleteSource removes a source row and its (destroyed) branch history rows.
 // Callers must ensure no live branches reference the source first.
 func (r *Registry) DeleteSource(id string) error {
@@ -363,6 +545,14 @@ func (r *Registry) DeleteSource(id string) error {
 		return err
 	}
 	defer tx.Rollback()
+	// layers self-reference via parent_layer_id; defer FK checks so the whole
+	// chain can go in one statement
+	if _, err := tx.Exec(`PRAGMA defer_foreign_keys=ON`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM layers WHERE source_id=?`, id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM branches WHERE source_id=?`, id); err != nil {
 		return err
 	}
