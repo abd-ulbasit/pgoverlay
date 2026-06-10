@@ -15,11 +15,18 @@ import (
 	"github.com/abd-ulbasit/pgbranch/internal/runtime"
 )
 
-// StartSourcePG starts a "production" postgres on a dedicated docker network
-// and returns its in-network host, port, network name, and a host connection
-// string. It is a shared integration-test helper (lives in a non-test file so
-// other packages' tests can import it).
+// StartSourcePG starts a "production" postgres:17 on a dedicated docker
+// network and returns its in-network host, port, network name, and a host
+// connection string. It is a shared integration-test helper (lives in a
+// non-test file so other packages' tests can import it).
 func StartSourcePG(t *testing.T, ctx context.Context) (host string, port int, networkName string, hostConn string) {
+	t.Helper()
+	return StartSourcePGVersion(t, ctx, "17")
+}
+
+// StartSourcePGVersion is StartSourcePG for an arbitrary Postgres major
+// (image postgres:<major>), used by the version-matrix integration test.
+func StartSourcePGVersion(t *testing.T, ctx context.Context, major string) (host string, port int, networkName string, hostConn string) {
 	t.Helper()
 	// testcontainers-go resolves the docker host from DOCKER_HOST or
 	// /var/run/docker.sock but not from docker CLI contexts (Colima).
@@ -34,7 +41,7 @@ func StartSourcePG(t *testing.T, ctx context.Context) (host string, port int, ne
 	}
 	t.Cleanup(func() { net.Remove(context.Background()) })
 	req := tc.ContainerRequest{
-		Image:          "postgres:17",
+		Image:          "postgres:" + major,
 		Env:            map[string]string{"POSTGRES_PASSWORD": "secret"},
 		Networks:       []string{net.Name},
 		NetworkAliases: map[string][]string{net.Name: {"sourcedb"}},

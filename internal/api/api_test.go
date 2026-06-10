@@ -448,3 +448,16 @@ func TestInvalidBranchNameBadRequest(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateSourceUnsupportedPGVersionRejected(t *testing.T) {
+	ts, _ := newTestServer(t)
+	code, body := do(t, ts, testToken, "POST", "/v1/sources", CreateSourceRequest{
+		Name: "old", Host: "db.internal", PGVersion: "13", Password: "secret",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400 (body=%s)", code, body)
+	}
+	if !strings.Contains(string(body), "unsupported pg_version") {
+		t.Errorf("body %s should explain the unsupported version", body)
+	}
+}

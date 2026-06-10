@@ -55,6 +55,17 @@ a host-local DB, or `--network <net>` for a DB on a Docker network). The
 password is read from the env var named by `--password-env` (default
 `PGPASSWORD`). State lives in `~/.pgbranch` (override with `PGBRANCH_HOME`).
 
+## Supported Postgres versions
+
+| Postgres major | 13 and older | 14 | 15 | 16 | 17 (default) | 18 |
+|---|---|---|---|---|---|---|
+| Supported | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+Declare the source's major with `--pg-version` (default 17) so branches run a
+matching `postgres:<major>` image; majors outside 14–18 are rejected at
+registration. PG 13 and older lack `recovery_init_sync_method=syncfs` (new in
+PG 14), which branch startup relies on for fast crash recovery on the overlay.
+
 Branches can self-destruct (`--ttl 24h`, reaped by `branchd`), be reset to
 their source snapshot (`pgb branch reset pr-1` — discards all writes, new
 container/port), and sources can be re-seeded (`pgb source refresh main` —

@@ -206,6 +206,16 @@ It is **not** a production database platform: no HA, no replication of branches,
 
 pgbranch also branches only from sources, not from other branches (layer-DAG branching is future work).
 
+## Supported Postgres versions
+
+| Postgres major | 13 and older | 14 | 15 | 16 | 17 (default) | 18 |
+|---|---|---|---|---|---|---|
+| Supported | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+Declare the major when registering a source (`pgb source add main --pg-version 16 …`, or `"pg_version":"16"` over the API); branches then run `postgres:<major>` so the binary matches the seeded data directory. Versions outside 14–18 are rejected at registration time.
+
+PG 13 and older are unsupported because branch startup passes `-c recovery_init_sync_method=syncfs`, a GUC added in **PG 14** — it is what makes WAL crash recovery on a fresh overlay fast (one `syncfs()` instead of fsyncing every data file; see [benchmarks](docs/benchmarks.md)). The matrix is exercised end-to-end by `make matrix` (seed → branch → verify → destroy per major; defaults to 14 and 18, the range edges).
+
 ## Comparison
 
 |  | pgbranch | Neon | DBLab (DLE) | pg_dump/restore |
@@ -223,7 +233,7 @@ pgbranch also branches only from sources, not from other branches (layer-DAG bra
 - **Phase 2** ✅ — `pgproxy` wire-protocol router (one stable endpoint, route by branch name), REST API + auth (`branchd` daemon reusing the same engine), TTL reaper for abandoned branches, branch reset, source refresh with generations. Branch-from-branch moved to a later phase.
 - **Phase 3** ✅ — Kubernetes runtime driver (branch pods on a storage node), Helm chart, GitHub webhook service (a branch per PR, automatically).
 - **Phase 4** ✅ — data masking hooks, embedded web UI with per-branch disk usage, published benchmarks (with the copy-up fix they motivated), experimental ZFS backend, docs site.
-- **Future work** — branch-from-branch (layer DAG), multi-node/CSI storage, TLS for the router, a Postgres minor/major version test matrix.
+- **Phase 5 (in progress)** — TLS for the router and REST API ✅, Postgres 14–18 support matrix ✅; still ahead: branch-from-branch (layer DAG), multi-node/CSI storage.
 
 ## Documentation
 
@@ -239,9 +249,10 @@ pgbranch also branches only from sources, not from other branches (layer-DAG bra
 ## Development
 
 ```bash
-make test   # unit tests
-make it     # integration tests (needs Docker): PGBRANCH_IT=1, ~min on first pull
-make lint   # go vet
+make test    # unit tests
+make it      # integration tests (needs Docker): PGBRANCH_IT=1, ~min on first pull
+make matrix  # Postgres version matrix (PGBRANCH_MATRIX_VERSIONS="14 18" by default)
+make lint    # go vet
 ```
 
 ## License

@@ -2,7 +2,10 @@ package registry
 
 import (
 	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -444,5 +447,31 @@ func TestResettingTransitions(t *testing.T) {
 	}
 	if err := r.TransitionBranch(b.ID, BranchFailed, "boom"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// pg_version must be a supported major (14-18) or empty (defaults to the
+// engine's image, postgres:17). Minors and out-of-range majors are rejected:
+// PG < 14 lacks recovery_init_sync_method=syncfs, which branch startup needs.
+func TestCreateSourcePGVersionValidation(t *testing.T) {
+	r := openTest(t)
+	for i, v := range []string{"", "14", "15", "16", "17", "18"} {
+		s := &Source{Name: fmt.Sprintf("ok-%d", i), PGVersion: v, ConnHost: "h", ConnPort: 5432, ConnUser: "u"}
+		if err := r.CreateSource(s); err != nil {
+			t.Errorf("pg_version %q: unexpected error %v", v, err)
+		}
+	}
+	for _, v := range []string{"13", "19", "17.2", "9.6", "fourteen", " 17"} {
+		s := &Source{Name: "bad", PGVersion: v, ConnHost: "h", ConnPort: 5432, ConnUser: "u"}
+		err := r.CreateSource(s)
+		if !errors.Is(err, ErrUnsupportedPGVersion) {
+			t.Errorf("pg_version %q: err = %v, want ErrUnsupportedPGVersion", v, err)
+		}
+		if err == nil {
+			continue
+		}
+		if !strings.Contains(err.Error(), v) || !strings.Contains(err.Error(), "14") {
+			t.Errorf("pg_version %q: error %q should name the version and the supported range", v, err)
+		}
 	}
 }

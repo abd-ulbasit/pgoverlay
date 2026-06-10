@@ -28,7 +28,8 @@ func writeEngineError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	msg := err.Error()
 	switch {
-	case errors.Is(err, engine.ErrInvalidName):
+	case errors.Is(err, engine.ErrInvalidName),
+		errors.Is(err, registry.ErrUnsupportedPGVersion):
 		code = http.StatusBadRequest
 	case errors.Is(err, registry.ErrNotFound):
 		code = http.StatusNotFound

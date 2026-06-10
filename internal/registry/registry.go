@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -28,6 +29,28 @@ const (
 )
 
 var ErrNotFound = errors.New("not found")
+
+// ErrUnsupportedPGVersion rejects sources whose pg_version is outside the
+// supported matrix. Majors 14-18 only: branch startup relies on
+// recovery_init_sync_method=syncfs, which PG 13 and older do not have.
+var ErrUnsupportedPGVersion = errors.New("unsupported pg_version")
+
+// supportedPGVersions is the allowlist of Postgres majors pgbranch supports
+// ("" defaults to the engine's image, postgres:17).
+var supportedPGVersions = []string{"14", "15", "16", "17", "18"}
+
+func validatePGVersion(v string) error {
+	if v == "" {
+		return nil
+	}
+	for _, s := range supportedPGVersions {
+		if v == s {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w %q: supported majors are %s (PG 13 and older lack recovery_init_sync_method=syncfs)",
+		ErrUnsupportedPGVersion, v, strings.Join(supportedPGVersions, ", "))
+}
 
 type Source struct {
 	ID, Name, PGVersion, Volume         string
@@ -114,6 +137,9 @@ func newID() string {
 }
 
 func (r *Registry) CreateSource(s *Source) error {
+	if err := validatePGVersion(s.PGVersion); err != nil {
+		return err
+	}
 	s.ID, s.State = newID(), SourceSeeding
 	_, err := r.db.Exec(`INSERT INTO sources
 		(id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,state)

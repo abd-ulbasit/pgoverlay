@@ -69,7 +69,7 @@ func newSourceAddCmd() *cobra.Command {
 	cmd.Flags().StringVar(&user, "user", "postgres", "user with REPLICATION privilege")
 	cmd.Flags().StringVar(&db, "database", "postgres", "database name recorded for connection strings")
 	cmd.Flags().StringVar(&network, "network", "", "docker network from which the source is reachable")
-	cmd.Flags().StringVar(&pgVersion, "pg-version", "17", "source Postgres major version (branch image must match)")
+	cmd.Flags().StringVar(&pgVersion, "pg-version", "17", "source Postgres major version, 14-18 (branch image must match)")
 	cmd.Flags().StringVar(&passwordEnv, "password-env", "PGPASSWORD", "env var holding the source password")
 	cmd.MarkFlagRequired("host")
 	return cmd
