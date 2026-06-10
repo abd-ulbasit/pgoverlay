@@ -50,7 +50,7 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 }
 func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error { return nil }
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
-	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Port: 54321}, nil
+	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
 }
 func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 	delete(f.containers, id)
@@ -189,6 +189,9 @@ func TestSourceAndBranchLifecycle(t *testing.T) {
 	b := mustUnmarshal[Branch](t, body)
 	if b.Name != "pr-1" || b.Source != "main" || b.State != "ready" || b.Port != 54321 {
 		t.Fatalf("branch %+v", b)
+	}
+	if b.Host != "127.0.0.1" {
+		t.Fatalf("branch host %q want 127.0.0.1", b.Host)
 	}
 	if b.ProxyDatabase != "postgres@pr-1" {
 		t.Fatalf("proxy hint %q", b.ProxyDatabase)
@@ -337,5 +340,20 @@ func TestBadRequests(t *testing.T) {
 	}
 	if code, _ := do(t, ts, testToken, "POST", "/v1/sources", CreateSourceRequest{Name: "x"}); code != http.StatusBadRequest {
 		t.Fatalf("missing host: code=%d", code)
+	}
+}
+
+func TestInvalidBranchNameBadRequest(t *testing.T) {
+	ts, _ := newTestServer(t)
+	addSource(t, ts)
+	for _, name := range []string{"PR-1", "pr_1", "-pr-1", strings.Repeat("a", 42)} {
+		code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: name, Source: "main"})
+		if code != http.StatusBadRequest {
+			t.Errorf("name %q: code=%d body=%s, want 400", name, code, body)
+		}
+		e := mustUnmarshal[map[string]string](t, body)
+		if !strings.Contains(e["error"], "invalid branch name") {
+			t.Errorf("name %q: error %q", name, e["error"])
+		}
 	}
 }

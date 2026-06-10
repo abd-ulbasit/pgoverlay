@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abd-ulbasit/pgbranch/internal/engine"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 )
 
@@ -20,12 +21,15 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
-// writeEngineError maps engine/registry failures to HTTP statuses: missing
-// rows -> 404, name/lifecycle conflicts -> 409, everything else -> 500.
+// writeEngineError maps engine/registry failures to HTTP statuses: invalid
+// input -> 400, missing rows -> 404, name/lifecycle conflicts -> 409,
+// everything else -> 500.
 func writeEngineError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	msg := err.Error()
 	switch {
+	case errors.Is(err, engine.ErrInvalidName):
+		code = http.StatusBadRequest
 	case errors.Is(err, registry.ErrNotFound):
 		code = http.StatusNotFound
 	case strings.Contains(msg, "UNIQUE constraint"),
@@ -69,7 +73,7 @@ func (s *Server) branchJSON(b *registry.Branch) Branch {
 		}
 	}
 	return Branch{
-		Name: b.Name, Source: srcName, State: string(b.State), Port: b.Port,
+		Name: b.Name, Source: srcName, State: string(b.State), Host: b.Host, Port: b.Port,
 		User: user, Database: db, ProxyDatabase: db + "@" + b.Name,
 		ExpiresAt: b.ExpiresAt, CreatedAt: b.CreatedAt,
 	}

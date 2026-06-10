@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2}
+var migrations = []string{schemaV1, migrateV2, migrateV3}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -76,4 +76,11 @@ DROP TABLE sources;
 ALTER TABLE sources_new RENAME TO sources;
 -- name unique among non-failed sources only (failed seeds don't block retry)
 CREATE UNIQUE INDEX sources_live_name ON sources(name) WHERE state != 'failed';
+`
+
+// v3 (Phase 3): branches record the host their instance listens on. Docker
+// publishes on 127.0.0.1 (the historical behavior, hence the backfill
+// default); the K8s driver stores the pod IP.
+const migrateV3 = `
+ALTER TABLE branches ADD COLUMN host TEXT NOT NULL DEFAULT '127.0.0.1';
 `

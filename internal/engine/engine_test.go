@@ -44,7 +44,7 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 }
 func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error { return f.execErr }
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
-	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Port: 54321}, nil
+	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
 }
 func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 	delete(f.containers, id)
@@ -126,11 +126,48 @@ func TestCreateBranchHappyPath(t *testing.T) {
 	if b.State != registry.BranchReady || b.Port != 54321 {
 		t.Fatalf("branch %+v", b)
 	}
+	if b.Host != "127.0.0.1" {
+		t.Fatalf("Host=%q want 127.0.0.1 (from driver Inspect)", b.Host)
+	}
 	if !d.volumes["pgbranch-br-pr-1-rw"] {
 		t.Fatal("rw volume not created")
 	}
 	if !d.containers["cid-pgbranch-br-pr-1"] {
 		t.Fatal("container not started")
+	}
+}
+
+func TestCreateBranchRejectsInvalidNames(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+
+	for _, name := range []string{
+		"",                      // empty
+		"PR-1",                  // uppercase
+		"pr_1",                  // underscore
+		"-pr-1",                 // leading dash
+		strings.Repeat("a", 42), // longer than 41 chars
+	} {
+		_, err := e.CreateBranch(context.Background(), name, "main", 0)
+		if !errors.Is(err, ErrInvalidName) {
+			t.Errorf("CreateBranch(%q) err = %v, want ErrInvalidName", name, err)
+		}
+		if err != nil && !strings.Contains(err.Error(), "[a-z0-9][a-z0-9-]{0,40}") {
+			t.Errorf("CreateBranch(%q) error %q does not state the rule", name, err)
+		}
+	}
+	// no registry rows or driver resources created for rejected names
+	if live, _ := r.ListLiveBranches(); len(live) != 0 {
+		t.Fatalf("rejected names left rows: %v", live)
+	}
+	if len(d.volumes) != 0 || len(d.containers) != 0 {
+		t.Fatalf("rejected names leaked resources: v=%v c=%v", d.volumes, d.containers)
+	}
+	// boundary: max-length valid name (41 chars) is accepted
+	long := strings.Repeat("a", 41)
+	if _, err := e.CreateBranch(context.Background(), long, "main", 0); err != nil {
+		t.Fatalf("CreateBranch(41 chars) = %v, want ok", err)
 	}
 }
 

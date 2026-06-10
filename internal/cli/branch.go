@@ -169,9 +169,15 @@ func newConnectCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				host := u.Hostname()
-				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", b.User, host, b.Port, b.Database)
-				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:6432/%s\n", b.User, host, b.ProxyDatabase)
+				serverHost := u.Hostname()
+				// direct URL targets the branch's recorded host (pod IP on
+				// k8s); pre-v3 servers send no host, fall back to the server's
+				directHost := b.Host
+				if directHost == "" {
+					directHost = serverHost
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", b.User, directHost, b.Port, b.Database)
+				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:6432/%s\n", b.User, serverHost, b.ProxyDatabase)
 				return nil
 			}
 			_, reg, err := open()
@@ -187,7 +193,7 @@ func newConnectCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@localhost:%d/%s\n", s.ConnUser, b.Port, s.ConnDB)
+			fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", s.ConnUser, b.Host, b.Port, s.ConnDB)
 			return nil
 		},
 	}

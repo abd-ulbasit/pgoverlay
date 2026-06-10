@@ -30,6 +30,7 @@ type Branch struct {
 	Name     string `json:"name"`
 	Source   string `json:"source"`
 	State    string `json:"state"`
+	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	User     string `json:"user"`
 	Database string `json:"database"`

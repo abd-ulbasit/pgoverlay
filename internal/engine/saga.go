@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/cow"
@@ -10,10 +12,30 @@ import (
 	"github.com/abd-ulbasit/pgbranch/internal/runtime"
 )
 
+// ErrInvalidName rejects branch names that cannot be used across runtimes
+// (docker container names, k8s pod names — RFC 1123 after the pgbranch-br-
+// prefix). The API maps it to 400.
+var ErrInvalidName = errors.New("invalid branch name")
+
+var branchNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
+
+// validateBranchName enforces the cross-runtime naming rule on new branches.
+// Stored names (reset/destroy paths) are assumed valid: they passed this
+// check when created.
+func validateBranchName(name string) error {
+	if !branchNameRe.MatchString(name) {
+		return fmt.Errorf("%w %q: must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", ErrInvalidName, name)
+	}
+	return nil
+}
+
 // CreateBranch is a saga: every step registers a compensation that runs
 // (in reverse order) if a later step fails. No orphans, ever.
 // ttl 0 means the branch never expires.
 func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl time.Duration) (*registry.Branch, error) {
+	if err := validateBranchName(name); err != nil {
+		return nil, err
+	}
 	src, err := e.reg.GetSourceByName(sourceName)
 	if err != nil {
 		return nil, fmt.Errorf("source %q: %w", sourceName, err)
@@ -99,12 +121,12 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, pgVersion st
 		return fail(fmt.Errorf("instance never became ready: %w", err))
 	}
 
-	// 5. record container + host port, mark ready
+	// 5. record container + address, mark ready
 	info, err := e.drv.Inspect(ctx, cid)
 	if err != nil {
 		return fail(err)
 	}
-	if err := e.reg.MarkBranchReady(b.ID, cid, info.Port); err != nil {
+	if err := e.reg.MarkBranchReady(b.ID, cid, info.Host, info.Port); err != nil {
 		return fail(err)
 	}
 	return nil

@@ -76,6 +76,27 @@ func TestServerModeConnectPrintsDirectAndProxyURLs(t *testing.T) {
 			t.Errorf("path %s", r.URL.Path)
 		}
 		json.NewEncoder(w).Encode(api.Branch{
+			Name: "pr-9", State: "ready", Host: "10.0.0.7", Port: 32788,
+			User: "postgres", Database: "postgres", ProxyDatabase: "postgres@pr-9",
+		})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "connect", "pr-9", "--server", ts.URL)
+	// direct URL uses the branch's recorded host (pod IP on k8s)
+	if !strings.Contains(out, "@10.0.0.7:32788/postgres") {
+		t.Fatalf("direct URL missing branch host in %q", out)
+	}
+	// proxy URL keeps the server's host
+	if !strings.Contains(out, ":6432/postgres@pr-9") {
+		t.Fatalf("proxy URL missing in %q", out)
+	}
+}
+
+func TestServerModeConnectFallsBackToServerHost(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(api.Branch{
 			Name: "pr-9", State: "ready", Port: 32788,
 			User: "postgres", Database: "postgres", ProxyDatabase: "postgres@pr-9",
 		})
@@ -84,11 +105,9 @@ func TestServerModeConnectPrintsDirectAndProxyURLs(t *testing.T) {
 	t.Setenv("PGBRANCH_TOKEN", "tok")
 
 	out := run(t, "connect", "pr-9", "--server", ts.URL)
-	if !strings.Contains(out, ":32788/postgres") {
-		t.Fatalf("direct URL missing in %q", out)
-	}
-	if !strings.Contains(out, ":6432/postgres@pr-9") {
-		t.Fatalf("proxy URL missing in %q", out)
+	// no host from the server (pre-v3 row): fall back to the server's host
+	if !strings.Contains(out, ":32788/postgres") || strings.Contains(out, "@:32788") {
+		t.Fatalf("direct URL fallback broken in %q", out)
 	}
 }
 

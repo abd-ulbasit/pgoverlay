@@ -42,6 +42,7 @@ type Branch struct {
 	ID, Name, SourceID, ContainerID, RWVolume string
 	SourceVolume                              string // source volume the branch was created from
 	ExpiresAt                                 string // RFC3339, "" = never
+	Host                                      string // address the instance listens on (127.0.0.1 for docker, pod IP for k8s)
 	Port                                      int
 	State                                     BranchState
 	CreatedAt                                 string
@@ -201,19 +202,19 @@ func (r *Registry) TransitionBranch(id string, to BranchState, reason string) er
 	return fmt.Errorf("illegal branch transition %s -> %s", b.State, to)
 }
 
-func (r *Registry) MarkBranchReady(id, containerID string, port int) error {
-	if _, err := r.db.Exec(`UPDATE branches SET container_id=?, port=? WHERE id=?`, containerID, port, id); err != nil {
+func (r *Registry) MarkBranchReady(id, containerID, host string, port int) error {
+	if _, err := r.db.Exec(`UPDATE branches SET container_id=?, host=?, port=? WHERE id=?`, containerID, host, port, id); err != nil {
 		return err
 	}
 	return r.TransitionBranch(id, BranchReady, "instance running")
 }
 
-const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,port,created_at`
+const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,host,port,created_at`
 
 func scanBranch(row interface{ Scan(...any) error }) (*Branch, error) {
 	b := &Branch{}
 	err := row.Scan(&b.ID, &b.Name, &b.SourceID, &b.State, &b.ContainerID, &b.RWVolume,
-		&b.SourceVolume, &b.ExpiresAt, &b.Port, &b.CreatedAt)
+		&b.SourceVolume, &b.ExpiresAt, &b.Host, &b.Port, &b.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

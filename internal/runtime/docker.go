@@ -195,7 +195,7 @@ func (d *DockerDriver) Inspect(ctx context.Context, id string) (ContainerInfo, e
 	if err != nil {
 		return ContainerInfo{}, err
 	}
-	info := ContainerInfo{ID: j.ID, Running: j.State != nil && j.State.Running, Labels: j.Config.Labels}
+	info := ContainerInfo{ID: j.ID, Running: j.State != nil && j.State.Running, Host: "127.0.0.1", Labels: j.Config.Labels}
 	if b, ok := j.NetworkSettings.Ports["5432/tcp"]; ok && len(b) > 0 {
 		info.Port, _ = strconv.Atoi(b[0].HostPort)
 	}

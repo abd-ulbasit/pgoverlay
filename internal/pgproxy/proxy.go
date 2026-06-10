@@ -1,8 +1,8 @@
 // Package pgproxy is a Postgres wire-protocol router. Clients connect with
 // database=dbname@branch; the proxy reads the startup message, resolves the
-// branch to its host port, rewrites the database param back to the real
-// dbname, replays the startup to the branch backend, and then relays bytes
-// transparently in both directions (SCRAM auth flows untouched).
+// branch to its backend address, rewrites the database param back to the
+// real dbname, replays the startup to the branch backend, and then relays
+// bytes transparently in both directions (SCRAM auth flows untouched).
 package pgproxy
 
 import (
@@ -19,11 +19,11 @@ import (
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 )
 
-// BranchResolver maps a branch name to the host port of its Postgres
-// instance. Implementations must only resolve branches that can accept
-// connections.
+// BranchResolver maps a branch name to the "host:port" address of its
+// Postgres instance. Implementations must only resolve branches that can
+// accept connections.
 type BranchResolver interface {
-	ResolveBranch(name string) (hostPort int, err error)
+	ResolveBranch(name string) (addr string, err error)
 }
 
 // RegistryResolver adapts the registry: only ready branches resolve.
@@ -31,28 +31,25 @@ type RegistryResolver struct {
 	Reg *registry.Registry
 }
 
-func (r *RegistryResolver) ResolveBranch(name string) (int, error) {
+func (r *RegistryResolver) ResolveBranch(name string) (string, error) {
 	b, err := r.Reg.GetBranchByName(name)
 	if err != nil {
-		return 0, err // registry.ErrNotFound for unknown names
+		return "", err // registry.ErrNotFound for unknown names
 	}
 	if b.State != registry.BranchReady {
-		return 0, fmt.Errorf("branch is %s, not ready", b.State)
+		return "", fmt.Errorf("branch is %s, not ready", b.State)
 	}
-	return b.Port, nil
+	return net.JoinHostPort(b.Host, strconv.Itoa(b.Port)), nil
 }
 
 type Proxy struct {
 	Resolver BranchResolver
-	// BackendHost is the address branch ports are bound on. Defaults to
-	// 127.0.0.1 (the docker port mapping binds 127.0.0.1).
-	BackendHost string
 	// DialTimeout bounds the backend dial. Defaults to 5s.
 	DialTimeout time.Duration
 }
 
 func New(r BranchResolver) *Proxy {
-	return &Proxy{Resolver: r, BackendHost: "127.0.0.1", DialTimeout: 5 * time.Second}
+	return &Proxy{Resolver: r, DialTimeout: 5 * time.Second}
 }
 
 // Serve accepts connections until ctx is cancelled (which closes the
@@ -114,7 +111,7 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 			fmt.Sprintf("pgbranch: connect with dbname@branch (got database %q)", db))
 		return
 	}
-	port, err := p.Resolver.ResolveBranch(branch)
+	addr, err := p.Resolver.ResolveBranch(branch)
 	if err != nil {
 		writeRefusal(client, "3D000",
 			fmt.Sprintf("pgbranch: cannot route to branch %q: %v", branch, err))
@@ -126,7 +123,7 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 		writeRefusal(client, "08P01", "pgbranch: "+err.Error())
 		return
 	}
-	backend, err := net.DialTimeout("tcp", net.JoinHostPort(p.BackendHost, strconv.Itoa(port)), p.DialTimeout)
+	backend, err := net.DialTimeout("tcp", addr, p.DialTimeout)
 	if err != nil {
 		writeRefusal(client, "08006", // connection_failure
 			fmt.Sprintf("pgbranch: branch %q backend unreachable: %v", branch, err))

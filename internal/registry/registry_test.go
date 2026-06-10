@@ -66,11 +66,11 @@ func TestBranchLifecycleAndTransitions(t *testing.T) {
 	if err := r.TransitionBranch(b.ID, BranchDestroyed, ""); err == nil {
 		t.Fatal("want illegal transition error")
 	}
-	if err := r.MarkBranchReady(b.ID, "cid123", 54321); err != nil {
+	if err := r.MarkBranchReady(b.ID, "cid123", "10.1.2.3", 54321); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := r.GetBranchByName("pr-1")
-	if got.State != BranchReady || got.ContainerID != "cid123" || got.Port != 54321 {
+	if got.State != BranchReady || got.ContainerID != "cid123" || got.Host != "10.1.2.3" || got.Port != 54321 {
 		t.Fatalf("got %+v", got)
 	}
 	if err := r.TransitionBranch(b.ID, BranchDestroying, "user destroy"); err != nil {
@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS transitions (
 );
 `
 
-func TestMigrateV1ToV2(t *testing.T) {
+func TestMigrateV1ToLatest(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v1.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -161,8 +161,8 @@ func TestMigrateV1ToV2(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 2 {
-		t.Fatalf("user_version=%d want 2", v)
+	if v != 3 {
+		t.Fatalf("user_version=%d want 3", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -186,6 +186,10 @@ func TestMigrateV1ToV2(t *testing.T) {
 	}
 	if b.ExpiresAt != "" {
 		t.Fatalf("ExpiresAt=%q want empty", b.ExpiresAt)
+	}
+	// v3: host column backfilled with the docker default
+	if b.Host != "127.0.0.1" {
+		t.Fatalf("Host=%q want default backfill 127.0.0.1", b.Host)
 	}
 	// re-opening an already-migrated DB is a no-op
 	r2, err := Open(path)
@@ -230,15 +234,15 @@ func TestListExpiredBranches(t *testing.T) {
 		return b
 	}
 	expired := mk("old", "2026-01-01T00:00:00Z")
-	if err := r.MarkBranchReady(expired.ID, "c1", 1); err != nil {
+	if err := r.MarkBranchReady(expired.ID, "c1", "127.0.0.1", 1); err != nil {
 		t.Fatal(err)
 	}
 	forever := mk("forever", "")
-	if err := r.MarkBranchReady(forever.ID, "c2", 2); err != nil {
+	if err := r.MarkBranchReady(forever.ID, "c2", "127.0.0.1", 2); err != nil {
 		t.Fatal(err)
 	}
 	future := mk("future", "2027-01-01T00:00:00Z")
-	if err := r.MarkBranchReady(future.ID, "c3", 3); err != nil {
+	if err := r.MarkBranchReady(future.ID, "c3", "127.0.0.1", 3); err != nil {
 		t.Fatal(err)
 	}
 	mk("stuck-creating", "2026-01-01T00:00:00Z") // creating: not reaped
@@ -299,7 +303,7 @@ func TestBumpSourceGenerationAndCounts(t *testing.T) {
 		t.Fatalf("live by g2 volume=%d want 0", n)
 	}
 	// destroyed branches don't count
-	if err := r.MarkBranchReady(b.ID, "c", 1); err != nil {
+	if err := r.MarkBranchReady(b.ID, "c", "127.0.0.1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.TransitionBranch(b.ID, BranchDestroying, ""); err != nil {
@@ -361,14 +365,14 @@ func TestResettingTransitions(t *testing.T) {
 	if err := r.TransitionBranch(b.ID, BranchResetting, ""); err == nil {
 		t.Fatal("want illegal transition error from creating")
 	}
-	if err := r.MarkBranchReady(b.ID, "c", 1); err != nil {
+	if err := r.MarkBranchReady(b.ID, "c", "127.0.0.1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.TransitionBranch(b.ID, BranchResetting, "reset requested"); err != nil {
 		t.Fatal(err)
 	}
 	// resetting -> ready (via MarkBranchReady, new container/port)
-	if err := r.MarkBranchReady(b.ID, "c2", 2); err != nil {
+	if err := r.MarkBranchReady(b.ID, "c2", "127.0.0.1", 2); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := r.GetBranchByName("pr-1")

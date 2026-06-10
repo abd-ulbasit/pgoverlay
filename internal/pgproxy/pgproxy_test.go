@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,15 +16,17 @@ import (
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 )
 
-type fakeResolver map[string]int
+type fakeResolver map[string]string
 
-func (f fakeResolver) ResolveBranch(name string) (int, error) {
-	port, ok := f[name]
+func (f fakeResolver) ResolveBranch(name string) (string, error) {
+	addr, ok := f[name]
 	if !ok {
-		return 0, registry.ErrNotFound
+		return "", registry.ErrNotFound
 	}
-	return port, nil
+	return addr, nil
 }
+
+func local(port int) string { return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)) }
 
 // startProxy runs a Proxy on an ephemeral listener and returns its address.
 func startProxy(t *testing.T, r BranchResolver) string {
@@ -147,7 +150,7 @@ func TestRoutesRewritesAndRelays(t *testing.T) {
 		queryCh <- q.String
 	})
 
-	addr := startProxy(t, fakeResolver{"pr-1": port})
+	addr := startProxy(t, fakeResolver{"pr-1": local(port)})
 	conn := dialProxy(t, addr)
 	fe := pgproto3.NewFrontend(conn, conn)
 	// database with embedded @: only the LAST @ is the branch separator
@@ -201,7 +204,7 @@ func TestSSLRequestAnsweredWithN(t *testing.T) {
 		be.Send(&pgproto3.AuthenticationOk{})
 		be.Flush()
 	})
-	addr := startProxy(t, fakeResolver{"pr-1": port})
+	addr := startProxy(t, fakeResolver{"pr-1": local(port)})
 	conn := dialProxy(t, addr)
 
 	// hand-rolled SSLRequest: length 8, magic 80877103
@@ -250,7 +253,7 @@ func TestCancelRequestClosedSilently(t *testing.T) {
 }
 
 func TestMissingBranchSuffixRefused(t *testing.T) {
-	addr := startProxy(t, fakeResolver{"pr-1": 1})
+	addr := startProxy(t, fakeResolver{"pr-1": local(1)})
 	conn := dialProxy(t, addr)
 	fe := pgproto3.NewFrontend(conn, conn)
 	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres"})
@@ -286,7 +289,7 @@ func TestNoDatabaseParamRefused(t *testing.T) {
 }
 
 func TestUnknownBranchRefused(t *testing.T) {
-	addr := startProxy(t, fakeResolver{"pr-1": 1})
+	addr := startProxy(t, fakeResolver{"pr-1": local(1)})
 	conn := dialProxy(t, addr)
 	fe := pgproto3.NewFrontend(conn, conn)
 	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@nope"})
@@ -309,7 +312,7 @@ func TestBackendDialFailureRefused(t *testing.T) {
 	deadPort := lis.Addr().(*net.TCPAddr).Port
 	lis.Close()
 
-	addr := startProxy(t, fakeResolver{"pr-1": deadPort})
+	addr := startProxy(t, fakeResolver{"pr-1": local(deadPort)})
 	conn := dialProxy(t, addr)
 	fe := pgproto3.NewFrontend(conn, conn)
 	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@pr-1"})
@@ -337,7 +340,7 @@ func TestRegistryResolver(t *testing.T) {
 	if err := reg.CreateBranch(ready); err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.MarkBranchReady(ready.ID, "cid", 54321); err != nil {
+	if err := reg.MarkBranchReady(ready.ID, "cid", "10.2.3.4", 54321); err != nil {
 		t.Fatal(err)
 	}
 	creating := &registry.Branch{Name: "pr-2", SourceID: src.ID, RWVolume: "v2"}
@@ -346,9 +349,9 @@ func TestRegistryResolver(t *testing.T) {
 	}
 
 	r := &RegistryResolver{Reg: reg}
-	port, err := r.ResolveBranch("pr-1")
-	if err != nil || port != 54321 {
-		t.Errorf("ResolveBranch(pr-1) = (%d, %v), want (54321, nil)", port, err)
+	addr, err := r.ResolveBranch("pr-1")
+	if err != nil || addr != "10.2.3.4:54321" {
+		t.Errorf("ResolveBranch(pr-1) = (%q, %v), want (10.2.3.4:54321, nil)", addr, err)
 	}
 	if _, err := r.ResolveBranch("pr-2"); err == nil || !strings.Contains(err.Error(), "creating") {
 		t.Errorf("ResolveBranch(pr-2) err = %v, want not-ready error", err)

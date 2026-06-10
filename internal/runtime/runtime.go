@@ -35,7 +35,8 @@ type BranchSpec struct {
 type ContainerInfo struct {
 	ID      string
 	Running bool
-	Port    int // host port mapped to 5432, 0 if none
+	Host    string // address the instance is reachable on (127.0.0.1 for docker, pod IP for k8s)
+	Port    int    // port on Host (docker: host port mapped to 5432, 0 if none)
 	Labels  map[string]string
 }
 
