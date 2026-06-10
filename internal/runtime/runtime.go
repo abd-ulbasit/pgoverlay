@@ -62,6 +62,10 @@ type Driver interface {
 	EnsureImage(ctx context.Context, image string) error
 	CreateVolume(ctx context.Context, name string, labels map[string]string) error
 	RemoveVolume(ctx context.Context, name string) error
+	// CloneVolume provisions dst as a copy of src (dst must not exist; labels
+	// land on dst). Copy-on-write where the storage supports it (kube csi:
+	// PVC dataSource clone / snapshot restore); a full copy elsewhere.
+	CloneVolume(ctx context.Context, src, dst string, labels map[string]string) error
 	RunHelper(ctx context.Context, spec HelperSpec) (output string, err error)
 	StartBranch(ctx context.Context, spec BranchSpec) (id string, err error)
 	Exec(ctx context.Context, containerID string, cmd []string) error // error on non-zero exit

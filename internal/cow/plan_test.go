@@ -121,7 +121,10 @@ func TestParseBackend(t *testing.T) {
 	if b, err := ParseBackend("zfs"); err != nil || b != BackendZFS {
 		t.Fatalf("zfs -> %q, %v", b, err)
 	}
-	for _, bad := range []string{"", "btrfs", "ZFS", "Overlay"} {
+	if b, err := ParseBackend("csi"); err != nil || b != BackendCSI {
+		t.Fatalf("csi -> %q, %v", b, err)
+	}
+	for _, bad := range []string{"", "btrfs", "ZFS", "Overlay", "CSI"} {
 		if _, err := ParseBackend(bad); err == nil {
 			t.Errorf("ParseBackend(%q) = nil error, want error", bad)
 		}
@@ -146,6 +149,24 @@ func TestPlannerOverlayNames(t *testing.T) {
 	}
 }
 
+func TestPlannerCSINames(t *testing.T) {
+	// csi "volumes" are PVCs; they reuse the overlay volume names (valid
+	// DNS-1123 PVC names) and the direct (no-overlay) entrypoint.
+	p := Planner{Backend: BackendCSI}
+	if got := p.SourceLayerName("main", 1); got != "pgbranch-src-main" {
+		t.Fatalf("gen1 = %q", got)
+	}
+	if got := p.SourceLayerName("main", 3); got != "pgbranch-src-main-g3" {
+		t.Fatalf("gen3 = %q", got)
+	}
+	if got := p.BranchLayerName("pr-1"); got != "pgbranch-br-pr-1-rw" {
+		t.Fatalf("branch layer = %q", got)
+	}
+	if p.Entrypoint() != EntrypointScriptDirect {
+		t.Fatal("csi planner must use the direct entrypoint")
+	}
+}
+
 func TestPlannerZFSNames(t *testing.T) {
 	p := Planner{Backend: BackendZFS, Dataset: "tank/pgbranch"}
 	// zfs datasets are namespaced under the configured prefix; generation 1
@@ -166,7 +187,7 @@ func TestPlannerZFSNames(t *testing.T) {
 	if got := p.Mountpoint("tank/pgbranch/br-pr-1"); got != "/tank/pgbranch/br-pr-1" {
 		t.Fatalf("mountpoint = %q", got)
 	}
-	if p.Entrypoint() != EntrypointScriptZFS {
+	if p.Entrypoint() != EntrypointScriptDirect {
 		t.Fatal("zfs planner must use the zfs entrypoint")
 	}
 }
@@ -202,21 +223,21 @@ func TestZFSEntrypointScriptContent(t *testing.T) {
 		"rm -f \"$PGDATA/postmaster.pid\"",
 		"exec docker-entrypoint.sh postgres -c recovery_init_sync_method=syncfs",
 	} {
-		if !strings.Contains(EntrypointScriptZFS, want) {
+		if !strings.Contains(EntrypointScriptDirect, want) {
 			t.Fatalf("zfs entrypoint script missing %q", want)
 		}
 	}
 	for _, reject := range []string{"mount -t overlay", "lowerdir", "upperdir", "workdir", "PGBRANCH_LOWERS"} {
-		if strings.Contains(EntrypointScriptZFS, reject) {
+		if strings.Contains(EntrypointScriptDirect, reject) {
 			t.Fatalf("zfs entrypoint script must not contain %q", reject)
 		}
 	}
 }
 
-func TestZFSDataPath(t *testing.T) {
+func TestDirectDataPath(t *testing.T) {
 	// seeding writes the cluster into <layer>/data; the clone mountpoint is
 	// bind-mounted at RWPath, so PGDATA is RWPath/data
-	if ZFSDataPath != "/pgbranch/rw/data" {
-		t.Fatalf("ZFSDataPath = %q", ZFSDataPath)
+	if DirectDataPath != "/pgbranch/rw/data" {
+		t.Fatalf("DirectDataPath = %q", DirectDataPath)
 	}
 }

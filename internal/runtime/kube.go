@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -17,35 +18,63 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-// KubeDriver runs branches as pods pinned to one storage node; "volumes" are
-// subdirectories of dataRoot on that node, mounted via hostPath (decision 1:
-// single-node dev/test scope; multi-node via CSI is future work).
+// KubeDriver runs branches as pods. Where the data lives is a pluggable
+// storage strategy:
+//
+//   - hostPath (default): "volumes" are subdirectories of dataRoot on one
+//     designated storage node; every pod is pinned there with nodeName and
+//     branch pods get SYS_ADMIN for their in-container overlay mount
+//     (decision 1: single-node dev/test scope).
+//   - csi: "volumes" are PersistentVolumeClaims and branches are PVC clones;
+//     pods schedule anywhere, need no extra capabilities, and run postgres
+//     directly on their claim (multi-node scope, decision 4 / Phase 5 D).
+//
 // Container IDs are pod names.
 type KubeDriver struct {
 	cs        kubernetes.Interface
-	cfg       *rest.Config // for exec (SPDY); nil only in unit tests
+	dyn       dynamic.Interface // VolumeSnapshot ops (csi snapshot mode); nil otherwise
+	cfg       *rest.Config      // for exec (SPDY); nil only in unit tests
 	namespace string
-	nodeName  string
-	dataRoot  string
+	storage   kubeStorage
+}
+
+// kubeStorage is the storage strategy inside KubeDriver: it owns volume
+// provisioning and decides how driver mounts and pod placement/privileges
+// translate to pod specs.
+type kubeStorage interface {
+	createVolume(ctx context.Context, name string, labels map[string]string) error
+	removeVolume(ctx context.Context, name string) error
+	cloneVolume(ctx context.Context, src, dst string, labels map[string]string) error
+	// podVolumes translates driver mounts to pod volumes + container mounts.
+	podVolumes(ms []Mount) ([]corev1.Volume, []corev1.VolumeMount)
+	// nodeName pins pods to the storage node ("" = let the scheduler place).
+	nodeName() string
+	// branchSecurityContext is the branch container's security context
+	// (SYS_ADMIN for in-container overlay mounts; nil = none needed).
+	branchSecurityContext() *corev1.SecurityContext
 }
 
 const volumeHelperImage = "alpine:3.21"
 
-// NewKubeDriver connects to the cluster. kubeconfig=="" uses in-cluster
+// kubeRestConfig loads the cluster config: kubeconfig=="" uses in-cluster
 // config when available, else the default kubeconfig loading rules
 // (KUBECONFIG / ~/.kube/config).
-func NewKubeDriver(kubeconfig, namespace, nodeName, dataRoot string) (*KubeDriver, error) {
-	var cfg *rest.Config
-	var err error
-	if kubeconfig == "" {
-		cfg, err = rest.InClusterConfig()
-		if err == rest.ErrNotInCluster {
-			cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-				clientcmd.NewDefaultClientConfigLoadingRules(), nil).ClientConfig()
-		}
-	} else {
-		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+func kubeRestConfig(kubeconfig string) (*rest.Config, error) {
+	if kubeconfig != "" {
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
 	}
+	cfg, err := rest.InClusterConfig()
+	if err == rest.ErrNotInCluster {
+		return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			clientcmd.NewDefaultClientConfigLoadingRules(), nil).ClientConfig()
+	}
+	return cfg, err
+}
+
+// NewKubeDriver connects to the cluster with the hostPath storage strategy
+// (all data under dataRoot on the named storage node).
+func NewKubeDriver(kubeconfig, namespace, nodeName, dataRoot string) (*KubeDriver, error) {
+	cfg, err := kubeRestConfig(kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("kube config: %w", err)
 	}
@@ -62,14 +91,63 @@ func NewKubeDriver(kubeconfig, namespace, nodeName, dataRoot string) (*KubeDrive
 	if nodeName == "" {
 		return nil, fmt.Errorf("kube driver requires a storage node name")
 	}
-	return &KubeDriver{cs: cs, cfg: cfg, namespace: namespace, nodeName: nodeName, dataRoot: dataRoot}, nil
+	d := &KubeDriver{cs: cs, cfg: cfg, namespace: namespace}
+	d.storage = &hostPathStorage{d: d, node: nodeName, dataRoot: dataRoot}
+	return d, nil
+}
+
+// CSIConfig configures the csi storage strategy.
+type CSIConfig struct {
+	// StorageClass provisions every pgbranch PVC; it must support PVC
+	// dataSource cloning (or VolumeSnapshots when SnapshotClass is set).
+	StorageClass string
+	// SnapshotClass switches branch cloning from PVC dataSource clones to
+	// VolumeSnapshot + restore ("" = direct PVC clones).
+	SnapshotClass string
+	// VolumeSize is the storage request of every pgbranch PVC ("" = 10Gi).
+	VolumeSize string
+}
+
+// NewKubeDriverCSI connects to the cluster with the csi storage strategy:
+// volumes are PVCs, branches are PVC clones, pods schedule on any node.
+func NewKubeDriverCSI(kubeconfig, namespace string, csi CSIConfig) (*KubeDriver, error) {
+	if csi.StorageClass == "" {
+		return nil, fmt.Errorf("csi storage requires a storage class")
+	}
+	cfg, err := kubeRestConfig(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("kube config: %w", err)
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("kube client: %w", err)
+	}
+	var dyn dynamic.Interface
+	if csi.SnapshotClass != "" {
+		if dyn, err = dynamic.NewForConfig(cfg); err != nil {
+			return nil, fmt.Errorf("kube dynamic client: %w", err)
+		}
+	}
+	if namespace == "" {
+		namespace = "default"
+	}
+	if csi.VolumeSize == "" {
+		csi.VolumeSize = defaultPVCSize
+	}
+	size, err := parsePVCSize(csi.VolumeSize)
+	if err != nil {
+		return nil, err
+	}
+	d := &KubeDriver{cs: cs, dyn: dyn, cfg: cfg, namespace: namespace}
+	d.storage = &csiStorage{d: d, storageClass: csi.StorageClass, snapshotClass: csi.SnapshotClass, volumeSize: size}
+	return d, nil
 }
 
 // EnsureImage is a no-op: the kubelet pulls images on pod start.
 func (d *KubeDriver) EnsureImage(ctx context.Context, image string) error { return nil }
 
-// CreateVolume mkdirs the volume dir on the storage node via a helper pod and
-// records the labels in <vol>/.pgbranch-labels.json.
+// CreateVolume provisions an empty volume (hostPath: node dir via helper pod;
+// csi: PVC) carrying the given labels.
 func (d *KubeDriver) CreateVolume(ctx context.Context, name string, labels map[string]string) error {
 	if err := validVolumeName(name); err != nil {
 		return err
@@ -77,47 +155,116 @@ func (d *KubeDriver) CreateVolume(ctx context.Context, name string, labels map[s
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	if err := d.storage.createVolume(ctx, name, labels); err != nil {
+		return fmt.Errorf("create volume %s: %w", name, err)
+	}
+	return nil
+}
+
+// RemoveVolume deletes the volume. Idempotent (removing a missing volume
+// succeeds).
+func (d *KubeDriver) RemoveVolume(ctx context.Context, name string) error {
+	if err := validVolumeName(name); err != nil {
+		return err
+	}
+	if err := d.storage.removeVolume(ctx, name); err != nil {
+		return fmt.Errorf("remove volume %s: %w", name, err)
+	}
+	return nil
+}
+
+// CloneVolume provisions dst as a copy of src: a full `cp -a` through a
+// helper pod (hostPath) or a copy-on-write PVC clone / snapshot restore (csi).
+func (d *KubeDriver) CloneVolume(ctx context.Context, src, dst string, labels map[string]string) error {
+	if err := validVolumeName(src); err != nil {
+		return err
+	}
+	if err := validVolumeName(dst); err != nil {
+		return err
+	}
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	if err := d.storage.cloneVolume(ctx, src, dst, labels); err != nil {
+		return fmt.Errorf("clone volume %s -> %s: %w", src, dst, err)
+	}
+	return nil
+}
+
+// hostPathStorage is the original single-node strategy: volume name ->
+// <dataRoot>/<name> on the storage node, pods pinned there via nodeName,
+// branch pods overlay-mount in-container (SYS_ADMIN).
+type hostPathStorage struct {
+	d        *KubeDriver
+	node     string
+	dataRoot string
+}
+
+func (s *hostPathStorage) nodeName() string { return s.node }
+
+// branchSecurityContext: SYS_ADMIN is required for the in-container overlay
+// mount, same as the docker driver.
+func (s *hostPathStorage) branchSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"SYS_ADMIN"}},
+	}
+}
+
+func (s *hostPathStorage) podVolumes(ms []Mount) ([]corev1.Volume, []corev1.VolumeMount) {
+	return hostPathPodVolumes(s.dataRoot, ms)
+}
+
+// createVolume mkdirs the volume dir on the storage node via a helper pod and
+// records the labels in <vol>/.pgbranch-labels.json.
+func (s *hostPathStorage) createVolume(ctx context.Context, name string, labels map[string]string) error {
 	j, err := json.Marshal(labels)
 	if err != nil {
 		return err
 	}
 	dir := dataRootMountPath + "/" + name
 	cmd := fmt.Sprintf(`mkdir -p %s && printf '%%s' "$PGBRANCH_VOLUME_LABELS" > %s/%s`, dir, dir, volumeLabelsFile)
-	if _, err := d.runRootHelper(ctx, cmd, []string{"PGBRANCH_VOLUME_LABELS=" + string(j)}); err != nil {
-		return fmt.Errorf("create volume %s: %w", name, err)
-	}
-	return nil
+	_, err = s.runRootHelper(ctx, cmd, []string{"PGBRANCH_VOLUME_LABELS=" + string(j)})
+	return err
 }
 
-// RemoveVolume deletes the volume dir on the storage node. Idempotent
-// (rm -rf on a missing dir succeeds).
-func (d *KubeDriver) RemoveVolume(ctx context.Context, name string) error {
-	if err := validVolumeName(name); err != nil {
+// removeVolume deletes the volume dir on the storage node (rm -rf on a
+// missing dir succeeds).
+func (s *hostPathStorage) removeVolume(ctx context.Context, name string) error {
+	_, err := s.runRootHelper(ctx, "rm -rf "+dataRootMountPath+"/"+name, nil)
+	return err
+}
+
+// cloneVolume copies src's directory into a fresh dst dir (full copy — plain
+// directories have no CoW primitive) and stamps dst with its own labels.
+func (s *hostPathStorage) cloneVolume(ctx context.Context, src, dst string, labels map[string]string) error {
+	j, err := json.Marshal(labels)
+	if err != nil {
 		return err
 	}
-	if _, err := d.runRootHelper(ctx, "rm -rf "+dataRootMountPath+"/"+name, nil); err != nil {
-		return fmt.Errorf("remove volume %s: %w", name, err)
-	}
-	return nil
+	srcDir, dstDir := dataRootMountPath+"/"+src, dataRootMountPath+"/"+dst
+	cmd := fmt.Sprintf(`rm -rf %s && mkdir -p %s && cp -a %s/. %s/ && printf '%%s' "$PGBRANCH_VOLUME_LABELS" > %s/%s`,
+		dstDir, dstDir, srcDir, dstDir, dstDir, volumeLabelsFile)
+	_, err = s.runRootHelper(ctx, cmd, []string{"PGBRANCH_VOLUME_LABELS=" + string(j)})
+	return err
 }
 
 // runRootHelper runs sh -c cmd in a helper pod with the whole data root
 // mounted at dataRootMountPath (needed to create/remove volume dirs).
-func (d *KubeDriver) runRootHelper(ctx context.Context, cmd string, env []string) (string, error) {
-	pod := buildHelperPod(d.namespace, d.nodeName, d.dataRoot,
+func (s *hostPathStorage) runRootHelper(ctx context.Context, cmd string, env []string) (string, error) {
+	pod := buildHelperPod(s.d.namespace, s,
 		HelperSpec{Image: volumeHelperImage, Cmd: []string{"sh", "-c", cmd}, Env: env})
 	t := corev1.HostPathDirectoryOrCreate
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 		Name:         "data-root",
-		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: d.dataRoot, Type: &t}},
+		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: s.dataRoot, Type: &t}},
 	})
 	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
 		corev1.VolumeMount{Name: "data-root", MountPath: dataRootMountPath})
-	return d.runPodToCompletion(ctx, pod)
+	return s.d.runPodToCompletion(ctx, pod)
 }
 
 func (d *KubeDriver) RunHelper(ctx context.Context, spec HelperSpec) (string, error) {
-	return d.runPodToCompletion(ctx, buildHelperPod(d.namespace, d.nodeName, d.dataRoot, spec))
+	return d.runPodToCompletion(ctx, buildHelperPod(d.namespace, d.storage, spec))
 }
 
 // runPodToCompletion creates the pod, waits for Succeeded/Failed (deadline
@@ -186,7 +333,7 @@ func (d *KubeDriver) podLogs(ctx context.Context, name string) string {
 }
 
 func (d *KubeDriver) StartBranch(ctx context.Context, spec BranchSpec) (string, error) {
-	pod := buildBranchPod(d.namespace, d.nodeName, d.dataRoot, spec)
+	pod := buildBranchPod(d.namespace, d.storage, spec)
 	created, err := d.cs.CoreV1().Pods(d.namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
 		return "", fmt.Errorf("create branch pod: %w", err)

@@ -21,6 +21,8 @@ type fakeDriver struct {
 	execErr       error
 	psqlErr       error                // returned by Exec for psql commands only (fails masking/checkpoint)
 	helperErr     error                // returned by RunHelper (fails seeding)
+	cloneErr      error                // returned by CloneVolume
+	clones        [][2]string          // every CloneVolume call (src, dst), in order
 	helperOut     string               // returned by RunHelper as captured output
 	helpers       []runtime.HelperSpec // every RunHelper call, in order
 	starts        int                  // successful StartBranch invocations
@@ -40,6 +42,16 @@ func (f *fakeDriver) CreateVolume(ctx context.Context, name string, l map[string
 }
 func (f *fakeDriver) RemoveVolume(ctx context.Context, name string) error {
 	delete(f.volumes, name)
+	f.log = append(f.log, "rmvolume:"+name)
+	return nil
+}
+func (f *fakeDriver) CloneVolume(ctx context.Context, src, dst string, l map[string]string) error {
+	if f.cloneErr != nil {
+		return f.cloneErr
+	}
+	f.volumes[dst] = true
+	f.clones = append(f.clones, [2]string{src, dst})
+	f.log = append(f.log, "clone:"+src+">"+dst)
 	return nil
 }
 func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {

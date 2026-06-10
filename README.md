@@ -143,7 +143,7 @@ helm install pgbranch deploy/helm/pgbranch \
 
 Values that matter:
 
-- **`node` (required)** — the name of the **storage node** (`kubectl get nodes`). All CoW data lives under `dataRoot` (default `/var/lib/pgbranch`) on this one node as plain directories; branchd, every branch pod, and every helper pod are pinned there with `nodeName` + `hostPath`. This is the honest dev/test scope — one node's disk, no CSI; multi-node storage is future work.
+- **`node` (required)** — the name of the **storage node** (`kubectl get nodes`). All CoW data lives under `dataRoot` (default `/var/lib/pgbranch`) on this one node as plain directories; branchd, every branch pod, and every helper pod are pinned there with `nodeName` + `hostPath`. This is the default `hostpath` storage mode; set `storage.mode=csi` with `storage.storageClass=<class supporting PVC cloning>` for multi-node storage — branches become PVC clones, pods schedule on any node, and no `SYS_ADMIN` is needed (see [docs/kubernetes.md](docs/kubernetes.md)).
 - **`token` / `existingSecret`** — the REST API bearer token. Either let the chart render a Secret from `token`, or point `existingSecret` at a pre-created Secret with key `token`.
 - **`proxy.service.type`** — set to `NodePort` (with `proxy.service.nodePort`) to reach branches from outside the cluster without a port-forward.
 
@@ -233,7 +233,7 @@ PG 13 and older are unsupported because branch startup passes `-c recovery_init_
 - **Phase 2** ✅ — `pgproxy` wire-protocol router (one stable endpoint, route by branch name), REST API + auth (`branchd` daemon reusing the same engine), TTL reaper for abandoned branches, branch reset, source refresh with generations. Branch-from-branch moved to a later phase.
 - **Phase 3** ✅ — Kubernetes runtime driver (branch pods on a storage node), Helm chart, GitHub webhook service (a branch per PR, automatically).
 - **Phase 4** ✅ — data masking hooks, embedded web UI with per-branch disk usage, published benchmarks (with the copy-up fix they motivated), experimental ZFS backend, docs site.
-- **Phase 5 (in progress)** — TLS for the router and REST API ✅, Postgres 14–18 support matrix ✅; still ahead: branch-from-branch (layer DAG), multi-node/CSI storage.
+- **Phase 5 (in progress)** — TLS for the router and REST API ✅, Postgres 14–18 support matrix ✅; branch-from-branch (layer DAG) ✅, multi-node CSI storage for Kubernetes (PVC-clone branches, no `SYS_ADMIN`, any node) ✅.
 
 ## Documentation
 

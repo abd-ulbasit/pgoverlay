@@ -25,10 +25,23 @@ spec:
         - name: branchd
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if not (has .Values.storage.mode (list "hostpath" "csi")) }}
+          {{- fail "storage.mode must be hostpath or csi" }}
+          {{- end }}
           args:
             - --runtime=kube
             - --kube-node={{ .Values.node }}
             - --kube-data-root={{ .Values.dataRoot }}
+            {{- if eq .Values.storage.mode "csi" }}
+            - --kube-storage=csi
+            - --csi-storage-class={{ required "set storage.storageClass to a StorageClass supporting PVC cloning (required with storage.mode=csi)" .Values.storage.storageClass }}
+            {{- with .Values.storage.snapshotClass }}
+            - --csi-snapshot-class={{ . }}
+            {{- end }}
+            {{- with .Values.storage.volumeSize }}
+            - --csi-volume-size={{ . }}
+            {{- end }}
+            {{- end }}
             - --api-addr=:{{ .Values.api.port }}
             - --pg-addr=:{{ .Values.proxy.port }}
             - --reap-interval={{ .Values.reapInterval }}

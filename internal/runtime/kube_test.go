@@ -49,7 +49,7 @@ func TestBuildHelperPod(t *testing.T) {
 		Network: "ignored-on-k8s",
 		User:    "postgres",
 	}
-	pod := buildHelperPod("pgb", "node-1", "/var/lib/pgbranch", spec)
+	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, spec)
 
 	if pod.GenerateName != "pgbranch-helper-" {
 		t.Errorf("GenerateName = %q", pod.GenerateName)
@@ -102,7 +102,7 @@ func TestBuildHelperPod(t *testing.T) {
 }
 
 func TestBuildHelperPodNoUser(t *testing.T) {
-	pod := buildHelperPod("default", "n", "/var/lib/pgbranch", HelperSpec{Image: "alpine:3.21", Cmd: []string{"true"}})
+	pod := buildHelperPod("default", &hostPathStorage{node: "n", dataRoot: "/var/lib/pgbranch"}, HelperSpec{Image: "alpine:3.21", Cmd: []string{"true"}})
 	if sc := pod.Spec.Containers[0].SecurityContext; sc != nil {
 		t.Errorf("SecurityContext = %+v, want nil when User empty", sc)
 	}
@@ -114,7 +114,7 @@ func TestBuildHelperPodNoUser(t *testing.T) {
 func TestBuildHelperPodPrivileged(t *testing.T) {
 	// zfs helpers: privileged pod (a privileged container sees host devices,
 	// so HostDevices needs no explicit kube mapping)
-	pod := buildHelperPod("pgb", "node-1", "/var/lib/pgbranch", HelperSpec{
+	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, HelperSpec{
 		Image:       "alpine:3.21",
 		Cmd:         []string{"sh", "-c", "zfs snapshot tank/pgbranch/src-main-g1@br-pr-1"},
 		Privileged:  true,
@@ -125,7 +125,7 @@ func TestBuildHelperPodPrivileged(t *testing.T) {
 		t.Fatalf("SecurityContext = %+v, want privileged", sc)
 	}
 	// privileged + user compose (not used today, but must not panic or drop one)
-	pod = buildHelperPod("pgb", "node-1", "/var/lib/pgbranch", HelperSpec{
+	pod = buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, HelperSpec{
 		Image: "alpine:3.21", Cmd: []string{"true"}, User: "postgres", Privileged: true,
 	})
 	sc = pod.Spec.Containers[0].SecurityContext
@@ -137,7 +137,7 @@ func TestBuildHelperPodPrivileged(t *testing.T) {
 func TestBuildHelperPodHostPathMount(t *testing.T) {
 	// MountHostPath mounts an absolute host path (a zfs dataset mountpoint)
 	// directly — not a dataRoot subdirectory — and requires it to exist.
-	pod := buildHelperPod("pgb", "node-1", "/var/lib/pgbranch", HelperSpec{
+	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, HelperSpec{
 		Image: "alpine:3.21",
 		Cmd:   []string{"true"},
 		Mounts: []Mount{
@@ -177,7 +177,7 @@ func TestBuildBranchPod(t *testing.T) {
 		Entrypoint: []string{"/bin/sh", "/pgbranch/rw/entrypoint.sh"},
 		Labels:     labels,
 	}
-	pod := buildBranchPod("pgb", "node-1", "/var/lib/pgbranch", spec)
+	pod := buildBranchPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, spec)
 
 	if pod.Name != "pgbranch-br-pr-1" || pod.Namespace != "pgb" {
 		t.Errorf("name/ns = %q/%q", pod.Name, pod.Namespace)
@@ -242,7 +242,9 @@ func fakeKubeDriver(t *testing.T) (*KubeDriver, *fake.Clientset) {
 		}
 		return false, nil, nil
 	})
-	return &KubeDriver{cs: cs, namespace: "default", nodeName: "n", dataRoot: "/var/lib/pgbranch"}, cs
+	d := &KubeDriver{cs: cs, namespace: "default"}
+	d.storage = &hostPathStorage{d: d, node: "n", dataRoot: "/var/lib/pgbranch"}
+	return d, cs
 }
 
 // settlePods flips every pod the fake API server sees to the given phase, so
@@ -320,7 +322,7 @@ func TestKubeInspectAndListManaged(t *testing.T) {
 	d, cs := fakeKubeDriver(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	pod := buildBranchPod("default", "n", "/var/lib/pgbranch", BranchSpec{
+	pod := buildBranchPod("default", &hostPathStorage{node: "n", dataRoot: "/var/lib/pgbranch"}, BranchSpec{
 		Name: "pgbranch-br-x", Image: "postgres:17",
 		Labels: map[string]string{"pgbranch.managed": "true", "pgbranch.role": "branch"},
 	})

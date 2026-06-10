@@ -74,6 +74,9 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	if e.zfs() {
 		return e.provisionZFS(ctx, b, src)
 	}
+	if e.csi() {
+		return e.provisionCSI(ctx, b, src)
+	}
 	chain, err := e.reg.LayerChain(b.ID)
 	if err != nil {
 		return err
@@ -194,7 +197,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	if _, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
 		Image:  "alpine:3.21",
 		Cmd:    []string{"sh", "-c", `printf '%s' "$PGBRANCH_ENTRYPOINT" > /pgbranch/rw/entrypoint.sh && chmod 0755 /pgbranch/rw/entrypoint.sh`},
-		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScriptZFS},
+		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScriptDirect},
 		Mounts: []runtime.Mount{cloneMount},
 	}); err != nil {
 		return fail(fmt.Errorf("install entrypoint: %w", err))
@@ -204,7 +207,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	cid, err := e.drv.StartBranch(ctx, runtime.BranchSpec{
 		Name:       "pgbranch-br-" + b.Name,
 		Image:      e.image(src.PGVersion),
-		Env:        []string{"PGDATA=" + cow.ZFSDataPath},
+		Env:        []string{"PGDATA=" + cow.DirectDataPath},
 		Mounts:     []runtime.Mount{cloneMount},
 		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
 		Labels:     branchLabels(b),

@@ -28,6 +28,10 @@ import (
 //
 // ZFS backend: block-level CoW — snapshot the parent's clone and clone that.
 // No freeze, no stop, no layer rows.
+//
+// CSI backend: the child's PVC is a clone of the parent's PVC. No freeze or
+// layer rows either, but the parent is briefly stopped around the clone for
+// crash consistency (see provisionCSI).
 func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, ttl time.Duration) (*registry.Branch, error) {
 	if err := validateBranchName(name); err != nil {
 		return nil, err
@@ -51,11 +55,11 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 		Name: name, SourceID: parent.SourceID, RWVolume: e.planner.BranchLayerName(name),
 		SourceVolume: parent.SourceVolume, ExpiresAt: expiresAt, ParentBranchName: parentName,
 	}
-	if e.zfs() {
-		// The child snapshots + clones the parent's clone dataset. Recording
-		// that dataset as the child's SourceVolume makes provisionZFS, reset
-		// (re-clone from the parent) and destroy (snapshot lives on the
-		// parent's dataset) all operate on it naturally.
+	if e.zfs() || e.csi() {
+		// The child clones the parent's writable layer (zfs: snapshot+clone
+		// of the clone dataset; csi: PVC clone). Recording it as the child's
+		// SourceVolume makes provisioning, reset (re-clone from the parent)
+		// and destroy all operate on it naturally.
 		child.SourceVolume = parent.RWVolume
 	}
 	if err := e.reg.CreateBranch(child); err != nil {
@@ -64,6 +68,9 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	provision := func() error { return e.freezeAndProvision(ctx, child, parent, src) }
 	if e.zfs() {
 		provision = func() error { return e.provisionZFS(ctx, child, src) }
+	}
+	if e.csi() {
+		provision = func() error { return e.provisionCSI(ctx, child, src) }
 	}
 	if err := provision(); err != nil {
 		e.reg.TransitionBranch(child.ID, registry.BranchFailed, err.Error())

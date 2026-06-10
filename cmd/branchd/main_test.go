@@ -91,6 +91,59 @@ func TestTLSConfigFromFlags(t *testing.T) {
 	}
 }
 
+// resolveStorage validates the --runtime/--kube-storage/--cow triangle and
+// returns the effective cow backend (--kube-storage csi FORCES the csi
+// backend; no separate --cow csi needed).
+func TestResolveStorage(t *testing.T) {
+	ok := []struct {
+		name string
+		o    storageOptions
+		want string
+	}{
+		{"docker defaults", storageOptions{runtime: "docker", kubeStorage: "hostpath", cowFlag: "overlay"}, "overlay"},
+		{"docker zfs", storageOptions{runtime: "docker", kubeStorage: "hostpath", cowFlag: "zfs", cowSet: true}, "zfs"},
+		{"kube hostpath", storageOptions{runtime: "kube", kubeStorage: "hostpath", cowFlag: "overlay", kubeNode: "n1"}, "overlay"},
+		{"kube csi forces csi backend", storageOptions{runtime: "kube", kubeStorage: "csi", cowFlag: "overlay", storageClass: "sc"}, "csi"},
+		{"kube csi explicit cow csi", storageOptions{runtime: "kube", kubeStorage: "csi", cowFlag: "csi", cowSet: true, storageClass: "sc"}, "csi"},
+		{"kube csi no node needed", storageOptions{runtime: "kube", kubeStorage: "csi", cowFlag: "overlay", storageClass: "sc", snapshotClass: "snap", volumeSize: "20Gi"}, "csi"},
+	}
+	for _, tc := range ok {
+		got, err := resolveStorage(tc.o)
+		if err != nil || string(got) != tc.want {
+			t.Errorf("%s: resolveStorage = %q, %v; want %q", tc.name, got, err, tc.want)
+		}
+	}
+
+	bad := []struct {
+		name    string
+		o       storageOptions
+		errWant string
+	}{
+		{"csi on docker", storageOptions{runtime: "docker", kubeStorage: "csi", cowFlag: "overlay", storageClass: "sc"}, "--runtime kube"},
+		{"csi without storage class", storageOptions{runtime: "kube", kubeStorage: "csi", cowFlag: "overlay"}, "--csi-storage-class"},
+		{"csi with cow zfs", storageOptions{runtime: "kube", kubeStorage: "csi", cowFlag: "zfs", cowSet: true, storageClass: "sc"}, "--cow"},
+		{"cow csi without csi storage", storageOptions{runtime: "kube", kubeStorage: "hostpath", cowFlag: "csi", cowSet: true, kubeNode: "n1"}, "--kube-storage csi"},
+		{"cow csi on docker", storageOptions{runtime: "docker", kubeStorage: "hostpath", cowFlag: "csi", cowSet: true}, "--kube-storage csi"},
+		{"kube hostpath without node", storageOptions{runtime: "kube", kubeStorage: "hostpath", cowFlag: "overlay"}, "--kube-node"},
+		{"storage class without csi", storageOptions{runtime: "kube", kubeStorage: "hostpath", cowFlag: "overlay", kubeNode: "n1", storageClass: "sc"}, "--kube-storage csi"},
+		{"snapshot class without csi", storageOptions{runtime: "docker", kubeStorage: "hostpath", cowFlag: "overlay", snapshotClass: "snap"}, "--kube-storage csi"},
+		{"volume size without csi", storageOptions{runtime: "docker", kubeStorage: "hostpath", cowFlag: "overlay", volumeSize: "20Gi"}, "--kube-storage csi"},
+		{"unknown storage mode", storageOptions{runtime: "kube", kubeStorage: "nfs", cowFlag: "overlay", kubeNode: "n1"}, "--kube-storage"},
+		{"unknown cow backend", storageOptions{runtime: "docker", kubeStorage: "hostpath", cowFlag: "btrfs", cowSet: true}, "cow backend"},
+		{"unknown runtime", storageOptions{runtime: "podman", kubeStorage: "hostpath", cowFlag: "overlay"}, "--runtime"},
+	}
+	for _, tc := range bad {
+		_, err := resolveStorage(tc.o)
+		if err == nil {
+			t.Errorf("%s: want error", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.errWant) {
+			t.Errorf("%s: error %q does not mention %q", tc.name, err, tc.errWant)
+		}
+	}
+}
+
 func TestUIURLScheme(t *testing.T) {
 	if got := uiURL(":7070", false); got != "http://localhost:7070/ui/" {
 		t.Errorf("uiURL(:7070, false) = %q", got)

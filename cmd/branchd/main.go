@@ -72,16 +72,72 @@ func tlsConfigFromFlags(certFile, keyFile, name string) (*tls.Config, error) {
 	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
 }
 
+// storageOptions captures the --runtime/--kube-storage/--cow flag triangle
+// plus the csi-only flags.
+type storageOptions struct {
+	runtime       string // docker | kube
+	kubeStorage   string // hostpath | csi
+	cowFlag       string // --cow value
+	cowSet        bool   // --cow explicitly passed
+	storageClass  string // --csi-storage-class
+	snapshotClass string // --csi-snapshot-class
+	volumeSize    string // --csi-volume-size
+	kubeNode      string // --kube-node
+}
+
+// resolveStorage validates the storage flag combination and returns the
+// effective cow backend. --kube-storage csi FORCES the csi backend (no
+// separate --cow needed); every invalid combination is a startup error.
+func resolveStorage(o storageOptions) (cow.Backend, error) {
+	if o.runtime != "docker" && o.runtime != "kube" {
+		return "", fmt.Errorf("unknown --runtime %q (want docker or kube)", o.runtime)
+	}
+	backend, err := cow.ParseBackend(o.cowFlag)
+	if err != nil {
+		return "", err
+	}
+	switch o.kubeStorage {
+	case "csi":
+		if o.runtime != "kube" {
+			return "", errors.New("--kube-storage csi requires --runtime kube")
+		}
+		if o.storageClass == "" {
+			return "", errors.New("--csi-storage-class is required with --kube-storage csi (a StorageClass whose CSI driver supports PVC cloning, or snapshots with --csi-snapshot-class)")
+		}
+		if o.cowSet && backend != cow.BackendCSI {
+			return "", fmt.Errorf("--kube-storage csi forces --cow csi (got --cow %s)", backend)
+		}
+		return cow.BackendCSI, nil
+	case "hostpath":
+		if backend == cow.BackendCSI {
+			return "", errors.New("--cow csi requires --runtime kube --kube-storage csi")
+		}
+		if o.storageClass != "" || o.snapshotClass != "" || o.volumeSize != "" {
+			return "", errors.New("--csi-storage-class, --csi-snapshot-class and --csi-volume-size require --kube-storage csi")
+		}
+		if o.runtime == "kube" && o.kubeNode == "" {
+			return "", errors.New("--kube-node is required with --runtime kube --kube-storage hostpath (the node that stores all branch data)")
+		}
+		return backend, nil
+	default:
+		return "", fmt.Errorf("unknown --kube-storage %q (want hostpath or csi)", o.kubeStorage)
+	}
+}
+
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
 	reapInterval := flag.Duration("reap-interval", 30*time.Second, "TTL reaper tick interval")
 	runtimeName := flag.String("runtime", "docker", "container runtime: docker or kube")
 	kubeNamespace := flag.String("kube-namespace", "", `namespace for branch/helper pods (default: POD_NAMESPACE when in-cluster, else "pgbranch")`)
-	kubeNode := flag.String("kube-node", "", "storage node name (required with --runtime kube; all CoW data lives on this node)")
-	kubeDataRoot := flag.String("kube-data-root", "/var/lib/pgbranch", "CoW data root on the storage node")
+	kubeNode := flag.String("kube-node", "", "storage node name (required with --runtime kube --kube-storage hostpath; all CoW data lives on this node)")
+	kubeDataRoot := flag.String("kube-data-root", "/var/lib/pgbranch", "CoW data root on the storage node (hostpath storage only)")
 	kubeconfig := flag.String("kubeconfig", "", "kubeconfig path (default: in-cluster config, then KUBECONFIG / ~/.kube/config)")
-	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default) or zfs (experimental, see docs/zfs.md)")
+	kubeStorage := flag.String("kube-storage", "hostpath", "kube storage mode: hostpath (single node, data under --kube-data-root) or csi (multi-node, PVC clones; see docs/kubernetes.md)")
+	csiStorageClass := flag.String("csi-storage-class", "", "StorageClass for pgbranch PVCs (required with --kube-storage csi; its CSI driver must support PVC cloning, or snapshots with --csi-snapshot-class)")
+	csiSnapshotClass := flag.String("csi-snapshot-class", "", "VolumeSnapshotClass: clone branches via VolumeSnapshot+restore instead of direct PVC clones (--kube-storage csi only)")
+	csiVolumeSize := flag.String("csi-volume-size", "", "size of every pgbranch PVC, e.g. 50Gi (default 10Gi; --kube-storage csi only)")
+	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default), zfs (experimental, see docs/zfs.md) or csi (forced by --kube-storage csi)")
 	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgbranch datasets, e.g. tank/pgbranch (required with --cow zfs)")
 	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
@@ -115,14 +171,28 @@ func run() error {
 		return err
 	}
 	defer reg.Close()
+	cowSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "cow" {
+			cowSet = true
+		}
+	})
+	backend, err := resolveStorage(storageOptions{
+		runtime: *runtimeName, kubeStorage: *kubeStorage, cowFlag: *cowBackend, cowSet: cowSet,
+		storageClass: *csiStorageClass, snapshotClass: *csiSnapshotClass, volumeSize: *csiVolumeSize,
+		kubeNode: *kubeNode,
+	})
+	if err != nil {
+		return err
+	}
+	if backend == cow.BackendZFS && *zfsDataset == "" {
+		return errors.New("--zfs-dataset is required with --cow zfs (the dataset prefix pgbranch owns, e.g. tank/pgbranch)")
+	}
 	var drv runtime.Driver
 	switch *runtimeName {
 	case "docker":
 		drv, err = runtime.NewDockerDriver()
 	case "kube":
-		if *kubeNode == "" {
-			return errors.New("--kube-node is required with --runtime kube (the node that stores all branch data)")
-		}
 		ns := *kubeNamespace
 		if ns == "" {
 			ns = os.Getenv("POD_NAMESPACE")
@@ -130,19 +200,16 @@ func run() error {
 		if ns == "" {
 			ns = "pgbranch"
 		}
-		drv, err = runtime.NewKubeDriver(*kubeconfig, ns, *kubeNode, *kubeDataRoot)
-	default:
-		return fmt.Errorf("unknown --runtime %q (want docker or kube)", *runtimeName)
+		if backend == cow.BackendCSI {
+			drv, err = runtime.NewKubeDriverCSI(*kubeconfig, ns, runtime.CSIConfig{
+				StorageClass: *csiStorageClass, SnapshotClass: *csiSnapshotClass, VolumeSize: *csiVolumeSize,
+			})
+		} else {
+			drv, err = runtime.NewKubeDriver(*kubeconfig, ns, *kubeNode, *kubeDataRoot)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("init %s runtime: %w", *runtimeName, err)
-	}
-	backend, err := cow.ParseBackend(*cowBackend)
-	if err != nil {
-		return err
-	}
-	if backend == cow.BackendZFS && *zfsDataset == "" {
-		return errors.New("--zfs-dataset is required with --cow zfs (the dataset prefix pgbranch owns, e.g. tank/pgbranch)")
 	}
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
 		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")})

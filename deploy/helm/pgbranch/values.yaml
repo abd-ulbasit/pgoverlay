@@ -10,9 +10,29 @@ node: ""
 dataRoot: /var/lib/pgbranch
 
 # CoW backend: this chart deploys branchd with the default OverlayFS backend
-# only. The experimental zfs backend (branchd --cow zfs --zfs-dataset ...)
-# needs a zpool on the storage node and privileged helper pods; it is not
-# wired into chart values yet — see docs/zfs.md to run it by hand.
+# (hostpath storage) or the csi backend (storage.mode=csi). The experimental
+# zfs backend (branchd --cow zfs --zfs-dataset ...) needs a zpool on the
+# storage node and privileged helper pods; it is not wired into chart values
+# yet — see docs/zfs.md to run it by hand.
+
+# Branch data storage (see docs/kubernetes.md):
+#  - hostpath (default): plain directories under dataRoot on `node`; branch
+#    pods are pinned there and overlay-mount in-container (CAP_SYS_ADMIN).
+#  - csi: sources/branches are PVCs and every branch is a PVC clone; branch
+#    pods schedule on ANY node with no extra capabilities. Requires a
+#    StorageClass whose CSI driver supports PVC cloning (e.g. EBS, Ceph RBD,
+#    zfs-localpv, LINSTOR) — or VolumeSnapshots when snapshotClass is set.
+#    `node` is still required: branchd itself keeps its sqlite state on it.
+storage:
+  mode: hostpath
+  # REQUIRED when mode=csi: StorageClass for all pgbranch PVCs.
+  storageClass: ""
+  # Optional (mode=csi): VolumeSnapshotClass — branches then clone via
+  # VolumeSnapshot + restore instead of direct PVC dataSource clones.
+  snapshotClass: ""
+  # Optional (mode=csi): size of every pgbranch PVC (branchd defaults to
+  # 10Gi; CSI drivers thin-provision, so roomy is cheap).
+  volumeSize: ""
 
 image:
   repository: pgbranch/branchd

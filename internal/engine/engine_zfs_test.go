@@ -140,7 +140,7 @@ func TestZFSCreateBranchSnapshotsClonesAndMountsClone(t *testing.T) {
 	if ep.Privileged {
 		t.Fatal("entrypoint install must not be privileged")
 	}
-	if len(ep.Env) != 1 || ep.Env[0] != "PGBRANCH_ENTRYPOINT="+cow.EntrypointScriptZFS {
+	if len(ep.Env) != 1 || ep.Env[0] != "PGBRANCH_ENTRYPOINT="+cow.EntrypointScriptDirect {
 		t.Fatalf("entrypoint helper env = %v, want the zfs entrypoint script", ep.Env)
 	}
 	if len(ep.Mounts) != 1 || ep.Mounts[0].Kind != runtime.MountHostPath || ep.Mounts[0].Volume != "/tank/pgbranch/br-pr-1" {
@@ -156,8 +156,8 @@ func TestZFSCreateBranchSnapshotsClonesAndMountsClone(t *testing.T) {
 		bs.Mounts[0].Volume != "/tank/pgbranch/br-pr-1" || bs.Mounts[0].Target != cow.RWPath || bs.Mounts[0].ReadOnly {
 		t.Fatalf("branch mounts = %+v, want rw hostpath clone mountpoint at %s", bs.Mounts, cow.RWPath)
 	}
-	if len(bs.Env) != 1 || bs.Env[0] != "PGDATA="+cow.ZFSDataPath {
-		t.Fatalf("branch env = %v, want only PGDATA=%s", bs.Env, cow.ZFSDataPath)
+	if len(bs.Env) != 1 || bs.Env[0] != "PGDATA="+cow.DirectDataPath {
+		t.Fatalf("branch env = %v, want only PGDATA=%s", bs.Env, cow.DirectDataPath)
 	}
 	if len(d.volumes) != 0 {
 		t.Fatalf("zfs mode created docker volumes: %v", d.volumes)

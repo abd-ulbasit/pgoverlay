@@ -40,6 +40,10 @@ func (f *fakeDriver) RemoveVolume(ctx context.Context, name string) error {
 	delete(f.volumes, name)
 	return nil
 }
+func (f *fakeDriver) CloneVolume(ctx context.Context, src, dst string, l map[string]string) error {
+	f.volumes[dst] = true
+	return nil
+}
 
 // RunHelper returns canned du output so the usage endpoint has something to parse.
 func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {

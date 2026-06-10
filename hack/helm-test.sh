@@ -38,6 +38,41 @@ has "$out" 'type: NodePort' custom
 has "$out" 'nodePort: 30432' custom
 hasnt "$out" 'SYS_ADMIN' custom
 
+# csi storage mode: --kube-storage/--csi-* args + PVC/snapshot RBAC; still no
+# SYS_ADMIN anywhere (csi branch pods need no capabilities at all)
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set storage.mode=csi --set storage.storageClass=fast-clone \
+  --set storage.snapshotClass=fast-snap --set storage.volumeSize=20Gi)
+has "$out" '--kube-storage=csi' csi
+has "$out" '--csi-storage-class=fast-clone' csi
+has "$out" '--csi-snapshot-class=fast-snap' csi
+has "$out" '--csi-volume-size=20Gi' csi
+has "$out" 'persistentvolumeclaims' csi
+has "$out" 'volumesnapshots' csi
+has "$out" 'snapshot.storage.k8s.io' csi
+hasnt "$out" 'SYS_ADMIN' csi
+
+# csi without the optional values renders no empty flags
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set storage.mode=csi --set storage.storageClass=fast-clone)
+has "$out" '--kube-storage=csi' csi-minimal
+hasnt "$out" '--csi-snapshot-class' csi-minimal
+hasnt "$out" '--csi-volume-size' csi-minimal
+
+# default (hostpath) renders no csi args and no PVC RBAC
+out=$(helm template pgbranch "$CHART" --set node=storage-1 --set token=s3cret)
+hasnt "$out" '--kube-storage' default
+hasnt "$out" '--csi-storage-class' default
+hasnt "$out" 'persistentvolumeclaims' default
+
+# csi mode requires a storage class; unknown modes fail fast
+if helm template "$CHART" --set node=n --set token=t --set storage.mode=csi >/dev/null 2>&1; then
+  echo "FAIL: storage.mode=csi without storage.storageClass must fail" >&2; exit 1
+fi
+if helm template "$CHART" --set node=n --set token=t --set storage.mode=nfs >/dev/null 2>&1; then
+  echo "FAIL: unknown storage.mode must fail" >&2; exit 1
+fi
+
 # ghook is off by default: no webhook resources in the default render
 out=$(helm template pgbranch "$CHART" --set node=storage-1 --set token=s3cret)
 hasnt "$out" 'ghook' default

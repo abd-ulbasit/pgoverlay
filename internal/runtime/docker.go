@@ -95,6 +95,29 @@ func (d *DockerDriver) RemoveVolume(ctx context.Context, name string) error {
 	return d.cli.VolumeRemove(ctx, name, true)
 }
 
+// CloneVolume provisions dst as a copy of src. Docker named volumes have no
+// copy-on-write clone primitive, so this is a full `cp -a` through a helper
+// container — a generic fallback satisfying the Driver contract; no engine
+// flow uses it on docker today (the overlay and zfs backends have cheaper
+// mechanisms).
+func (d *DockerDriver) CloneVolume(ctx context.Context, src, dst string, labels map[string]string) error {
+	if err := d.CreateVolume(ctx, dst, labels); err != nil {
+		return fmt.Errorf("clone volume %s -> %s: %w", src, dst, err)
+	}
+	if _, err := d.RunHelper(ctx, HelperSpec{
+		Image: "alpine:3.21",
+		Cmd:   []string{"sh", "-c", "cp -a /pgbranch-clone-src/. /pgbranch-clone-dst/"},
+		Mounts: []Mount{
+			{Volume: src, Target: "/pgbranch-clone-src", ReadOnly: true},
+			{Volume: dst, Target: "/pgbranch-clone-dst"},
+		},
+	}); err != nil {
+		d.RemoveVolume(context.WithoutCancel(ctx), dst)
+		return fmt.Errorf("clone volume %s -> %s: %w", src, dst, err)
+	}
+	return nil
+}
+
 func toMounts(ms []Mount) []mount.Mount {
 	out := make([]mount.Mount, 0, len(ms))
 	for _, m := range ms {

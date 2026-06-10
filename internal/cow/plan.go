@@ -12,15 +12,19 @@ import (
 //go:embed entrypoint.sh
 var EntrypointScript string
 
-//go:embed entrypoint_zfs.sh
-var EntrypointScriptZFS string
+// EntrypointScriptDirect runs postgres straight on a writable copy-on-write
+// view of the data dir — zfs clones and csi PVC clones; no overlay assembly.
+//
+//go:embed entrypoint_direct.sh
+var EntrypointScriptDirect string
 
 const (
 	MergedPath = "/pgbranch/merged" // PGDATA inside branch container (overlay)
 	RWPath     = "/pgbranch/rw"     // branch rw layer mountpoint
-	// ZFSDataPath is PGDATA in zfs mode: the clone mountpoint is bind-mounted
-	// at RWPath and seeding put the cluster in its data/ subdir.
-	ZFSDataPath = RWPath + "/data"
+	// DirectDataPath is PGDATA in the direct (zfs/csi) modes: the writable
+	// clone (dataset mountpoint or PVC) is mounted at RWPath and seeding put
+	// the cluster in its data/ subdir.
+	DirectDataPath = RWPath + "/data"
 )
 
 // Backend selects the copy-on-write mechanism branches are built on.
@@ -29,15 +33,16 @@ type Backend string
 const (
 	BackendOverlay Backend = "overlay" // OverlayFS assembled inside the branch container (default)
 	BackendZFS     Backend = "zfs"     // ZFS snapshot+clone datasets (experimental)
+	BackendCSI     Backend = "csi"     // Kubernetes PVC clones (--runtime kube --kube-storage csi only)
 )
 
 // ParseBackend validates a backend name from configuration (branchd --cow).
 func ParseBackend(s string) (Backend, error) {
 	switch Backend(s) {
-	case BackendOverlay, BackendZFS:
+	case BackendOverlay, BackendZFS, BackendCSI:
 		return Backend(s), nil
 	}
-	return "", fmt.Errorf("unknown cow backend %q (want %q or %q)", s, BackendOverlay, BackendZFS)
+	return "", fmt.Errorf("unknown cow backend %q (want %q, %q or %q)", s, BackendOverlay, BackendZFS, BackendCSI)
 }
 
 // Planner yields backend-specific layer names, entrypoints, and (zfs) the
@@ -75,9 +80,11 @@ func (p Planner) SnapshotName(sourceDataset, branch string) string {
 func (p Planner) Mountpoint(dataset string) string { return "/" + dataset }
 
 // Entrypoint returns the branch container entrypoint script for the backend.
+// zfs and csi branches run directly on their writable clone; only overlay
+// branches assemble a mount in-container.
 func (p Planner) Entrypoint() string {
-	if p.Backend == BackendZFS {
-		return EntrypointScriptZFS
+	if p.Backend == BackendZFS || p.Backend == BackendCSI {
+		return EntrypointScriptDirect
 	}
 	return EntrypointScript
 }
