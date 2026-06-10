@@ -233,7 +233,8 @@ PG 13 and older are unsupported because branch startup passes `-c recovery_init_
 - **Phase 2** ✅ — `pgproxy` wire-protocol router (one stable endpoint, route by branch name), REST API + auth (`branchd` daemon reusing the same engine), TTL reaper for abandoned branches, branch reset, source refresh with generations. Branch-from-branch moved to a later phase.
 - **Phase 3** ✅ — Kubernetes runtime driver (branch pods on a storage node), Helm chart, GitHub webhook service (a branch per PR, automatically).
 - **Phase 4** ✅ — data masking hooks, embedded web UI with per-branch disk usage, published benchmarks (with the copy-up fix they motivated), experimental ZFS backend, docs site.
-- **Phase 5 (in progress)** — TLS for the router and REST API ✅, Postgres 14–18 support matrix ✅; branch-from-branch (layer DAG) ✅, multi-node CSI storage for Kubernetes (PVC-clone branches, no `SYS_ADMIN`, any node) ✅.
+- **Phase 5** ✅ — TLS (router + REST API), Postgres 14–18 support matrix, branch-from-branch (frozen-layer DAG), multi-node CSI storage for Kubernetes (PVC-clone branches, no `SYS_ADMIN`, any node).
+- **Future** — merge-back of branch data and multi-writer branches remain non-goals; ideas welcome in issues.
 
 ## Documentation
 

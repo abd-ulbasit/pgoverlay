@@ -17,9 +17,9 @@ the code.
             │                └──────────────┬────────────────────────────┘
             ▼                               ▼
         ┌─ engine ──────────────────────────────────┐
-        │  sagas: create / reset / destroy / seed   │
-        │  cow.Planner: overlay | zfs (layer names, │
-        │  entrypoints, zfs argv)                   │
+        │  sagas: create/from-branch/reset/destroy    │
+        │  cow.Planner: overlay | zfs | csi (names,    │
+        │  entrypoints, zfs argv, clone plans)        │
         └───────┬──────────────────────┬────────────┘
                 ▼                      ▼
         registry (SQLite)      runtime.Driver
@@ -119,17 +119,48 @@ database name:
 ```
 
 Everything after the startup message — including SCRAM authentication — is
-relayed untouched between client and branch.
+relayed untouched between client and branch. With `--pg-tls-cert/--pg-tls-key`
+the router answers `SSLRequest` with `'S'` and terminates TLS before reading
+the startup message (`sslmode=require` works); without certs it answers `'N'`
+as before. The REST API gets the same treatment via `--api-tls-*`.
 
-## Kubernetes: the storage-node model
+## Branch-from-branch: the layer DAG
 
-The kube driver maps the same abstractions onto one designated **storage
-node**: "volumes" are subdirectories of a data root (default
-`/var/lib/pgbranch`) mounted via `hostPath`; helpers are one-shot pods and
-branches are plain pods, all pinned to that node with `nodeName`. No CSI, no
-CRDs, no operator — branchd is a normal Deployment with a namespace-scoped
-Role. This is deliberately the honest dev/test scope; multi-node storage is
-future work.
+`pgb branch create child --from-branch parent` snapshots a **running branch**.
+Overlay mode can't snapshot a live upper dir atomically, so the engine
+*freezes* it: `CHECKPOINT` on the parent, stop its container, the parent's
+current rw volume becomes an immutable **layer** row in the registry, the
+parent restarts on a fresh rw volume layered above it, and the child starts
+on its own fresh rw volume with the same lower chain. Both now share the
+frozen layer read-only:
+
+```
+ parent:  [new upper]──┐
+                       ├──► frozen layer (old upper) ──► source data
+ child:   [new upper]──┘         (refcounted)
+```
+
+`PGBRANCH_LOWERS` carries the chain newest-first; frozen layers contribute
+their `/upper` subdir, the source its `/data`. Layers are garbage-collected
+when the last branch whose chain references them is destroyed — destroying
+the parent first leaves the child (and the layer) intact. ZFS and CSI modes
+skip the freeze machinery entirely: they snapshot/clone at the block or
+volume level (ZFS: `zfs snapshot` + `clone`; CSI: PVC clone after a brief
+parent quiesce).
+
+## Kubernetes: storage-node and CSI models
+
+The kube driver has two storage strategies. **hostPath** (default) maps
+"volumes" to subdirectories of a data root (default `/var/lib/pgbranch`) on
+one designated **storage node**; helpers are one-shot pods and branches are
+plain pods, all pinned with `nodeName`, branch pods carrying `SYS_ADMIN` for
+the overlay mount. **csi** (`--kube-storage csi`) makes every volume a PVC
+and every branch a PVC *clone* (`dataSource`, or VolumeSnapshot+restore when
+a snapshot class is configured): branch pods need no `SYS_ADMIN`, no node
+pin — they schedule anywhere, which is the multi-node payoff. The trade-off:
+clone CoW economics belong to the CSI driver (instant on EBS/Ceph/zfs-localpv,
+full copy on naive drivers). Either way: no CRDs, no operator — branchd is a
+normal Deployment with a namespace-scoped Role.
 
 ## What runs where
 
