@@ -114,7 +114,7 @@ func (d *DockerDriver) RunHelper(ctx context.Context, spec HelperSpec) error {
 	if err != nil {
 		return fmt.Errorf("create helper: %w", err)
 	}
-	defer d.cli.ContainerRemove(context.WithoutCancel(ctx), cr.ID, container.RemoveOptions{Force: true})
+	defer d.cli.ContainerRemove(context.WithoutCancel(ctx), cr.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	if err := d.cli.ContainerStart(ctx, cr.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("start helper: %w", err)
 	}
@@ -162,7 +162,7 @@ func (d *DockerDriver) StartBranch(ctx context.Context, spec BranchSpec) (string
 		return "", fmt.Errorf("create branch container: %w", err)
 	}
 	if err := d.cli.ContainerStart(ctx, cr.ID, container.StartOptions{}); err != nil {
-		d.cli.ContainerRemove(context.WithoutCancel(ctx), cr.ID, container.RemoveOptions{Force: true})
+		d.cli.ContainerRemove(context.WithoutCancel(ctx), cr.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 		return "", fmt.Errorf("start branch container: %w", err)
 	}
 	return cr.ID, nil
@@ -205,7 +205,7 @@ func (d *DockerDriver) Inspect(ctx context.Context, id string) (ContainerInfo, e
 func (d *DockerDriver) StopRemove(ctx context.Context, id string) error {
 	timeout := 30
 	_ = d.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
-	err := d.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
+	err := d.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	if client.IsErrNotFound(err) {
 		return nil
 	}
