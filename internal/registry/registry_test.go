@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
@@ -86,5 +87,299 @@ func TestBranchLifecycleAndTransitions(t *testing.T) {
 	live, err := r.ListLiveBranches()
 	if err != nil || len(live) != 1 {
 		t.Fatalf("live=%v err=%v", live, err)
+	}
+}
+
+// schemaV1Fixture is the Phase 1 schema exactly as shipped, used to build a
+// pre-migration database file for upgrade tests.
+const schemaV1Fixture = `
+CREATE TABLE IF NOT EXISTS sources (
+  id TEXT PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  pg_version TEXT NOT NULL,
+  volume TEXT NOT NULL,
+  conn_host TEXT NOT NULL DEFAULT '',
+  conn_port INTEGER NOT NULL DEFAULT 0,
+  conn_user TEXT NOT NULL DEFAULT '',
+  conn_db   TEXT NOT NULL DEFAULT '',
+  network   TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE TABLE IF NOT EXISTS branches (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  source_id TEXT NOT NULL REFERENCES sources(id),
+  state TEXT NOT NULL,
+  container_id TEXT NOT NULL DEFAULT '',
+  rw_volume TEXT NOT NULL,
+  port INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS branches_live_name
+  ON branches(name) WHERE state != 'destroyed';
+CREATE TABLE IF NOT EXISTS transitions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  from_state TEXT NOT NULL,
+  to_state TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+`
+
+func TestMigrateV1ToV2(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v1.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schemaV1Fixture); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sources (id,name,pg_version,volume,state) VALUES ('src1','main','17','pgbranch-src-main','ready')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO branches (id,name,source_id,state,container_id,rw_volume,port)
+		VALUES ('br1','pr-1','src1','ready','cid1','pgbranch-br-pr-1-rw',54321)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+
+	var v int
+	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != 2 {
+		t.Fatalf("user_version=%d want 2", v)
+	}
+	s, err := r.GetSourceByName("main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ID != "src1" || s.Volume != "pgbranch-src-main" || s.State != SourceReady {
+		t.Fatalf("source row not preserved: %+v", s)
+	}
+	if s.Generation != 1 {
+		t.Fatalf("Generation=%d want 1", s.Generation)
+	}
+	b, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ID != "br1" || b.ContainerID != "cid1" || b.Port != 54321 || b.State != BranchReady {
+		t.Fatalf("branch row not preserved: %+v", b)
+	}
+	if b.SourceVolume != "pgbranch-src-main" {
+		t.Fatalf("SourceVolume=%q want backfill from source", b.SourceVolume)
+	}
+	if b.ExpiresAt != "" {
+		t.Fatalf("ExpiresAt=%q want empty", b.ExpiresAt)
+	}
+	// re-opening an already-migrated DB is a no-op
+	r2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2.Close()
+}
+
+func TestSourceNameReusableAfterFailure(t *testing.T) {
+	r := openTest(t)
+	s1 := &Source{Name: "main", PGVersion: "17", Volume: "v1"}
+	if err := r.CreateSource(s1); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetSourceState(s1.ID, SourceFailed, "seed failed"); err != nil {
+		t.Fatal(err)
+	}
+	// failed row must not block re-creating the source under the same name
+	s2 := &Source{Name: "main", PGVersion: "17", Volume: "v2"}
+	if err := r.CreateSource(s2); err != nil {
+		t.Fatalf("recreate after failure: %v", err)
+	}
+	// but a live row still blocks duplicates
+	if err := r.CreateSource(&Source{Name: "main", PGVersion: "17", Volume: "v3"}); err == nil {
+		t.Fatal("want duplicate-name error while a live source exists")
+	}
+}
+
+func TestListExpiredBranches(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name, expiresAt string) *Branch {
+		t.Helper()
+		b := &Branch{Name: name, SourceID: s.ID, RWVolume: name + "-rw", SourceVolume: "v", ExpiresAt: expiresAt}
+		if err := r.CreateBranch(b); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	expired := mk("old", "2026-01-01T00:00:00Z")
+	if err := r.MarkBranchReady(expired.ID, "c1", 1); err != nil {
+		t.Fatal(err)
+	}
+	forever := mk("forever", "")
+	if err := r.MarkBranchReady(forever.ID, "c2", 2); err != nil {
+		t.Fatal(err)
+	}
+	future := mk("future", "2027-01-01T00:00:00Z")
+	if err := r.MarkBranchReady(future.ID, "c3", 3); err != nil {
+		t.Fatal(err)
+	}
+	mk("stuck-creating", "2026-01-01T00:00:00Z") // creating: not reaped
+
+	got, err := r.ListExpiredBranches("2026-06-10T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "old" {
+		t.Fatalf("expired=%v", got)
+	}
+	// failed branches with a past expiry are reaped too
+	if err := r.TransitionBranch(future.ID, BranchDestroying, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(future.ID, BranchDestroyed, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err = r.ListExpiredBranches("2028-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "old" {
+		t.Fatalf("expired=%v (destroyed/creating/never must be excluded)", got)
+	}
+}
+
+func TestBumpSourceGenerationAndCounts(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	if s2, _ := r.GetSourceByName("main"); s2.Generation != 1 {
+		t.Fatalf("fresh source generation=%d want 1", s2.Generation)
+	}
+	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "rw", SourceVolume: "pgbranch-src-main"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BumpSourceGeneration(s.ID, "pgbranch-src-main-g2"); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := r.GetSourceByName("main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.Generation != 2 || s2.Volume != "pgbranch-src-main-g2" {
+		t.Fatalf("after bump: %+v", s2)
+	}
+	if n, _ := r.CountLiveBranchesBySource(s.ID); n != 1 {
+		t.Fatalf("live by source=%d want 1", n)
+	}
+	if n, _ := r.CountLiveBranchesByVolume("pgbranch-src-main"); n != 1 {
+		t.Fatalf("live by volume=%d want 1", n)
+	}
+	if n, _ := r.CountLiveBranchesByVolume("pgbranch-src-main-g2"); n != 0 {
+		t.Fatalf("live by g2 volume=%d want 0", n)
+	}
+	// destroyed branches don't count
+	if err := r.MarkBranchReady(b.ID, "c", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(b.ID, BranchDestroying, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(b.ID, BranchDestroyed, ""); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := r.CountLiveBranchesBySource(s.ID); n != 0 {
+		t.Fatalf("live by source after destroy=%d want 0", n)
+	}
+	if n, _ := r.CountLiveBranchesByVolume("pgbranch-src-main"); n != 0 {
+		t.Fatalf("live by volume after destroy=%d want 0", n)
+	}
+}
+
+func TestDeleteSource(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "rw", SourceVolume: "v"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(b.ID, BranchFailed, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(b.ID, BranchDestroying, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(b.ID, BranchDestroyed, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DeleteSource(s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.GetSourceByName("main"); err != ErrNotFound {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	// name immediately reusable
+	if err := r.CreateSource(&Source{Name: "main", PGVersion: "17", Volume: "v2"}); err != nil {
+		t.Fatalf("name not reusable after delete: %v", err)
+	}
+}
+
+func TestResettingTransitions(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "rw", SourceVolume: "v"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	// creating -> resetting is illegal
+	if err := r.TransitionBranch(b.ID, BranchResetting, ""); err == nil {
+		t.Fatal("want illegal transition error from creating")
+	}
+	if err := r.MarkBranchReady(b.ID, "c", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(b.ID, BranchResetting, "reset requested"); err != nil {
+		t.Fatal(err)
+	}
+	// resetting -> ready (via MarkBranchReady, new container/port)
+	if err := r.MarkBranchReady(b.ID, "c2", 2); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.GetBranchByName("pr-1")
+	if got.State != BranchReady || got.ContainerID != "c2" || got.Port != 2 {
+		t.Fatalf("after reset: %+v", got)
+	}
+	// resetting -> failed
+	if err := r.TransitionBranch(b.ID, BranchResetting, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.TransitionBranch(b.ID, BranchFailed, "boom"); err != nil {
+		t.Fatal(err)
 	}
 }
