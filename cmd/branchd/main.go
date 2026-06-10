@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
 	"github.com/abd-ulbasit/pgbranch/internal/config"
+	"github.com/abd-ulbasit/pgbranch/internal/cow"
 	"github.com/abd-ulbasit/pgbranch/internal/engine"
 	"github.com/abd-ulbasit/pgbranch/internal/pgproxy"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
@@ -57,6 +59,8 @@ func run() error {
 	kubeNode := flag.String("kube-node", "", "storage node name (required with --runtime kube; all CoW data lives on this node)")
 	kubeDataRoot := flag.String("kube-data-root", "/var/lib/pgbranch", "CoW data root on the storage node")
 	kubeconfig := flag.String("kubeconfig", "", "kubeconfig path (default: in-cluster config, then KUBECONFIG / ~/.kube/config)")
+	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default) or zfs (experimental, see docs/zfs.md)")
+	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgbranch datasets, e.g. tank/pgbranch (required with --cow zfs)")
 	flag.Parse()
 
 	token := os.Getenv("PGBRANCH_TOKEN")
@@ -98,7 +102,15 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("init %s runtime: %w", *runtimeName, err)
 	}
-	eng := engine.New(reg, drv, cfg.PostgresImage)
+	backend, err := cow.ParseBackend(*cowBackend)
+	if err != nil {
+		return err
+	}
+	if backend == cow.BackendZFS && *zfsDataset == "" {
+		return errors.New("--zfs-dataset is required with --cow zfs (the dataset prefix pgbranch owns, e.g. tank/pgbranch)")
+	}
+	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
+		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

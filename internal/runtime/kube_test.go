@@ -111,6 +111,56 @@ func TestBuildHelperPodNoUser(t *testing.T) {
 	}
 }
 
+func TestBuildHelperPodPrivileged(t *testing.T) {
+	// zfs helpers: privileged pod (a privileged container sees host devices,
+	// so HostDevices needs no explicit kube mapping)
+	pod := buildHelperPod("pgb", "node-1", "/var/lib/pgbranch", HelperSpec{
+		Image:       "alpine:3.21",
+		Cmd:         []string{"sh", "-c", "zfs snapshot tank/pgbranch/src-main-g1@br-pr-1"},
+		Privileged:  true,
+		HostDevices: []string{"/dev/zfs"},
+	})
+	sc := pod.Spec.Containers[0].SecurityContext
+	if sc == nil || sc.Privileged == nil || !*sc.Privileged {
+		t.Fatalf("SecurityContext = %+v, want privileged", sc)
+	}
+	// privileged + user compose (not used today, but must not panic or drop one)
+	pod = buildHelperPod("pgb", "node-1", "/var/lib/pgbranch", HelperSpec{
+		Image: "alpine:3.21", Cmd: []string{"true"}, User: "postgres", Privileged: true,
+	})
+	sc = pod.Spec.Containers[0].SecurityContext
+	if sc == nil || sc.Privileged == nil || !*sc.Privileged || sc.RunAsUser == nil || *sc.RunAsUser != 999 {
+		t.Fatalf("SecurityContext = %+v, want privileged + RunAsUser 999", sc)
+	}
+}
+
+func TestBuildHelperPodHostPathMount(t *testing.T) {
+	// MountHostPath mounts an absolute host path (a zfs dataset mountpoint)
+	// directly — not a dataRoot subdirectory — and requires it to exist.
+	pod := buildHelperPod("pgb", "node-1", "/var/lib/pgbranch", HelperSpec{
+		Image: "alpine:3.21",
+		Cmd:   []string{"true"},
+		Mounts: []Mount{
+			{Kind: MountHostPath, Volume: "/tank/pgbranch/br-pr-1", Target: "/pgbranch/rw"},
+			{Volume: "pgbranch-src-main", Target: "/seed"},
+		},
+	})
+	v0 := pod.Spec.Volumes[0]
+	if v0.HostPath == nil || v0.HostPath.Path != "/tank/pgbranch/br-pr-1" {
+		t.Fatalf("hostpath mount path = %+v, want /tank/pgbranch/br-pr-1", v0.HostPath)
+	}
+	if v0.HostPath.Type == nil || *v0.HostPath.Type != corev1.HostPathDirectory {
+		t.Errorf("hostpath mount type = %v, want Directory (must already exist)", v0.HostPath.Type)
+	}
+	v1 := pod.Spec.Volumes[1]
+	if v1.HostPath == nil || v1.HostPath.Path != "/var/lib/pgbranch/pgbranch-src-main" {
+		t.Fatalf("volume mount path = %+v, want dataRoot subdir", v1.HostPath)
+	}
+	if v1.HostPath.Type == nil || *v1.HostPath.Type != corev1.HostPathDirectoryOrCreate {
+		t.Errorf("volume mount type = %v, want DirectoryOrCreate", v1.HostPath.Type)
+	}
+}
+
 func TestBuildBranchPod(t *testing.T) {
 	labels := map[string]string{
 		"pgbranch.managed": "true", "pgbranch.role": "branch",

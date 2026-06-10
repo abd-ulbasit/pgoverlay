@@ -3,8 +3,21 @@ package runtime
 
 import "context"
 
+// MountKind selects how Mount.Volume is interpreted.
+type MountKind string
+
+const (
+	// MountVolume (the zero value) names a managed volume: a docker named
+	// volume, or a dataRoot subdirectory on the kube storage node.
+	MountVolume MountKind = ""
+	// MountHostPath bind-mounts an absolute host path. Used by the zfs
+	// backend to mount dataset mountpoints; the path must already exist.
+	MountHostPath MountKind = "hostpath"
+)
+
 type Mount struct {
-	Volume   string
+	Kind     MountKind
+	Volume   string // volume name (MountVolume) or absolute host path (MountHostPath)
 	Target   string
 	ReadOnly bool
 }
@@ -19,6 +32,11 @@ type HelperSpec struct {
 	Mounts  []Mount
 	Network string
 	User    string // e.g. "postgres" for pg_basebackup so file ownership is uid 999
+	// Privileged runs the helper with full privileges, with HostDevices
+	// mapped in (zfs backend: /dev/zfs). The docker driver maps the devices
+	// explicitly; on kube a privileged container sees host devices anyway.
+	Privileged  bool
+	HostDevices []string
 }
 
 // BranchSpec is a long-running branch Postgres container.

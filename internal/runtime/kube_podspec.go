@@ -51,17 +51,23 @@ func kubeEnv(env []string) []corev1.EnvVar {
 }
 
 // kubePodVolumes translates driver mounts to hostPath volumes + mounts.
-// DirectoryOrCreate keeps CreateVolume trivial (mkdir is implicit).
+// MountVolume maps to a dataRoot subdirectory (DirectoryOrCreate keeps
+// CreateVolume trivial); MountHostPath maps the absolute path directly and
+// requires it to exist (a zfs dataset mountpoint — a missing one is an error
+// worth surfacing, not papering over with an empty dir).
 func kubePodVolumes(dataRoot string, ms []Mount) ([]corev1.Volume, []corev1.VolumeMount) {
-	t := corev1.HostPathDirectoryOrCreate
 	vols := make([]corev1.Volume, 0, len(ms))
 	mounts := make([]corev1.VolumeMount, 0, len(ms))
 	for i, m := range ms {
+		p, t := volumeHostPath(dataRoot, m.Volume), corev1.HostPathDirectoryOrCreate
+		if m.Kind == MountHostPath {
+			p, t = m.Volume, corev1.HostPathDirectory
+		}
 		name := fmt.Sprintf("vol-%d", i)
 		vols = append(vols, corev1.Volume{
 			Name: name,
 			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{Path: volumeHostPath(dataRoot, m.Volume), Type: &t},
+				HostPath: &corev1.HostPathVolumeSource{Path: p, Type: &t},
 			},
 		})
 		mounts = append(mounts, corev1.VolumeMount{Name: name, MountPath: m.Target, ReadOnly: m.ReadOnly})
@@ -86,9 +92,18 @@ func helperSecurityContext(user string) *corev1.SecurityContext {
 
 // buildHelperPod renders a one-shot helper pod pinned to the storage node.
 // HelperSpec.Network is ignored on K8s: the pod network reaches both cluster
-// pods and external hosts, which is all helpers need.
+// pods and external hosts, which is all helpers need. HelperSpec.HostDevices
+// is also ignored: a privileged container sees host devices already.
 func buildHelperPod(namespace, nodeName, dataRoot string, spec HelperSpec) *corev1.Pod {
 	vols, mounts := kubePodVolumes(dataRoot, spec.Mounts)
+	sc := helperSecurityContext(spec.User)
+	if spec.Privileged {
+		if sc == nil {
+			sc = &corev1.SecurityContext{}
+		}
+		priv := true
+		sc.Privileged = &priv
+	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "pgbranch-helper-",
@@ -105,7 +120,7 @@ func buildHelperPod(namespace, nodeName, dataRoot string, spec HelperSpec) *core
 				Command:         spec.Cmd,
 				Env:             kubeEnv(spec.Env),
 				VolumeMounts:    mounts,
-				SecurityContext: helperSecurityContext(spec.User),
+				SecurityContext: sc,
 			}},
 		},
 	}

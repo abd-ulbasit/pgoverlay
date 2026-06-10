@@ -9,6 +9,11 @@ node: ""
 # state (sqlite registry) lives under <dataRoot>/state.
 dataRoot: /var/lib/pgbranch
 
+# CoW backend: this chart deploys branchd with the default OverlayFS backend
+# only. The experimental zfs backend (branchd --cow zfs --zfs-dataset ...)
+# needs a zpool on the storage node and privileged helper pods; it is not
+# wired into chart values yet — see docs/zfs.md to run it by hand.
+
 image:
   repository: pgbranch/branchd
   tag: dev

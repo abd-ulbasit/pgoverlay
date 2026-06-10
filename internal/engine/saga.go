@@ -48,7 +48,7 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 		expiresAt = time.Now().Add(ttl).UTC().Format(time.RFC3339)
 	}
 	b := &registry.Branch{
-		Name: name, SourceID: src.ID, RWVolume: cow.BranchRWVolumeName(name),
+		Name: name, SourceID: src.ID, RWVolume: e.planner.BranchLayerName(name),
 		SourceVolume: src.Volume, ExpiresAt: expiresAt,
 	}
 	if err := e.reg.CreateBranch(b); err != nil {
@@ -61,11 +61,15 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	return e.reg.GetBranchByName(name)
 }
 
-// provision runs the resource steps shared by create and reset: rw volume,
-// entrypoint install, branch container, readiness wait, masking, mark ready.
-// Every step registers a compensation that unwinds (in reverse order) on
-// failure; the caller owns the state transition to failed.
+// provision runs the resource steps shared by create and reset: writable
+// layer, entrypoint install, branch container, readiness wait, masking, mark
+// ready. Every step registers a compensation that unwinds (in reverse order)
+// on failure; the caller owns the state transition to failed. The layer
+// steps depend on the cow backend (overlay volumes vs zfs snapshot+clone).
 func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registry.Source) error {
+	if e.zfs() {
+		return e.provisionZFS(ctx, b, src)
+	}
 	plan := cow.PlanBranch(b.Name, b.SourceVolume)
 
 	var undo []func()
@@ -106,37 +110,102 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 			{Volume: plan.RWVolume, Target: cow.RWPath},
 		},
 		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
-		Labels: map[string]string{
-			"pgbranch.managed": "true", "pgbranch.role": "branch",
-			"pgbranch.branch.id": b.ID, "pgbranch.branch.name": b.Name,
-		},
+		Labels:     branchLabels(b),
 	})
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
 	undo = append(undo, func() { e.drv.StopRemove(bg, cid) })
 
-	// 4. wait for postgres readiness (covers WAL recovery time)
-	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
-		return fail(fmt.Errorf("instance never became ready: %w", err))
-	}
-
-	// 5. apply the source's masking scripts inside the fresh clone (so the
-	// branch never serves unmasked data); reset re-runs this because it
-	// re-clones from the source. A failing script fails the branch.
-	if err := e.applyMasking(ctx, cid, src); err != nil {
-		return fail(err)
-	}
-
-	// 6. record container + address, mark ready
-	info, err := e.drv.Inspect(ctx, cid)
-	if err != nil {
-		return fail(err)
-	}
-	if err := e.reg.MarkBranchReady(b.ID, cid, info.Host, info.Port); err != nil {
+	// 4-6. readiness, masking, mark ready
+	if err := e.awaitAndMark(ctx, b, src, cid); err != nil {
 		return fail(err)
 	}
 	return nil
+}
+
+// provisionZFS is provision's layer half for the zfs backend: instead of an
+// empty rw volume overlaid on the source, the branch gets a writable clone
+// of a per-branch snapshot of the source dataset — both instant — and the
+// container runs straight on the clone's mountpoint (no overlay entrypoint).
+func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *registry.Source) error {
+	var undo []func()
+	fail := func(stepErr error) error {
+		for i := len(undo) - 1; i >= 0; i-- {
+			undo[i]()
+		}
+		return stepErr
+	}
+	bg := context.WithoutCancel(ctx)
+
+	// 1. snapshot the source dataset
+	if err := e.runZFS(ctx, zfsHelperSpec(e.planner.ZFSSnapshot(b.SourceVolume, b.Name))); err != nil {
+		return fail(fmt.Errorf("zfs snapshot: %w", err))
+	}
+	undo = append(undo, func() { e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroySnapshot(b.SourceVolume, b.Name))) })
+
+	// 2. clone it into the branch's writable dataset
+	if err := e.runZFS(ctx, zfsHelperSpec(e.planner.ZFSClone(b.SourceVolume, b.Name))); err != nil {
+		return fail(fmt.Errorf("zfs clone: %w", err))
+	}
+	undo = append(undo, func() { e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroyClone(b.Name))) })
+
+	// 3. install the zfs entrypoint into the clone, next to its data/ dir
+	// (plain unprivileged helper: it only writes a file)
+	cloneMount := runtime.Mount{Kind: runtime.MountHostPath, Volume: e.planner.Mountpoint(b.RWVolume), Target: cow.RWPath}
+	if _, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
+		Image:  "alpine:3.21",
+		Cmd:    []string{"sh", "-c", `printf '%s' "$PGBRANCH_ENTRYPOINT" > /pgbranch/rw/entrypoint.sh && chmod 0755 /pgbranch/rw/entrypoint.sh`},
+		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScriptZFS},
+		Mounts: []runtime.Mount{cloneMount},
+	}); err != nil {
+		return fail(fmt.Errorf("install entrypoint: %w", err))
+	}
+
+	// 4. branch container on the clone mountpoint
+	cid, err := e.drv.StartBranch(ctx, runtime.BranchSpec{
+		Name:       "pgbranch-br-" + b.Name,
+		Image:      e.image(src.PGVersion),
+		Env:        []string{"PGDATA=" + cow.ZFSDataPath},
+		Mounts:     []runtime.Mount{cloneMount},
+		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
+		Labels:     branchLabels(b),
+	})
+	if err != nil {
+		return fail(fmt.Errorf("start instance: %w", err))
+	}
+	undo = append(undo, func() { e.drv.StopRemove(bg, cid) })
+
+	if err := e.awaitAndMark(ctx, b, src, cid); err != nil {
+		return fail(err)
+	}
+	return nil
+}
+
+func branchLabels(b *registry.Branch) map[string]string {
+	return map[string]string{
+		"pgbranch.managed": "true", "pgbranch.role": "branch",
+		"pgbranch.branch.id": b.ID, "pgbranch.branch.name": b.Name,
+	}
+}
+
+// awaitAndMark is the backend-independent tail of provisioning: wait for
+// postgres readiness (covers WAL recovery time), apply the source's masking
+// scripts inside the fresh clone (so the branch never serves unmasked data;
+// reset re-runs this because it re-clones), then record container + address
+// and mark ready. A failing masking script fails the branch.
+func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *registry.Source, cid string) error {
+	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
+		return fmt.Errorf("instance never became ready: %w", err)
+	}
+	if err := e.applyMasking(ctx, cid, src); err != nil {
+		return err
+	}
+	info, err := e.drv.Inspect(ctx, cid)
+	if err != nil {
+		return err
+	}
+	return e.reg.MarkBranchReady(b.ID, cid, info.Host, info.Port)
 }
 
 // ResetBranch throws away a ready branch's writes and reprovisions it from
@@ -163,8 +232,8 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (*registry.Branch
 			return fail(fmt.Errorf("remove container: %w", err))
 		}
 	}
-	if err := e.drv.RemoveVolume(ctx, b.RWVolume); err != nil {
-		return fail(fmt.Errorf("remove rw volume: %w", err))
+	if err := e.removeBranchLayer(ctx, b); err != nil {
+		return fail(fmt.Errorf("remove branch layer: %w", err))
 	}
 	if err := e.provision(ctx, b, src); err != nil {
 		return fail(fmt.Errorf("reset %q: %w", name, err))
@@ -227,8 +296,8 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) error {
 			return fmt.Errorf("remove container: %w", err)
 		}
 	}
-	if err := e.drv.RemoveVolume(ctx, b.RWVolume); err != nil {
-		return fmt.Errorf("remove rw volume: %w", err)
+	if err := e.removeBranchLayer(ctx, b); err != nil {
+		return fmt.Errorf("remove branch layer: %w", err)
 	}
 	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroyed, ""); err != nil {
 		return err
@@ -252,5 +321,5 @@ func (e *Engine) gcSourceVolume(ctx context.Context, sourceID, volume string) {
 	if n, err := e.reg.CountLiveBranchesByVolume(volume); err != nil || n > 0 {
 		return
 	}
-	e.drv.RemoveVolume(ctx, volume)
+	e.removeSourceLayer(ctx, volume)
 }

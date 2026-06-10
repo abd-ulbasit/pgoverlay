@@ -98,9 +98,29 @@ func (d *DockerDriver) RemoveVolume(ctx context.Context, name string) error {
 func toMounts(ms []Mount) []mount.Mount {
 	out := make([]mount.Mount, 0, len(ms))
 	for _, m := range ms {
-		out = append(out, mount.Mount{Type: mount.TypeVolume, Source: m.Volume, Target: m.Target, ReadOnly: m.ReadOnly})
+		typ := mount.TypeVolume
+		if m.Kind == MountHostPath {
+			typ = mount.TypeBind
+		}
+		out = append(out, mount.Mount{Type: typ, Source: m.Volume, Target: m.Target, ReadOnly: m.ReadOnly})
 	}
 	return out
+}
+
+// helperHostConfig renders the host-side container config for a helper:
+// mounts, network, and — for zfs helpers — privileged mode with the host
+// devices mapped in.
+func helperHostConfig(spec HelperSpec) *container.HostConfig {
+	host := &container.HostConfig{
+		Mounts:      toMounts(spec.Mounts),
+		NetworkMode: container.NetworkMode(spec.Network),
+		Privileged:  spec.Privileged,
+	}
+	for _, dev := range spec.HostDevices {
+		host.Resources.Devices = append(host.Resources.Devices,
+			container.DeviceMapping{PathOnHost: dev, PathInContainer: dev, CgroupPermissions: "rwm"})
+	}
+	return host
 }
 
 func (d *DockerDriver) RunHelper(ctx context.Context, spec HelperSpec) (string, error) {
@@ -109,7 +129,7 @@ func (d *DockerDriver) RunHelper(ctx context.Context, spec HelperSpec) (string, 
 	}
 	cfg := &container.Config{Image: spec.Image, Cmd: spec.Cmd, Env: spec.Env, User: spec.User,
 		Labels: map[string]string{"pgbranch.managed": "true", "pgbranch.role": "helper"}}
-	host := &container.HostConfig{Mounts: toMounts(spec.Mounts), NetworkMode: container.NetworkMode(spec.Network)}
+	host := helperHostConfig(spec)
 	cr, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("create helper: %w", err)

@@ -20,10 +20,17 @@ type Engine struct {
 	reg          *registry.Registry
 	drv          runtime.Driver
 	defaultImage string
+	planner      cow.Planner
 }
 
+// New builds an engine on the default OverlayFS backend.
 func New(reg *registry.Registry, drv runtime.Driver, defaultImage string) *Engine {
-	return &Engine{reg: reg, drv: drv, defaultImage: defaultImage}
+	return NewWithPlanner(reg, drv, defaultImage, cow.Planner{Backend: cow.BackendOverlay})
+}
+
+// NewWithPlanner selects the copy-on-write backend (branchd --cow).
+func NewWithPlanner(reg *registry.Registry, drv runtime.Driver, defaultImage string, planner cow.Planner) *Engine {
+	return &Engine{reg: reg, drv: drv, defaultImage: defaultImage, planner: planner}
 }
 
 func (e *Engine) image(pgVersion string) string {
@@ -35,20 +42,21 @@ func (e *Engine) image(pgVersion string) string {
 
 // AddSource registers a source and seeds it from the given live Postgres.
 func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password string) error {
-	s.Volume = cow.SourceVolumeName(s.Name, 1)
+	s.Volume = e.planner.SourceLayerName(s.Name, 1)
 	if err := e.reg.CreateSource(s); err != nil {
 		return err
 	}
-	if err := e.drv.CreateVolume(ctx, s.Volume, map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": s.Name}); err != nil {
-		e.reg.SetSourceState(s.ID, registry.SourceFailed, "volume create failed")
+	if err := e.createSourceLayer(ctx, s.Volume, map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": s.Name}); err != nil {
+		e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed")
 		return err
 	}
+	seedVol, seedKind := e.seedTarget(s.Volume)
 	err := pgctl.Seed(ctx, e.drv, pgctl.SeedSpec{
-		Image: e.image(s.PGVersion), Volume: s.Volume, Network: s.Network,
+		Image: e.image(s.PGVersion), Volume: seedVol, MountKind: seedKind, Network: s.Network,
 		Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser, Password: password,
 	})
 	if err != nil {
-		e.drv.RemoveVolume(context.WithoutCancel(ctx), s.Volume)
+		e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume)
 		e.reg.SetSourceState(s.ID, registry.SourceFailed, err.Error())
 		return fmt.Errorf("seed source %q: %w", s.Name, err)
 	}
@@ -67,16 +75,17 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 	if src.State != registry.SourceReady {
 		return fmt.Errorf("source %q is %s, not ready", name, src.State)
 	}
-	newVol := cow.SourceVolumeName(name, src.Generation+1)
-	if err := e.drv.CreateVolume(ctx, newVol, map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": name}); err != nil {
+	newVol := e.planner.SourceLayerName(name, src.Generation+1)
+	if err := e.createSourceLayer(ctx, newVol, map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": name}); err != nil {
 		return err
 	}
+	seedVol, seedKind := e.seedTarget(newVol)
 	err = pgctl.Seed(ctx, e.drv, pgctl.SeedSpec{
-		Image: e.image(src.PGVersion), Volume: newVol, Network: src.Network,
+		Image: e.image(src.PGVersion), Volume: seedVol, MountKind: seedKind, Network: src.Network,
 		Host: src.ConnHost, Port: src.ConnPort, User: src.ConnUser, Password: password,
 	})
 	if err != nil {
-		e.drv.RemoveVolume(context.WithoutCancel(ctx), newVol)
+		e.removeSourceLayer(context.WithoutCancel(ctx), newVol)
 		return fmt.Errorf("refresh source %q: %w", name, err)
 	}
 	oldVol := src.Volume
@@ -101,36 +110,41 @@ func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 	if n > 0 {
 		return fmt.Errorf("source %q has %d live branch(es); destroy them first", name, n)
 	}
-	if err := e.drv.RemoveVolume(ctx, src.Volume); err != nil && src.State == registry.SourceReady {
-		// failed sources may have no volume (seed cleanup removed it)
-		return fmt.Errorf("remove source volume: %w", err)
+	if err := e.removeSourceLayer(ctx, src.Volume); err != nil && src.State == registry.SourceReady {
+		// failed sources may have no layer (seed cleanup removed it)
+		return fmt.Errorf("remove source layer: %w", err)
 	}
 	return e.reg.DeleteSource(src.ID)
 }
 
-// BranchUsage measures a branch's copy-on-write rw volume in bytes (the
-// branch's own writes, not the shared source data) by running `du -sb` in a
-// one-shot helper. It is a helper-container roundtrip — cheap, but not free.
+// BranchUsage measures a branch's copy-on-write layer in bytes (the branch's
+// own writes, not the shared source data). Overlay: `du -sb` on the rw
+// volume; zfs: the clone's `used` property (space unique to the clone). It
+// is a helper-container roundtrip — cheap, but not free.
 func (e *Engine) BranchUsage(ctx context.Context, name string) (int64, error) {
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
 		return 0, err
 	}
-	out, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
+	spec := runtime.HelperSpec{
 		Image:  "alpine:3.21",
 		Cmd:    []string{"du", "-sb", cow.RWPath},
 		Mounts: []runtime.Mount{{Volume: b.RWVolume, Target: cow.RWPath, ReadOnly: true}},
-	})
+	}
+	if e.zfs() {
+		spec = zfsHelperSpec(e.planner.ZFSUsed(b.RWVolume))
+	}
+	out, err := e.drv.RunHelper(ctx, spec)
 	if err != nil {
 		return 0, fmt.Errorf("measure branch %q usage: %w", name, err)
 	}
 	fields := strings.Fields(out)
 	if len(fields) == 0 {
-		return 0, fmt.Errorf("measure branch %q usage: empty du output", name)
+		return 0, fmt.Errorf("measure branch %q usage: empty measurement output", name)
 	}
 	n, err := strconv.ParseInt(fields[0], 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("measure branch %q usage: unparseable du output %q", name, out)
+		return 0, fmt.Errorf("measure branch %q usage: unparseable measurement output %q", name, out)
 	}
 	return n, nil
 }
@@ -195,7 +209,7 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			if b.ContainerID != "" {
 				e.drv.StopRemove(ctx, b.ContainerID)
 			}
-			e.drv.RemoveVolume(ctx, b.RWVolume)
+			e.removeBranchLayer(ctx, b)
 			e.reg.TransitionBranch(b.ID, registry.BranchFailed, "reconcile: interrupted create")
 		}
 	}

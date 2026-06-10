@@ -8,6 +8,51 @@ import (
 	"time"
 )
 
+func TestToMountsKinds(t *testing.T) {
+	got := toMounts([]Mount{
+		{Volume: "pgbranch-src-main", Target: "/pgbranch/lower0", ReadOnly: true},
+		{Kind: MountHostPath, Volume: "/tank/pgbranch/br-pr-1", Target: "/pgbranch/rw"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("mounts = %d", len(got))
+	}
+	if string(got[0].Type) != "volume" || got[0].Source != "pgbranch-src-main" || !got[0].ReadOnly {
+		t.Errorf("mount[0] = %+v, want ro volume pgbranch-src-main", got[0])
+	}
+	if string(got[1].Type) != "bind" || got[1].Source != "/tank/pgbranch/br-pr-1" || got[1].Target != "/pgbranch/rw" || got[1].ReadOnly {
+		t.Errorf("mount[1] = %+v, want rw bind /tank/pgbranch/br-pr-1", got[1])
+	}
+}
+
+func TestHelperHostConfigPrivilegedDevices(t *testing.T) {
+	// zfs helpers: privileged with /dev/zfs mapped in
+	host := helperHostConfig(HelperSpec{
+		Privileged:  true,
+		HostDevices: []string{"/dev/zfs"},
+		Mounts:      []Mount{{Kind: MountHostPath, Volume: "/tank/pgbranch/src-main-g1", Target: "/seed"}},
+		Network:     "bridge",
+	})
+	if !host.Privileged {
+		t.Fatal("want Privileged")
+	}
+	if len(host.Resources.Devices) != 1 ||
+		host.Resources.Devices[0].PathOnHost != "/dev/zfs" ||
+		host.Resources.Devices[0].PathInContainer != "/dev/zfs" {
+		t.Fatalf("devices = %+v, want /dev/zfs mapped", host.Resources.Devices)
+	}
+	if string(host.NetworkMode) != "bridge" {
+		t.Errorf("network = %q", host.NetworkMode)
+	}
+	if len(host.Mounts) != 1 || string(host.Mounts[0].Type) != "bind" {
+		t.Errorf("mounts = %+v, want one bind mount", host.Mounts)
+	}
+	// default helpers stay unprivileged with no devices
+	plain := helperHostConfig(HelperSpec{Mounts: []Mount{{Volume: "v", Target: "/t"}}})
+	if plain.Privileged || len(plain.Resources.Devices) != 0 {
+		t.Fatalf("plain helper privileged=%v devices=%v, want false/none", plain.Privileged, plain.Resources.Devices)
+	}
+}
+
 func itDriver(t *testing.T) Driver {
 	t.Helper()
 	if os.Getenv("PGBRANCH_IT") != "1" {

@@ -22,6 +22,7 @@ type fakeDriver struct {
 	helperOut  string               // returned by RunHelper as captured output
 	helpers    []runtime.HelperSpec // every RunHelper call, in order
 	starts     int                  // StartBranch invocations
+	branches   []runtime.BranchSpec // every StartBranch call, in order
 	execs      [][]string           // every Exec call, in order
 }
 
@@ -46,6 +47,7 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 		return "", errors.New("boom")
 	}
 	f.starts++
+	f.branches = append(f.branches, s)
 	f.containers["cid-"+s.Name] = true
 	return "cid-" + s.Name, nil
 }
