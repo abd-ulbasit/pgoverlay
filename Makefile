@@ -1,4 +1,4 @@
-.PHONY: build test it k8s-it matrix lint docker-build docker-build-ghook helm-test
+.PHONY: build test it k8s-it csi-it matrix lint docker-build docker-build-ghook helm-test
 
 build:
 	go build -o bin/pgb ./cmd/pgb
@@ -13,6 +13,13 @@ it:
 
 k8s-it:
 	PGBRANCH_K8S_IT=1 go test ./... -count=1 -timeout 30m
+
+# CSI storage mode e2e on kind: hack/kind-csi-up.sh installs the
+# external-snapshotter + csi-driver-host-path stack (vendored, pinned
+# manifests under hack/csi/), then seed -> PVC-clone branch -> verify ->
+# branch-from-branch -> destroy.
+csi-it:
+	PGBRANCH_CSI_IT=1 go test ./internal/runtime/ -run TestKubeCSI -count=1 -v -timeout 40m
 
 # Postgres version matrix: seed -> branch -> verify -> destroy per major
 # (default "14 18"; override with PGBRANCH_MATRIX_VERSIONS="14 15 16 17 18").

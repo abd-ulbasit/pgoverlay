@@ -1,0 +1,12 @@
+# StorageClass for the csi-driver-host-path test deployment: supports PVC
+# dataSource clones and (with the snapshot CRDs + controller) VolumeSnapshots.
+# WaitForFirstConsumer keeps provisioning on the node the consuming pod lands
+# on — the correct setting for a topology-constrained driver like hostpath.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-hostpath-sc
+provisioner: hostpath.csi.k8s.io
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

@@ -131,4 +131,12 @@ permissions, and the full `GHOOK_*` environment reference live in
 `make helm-test` lints and grep-asserts the rendered chart; `make k8s-it`
 runs the full integration suite against a local
 [kind](https://kind.sigs.k8s.io) cluster (`hack/kind-up.sh` creates
-`pgbranch-test` and preloads images).
+`pgbranch-test` and preloads images). `make csi-it` exercises the csi mode
+end-to-end on the same cluster: `hack/kind-csi-up.sh` installs the
+external-snapshotter CRDs/controller and
+[csi-driver-host-path](https://github.com/kubernetes-csi/csi-driver-host-path)
+(vendored, version-pinned manifests under `hack/csi/`), then the test seeds a
+source PVC, clones a branch, verifies isolation over SQL, branches from the
+branch, and tears everything down (no PVCs left). A snapshot-mode roundtrip
+covers the VolumeSnapshot+restore clone path against
+`csi-hostpath-snapclass`.
