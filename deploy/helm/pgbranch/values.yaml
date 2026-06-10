@@ -46,3 +46,40 @@ reapInterval: 30s
 runAsUser: 0
 
 resources: {}
+
+# Optional GitHub webhook service (pgbranch-github): branch-per-PR. Disabled
+# by default; see docs/github-app.md for the full setup walkthrough.
+ghook:
+  enabled: false
+  image:
+    repository: pgbranch/ghook
+    tag: dev
+    pullPolicy: IfNotPresent
+  # Webhook HMAC secret (X-Hub-Signature-256). Exactly one is required when
+  # enabled:
+  #  - webhookSecret: the chart renders a Secret holding it
+  #  - existingSecret: name of a pre-created Secret with key "webhook-secret"
+  #    (and optionally "github-token")
+  webhookSecret: ""
+  existingSecret: ""
+  # GitHub API token (issues:write) enabling the one-time connect-info PR
+  # comment; leave empty to disable commenting.
+  githubToken: ""
+  # REQUIRED when enabled: pgbranch source to create PR branches from.
+  source: ""
+  # Branch TTL (Go duration, e.g. 72h); empty = branches never expire.
+  ttl: 72h
+  # Reset the branch to the source snapshot on every push (synchronize).
+  resetOnPush: false
+  # Comma-separated "owner/name" allow-list; empty accepts any repository
+  # that signs with the webhook secret (logged as a warning).
+  repos: ""
+  # host[:port] of the pgbranch proxy as reachable by developers (shown in
+  # PR comments), e.g. a NodePort or LB address for proxy.service.
+  proxyHost: ""
+  # GitHub API base URL override (GitHub Enterprise).
+  githubAPI: ""
+  port: 8080
+  service:
+    type: ClusterIP
+  resources: {}

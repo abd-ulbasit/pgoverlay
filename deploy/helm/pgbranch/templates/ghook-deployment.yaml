@@ -1,0 +1,82 @@
+{{- if .Values.ghook.enabled }}
+{{- if not (or .Values.ghook.webhookSecret .Values.ghook.existingSecret) }}
+{{- fail "set ghook.webhookSecret or ghook.existingSecret (webhook HMAC secret)" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pgbranch.ghook.fullname" . }}
+  labels:
+    {{- include "pgbranch.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ghook
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pgbranch.ghook.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pgbranch.ghook.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: ghook
+          image: "{{ .Values.ghook.image.repository }}:{{ .Values.ghook.image.tag }}"
+          imagePullPolicy: {{ .Values.ghook.image.pullPolicy }}
+          env:
+            - name: GHOOK_LISTEN
+              value: ":{{ .Values.ghook.port }}"
+            - name: GHOOK_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgbranch.ghook.secretName" . }}
+                  key: webhook-secret
+            # branchd's REST API via in-cluster DNS
+            - name: GHOOK_PGBRANCH_SERVER
+              value: http://{{ include "pgbranch.fullname" . }}-api:{{ .Values.api.port }}
+            - name: GHOOK_PGBRANCH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgbranch.tokenSecretName" . }}
+                  key: token
+            - name: GHOOK_SOURCE
+              value: {{ required "set ghook.source (pgbranch source to branch from)" .Values.ghook.source | quote }}
+            {{- with .Values.ghook.ttl }}
+            - name: GHOOK_TTL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.ghook.resetOnPush }}
+            - name: GHOOK_RESET_ON_PUSH
+              value: "true"
+            {{- end }}
+            {{- with .Values.ghook.repos }}
+            - name: GHOOK_REPOS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.ghook.proxyHost }}
+            - name: GHOOK_PROXY_HOST
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.ghook.githubAPI }}
+            - name: GHOOK_GITHUB_API
+              value: {{ . | quote }}
+            {{- end }}
+            # optional: enables the connect-info PR comment when present
+            - name: GHOOK_GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgbranch.ghook.secretName" . }}
+                  key: github-token
+                  optional: true
+          ports:
+            - name: http
+              containerPort: {{ .Values.ghook.port }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          {{- with .Values.ghook.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

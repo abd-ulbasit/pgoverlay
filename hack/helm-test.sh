@@ -38,6 +38,47 @@ has "$out" 'type: NodePort' custom
 has "$out" 'nodePort: 30432' custom
 hasnt "$out" 'SYS_ADMIN' custom
 
+# ghook is off by default: no webhook resources in the default render
+out=$(helm template pgbranch "$CHART" --set node=storage-1 --set token=s3cret)
+hasnt "$out" 'ghook' default
+hasnt "$out" 'GHOOK_' default
+
+# ghook enabled: deployment + service + secret, wired to the api service
+out=$(helm template rel "$CHART" --set node=worker-9 --set token=s3cret \
+  --set ghook.enabled=true --set ghook.webhookSecret=whsec --set ghook.source=main \
+  --set ghook.githubToken=ghp_abc --set ghook.repos='acme/widgets' \
+  --set ghook.proxyHost=pg.example.com:30432 --set ghook.resetOnPush=true)
+has "$out" 'pgbranch/ghook:dev' ghook
+has "$out" 'name: rel-pgbranch-ghook' ghook # deployment/service/secret share the name
+has "$out" 'GHOOK_PGBRANCH_SERVER' ghook
+has "$out" 'value: http://rel-pgbranch-api:7070' ghook # in-cluster DNS to branchd
+has "$out" 'GHOOK_WEBHOOK_SECRET' ghook
+has "$out" 'key: webhook-secret' ghook
+has "$out" 'key: github-token' ghook
+has "$out" 'webhook-secret: "whsec"' ghook
+has "$out" 'GHOOK_SOURCE' ghook
+has "$out" 'GHOOK_RESET_ON_PUSH' ghook
+has "$out" 'GHOOK_REPOS' ghook
+has "$out" 'GHOOK_PROXY_HOST' ghook
+has "$out" 'GHOOK_TTL' ghook
+hasnt "$out" 'SYS_ADMIN' ghook
+
+# ghook existingSecret suppresses the rendered ghook Secret
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set ghook.enabled=true --set ghook.existingSecret=my-ghook --set ghook.source=main)
+has "$out" 'name: my-ghook' ghook-existing
+hasnt "$out" 'webhook-secret: ' ghook-existing # no ghook Secret stringData rendered
+
+# ghook required values fail fast when enabled
+if helm template "$CHART" --set node=n --set token=t --set ghook.enabled=true \
+  --set ghook.source=main >/dev/null 2>&1; then
+  echo "FAIL: ghook without webhookSecret/existingSecret must fail" >&2; exit 1
+fi
+if helm template "$CHART" --set node=n --set token=t --set ghook.enabled=true \
+  --set ghook.webhookSecret=w >/dev/null 2>&1; then
+  echo "FAIL: ghook without source must fail" >&2; exit 1
+fi
+
 # required values fail fast
 if helm template "$CHART" --set token=x >/dev/null 2>&1; then
   echo "FAIL: template without node must fail" >&2; exit 1

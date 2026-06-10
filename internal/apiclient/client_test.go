@@ -122,3 +122,18 @@ func TestErrorResponsesSurfaceMessage(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestNotFoundErrorsAreDetectable(t *testing.T) {
+	ts, _, _ := newStub(t, http.StatusNotFound, map[string]string{"error": "not found"})
+	c := New(ts.URL, "tok")
+	_, err := c.GetBranch(context.Background(), "pr-404")
+	if err == nil || !IsNotFound(err) {
+		t.Fatalf("want IsNotFound, got %v", err)
+	}
+
+	ts2, _, _ := newStub(t, http.StatusConflict, map[string]string{"error": "boom"})
+	_, err = New(ts2.URL, "tok").CreateBranch(context.Background(), api.CreateBranchRequest{Name: "x"})
+	if err == nil || IsNotFound(err) {
+		t.Fatalf("409 must not be IsNotFound: %v", err)
+	}
+}

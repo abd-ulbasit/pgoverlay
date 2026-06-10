@@ -1,0 +1,6 @@
+{
+  "action": "opened",
+  "number": 7,
+  "pull_request": {"head": {"sha": "0d1e2f3a4b5c6d7e"}},
+  "repository": {"full_name": "acme/widgets"}
+}

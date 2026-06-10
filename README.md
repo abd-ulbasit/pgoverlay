@@ -155,6 +155,10 @@ psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
 
 `make helm-test` lints and grep-asserts the rendered chart; `make k8s-it` runs the full integration suite against a local [kind](https://kind.sigs.k8s.io) cluster (`hack/kind-up.sh` creates `pgbranch-test` and preloads images).
 
+## Branch per pull request
+
+`pgbranch-github` (`cmd/pgbranch-github`, image `pgbranch/ghook` via `make docker-build-ghook`) turns pull requests into branches: a signed GitHub webhook creates `pr-<number>` when a PR opens, optionally resets it on every push, destroys it on close, and can post a one-time connect-info comment on the PR. The Helm chart ships it as an optional sub-deployment (`--set ghook.enabled=true ...`). Setup, permissions, and the full `GHOOK_*` environment reference live in [docs/github-app.md](docs/github-app.md).
+
 ## How it works
 
 `pgb source add` runs `pg_basebackup` in a one-shot helper container, streaming the source cluster into a named Docker volume. That volume becomes the read-only **lower layer** for every branch.

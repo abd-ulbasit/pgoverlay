@@ -1,8 +1,9 @@
-.PHONY: build test it k8s-it lint docker-build helm-test
+.PHONY: build test it k8s-it lint docker-build docker-build-ghook helm-test
 
 build:
 	go build -o bin/pgb ./cmd/pgb
 	go build -o bin/branchd ./cmd/branchd
+	go build -o bin/pgbranch-github ./cmd/pgbranch-github
 
 test:
 	go test ./...
@@ -18,6 +19,9 @@ lint:
 
 docker-build:
 	docker build -t pgbranch/branchd:dev .
+
+docker-build-ghook:
+	docker build -f Dockerfile.ghook -t pgbranch/ghook:dev .
 
 helm-test:
 	hack/helm-test.sh

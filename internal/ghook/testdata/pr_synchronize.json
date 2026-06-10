@@ -1,0 +1,6 @@
+{
+  "action": "synchronize",
+  "number": 7,
+  "pull_request": {"head": {"sha": "9f8e7d6c5b4a3210"}},
+  "repository": {"full_name": "acme/widgets"}
+}

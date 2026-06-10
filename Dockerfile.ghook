@@ -1,0 +1,12 @@
+# pgbranch-github container image (the Helm chart's optional ghook
+# sub-deployment). Same pure-Go static build recipe as the branchd image.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /pgbranch-github ./cmd/pgbranch-github
+
+FROM alpine:3.21
+COPY --from=build /pgbranch-github /usr/local/bin/pgbranch-github
+ENTRYPOINT ["pgbranch-github"]

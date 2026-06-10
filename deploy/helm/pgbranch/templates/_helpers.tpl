@@ -23,3 +23,20 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "pgbranch.tokenSecretName" -}}
 {{- .Values.existingSecret | default (printf "%s-token" (include "pgbranch.fullname" .)) -}}
 {{- end -}}
+
+{{/* ghook (GitHub webhook service) naming: distinct selector labels so the
+     branchd api/proxy Services never match ghook pods. */}}
+{{- define "pgbranch.ghook.fullname" -}}
+{{- printf "%s-ghook" (include "pgbranch.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "pgbranch.ghook.selectorLabels" -}}
+app.kubernetes.io/name: pgbranch-ghook
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{/* Secret holding the webhook HMAC secret (key "webhook-secret") and the
+     optional GitHub token (key "github-token"). */}}
+{{- define "pgbranch.ghook.secretName" -}}
+{{- .Values.ghook.existingSecret | default (include "pgbranch.ghook.fullname" .) -}}
+{{- end -}}

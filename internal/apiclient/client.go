@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,21 @@ type Client struct {
 
 func New(baseURL, token string) *Client {
 	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: http.DefaultClient}
+}
+
+// StatusError is returned for non-2xx responses; it carries the HTTP status
+// so callers can branch on it (e.g. tolerate 404s).
+type StatusError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *StatusError) Error() string { return e.Message }
+
+// IsNotFound reports whether err is a server response with status 404.
+func IsNotFound(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.StatusCode == http.StatusNotFound
 }
 
 // do sends a JSON request and decodes the JSON response into out (skipped if
@@ -57,10 +73,11 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		var e struct {
 			Error string `json:"error"`
 		}
+		msg := fmt.Sprintf("HTTP %d", resp.StatusCode)
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("%s %s: %s", method, path, e.Error)
+			msg = e.Error
 		}
-		return fmt.Errorf("%s %s: HTTP %d", method, path, resp.StatusCode)
+		return &StatusError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("%s %s: %s", method, path, msg)}
 	}
 	if out == nil {
 		return nil
