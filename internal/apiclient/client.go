@@ -111,6 +111,21 @@ func (c *Client) RefreshSource(ctx context.Context, name, password string) (*api
 	return &s, nil
 }
 
+// SetMaskScripts replaces a source's masking scripts (empty slice clears
+// them) and returns the stored list.
+func (c *Client) SetMaskScripts(ctx context.Context, name string, scripts []api.MaskScript) ([]api.MaskScript, error) {
+	if scripts == nil {
+		scripts = []api.MaskScript{}
+	}
+	var out []api.MaskScript
+	return out, c.do(ctx, "PUT", "/v1/sources/"+url.PathEscape(name)+"/mask", scripts, &out)
+}
+
+func (c *Client) GetMaskScripts(ctx context.Context, name string) ([]api.MaskScript, error) {
+	var out []api.MaskScript
+	return out, c.do(ctx, "GET", "/v1/sources/"+url.PathEscape(name)+"/mask", nil, &out)
+}
+
 func (c *Client) CreateBranch(ctx context.Context, req api.CreateBranchRequest) (*api.Branch, error) {
 	var b api.Branch
 	if err := c.do(ctx, "POST", "/v1/branches", req, &b); err != nil {

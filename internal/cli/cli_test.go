@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
+	"github.com/abd-ulbasit/pgbranch/internal/registry"
 )
 
 func TestCommandTree(t *testing.T) {
 	root := NewRootCmd()
 	for _, path := range [][]string{
 		{"source", "add"}, {"source", "ls"}, {"source", "rm"}, {"source", "refresh"},
+		{"source", "set-mask"}, {"source", "get-mask"},
 		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"},
 		{"connect"},
 	} {
@@ -124,6 +128,100 @@ func TestServerModeFromEnv(t *testing.T) {
 	run(t, "branch", "ls")
 	if !called {
 		t.Fatal("PGBRANCH_SERVER env did not enable server mode")
+	}
+}
+
+func TestServerModeSetMask(t *testing.T) {
+	dir := t.TempDir()
+	f1 := filepath.Join(dir, "emails.sql")
+	f2 := filepath.Join(dir, "names.sql")
+	if err := os.WriteFile(f1, []byte("UPDATE users SET email = 'x@invalid'"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f2, []byte("UPDATE users SET name = 'redacted'"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotMethod, gotPath string
+	var got []api.MaskScript
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		json.NewDecoder(r.Body).Decode(&got)
+		json.NewEncoder(w).Encode(got)
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "source", "set-mask", "main", f1, f2, "--server", ts.URL)
+	if gotMethod != "PUT" || gotPath != "/v1/sources/main/mask" {
+		t.Fatalf("%s %s", gotMethod, gotPath)
+	}
+	// order = argv, script name = basename
+	if len(got) != 2 || got[0].Name != "emails.sql" || got[1].Name != "names.sql" {
+		t.Fatalf("sent %v", got)
+	}
+	if got[0].SQL != "UPDATE users SET email = 'x@invalid'" || got[1].SQL != "UPDATE users SET name = 'redacted'" {
+		t.Fatalf("sent SQL %v", got)
+	}
+	if !strings.Contains(out, "2") {
+		t.Fatalf("output %q", out)
+	}
+}
+
+func TestServerModeGetMask(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/sources/main/mask" {
+			t.Errorf("%s %s", r.Method, r.URL.Path)
+		}
+		json.NewEncoder(w).Encode([]api.MaskScript{{Name: "emails.sql", SQL: "..."}, {Name: "names.sql", SQL: "..."}})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "source", "get-mask", "main", "--server", ts.URL)
+	if !strings.Contains(out, "emails.sql") || !strings.Contains(out, "names.sql") {
+		t.Fatalf("output %q", out)
+	}
+}
+
+func TestLocalModeSetAndGetMask(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("PGBRANCH_HOME", home)
+	t.Setenv("PGBRANCH_SERVER", "")
+
+	// seed a source row the commands can resolve
+	reg, err := registry.Open(filepath.Join(home, "pgbranch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &registry.Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := reg.CreateSource(src); err != nil {
+		t.Fatal(err)
+	}
+	reg.Close()
+
+	f := filepath.Join(t.TempDir(), "mask.sql")
+	if err := os.WriteFile(f, []byte("UPDATE t SET x=1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "source", "set-mask", "main", f)
+
+	out := run(t, "source", "get-mask", "main")
+	if !strings.Contains(out, "mask.sql") {
+		t.Fatalf("output %q", out)
+	}
+
+	reg, err = registry.Open(filepath.Join(home, "pgbranch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	scripts, err := reg.GetMaskScripts(src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scripts) != 1 || scripts[0].Name != "mask.sql" || scripts[0].SQL != "UPDATE t SET x=1" {
+		t.Fatalf("stored %v", scripts)
 	}
 }
 

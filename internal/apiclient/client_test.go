@@ -114,6 +114,45 @@ func TestPathsForNamedResources(t *testing.T) {
 	}
 }
 
+func TestMaskScriptsClient(t *testing.T) {
+	scripts := []api.MaskScript{
+		{Name: "emails.sql", SQL: "UPDATE users SET email = 'x@invalid'"},
+		{Name: "names.sql", SQL: "UPDATE users SET name = 'redacted'"},
+	}
+	ts, req, body := newStub(t, http.StatusOK, scripts)
+	c := New(ts.URL, "tok")
+
+	got, err := c.SetMaskScripts(context.Background(), "main", scripts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Method != "PUT" || req.URL.Path != "/v1/sources/main/mask" {
+		t.Fatalf("%s %s", req.Method, req.URL.Path)
+	}
+	var sent []api.MaskScript
+	if err := json.Unmarshal(*body, &sent); err != nil {
+		t.Fatalf("body %q: %v", *body, err)
+	}
+	if len(sent) != 2 || sent[0] != scripts[0] || sent[1] != scripts[1] {
+		t.Fatalf("sent %v", sent)
+	}
+	if len(got) != 2 || got[0] != scripts[0] {
+		t.Fatalf("got %v", got)
+	}
+
+	ts2, req2, _ := newStub(t, http.StatusOK, scripts)
+	got, err = New(ts2.URL, "tok").GetMaskScripts(context.Background(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req2.Method != "GET" || req2.URL.Path != "/v1/sources/main/mask" {
+		t.Fatalf("%s %s", req2.Method, req2.URL.Path)
+	}
+	if len(got) != 2 || got[1] != scripts[1] {
+		t.Fatalf("got %v", got)
+	}
+}
+
 func TestErrorResponsesSurfaceMessage(t *testing.T) {
 	ts, _, _ := newStub(t, http.StatusConflict, map[string]string{"error": "branch exists already"})
 	c := New(ts.URL, "tok")

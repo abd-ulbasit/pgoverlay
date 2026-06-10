@@ -25,6 +25,7 @@ type fakeDriver struct {
 	containers map[string]bool
 	failStart  bool
 	starts     int
+	execs      [][]string // every Exec call, in order
 }
 
 func newFake() *fakeDriver {
@@ -48,7 +49,10 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 	f.containers["cid-"+s.Name] = true
 	return "cid-" + s.Name, nil
 }
-func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error { return nil }
+func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error {
+	f.execs = append(f.execs, cmd)
+	return nil
+}
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
 	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
 }
@@ -318,6 +322,65 @@ func TestSourceRefreshAndRemove(t *testing.T) {
 	}
 	if len(d.volumes) != 0 {
 		t.Fatalf("volumes leaked: %v", d.volumes)
+	}
+}
+
+func TestMaskScriptsPutGetAndApply(t *testing.T) {
+	ts, d := newTestServer(t)
+	addSource(t, ts)
+
+	scripts := []MaskScript{
+		{Name: "emails.sql", SQL: "UPDATE users SET email = 'x@invalid'"},
+		{Name: "names.sql", SQL: "UPDATE users SET name = 'redacted'"},
+	}
+	code, body := do(t, ts, testToken, "PUT", "/v1/sources/main/mask", scripts)
+	if code != http.StatusOK {
+		t.Fatalf("put mask: code=%d body=%s", code, body)
+	}
+	code, body = do(t, ts, testToken, "GET", "/v1/sources/main/mask", nil)
+	if code != http.StatusOK {
+		t.Fatalf("get mask: code=%d body=%s", code, body)
+	}
+	got := mustUnmarshal[[]MaskScript](t, body)
+	if len(got) != 2 || got[0] != scripts[0] || got[1] != scripts[1] {
+		t.Fatalf("got %v want %v", got, scripts)
+	}
+
+	// PUT replaces all scripts
+	code, body = do(t, ts, testToken, "PUT", "/v1/sources/main/mask", scripts[:1])
+	if code != http.StatusOK {
+		t.Fatalf("put replace: code=%d body=%s", code, body)
+	}
+	code, body = do(t, ts, testToken, "GET", "/v1/sources/main/mask", nil)
+	if code != http.StatusOK {
+		t.Fatalf("get after replace: code=%d", code)
+	}
+	if got = mustUnmarshal[[]MaskScript](t, body); len(got) != 1 || got[0] != scripts[0] {
+		t.Fatalf("after replace: %v", got)
+	}
+
+	// branch creation applies the script via in-container psql
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create branch: code=%d body=%s", code, body)
+	}
+	var masked bool
+	for _, c := range d.execs {
+		if len(c) > 0 && c[0] == "psql" && c[len(c)-1] == scripts[0].SQL {
+			masked = true
+		}
+	}
+	if !masked {
+		t.Fatalf("masking psql exec not recorded: %v", d.execs)
+	}
+}
+
+func TestMaskScriptsUnknownSource(t *testing.T) {
+	ts, _ := newTestServer(t)
+	if code, body := do(t, ts, testToken, "PUT", "/v1/sources/nope/mask", []MaskScript{{Name: "a", SQL: "SELECT 1"}}); code != http.StatusNotFound {
+		t.Fatalf("put unknown source: code=%d body=%s", code, body)
+	}
+	if code, body := do(t, ts, testToken, "GET", "/v1/sources/nope/mask", nil); code != http.StatusNotFound {
+		t.Fatalf("get unknown source: code=%d body=%s", code, body)
 	}
 }
 

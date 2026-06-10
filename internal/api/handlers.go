@@ -152,6 +152,56 @@ func (s *Server) refreshSource(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sourceJSON(fresh))
 }
 
+// setMaskScripts replaces a source's masking scripts with the request body
+// (a JSON array of {name, sql}; empty array clears them).
+func (s *Server) setMaskScripts(w http.ResponseWriter, r *http.Request) {
+	src, err := s.reg.GetSourceByName(r.PathValue("name"))
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	scripts, ok := decode[[]MaskScript](w, r)
+	if !ok {
+		return
+	}
+	for _, sc := range scripts {
+		if sc.SQL == "" {
+			writeError(w, http.StatusBadRequest, "mask script sql must not be empty")
+			return
+		}
+	}
+	rs := make([]registry.MaskScript, len(scripts))
+	for i, sc := range scripts {
+		rs[i] = registry.MaskScript{Name: sc.Name, SQL: sc.SQL}
+	}
+	if err := s.reg.SetMaskScripts(src.ID, rs); err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	if scripts == nil {
+		scripts = []MaskScript{}
+	}
+	writeJSON(w, http.StatusOK, scripts)
+}
+
+func (s *Server) getMaskScripts(w http.ResponseWriter, r *http.Request) {
+	src, err := s.reg.GetSourceByName(r.PathValue("name"))
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	rs, err := s.reg.GetMaskScripts(src.ID)
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	out := make([]MaskScript, 0, len(rs))
+	for _, sc := range rs {
+		out = append(out, MaskScript{Name: sc.Name, SQL: sc.SQL})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) {
 	req, ok := decode[CreateBranchRequest](w, r)
 	if !ok {

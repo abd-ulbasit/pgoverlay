@@ -256,6 +256,51 @@ func (r *Registry) listBranches(where string, args ...any) ([]*Branch, error) {
 	return out, rows.Err()
 }
 
+// MaskScript is one masking statement: SQL the engine runs (via in-container
+// psql) on every new/reset branch of the owning source, in stored order.
+type MaskScript struct {
+	Name string
+	SQL  string
+}
+
+// SetMaskScripts replaces a source's masking scripts with the given ordered
+// list (empty/nil clears them).
+func (r *Registry) SetMaskScripts(sourceID string, scripts []MaskScript) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM mask_scripts WHERE source_id=?`, sourceID); err != nil {
+		return err
+	}
+	for i, s := range scripts {
+		if _, err := tx.Exec(`INSERT INTO mask_scripts (source_id,ord,name,sql) VALUES (?,?,?,?)`,
+			sourceID, i, s.Name, s.SQL); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// GetMaskScripts returns a source's masking scripts in application order.
+func (r *Registry) GetMaskScripts(sourceID string) ([]MaskScript, error) {
+	rows, err := r.db.Query(`SELECT name, sql FROM mask_scripts WHERE source_id=? ORDER BY ord`, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MaskScript
+	for rows.Next() {
+		var s MaskScript
+		if err := rows.Scan(&s.Name, &s.SQL); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // BumpSourceGeneration advances a source to its next generation volume after
 // a successful refresh seed.
 func (r *Registry) BumpSourceGeneration(id, newVolume string) error {
@@ -293,6 +338,9 @@ func (r *Registry) DeleteSource(id string) error {
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(`DELETE FROM branches WHERE source_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM mask_scripts WHERE source_id=?`, id); err != nil {
 		return err
 	}
 	res, err := tx.Exec(`DELETE FROM sources WHERE id=?`, id)

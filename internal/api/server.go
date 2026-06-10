@@ -62,6 +62,13 @@ type RefreshSourceRequest struct {
 	Password string `json:"password"`
 }
 
+// MaskScript is one per-source masking statement, applied in order inside
+// every new/reset branch before it is marked ready.
+type MaskScript struct {
+	Name string `json:"name"`
+	SQL  string `json:"sql"`
+}
+
 type Server struct {
 	eng   *engine.Engine
 	reg   *registry.Registry
@@ -78,6 +85,8 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("GET /v1/sources", s.listSources)
 	v1.HandleFunc("DELETE /v1/sources/{name}", s.removeSource)
 	v1.HandleFunc("POST /v1/sources/{name}/refresh", s.refreshSource)
+	v1.HandleFunc("PUT /v1/sources/{name}/mask", s.setMaskScripts)
+	v1.HandleFunc("GET /v1/sources/{name}/mask", s.getMaskScripts)
 	v1.HandleFunc("POST /v1/branches", s.createBranch)
 	v1.HandleFunc("GET /v1/branches", s.listBranches)
 	v1.HandleFunc("GET /v1/branches/{name}", s.getBranch)

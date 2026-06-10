@@ -161,8 +161,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 3 {
-		t.Fatalf("user_version=%d want 3", v)
+	if v != 4 {
+		t.Fatalf("user_version=%d want 4", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -191,12 +191,64 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if b.Host != "127.0.0.1" {
 		t.Fatalf("Host=%q want default backfill 127.0.0.1", b.Host)
 	}
+	// v4: mask_scripts table exists and is usable on the upgraded DB
+	if err := r.SetMaskScripts("src1", []MaskScript{{Name: "m.sql", SQL: "SELECT 1"}}); err != nil {
+		t.Fatalf("v4 mask_scripts unusable after upgrade: %v", err)
+	}
+	if ms, err := r.GetMaskScripts("src1"); err != nil || len(ms) != 1 {
+		t.Fatalf("mask scripts after upgrade: %v err=%v", ms, err)
+	}
 	// re-opening an already-migrated DB is a no-op
 	r2, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	r2.Close()
+}
+
+func TestMaskScriptsSetGetReplace(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	// empty before any set
+	if ms, err := r.GetMaskScripts(s.ID); err != nil || len(ms) != 0 {
+		t.Fatalf("fresh source mask scripts: %v err=%v", ms, err)
+	}
+	// set preserves order
+	in := []MaskScript{
+		{Name: "b.sql", SQL: "UPDATE t SET x=1"},
+		{Name: "a.sql", SQL: "UPDATE t SET y=2"},
+	}
+	if err := r.SetMaskScripts(s.ID, in); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetMaskScripts(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != in[0] || got[1] != in[1] {
+		t.Fatalf("got %v want %v (order must be preserved)", got, in)
+	}
+	// set replaces all previous scripts
+	if err := r.SetMaskScripts(s.ID, []MaskScript{{Name: "only.sql", SQL: "DELETE FROM t"}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = r.GetMaskScripts(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "only.sql" {
+		t.Fatalf("replace: got %v", got)
+	}
+	// empty set clears
+	if err := r.SetMaskScripts(s.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = r.GetMaskScripts(s.ID); err != nil || len(got) != 0 {
+		t.Fatalf("clear: got %v err=%v", got, err)
+	}
 }
 
 func TestSourceNameReusableAfterFailure(t *testing.T) {
@@ -339,11 +391,18 @@ func TestDeleteSource(t *testing.T) {
 	if err := r.TransitionBranch(b.ID, BranchDestroyed, ""); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.SetMaskScripts(s.ID, []MaskScript{{Name: "m.sql", SQL: "SELECT 1"}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.DeleteSource(s.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.GetSourceByName("main"); err != ErrNotFound {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	// mask scripts go with the source
+	if ms, err := r.GetMaskScripts(s.ID); err != nil || len(ms) != 0 {
+		t.Fatalf("mask scripts orphaned after source delete: %v err=%v", ms, err)
 	}
 	// name immediately reusable
 	if err := r.CreateSource(&Source{Name: "main", PGVersion: "17", Volume: "v2"}); err != nil {

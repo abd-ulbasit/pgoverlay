@@ -110,3 +110,61 @@ func TestEndToEndBranching(t *testing.T) {
 		t.Fatalf("pr-2 saw pr-1 writes, sum=%d", n)
 	}
 }
+
+func TestMaskingAppliedToBranchNotSource(t *testing.T) {
+	if os.Getenv("PGBRANCH_IT") != "1" {
+		t.Skip("set PGBRANCH_IT=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	mustExec(t, ctx, hostConn, `CREATE TABLE accounts(id int primary key, email text);
+		INSERT INTO accounts SELECT i, 'user' || i || '@corp.example' FROM generate_series(1,1000) i`)
+
+	d, err := runtime.NewDockerDriver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := registry.Open(t.TempDir() + "/it.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	e := New(r, d, "postgres:17")
+
+	src := &registry.Source{Name: "mask-main", PGVersion: "17", ConnHost: host, ConnPort: port, ConnUser: "postgres", Network: network}
+	if err := e.AddSource(ctx, src, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.RemoveVolume(context.Background(), src.Volume) })
+
+	if err := r.SetMaskScripts(src.ID, []registry.MaskScript{{
+		Name: "mask-emails.sql",
+		SQL:  `UPDATE accounts SET email = 'masked-' || id || '@example.invalid'`,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := e.CreateBranch(ctx, "mask-pr-1", "mask-main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := e.DestroyBranch(context.Background(), "mask-pr-1"); err != nil {
+			t.Errorf("destroy mask-pr-1: %v", err)
+		}
+	})
+
+	// every branch row is masked before the branch was marked ready
+	if n := mustQueryInt(t, ctx, branchConn(b), `SELECT count(*) FROM accounts WHERE email NOT LIKE 'masked-%@example.invalid'`); n != 0 {
+		t.Fatalf("%d unmasked rows in branch", n)
+	}
+	if n := mustQueryInt(t, ctx, branchConn(b), `SELECT count(*) FROM accounts`); n != 1000 {
+		t.Fatalf("branch rows = %d", n)
+	}
+	// the source keeps its original data
+	if n := mustQueryInt(t, ctx, hostConn, `SELECT count(*) FROM accounts WHERE email LIKE 'user%@corp.example'`); n != 1000 {
+		t.Fatalf("source mutated: only %d original rows", n)
+	}
+}

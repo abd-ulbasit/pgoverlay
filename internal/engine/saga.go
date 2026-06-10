@@ -54,7 +54,7 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	if err := e.reg.CreateBranch(b); err != nil {
 		return nil, err
 	}
-	if err := e.provision(ctx, b, src.PGVersion); err != nil {
+	if err := e.provision(ctx, b, src); err != nil {
 		e.reg.TransitionBranch(b.ID, registry.BranchFailed, err.Error())
 		return nil, err
 	}
@@ -62,10 +62,10 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 }
 
 // provision runs the resource steps shared by create and reset: rw volume,
-// entrypoint install, branch container, readiness wait, mark ready. Every
-// step registers a compensation that unwinds (in reverse order) on failure;
-// the caller owns the state transition to failed.
-func (e *Engine) provision(ctx context.Context, b *registry.Branch, pgVersion string) error {
+// entrypoint install, branch container, readiness wait, masking, mark ready.
+// Every step registers a compensation that unwinds (in reverse order) on
+// failure; the caller owns the state transition to failed.
+func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registry.Source) error {
 	plan := cow.PlanBranch(b.Name, b.SourceVolume)
 
 	var undo []func()
@@ -96,7 +96,7 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, pgVersion st
 	// 3. branch container
 	cid, err := e.drv.StartBranch(ctx, runtime.BranchSpec{
 		Name:  "pgbranch-br-" + b.Name,
-		Image: e.image(pgVersion),
+		Image: e.image(src.PGVersion),
 		Env: []string{
 			"PGDATA=" + cow.MergedPath,
 			"PGBRANCH_LOWERS=" + plan.LowerEnv(),
@@ -121,7 +121,14 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, pgVersion st
 		return fail(fmt.Errorf("instance never became ready: %w", err))
 	}
 
-	// 5. record container + address, mark ready
+	// 5. apply the source's masking scripts inside the fresh clone (so the
+	// branch never serves unmasked data); reset re-runs this because it
+	// re-clones from the source. A failing script fails the branch.
+	if err := e.applyMasking(ctx, cid, src); err != nil {
+		return fail(err)
+	}
+
+	// 6. record container + address, mark ready
 	info, err := e.drv.Inspect(ctx, cid)
 	if err != nil {
 		return fail(err)
@@ -159,10 +166,35 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (*registry.Branch
 	if err := e.drv.RemoveVolume(ctx, b.RWVolume); err != nil {
 		return fail(fmt.Errorf("remove rw volume: %w", err))
 	}
-	if err := e.provision(ctx, b, src.PGVersion); err != nil {
+	if err := e.provision(ctx, b, src); err != nil {
 		return fail(fmt.Errorf("reset %q: %w", name, err))
 	}
 	return e.reg.GetBranchByName(name)
+}
+
+// applyMasking runs the source's masking scripts (registry order) inside the
+// branch container via psql over the local socket — peer/local auth inside
+// the container means the engine never needs a password. ON_ERROR_STOP makes
+// any failing statement abort the script; the first failing script aborts
+// provisioning.
+func (e *Engine) applyMasking(ctx context.Context, cid string, src *registry.Source) error {
+	scripts, err := e.reg.GetMaskScripts(src.ID)
+	if err != nil {
+		return fmt.Errorf("load mask scripts: %w", err)
+	}
+	user, db := src.ConnUser, src.ConnDB
+	if user == "" {
+		user = "postgres"
+	}
+	if db == "" {
+		db = "postgres"
+	}
+	for _, sc := range scripts {
+		if err := e.drv.Exec(ctx, cid, []string{"psql", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", db, "-c", sc.SQL}); err != nil {
+			return fmt.Errorf("masking script %q: %w", sc.Name, err)
+		}
+	}
+	return nil
 }
 
 func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duration) error {

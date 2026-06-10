@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -13,7 +14,8 @@ import (
 
 func newSourceCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "source", Short: "Manage branch sources (seeded data dirs)"}
-	cmd.AddCommand(newSourceAddCmd(), newSourceLsCmd(), newSourceRmCmd(), newSourceRefreshCmd())
+	cmd.AddCommand(newSourceAddCmd(), newSourceLsCmd(), newSourceRmCmd(), newSourceRefreshCmd(),
+		newSourceSetMaskCmd(), newSourceGetMaskCmd())
 	return cmd
 }
 
@@ -127,6 +129,91 @@ func newSourceRmCmd() *cobra.Command {
 				}
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "source %q removed\n", args[0])
+			return nil
+		},
+	}
+}
+
+func newSourceSetMaskCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "set-mask NAME FILE...",
+		Short: "Replace a source's masking SQL (applied, in argument order, inside every new/reset branch)",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			scripts := make([]api.MaskScript, 0, len(args)-1)
+			for _, file := range args[1:] {
+				sql, err := os.ReadFile(file)
+				if err != nil {
+					return err
+				}
+				scripts = append(scripts, api.MaskScript{Name: filepath.Base(file), SQL: string(sql)})
+			}
+			if c := serverClient(cmd); c != nil {
+				if _, err := c.SetMaskScripts(cmd.Context(), name, scripts); err != nil {
+					return err
+				}
+			} else {
+				reg, err := openRegistry()
+				if err != nil {
+					return err
+				}
+				defer reg.Close()
+				src, err := reg.GetSourceByName(name)
+				if err != nil {
+					return fmt.Errorf("source %q: %w", name, err)
+				}
+				rs := make([]registry.MaskScript, len(scripts))
+				for i, sc := range scripts {
+					rs[i] = registry.MaskScript{Name: sc.Name, SQL: sc.SQL}
+				}
+				if err := reg.SetMaskScripts(src.ID, rs); err != nil {
+					return err
+				}
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "source %q masking set (%d script(s))\n", name, len(scripts))
+			return nil
+		},
+	}
+}
+
+func newSourceGetMaskCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "get-mask NAME",
+		Short: "List a source's masking scripts in application order",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			var names []string
+			if c := serverClient(cmd); c != nil {
+				scripts, err := c.GetMaskScripts(cmd.Context(), name)
+				if err != nil {
+					return err
+				}
+				for _, sc := range scripts {
+					names = append(names, sc.Name)
+				}
+			} else {
+				reg, err := openRegistry()
+				if err != nil {
+					return err
+				}
+				defer reg.Close()
+				src, err := reg.GetSourceByName(name)
+				if err != nil {
+					return fmt.Errorf("source %q: %w", name, err)
+				}
+				scripts, err := reg.GetMaskScripts(src.ID)
+				if err != nil {
+					return err
+				}
+				for _, sc := range scripts {
+					names = append(names, sc.Name)
+				}
+			}
+			for _, n := range names {
+				fmt.Fprintln(cmd.OutOrStdout(), n)
+			}
 			return nil
 		},
 	}

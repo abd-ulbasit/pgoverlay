@@ -17,8 +17,10 @@ type fakeDriver struct {
 	containers map[string]bool
 	failStart  bool
 	execErr    error
-	helperErr  error // returned by RunHelper (fails seeding)
-	starts     int   // StartBranch invocations
+	psqlErr    error      // returned by Exec for psql commands only (fails masking)
+	helperErr  error      // returned by RunHelper (fails seeding)
+	starts     int        // StartBranch invocations
+	execs      [][]string // every Exec call, in order
 }
 
 func newFake() *fakeDriver {
@@ -42,7 +44,24 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 	f.containers["cid-"+s.Name] = true
 	return "cid-" + s.Name, nil
 }
-func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error { return f.execErr }
+func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error {
+	f.execs = append(f.execs, cmd)
+	if len(cmd) > 0 && cmd[0] == "psql" && f.psqlErr != nil {
+		return f.psqlErr
+	}
+	return f.execErr
+}
+
+// psqlExecs returns the recorded Exec calls that ran psql (masking).
+func (f *fakeDriver) psqlExecs() [][]string {
+	var out [][]string
+	for _, c := range f.execs {
+		if len(c) > 0 && c[0] == "psql" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
 	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
 }
@@ -305,6 +324,128 @@ func TestResetBranchRequiresReady(t *testing.T) {
 	b, _ := r.GetBranchByName("pr-1")
 	if b.State != registry.BranchFailed {
 		t.Fatalf("state=%q", b.State)
+	}
+}
+
+func TestCreateBranchAppliesMaskScriptsInOrder(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	src := readySource(t, r)
+	scripts := []registry.MaskScript{
+		{Name: "emails.sql", SQL: "UPDATE users SET email = 'x@invalid'"},
+		{Name: "names.sql", SQL: "UPDATE users SET name = 'redacted'"},
+	}
+	if err := r.SetMaskScripts(src.ID, scripts); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := e.CreateBranch(context.Background(), "pr-1", "main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.State != registry.BranchReady {
+		t.Fatalf("state=%q", b.State)
+	}
+	got := d.psqlExecs()
+	if len(got) != 2 {
+		t.Fatalf("psql execs=%d want 2: %v", len(got), got)
+	}
+	for i, sc := range scripts {
+		want := []string{"psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c", sc.SQL}
+		if len(got[i]) != len(want) {
+			t.Fatalf("exec[%d]=%v want %v", i, got[i], want)
+		}
+		for j := range want {
+			if got[i][j] != want[j] {
+				t.Fatalf("exec[%d]=%v want %v", i, got[i], want)
+			}
+		}
+	}
+	// masking runs after readiness: pg_isready precedes the first psql call
+	firstPsql, lastReady := -1, -1
+	for i, c := range d.execs {
+		switch c[0] {
+		case "psql":
+			if firstPsql == -1 {
+				firstPsql = i
+			}
+		case "pg_isready":
+			lastReady = i
+		}
+	}
+	if lastReady == -1 || firstPsql < lastReady {
+		t.Fatalf("masking did not run after readiness: execs=%v", d.execs)
+	}
+}
+
+func TestCreateBranchMaskUsesSourceUserAndDB(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main", ConnUser: "app", ConnDB: "appdb"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetSourceState(s.ID, registry.SourceReady, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetMaskScripts(s.ID, []registry.MaskScript{{Name: "m.sql", SQL: "SELECT 1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	got := d.psqlExecs()
+	if len(got) != 1 {
+		t.Fatalf("psql execs=%v", got)
+	}
+	if got[0][4] != "app" || got[0][6] != "appdb" {
+		t.Fatalf("psql user/db args wrong: %v", got[0])
+	}
+}
+
+func TestCreateBranchMaskFailureFailsAndUnwinds(t *testing.T) {
+	d := newFake()
+	d.psqlErr = errors.New("ERROR: relation \"users\" does not exist")
+	e, r := testEngine(t, d)
+	src := readySource(t, r)
+	if err := r.SetMaskScripts(src.ID, []registry.MaskScript{{Name: "bad.sql", SQL: "UPDATE users SET x=1"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := e.CreateBranch(context.Background(), "pr-1", "main", 0)
+	if err == nil || !strings.Contains(err.Error(), "bad.sql") {
+		t.Fatalf("want masking error naming the script, got %v", err)
+	}
+	b, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.State != registry.BranchFailed {
+		t.Fatalf("state=%q want failed", b.State)
+	}
+	if len(d.volumes) != 0 || len(d.containers) != 0 {
+		t.Fatalf("leaked: c=%v v=%v", d.containers, d.volumes)
+	}
+}
+
+func TestResetBranchReappliesMasking(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	src := readySource(t, r)
+	if err := r.SetMaskScripts(src.ID, []registry.MaskScript{{Name: "m.sql", SQL: "UPDATE t SET x=1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(d.psqlExecs()); n != 1 {
+		t.Fatalf("psql execs after create=%d want 1", n)
+	}
+	if _, err := e.ResetBranch(context.Background(), "pr-1"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(d.psqlExecs()); n != 2 {
+		t.Fatalf("psql execs after reset=%d want 2 (reset re-clones, masking must re-run)", n)
 	}
 }
 

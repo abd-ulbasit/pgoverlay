@@ -40,6 +40,19 @@ func serverClient(cmd *cobra.Command) *apiclient.Client {
 	return apiclient.New(s, os.Getenv("PGBRANCH_TOKEN"))
 }
 
+// openRegistry opens just the registry (no runtime driver) for commands that
+// only read/write metadata; callers must Close it.
+func openRegistry() (*registry.Registry, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.EnsureHome(); err != nil {
+		return nil, err
+	}
+	return registry.Open(cfg.RegistryPath)
+}
+
 // open builds the engine; callers must Close the returned registry.
 func open() (*engine.Engine, *registry.Registry, error) {
 	cfg, err := config.Load()

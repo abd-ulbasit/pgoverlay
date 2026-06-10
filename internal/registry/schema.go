@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -83,4 +83,16 @@ CREATE UNIQUE INDEX sources_live_name ON sources(name) WHERE state != 'failed';
 // default); the K8s driver stores the pod IP.
 const migrateV3 = `
 ALTER TABLE branches ADD COLUMN host TEXT NOT NULL DEFAULT '127.0.0.1';
+`
+
+// v4 (Phase 4): per-source ordered masking SQL, applied by the engine inside
+// every branch create/reset before the branch is marked ready.
+const migrateV4 = `
+CREATE TABLE mask_scripts (
+  source_id TEXT NOT NULL,
+  ord INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  sql TEXT NOT NULL,
+  PRIMARY KEY (source_id, ord)
+);
 `
