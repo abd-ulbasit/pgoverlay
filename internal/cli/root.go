@@ -1,10 +1,15 @@
-// Package cli wires cobra commands to the engine. Engine construction is
-// lazy (inside RunE) so --help and tests never touch Docker.
+// Package cli wires cobra commands to the engine (local mode) or to a
+// running branchd via the REST API (server mode: --server / PGBRANCH_SERVER).
+// Engine construction is lazy (inside RunE) so --help and tests never touch
+// Docker.
 package cli
 
 import (
+	"os"
+
 	"github.com/spf13/cobra"
 
+	"github.com/abd-ulbasit/pgbranch/internal/apiclient"
 	"github.com/abd-ulbasit/pgbranch/internal/config"
 	"github.com/abd-ulbasit/pgbranch/internal/engine"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
@@ -18,8 +23,21 @@ func NewRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: false,
 	}
+	root.PersistentFlags().String("server", os.Getenv("PGBRANCH_SERVER"),
+		"branchd base URL (e.g. http://localhost:7070); enables server mode [env PGBRANCH_SERVER, token from PGBRANCH_TOKEN]")
 	root.AddCommand(newSourceCmd(), newBranchCmd(), newConnectCmd())
 	return root
+}
+
+// serverClient returns a REST client when server mode is enabled, else nil
+// (commands then embed the engine locally). Don't run local mode while a
+// branchd is using the same registry — SQLite is single-writer.
+func serverClient(cmd *cobra.Command) *apiclient.Client {
+	s, _ := cmd.Root().PersistentFlags().GetString("server")
+	if s == "" {
+		return nil
+	}
+	return apiclient.New(s, os.Getenv("PGBRANCH_TOKEN"))
 }
 
 // open builds the engine; callers must Close the returned registry.
