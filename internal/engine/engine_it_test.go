@@ -69,20 +69,20 @@ func TestEndToEndBranching(t *testing.T) {
 	t.Cleanup(func() { r.Close() })
 	e := New(r, d, "postgres:17")
 
-	src := &registry.Source{Name: "main", PGVersion: "17", ConnHost: host, ConnPort: port, ConnUser: "postgres", Network: network}
+	src := &registry.Source{Name: "e2e-main", PGVersion: "17", ConnHost: host, ConnPort: port, ConnUser: "postgres", Network: network}
 	if err := e.AddSource(ctx, src, "secret"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.RemoveVolume(context.Background(), src.Volume) })
 
 	start := time.Now()
-	b1, err := e.CreateBranch(ctx, "pr-1", "main", 0)
+	b1, err := e.CreateBranch(ctx, "e2e-pr-1", "e2e-main", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("branch pr-1 created in %s", time.Since(start))
 	t.Cleanup(func() {
-		if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
+		if err := e.DestroyBranch(context.Background(), "e2e-pr-1"); err != nil {
 			t.Errorf("destroy pr-1: %v", err)
 		}
 	})
@@ -97,12 +97,12 @@ func TestEndToEndBranching(t *testing.T) {
 		t.Fatalf("source mutated! sum=%d", n)
 	}
 	// second branch is isolated from first
-	b2, err := e.CreateBranch(ctx, "pr-2", "main", 0)
+	b2, err := e.CreateBranch(ctx, "e2e-pr-2", "e2e-main", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := e.DestroyBranch(context.Background(), "pr-2"); err != nil {
+		if err := e.DestroyBranch(context.Background(), "e2e-pr-2"); err != nil {
 			t.Errorf("destroy pr-2: %v", err)
 		}
 	})

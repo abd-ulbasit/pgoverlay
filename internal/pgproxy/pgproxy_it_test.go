@@ -19,7 +19,7 @@ import (
 )
 
 // TestProxyIntegration routes a real pgx connection through the proxy to a
-// real branch: database=postgres@pr-1, SCRAM password auth relayed untouched.
+// real branch: database=postgres@proxy-pr-1, SCRAM password auth relayed untouched.
 func TestProxyIntegration(t *testing.T) {
 	if os.Getenv("PGBRANCH_IT") != "1" {
 		t.Skip("set PGBRANCH_IT=1")
@@ -53,17 +53,17 @@ func TestProxyIntegration(t *testing.T) {
 	t.Cleanup(func() { reg.Close() })
 	e := engine.New(reg, d, "postgres:17")
 
-	src := &registry.Source{Name: "main", PGVersion: "17", ConnHost: host, ConnPort: port, ConnUser: "postgres", Network: network}
+	src := &registry.Source{Name: "proxy-main", PGVersion: "17", ConnHost: host, ConnPort: port, ConnUser: "postgres", Network: network}
 	if err := e.AddSource(ctx, src, "secret"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.RemoveVolume(context.Background(), src.Volume) })
 
-	if _, err := e.CreateBranch(ctx, "pr-1", "main", 0); err != nil {
+	if _, err := e.CreateBranch(ctx, "proxy-pr-1", "proxy-main", 0); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
+		if err := e.DestroyBranch(context.Background(), "proxy-pr-1"); err != nil {
 			t.Errorf("destroy pr-1: %v", err)
 		}
 	})
@@ -78,8 +78,8 @@ func TestProxyIntegration(t *testing.T) {
 	proxyAddr := lis.Addr().String()
 
 	// happy path: pgx sends SSLRequest (sslmode=prefer) -> 'N' -> plaintext
-	// startup with database=postgres@pr-1 -> SCRAM auth relayed -> query.
-	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://postgres:secret@%s/postgres@pr-1", proxyAddr))
+	// startup with database=postgres@proxy-pr-1 -> SCRAM auth relayed -> query.
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://postgres:secret@%s/postgres@proxy-pr-1", proxyAddr))
 	if err != nil {
 		t.Fatalf("connect through proxy: %v", err)
 	}
