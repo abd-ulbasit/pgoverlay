@@ -10,8 +10,8 @@ type Mount struct {
 }
 
 // HelperSpec is a one-shot container performing a data operation
-// (seeding, file fixes). Run blocks until exit; non-zero exit = error
-// including captured output.
+// (seeding, file fixes, measurements). Run blocks until exit and returns the
+// captured combined output; non-zero exit = error including that output.
 type HelperSpec struct {
 	Image   string
 	Cmd     []string
@@ -44,7 +44,7 @@ type Driver interface {
 	EnsureImage(ctx context.Context, image string) error
 	CreateVolume(ctx context.Context, name string, labels map[string]string) error
 	RemoveVolume(ctx context.Context, name string) error
-	RunHelper(ctx context.Context, spec HelperSpec) error
+	RunHelper(ctx context.Context, spec HelperSpec) (output string, err error)
 	StartBranch(ctx context.Context, spec BranchSpec) (id string, err error)
 	Exec(ctx context.Context, containerID string, cmd []string) error // error on non-zero exit
 	Inspect(ctx context.Context, containerID string) (ContainerInfo, error)

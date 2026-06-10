@@ -219,8 +219,14 @@ func TestRunHelperSuccessDeletesPod(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	settlePods(cs, corev1.PodSucceeded)
-	if err := d.RunHelper(ctx, HelperSpec{Image: "alpine:3.21", Cmd: []string{"true"}}); err != nil {
+	out, err := d.RunHelper(ctx, HelperSpec{Image: "alpine:3.21", Cmd: []string{"true"}})
+	if err != nil {
 		t.Fatalf("RunHelper = %v", err)
+	}
+	// the fake clientset serves "fake logs" for pod log requests; the real
+	// driver captures the pod's output the same way on success.
+	if !strings.Contains(out, "fake logs") {
+		t.Errorf("RunHelper output %q does not include pod logs", out)
 	}
 	pods, _ := cs.CoreV1().Pods("default").List(ctx, metav1.ListOptions{})
 	if len(pods.Items) != 0 {
@@ -233,7 +239,7 @@ func TestRunHelperFailureIncludesLogsAndDeletesPod(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	settlePods(cs, corev1.PodFailed)
-	err := d.RunHelper(ctx, HelperSpec{Image: "alpine:3.21", Cmd: []string{"false"}})
+	_, err := d.RunHelper(ctx, HelperSpec{Image: "alpine:3.21", Cmd: []string{"false"}})
 	if err == nil {
 		t.Fatal("want error from failed helper")
 	}

@@ -40,7 +40,11 @@ func (f *fakeDriver) RemoveVolume(ctx context.Context, name string) error {
 	delete(f.volumes, name)
 	return nil
 }
-func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) error { return nil }
+
+// RunHelper returns canned du output so the usage endpoint has something to parse.
+func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
+	return "4096\t/pgbranch/rw", nil
+}
 func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
 	if f.failStart {
 		return "", errors.New("boom")
@@ -381,6 +385,30 @@ func TestMaskScriptsUnknownSource(t *testing.T) {
 	}
 	if code, body := do(t, ts, testToken, "GET", "/v1/sources/nope/mask", nil); code != http.StatusNotFound {
 		t.Fatalf("get unknown source: code=%d body=%s", code, body)
+	}
+}
+
+func TestBranchUsageEndpoint(t *testing.T) {
+	ts, _ := newTestServer(t)
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create: code=%d body=%s", code, body)
+	}
+
+	code, body := do(t, ts, testToken, "GET", "/v1/branches/pr-1/usage", nil)
+	if code != http.StatusOK {
+		t.Fatalf("usage: code=%d body=%s", code, body)
+	}
+	got := mustUnmarshal[map[string]int64](t, body)
+	if got["bytes"] != 4096 { // the fake driver's canned du output
+		t.Fatalf("usage = %v want bytes=4096", got)
+	}
+
+	if code, body := do(t, ts, testToken, "GET", "/v1/branches/nope/usage", nil); code != http.StatusNotFound {
+		t.Fatalf("unknown branch usage: code=%d body=%s", code, body)
+	}
+	if code, _ := do(t, ts, "", "GET", "/v1/branches/pr-1/usage", nil); code != http.StatusUnauthorized {
+		t.Fatalf("usage without token: code=%d want 401", code)
 	}
 }
 

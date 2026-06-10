@@ -153,6 +153,22 @@ func TestMaskScriptsClient(t *testing.T) {
 	}
 }
 
+func TestBranchUsage(t *testing.T) {
+	ts, req, _ := newStub(t, http.StatusOK, map[string]int64{"bytes": 5242880})
+	c := New(ts.URL, "tok")
+
+	n, err := c.BranchUsage(context.Background(), "pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5242880 {
+		t.Fatalf("usage = %d want 5242880", n)
+	}
+	if req.Method != "GET" || req.URL.Path != "/v1/branches/pr-1/usage" {
+		t.Fatalf("%s %s", req.Method, req.URL.Path)
+	}
+}
+
 func TestErrorResponsesSurfaceMessage(t *testing.T) {
 	ts, _, _ := newStub(t, http.StatusConflict, map[string]string{"error": "branch exists already"})
 	c := New(ts.URL, "tok")

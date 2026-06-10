@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,23 +35,31 @@ func TestVolumeAndHelperRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	// write a file via one helper, verify via another
-	if err := d.RunHelper(ctx, HelperSpec{
+	if _, err := d.RunHelper(ctx, HelperSpec{
 		Image:  "alpine:3.21",
 		Cmd:    []string{"sh", "-c", "echo hello > /data/probe"},
 		Mounts: []Mount{{Volume: vol, Target: "/data"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.RunHelper(ctx, HelperSpec{
+	// successful helpers return their combined output
+	out, err := d.RunHelper(ctx, HelperSpec{
 		Image:  "alpine:3.21",
-		Cmd:    []string{"sh", "-c", "grep -q hello /data/probe"},
+		Cmd:    []string{"cat", "/data/probe"},
 		Mounts: []Mount{{Volume: vol, Target: "/data", ReadOnly: true}},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(out, "hello") {
+		t.Fatalf("helper output %q, want it to contain %q", out, "hello")
+	}
 	// failing helper surfaces output in error
-	err := d.RunHelper(ctx, HelperSpec{Image: "alpine:3.21", Cmd: []string{"sh", "-c", "echo boom >&2; exit 3"}})
+	_, err = d.RunHelper(ctx, HelperSpec{Image: "alpine:3.21", Cmd: []string{"sh", "-c", "echo boom >&2; exit 3"}})
 	if err == nil {
 		t.Fatal("want error from non-zero helper exit")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("helper error %q does not include captured output", err)
 	}
 }

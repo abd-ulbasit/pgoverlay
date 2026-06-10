@@ -246,6 +246,18 @@ func (s *Server) getBranch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.branchJSON(b))
 }
 
+// branchUsage measures the branch's rw-layer disk usage via a one-shot
+// helper container — a runtime roundtrip, so callers should treat it as an
+// on-demand probe, not a free field.
+func (s *Server) branchUsage(w http.ResponseWriter, r *http.Request) {
+	n, err := s.eng.BranchUsage(r.Context(), r.PathValue("name"))
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"bytes": n})
+}
+
 func (s *Server) destroyBranch(w http.ResponseWriter, r *http.Request) {
 	if err := s.eng.DestroyBranch(r.Context(), r.PathValue("name")); err != nil {
 		writeEngineError(w, err)

@@ -97,6 +97,7 @@ curl -H "$AUTH" -X DELETE localhost:7070/v1/sources/main
 curl -H "$AUTH" -d '{"name":"pr-42","source":"main","ttl_seconds":86400}' localhost:7070/v1/branches
 curl -H "$AUTH" localhost:7070/v1/branches
 curl -H "$AUTH" localhost:7070/v1/branches/pr-42
+curl -H "$AUTH" localhost:7070/v1/branches/pr-42/usage   # {"bytes":N} — rw-layer size (runs a helper container)
 curl -H "$AUTH" -X POST localhost:7070/v1/branches/pr-42/reset
 curl -H "$AUTH" -X DELETE localhost:7070/v1/branches/pr-42
 ```
@@ -118,7 +119,15 @@ pgb branch create pr-42 --from main --ttl 24h
 pgb connect pr-42    # prints the direct-port URL and the :6432 proxy URL
 ```
 
+`pgb branch ls --usage` adds a SIZE column showing each branch's copy-on-write rw layer (its own writes, not the shared source data). It runs one helper container per branch, so it's opt-in.
+
 Honest caveat: the registry is SQLite, which is single-writer. Don't run local-mode CLI commands (no `--server`) against the same `PGBRANCH_HOME` while branchd is running — use server mode; that's the supported combination.
+
+## Web UI
+
+branchd serves a small embedded web UI at `http://localhost:7070/ui/` (the exact URL is logged at startup) — a single static page baked into the binary, no build toolchain, no CDN, works air-gapped. Paste your `PGBRANCH_TOKEN` once (kept in the browser's localStorage); the page lists sources and branches with state, endpoint, expiry countdown and rw-layer disk usage, and has create/reset/destroy controls. Auto-refreshes every 5 seconds.
+
+*(screenshot placeholder: dark monospace dashboard with sources and branches tables)*
 
 ## Run on Kubernetes
 

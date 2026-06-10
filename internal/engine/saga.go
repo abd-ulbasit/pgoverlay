@@ -84,7 +84,7 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	undo = append(undo, func() { e.drv.RemoveVolume(bg, plan.RWVolume) })
 
 	// 2. write entrypoint into the rw volume
-	if err := e.drv.RunHelper(ctx, runtime.HelperSpec{
+	if _, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
 		Image:  "alpine:3.21",
 		Cmd:    []string{"sh", "-c", `printf '%s' "$PGBRANCH_ENTRYPOINT" > /pgbranch/rw/entrypoint.sh && chmod 0755 /pgbranch/rw/entrypoint.sh && mkdir -p /pgbranch/rw/upper /pgbranch/rw/work`},
 		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScript},

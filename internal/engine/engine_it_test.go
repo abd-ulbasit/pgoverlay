@@ -96,6 +96,20 @@ func TestEndToEndBranching(t *testing.T) {
 	if n := mustQueryInt(t, ctx, hostConn, `SELECT sum(balance) FROM accounts`); n != 1000000 {
 		t.Fatalf("source mutated! sum=%d", n)
 	}
+	// disk usage reflects branch writes: ~10MB of inserts must show up in the
+	// rw layer (overlay upperdir), measured via the helper-driven du
+	mustExec(t, ctx, branchConn(b1), `CREATE TABLE blob AS
+		SELECT i, repeat('x', 1000) AS pad FROM generate_series(1, 10000) i;
+		CHECKPOINT`)
+	usage, err := e.BranchUsage(ctx, "e2e-pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("branch pr-1 rw usage after ~10MB of writes: %d bytes", usage)
+	if usage < 5<<20 {
+		t.Fatalf("BranchUsage = %d bytes, want > %d after ~10MB of writes", usage, 5<<20)
+	}
+
 	// second branch is isolated from first
 	b2, err := e.CreateBranch(ctx, "e2e-pr-2", "e2e-main", 0)
 	if err != nil {

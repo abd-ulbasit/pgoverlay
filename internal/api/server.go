@@ -90,6 +90,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("POST /v1/branches", s.createBranch)
 	v1.HandleFunc("GET /v1/branches", s.listBranches)
 	v1.HandleFunc("GET /v1/branches/{name}", s.getBranch)
+	v1.HandleFunc("GET /v1/branches/{name}/usage", s.branchUsage)
 	v1.HandleFunc("DELETE /v1/branches/{name}", s.destroyBranch)
 	v1.HandleFunc("POST /v1/branches/{name}/reset", s.resetBranch)
 
@@ -97,6 +98,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	// static UI assets carry no secrets and are served without auth; every
+	// API call the page makes goes through /v1 and needs the bearer token.
+	mux.Handle("GET /ui/", uiHandler())
 	mux.Handle("/v1/", s.auth(v1))
 	return mux
 }

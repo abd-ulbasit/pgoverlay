@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/cow"
@@ -104,6 +106,33 @@ func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 		return fmt.Errorf("remove source volume: %w", err)
 	}
 	return e.reg.DeleteSource(src.ID)
+}
+
+// BranchUsage measures a branch's copy-on-write rw volume in bytes (the
+// branch's own writes, not the shared source data) by running `du -sb` in a
+// one-shot helper. It is a helper-container roundtrip — cheap, but not free.
+func (e *Engine) BranchUsage(ctx context.Context, name string) (int64, error) {
+	b, err := e.reg.GetBranchByName(name)
+	if err != nil {
+		return 0, err
+	}
+	out, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
+		Image:  "alpine:3.21",
+		Cmd:    []string{"du", "-sb", cow.RWPath},
+		Mounts: []runtime.Mount{{Volume: b.RWVolume, Target: cow.RWPath, ReadOnly: true}},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("measure branch %q usage: %w", name, err)
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("measure branch %q usage: empty du output", name)
+	}
+	n, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("measure branch %q usage: unparseable du output %q", name, out)
+	}
+	return n, nil
 }
 
 // ReapExpired destroys every ready/failed branch whose TTL has passed.

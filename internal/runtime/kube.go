@@ -83,7 +83,7 @@ func (d *KubeDriver) CreateVolume(ctx context.Context, name string, labels map[s
 	}
 	dir := dataRootMountPath + "/" + name
 	cmd := fmt.Sprintf(`mkdir -p %s && printf '%%s' "$PGBRANCH_VOLUME_LABELS" > %s/%s`, dir, dir, volumeLabelsFile)
-	if err := d.runRootHelper(ctx, cmd, []string{"PGBRANCH_VOLUME_LABELS=" + string(j)}); err != nil {
+	if _, err := d.runRootHelper(ctx, cmd, []string{"PGBRANCH_VOLUME_LABELS=" + string(j)}); err != nil {
 		return fmt.Errorf("create volume %s: %w", name, err)
 	}
 	return nil
@@ -95,7 +95,7 @@ func (d *KubeDriver) RemoveVolume(ctx context.Context, name string) error {
 	if err := validVolumeName(name); err != nil {
 		return err
 	}
-	if err := d.runRootHelper(ctx, "rm -rf "+dataRootMountPath+"/"+name, nil); err != nil {
+	if _, err := d.runRootHelper(ctx, "rm -rf "+dataRootMountPath+"/"+name, nil); err != nil {
 		return fmt.Errorf("remove volume %s: %w", name, err)
 	}
 	return nil
@@ -103,7 +103,7 @@ func (d *KubeDriver) RemoveVolume(ctx context.Context, name string) error {
 
 // runRootHelper runs sh -c cmd in a helper pod with the whole data root
 // mounted at dataRootMountPath (needed to create/remove volume dirs).
-func (d *KubeDriver) runRootHelper(ctx context.Context, cmd string, env []string) error {
+func (d *KubeDriver) runRootHelper(ctx context.Context, cmd string, env []string) (string, error) {
 	pod := buildHelperPod(d.namespace, d.nodeName, d.dataRoot,
 		HelperSpec{Image: volumeHelperImage, Cmd: []string{"sh", "-c", cmd}, Env: env})
 	t := corev1.HostPathDirectoryOrCreate
@@ -116,16 +116,17 @@ func (d *KubeDriver) runRootHelper(ctx context.Context, cmd string, env []string
 	return d.runPodToCompletion(ctx, pod)
 }
 
-func (d *KubeDriver) RunHelper(ctx context.Context, spec HelperSpec) error {
+func (d *KubeDriver) RunHelper(ctx context.Context, spec HelperSpec) (string, error) {
 	return d.runPodToCompletion(ctx, buildHelperPod(d.namespace, d.nodeName, d.dataRoot, spec))
 }
 
 // runPodToCompletion creates the pod, waits for Succeeded/Failed (deadline
-// from ctx), and always deletes it. Failure errors include the last log lines.
-func (d *KubeDriver) runPodToCompletion(ctx context.Context, pod *corev1.Pod) error {
+// from ctx), and always deletes it. The pod's captured logs are returned on
+// success and embedded in the error on failure.
+func (d *KubeDriver) runPodToCompletion(ctx context.Context, pod *corev1.Pod) (string, error) {
 	created, err := d.cs.CoreV1().Pods(d.namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("create helper pod: %w", err)
+		return "", fmt.Errorf("create helper pod: %w", err)
 	}
 	defer func() {
 		prop := metav1.DeletePropagationBackground
@@ -134,12 +135,13 @@ func (d *KubeDriver) runPodToCompletion(ctx context.Context, pod *corev1.Pod) er
 	}()
 	phase, err := d.waitPodDone(ctx, created.Name)
 	if err != nil {
-		return fmt.Errorf("helper pod %s: %w", created.Name, err)
+		return "", fmt.Errorf("helper pod %s: %w", created.Name, err)
 	}
+	logs := d.podLogs(ctx, created.Name)
 	if phase != corev1.PodSucceeded {
-		return fmt.Errorf("helper pod %s failed: %s", created.Name, d.podLogs(ctx, created.Name))
+		return logs, fmt.Errorf("helper pod %s failed: %s", created.Name, logs)
 	}
-	return nil
+	return logs, nil
 }
 
 // waitPodDone watches the pod until it reaches a terminal phase. The watch is

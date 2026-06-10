@@ -46,7 +46,7 @@ func TestSeedFromRunningPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	// PG_VERSION present => valid cluster layout
-	if err := d.RunHelper(ctx, runtime.HelperSpec{
+	if _, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image: "alpine:3.21", Cmd: []string{"test", "-f", "/seed/data/PG_VERSION"},
 		Mounts: []runtime.Mount{{Volume: vol, Target: "/seed", ReadOnly: true}},
 	}); err != nil {

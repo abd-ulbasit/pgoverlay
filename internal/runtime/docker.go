@@ -103,30 +103,31 @@ func toMounts(ms []Mount) []mount.Mount {
 	return out
 }
 
-func (d *DockerDriver) RunHelper(ctx context.Context, spec HelperSpec) error {
+func (d *DockerDriver) RunHelper(ctx context.Context, spec HelperSpec) (string, error) {
 	if err := d.EnsureImage(ctx, spec.Image); err != nil {
-		return err
+		return "", err
 	}
 	cfg := &container.Config{Image: spec.Image, Cmd: spec.Cmd, Env: spec.Env, User: spec.User,
 		Labels: map[string]string{"pgbranch.managed": "true", "pgbranch.role": "helper"}}
 	host := &container.HostConfig{Mounts: toMounts(spec.Mounts), NetworkMode: container.NetworkMode(spec.Network)}
 	cr, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, "")
 	if err != nil {
-		return fmt.Errorf("create helper: %w", err)
+		return "", fmt.Errorf("create helper: %w", err)
 	}
 	defer d.cli.ContainerRemove(context.WithoutCancel(ctx), cr.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	if err := d.cli.ContainerStart(ctx, cr.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("start helper: %w", err)
+		return "", fmt.Errorf("start helper: %w", err)
 	}
 	waitC, errC := d.cli.ContainerWait(ctx, cr.ID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errC:
-		return err
+		return "", err
 	case st := <-waitC:
+		out := d.logs(ctx, cr.ID)
 		if st.StatusCode != 0 {
-			return fmt.Errorf("helper exited %d: %s", st.StatusCode, d.logs(ctx, cr.ID))
+			return out, fmt.Errorf("helper exited %d: %s", st.StatusCode, out)
 		}
-		return nil
+		return out, nil
 	}
 }
 

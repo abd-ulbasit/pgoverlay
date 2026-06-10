@@ -17,10 +17,12 @@ type fakeDriver struct {
 	containers map[string]bool
 	failStart  bool
 	execErr    error
-	psqlErr    error      // returned by Exec for psql commands only (fails masking)
-	helperErr  error      // returned by RunHelper (fails seeding)
-	starts     int        // StartBranch invocations
-	execs      [][]string // every Exec call, in order
+	psqlErr    error                // returned by Exec for psql commands only (fails masking)
+	helperErr  error                // returned by RunHelper (fails seeding)
+	helperOut  string               // returned by RunHelper as captured output
+	helpers    []runtime.HelperSpec // every RunHelper call, in order
+	starts     int                  // StartBranch invocations
+	execs      [][]string           // every Exec call, in order
 }
 
 func newFake() *fakeDriver {
@@ -35,7 +37,10 @@ func (f *fakeDriver) RemoveVolume(ctx context.Context, name string) error {
 	delete(f.volumes, name)
 	return nil
 }
-func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) error { return f.helperErr }
+func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
+	f.helpers = append(f.helpers, s)
+	return f.helperOut, f.helperErr
+}
 func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
 	if f.failStart {
 		return "", errors.New("boom")
@@ -574,6 +579,55 @@ func TestRunReaperDestroysExpired(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("reaper never destroyed the expired branch")
+}
+
+func TestBranchUsage(t *testing.T) {
+	d := newFake()
+	d.helperOut = "123456\t/pgbranch/rw\n"
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := e.BranchUsage(context.Background(), "pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 123456 {
+		t.Fatalf("usage = %d want 123456", n)
+	}
+	// the measuring helper runs du -sb against the branch's rw volume,
+	// mounted read-only
+	last := d.helpers[len(d.helpers)-1]
+	wantCmd := []string{"du", "-sb", "/pgbranch/rw"}
+	if len(last.Cmd) != 3 || last.Cmd[0] != wantCmd[0] || last.Cmd[1] != wantCmd[1] || last.Cmd[2] != wantCmd[2] {
+		t.Fatalf("helper cmd = %v want %v", last.Cmd, wantCmd)
+	}
+	if len(last.Mounts) != 1 || last.Mounts[0].Volume != "pgbranch-br-pr-1-rw" || !last.Mounts[0].ReadOnly {
+		t.Fatalf("helper mounts = %+v want ro pgbranch-br-pr-1-rw", last.Mounts)
+	}
+}
+
+func TestBranchUsageUnknownBranch(t *testing.T) {
+	d := newFake()
+	e, _ := testEngine(t, d)
+	if _, err := e.BranchUsage(context.Background(), "nope"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("err = %v want ErrNotFound", err)
+	}
+}
+
+func TestBranchUsageBadHelperOutput(t *testing.T) {
+	d := newFake()
+	d.helperOut = "du: cannot access '/pgbranch/rw'"
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.BranchUsage(context.Background(), "pr-1"); err == nil {
+		t.Fatal("want error for unparseable du output")
+	}
 }
 
 func TestReapExpired(t *testing.T) {

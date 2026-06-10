@@ -74,6 +74,31 @@ func TestServerModeBranchLs(t *testing.T) {
 	}
 }
 
+func TestServerModeBranchLsUsage(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/branches":
+			json.NewEncoder(w).Encode([]api.Branch{{Name: "pr-9", State: "ready", Port: 32788, CreatedAt: "2026-06-10"}})
+		case "/v1/branches/pr-9/usage":
+			json.NewEncoder(w).Encode(map[string]int64{"bytes": 5242880})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	// without --usage there is no SIZE column (it costs a helper run per branch)
+	out := run(t, "branch", "ls", "--server", ts.URL)
+	if strings.Contains(out, "SIZE") {
+		t.Fatalf("SIZE column without --usage: %q", out)
+	}
+	out = run(t, "branch", "ls", "--usage", "--server", ts.URL)
+	if !strings.Contains(out, "SIZE") || !strings.Contains(out, "5.0 MiB") {
+		t.Fatalf("output %q, want SIZE column with 5.0 MiB", out)
+	}
+}
+
 func TestServerModeConnectPrintsDirectAndProxyURLs(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/branches/pr-9" {

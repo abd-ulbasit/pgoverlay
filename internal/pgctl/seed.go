@@ -27,14 +27,14 @@ type SeedSpec struct {
 // to uid 999 so it can. Requires REPLICATION privilege on the source
 // (superuser works).
 func Seed(ctx context.Context, d runtime.Driver, s SeedSpec) error {
-	if err := d.RunHelper(ctx, runtime.HelperSpec{
+	if _, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image:  "alpine:3.21",
 		Cmd:    []string{"sh", "-c", "mkdir -p /seed && chown 999:999 /seed"},
 		Mounts: []runtime.Mount{{Volume: s.Volume, Target: "/seed"}},
 	}); err != nil {
 		return fmt.Errorf("prepare seed volume: %w", err)
 	}
-	err := d.RunHelper(ctx, runtime.HelperSpec{
+	_, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image: s.Image,
 		User:  "postgres",
 		Cmd: []string{"pg_basebackup",

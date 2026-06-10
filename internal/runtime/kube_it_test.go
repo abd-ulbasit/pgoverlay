@@ -88,22 +88,27 @@ func TestKubeVolumeAndHelperRoundtrip(t *testing.T) {
 	})
 
 	// write via one helper, verify (and check the labels file) via another
-	if err := drv.RunHelper(ctx, rt.HelperSpec{
+	if _, err := drv.RunHelper(ctx, rt.HelperSpec{
 		Image:  "alpine:3.21",
 		Cmd:    []string{"sh", "-c", "echo hello > /data/probe"},
 		Mounts: []rt.Mount{{Volume: vol, Target: "/data"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := drv.RunHelper(ctx, rt.HelperSpec{
+	// successful helpers return their captured output (pod logs)
+	out, err := drv.RunHelper(ctx, rt.HelperSpec{
 		Image:  "alpine:3.21",
-		Cmd:    []string{"sh", "-c", "grep -q hello /data/probe && grep -q pgbranch.managed /data/.pgbranch-labels.json"},
+		Cmd:    []string{"sh", "-c", "cat /data/probe && grep -q pgbranch.managed /data/.pgbranch-labels.json"},
 		Mounts: []rt.Mount{{Volume: vol, Target: "/data", ReadOnly: true}},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(out, "hello") {
+		t.Fatalf("helper output %q, want it to contain %q", out, "hello")
+	}
 	// failing helper surfaces its logs in the error
-	err := drv.RunHelper(ctx, rt.HelperSpec{Image: "alpine:3.21", Cmd: []string{"sh", "-c", "echo boom >&2; exit 3"}})
+	_, err = drv.RunHelper(ctx, rt.HelperSpec{Image: "alpine:3.21", Cmd: []string{"sh", "-c", "echo boom >&2; exit 3"}})
 	if err == nil {
 		t.Fatal("want error from non-zero helper exit")
 	}

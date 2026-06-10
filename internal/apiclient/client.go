@@ -147,6 +147,18 @@ func (c *Client) GetBranch(ctx context.Context, name string) (*api.Branch, error
 	return &b, nil
 }
 
+// BranchUsage returns the branch's rw-layer disk usage in bytes. The server
+// runs a helper container per call — treat it as an on-demand probe.
+func (c *Client) BranchUsage(ctx context.Context, name string) (int64, error) {
+	var out struct {
+		Bytes int64 `json:"bytes"`
+	}
+	if err := c.do(ctx, "GET", "/v1/branches/"+url.PathEscape(name)+"/usage", nil, &out); err != nil {
+		return 0, err
+	}
+	return out.Bytes, nil
+}
+
 func (c *Client) DestroyBranch(ctx context.Context, name string) error {
 	return c.do(ctx, "DELETE", "/v1/branches/"+url.PathEscape(name), nil, nil)
 }

@@ -35,6 +35,19 @@ func main() {
 	}
 }
 
+// uiURL renders a clickable address for the embedded web UI from the API
+// listen address (":7070" -> "http://localhost:7070/ui/").
+func uiURL(apiAddr string) string {
+	host, port, err := net.SplitHostPort(apiAddr)
+	if err != nil {
+		return "http://" + apiAddr + "/ui/"
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "localhost"
+	}
+	return fmt.Sprintf("http://%s/ui/", net.JoinHostPort(host, port))
+}
+
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
@@ -100,6 +113,7 @@ func run() error {
 	srv := &http.Server{Addr: *apiAddr, Handler: api.New(eng, reg, token).Handler()}
 	g.Go(func() error {
 		log.Printf("REST API listening on %s", *apiAddr)
+		log.Printf("web UI at %s", uiURL(*apiAddr))
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}

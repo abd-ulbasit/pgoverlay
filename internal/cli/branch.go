@@ -56,22 +56,39 @@ func newBranchCreateCmd() *cobra.Command {
 }
 
 func newBranchLsCmd() *cobra.Command {
-	return &cobra.Command{
+	var withUsage bool
+	cmd := &cobra.Command{
 		Use: "ls", Short: "List branches",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 2, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tSTATE\tPORT\tEXPIRES\tCREATED")
+			header := "NAME\tSTATE\tPORT\tEXPIRES\tCREATED"
+			if withUsage {
+				header += "\tSIZE"
+			}
+			fmt.Fprintln(w, header)
+			row := func(name, state string, port int, expiresAt, createdAt string, usage func() (int64, error)) {
+				fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s", name, state, port, orNever(expiresAt), createdAt)
+				if withUsage {
+					if n, err := usage(); err != nil {
+						fmt.Fprintf(w, "\t? (%v)", err)
+					} else {
+						fmt.Fprintf(w, "\t%s", humanBytes(n))
+					}
+				}
+				fmt.Fprintln(w)
+			}
 			if c := serverClient(cmd); c != nil {
 				branches, err := c.ListBranches(cmd.Context())
 				if err != nil {
 					return err
 				}
 				for _, b := range branches {
-					fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", b.Name, b.State, b.Port, orNever(b.ExpiresAt), b.CreatedAt)
+					row(b.Name, b.State, b.Port, b.ExpiresAt, b.CreatedAt,
+						func() (int64, error) { return c.BranchUsage(cmd.Context(), b.Name) })
 				}
 				return w.Flush()
 			}
-			_, reg, err := open()
+			e, reg, err := open()
 			if err != nil {
 				return err
 			}
@@ -81,11 +98,28 @@ func newBranchLsCmd() *cobra.Command {
 				return err
 			}
 			for _, b := range branches {
-				fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", b.Name, b.State, b.Port, orNever(b.ExpiresAt), b.CreatedAt)
+				row(b.Name, string(b.State), b.Port, b.ExpiresAt, b.CreatedAt,
+					func() (int64, error) { return e.BranchUsage(cmd.Context(), b.Name) })
 			}
 			return w.Flush()
 		},
 	}
+	cmd.Flags().BoolVar(&withUsage, "usage", false, "measure each branch's rw-layer disk usage (runs one helper container per branch)")
+	return cmd
+}
+
+// humanBytes renders n in binary units (B, KiB, MiB, ...).
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func orNever(expiresAt string) string {
