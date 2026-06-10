@@ -27,7 +27,7 @@ type DockerDriver struct{ cli *client.Client }
 func NewDockerDriver() (*DockerDriver, error) {
 	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
 	if os.Getenv("DOCKER_HOST") == "" {
-		if host := hostFromDockerContext(); host != "" {
+		if host := DockerHostFromCLIContext(); host != "" {
 			opts = append(opts, client.WithHost(host))
 		}
 	}
@@ -38,11 +38,13 @@ func NewDockerDriver() (*DockerDriver, error) {
 	return &DockerDriver{cli: cli}, nil
 }
 
-// hostFromDockerContext resolves the docker endpoint from the CLI's current
-// context (~/.docker/config.json + contexts/meta). The Go SDK's FromEnv only
-// honors DOCKER_HOST, so without this, setups like Colima (where
-// /var/run/docker.sock is absent or stale) fail. Returns "" when unresolvable.
-func hostFromDockerContext() string {
+// DockerHostFromCLIContext resolves the docker endpoint from the CLI's
+// current context (~/.docker/config.json + contexts/meta). The Go SDK's
+// FromEnv only honors DOCKER_HOST, so without this, setups like Colima
+// (where /var/run/docker.sock is absent or stale) fail. Returns "" when
+// unresolvable. Exported so integration helpers can prime DOCKER_HOST for
+// libraries (e.g. testcontainers) that don't read docker CLI contexts.
+func DockerHostFromCLIContext() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
