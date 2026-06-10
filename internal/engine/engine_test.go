@@ -75,6 +75,40 @@ func readySource(t *testing.T, r *registry.Registry) *registry.Source {
 	return s
 }
 
+func mustSource(t *testing.T, r *registry.Registry) *registry.Source {
+	t.Helper()
+	s, err := r.GetSourceByName("main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestReconcileCleansOrphans(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	// registry says creating, but no container exists -> failed + cleaned
+	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-stuck-rw"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes["pgbranch-br-stuck-rw"] = true
+	// container exists but registry has no row -> removed
+	d.containers["cid-ghost"] = true
+
+	if err := e.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.GetBranchByName("stuck")
+	if got.State != registry.BranchFailed {
+		t.Fatalf("state=%q", got.State)
+	}
+	if d.containers["cid-ghost"] {
+		t.Fatal("ghost container not removed")
+	}
+}
+
 func TestCreateBranchHappyPath(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)

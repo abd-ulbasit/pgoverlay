@@ -50,3 +50,36 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 	}
 	return e.reg.SetSourceState(s.ID, registry.SourceReady, "seed complete")
 }
+
+// Reconcile aligns the registry with reality at startup: stuck 'creating'
+// branches are failed and their resources cleaned; managed containers with
+// no registry row are removed.
+func (e *Engine) Reconcile(ctx context.Context) error {
+	branches, err := e.reg.ListLiveBranches()
+	if err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	for _, b := range branches {
+		if b.ContainerID != "" {
+			known[b.ContainerID] = true
+		}
+		if b.State == registry.BranchCreating {
+			if b.ContainerID != "" {
+				e.drv.StopRemove(ctx, b.ContainerID)
+			}
+			e.drv.RemoveVolume(ctx, b.RWVolume)
+			e.reg.TransitionBranch(b.ID, registry.BranchFailed, "reconcile: interrupted create")
+		}
+	}
+	managed, err := e.drv.ListManaged(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range managed {
+		if !known[c.ID] {
+			e.drv.StopRemove(ctx, c.ID)
+		}
+	}
+	return nil
+}
