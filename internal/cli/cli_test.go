@@ -33,6 +33,9 @@ func TestCommandTree(t *testing.T) {
 	if f, _, _ := root.Find([]string{"branch", "create"}); f.Flags().Lookup("ttl") == nil {
 		t.Fatal("branch create --ttl flag missing")
 	}
+	if f, _, _ := root.Find([]string{"branch", "create"}); f.Flags().Lookup("from-branch") == nil {
+		t.Fatal("branch create --from-branch flag missing")
+	}
 	// help renders without side effects
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -263,5 +266,63 @@ func TestServerModeBranchCreateTTL(t *testing.T) {
 	run(t, "branch", "create", "pr-9", "--from", "main", "--ttl", "24h", "--server", ts.URL)
 	if got.Name != "pr-9" || got.Source != "main" || got.TTLSeconds != 86400 {
 		t.Fatalf("request %+v", got)
+	}
+	if got.Parent != "" {
+		t.Fatalf("request %+v: --from must not send a parent", got)
+	}
+}
+
+func TestServerModeBranchCreateFromBranch(t *testing.T) {
+	var got api.CreateBranchRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(api.Branch{Name: got.Name, Parent: got.Parent, State: "ready", Port: 1, ProxyDatabase: "postgres@" + got.Name})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	run(t, "branch", "create", "pr-9", "--from-branch", "pr-1", "--server", ts.URL)
+	if got.Name != "pr-9" || got.Parent != "pr-1" || got.Source != "" {
+		t.Fatalf("request %+v", got)
+	}
+}
+
+func TestBranchCreateFromFlagsMutuallyExclusive(t *testing.T) {
+	for name, args := range map[string][]string{
+		"both":    {"branch", "create", "pr-9", "--from", "main", "--from-branch", "pr-1"},
+		"neither": {"branch", "create", "pr-9"},
+	} {
+		root := NewRootCmd()
+		root.SetOut(&bytes.Buffer{})
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(args)
+		err := root.Execute()
+		if err == nil || !strings.Contains(err.Error(), "--from") || !strings.Contains(err.Error(), "--from-branch") {
+			t.Errorf("%s: err=%v, want one explaining --from/--from-branch exclusivity", name, err)
+		}
+	}
+}
+
+func TestServerModeBranchLsShowsParent(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]api.Branch{
+			{Name: "pr-1", State: "ready", Port: 1, CreatedAt: "2026-06-11"},
+			{Name: "pr-2", Parent: "pr-1", State: "ready", Port: 2, CreatedAt: "2026-06-11"},
+		})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "branch", "ls", "--server", ts.URL)
+	if !strings.Contains(out, "PARENT") {
+		t.Fatalf("no PARENT column: %q", out)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("output %q", out)
+	}
+	if !strings.Contains(lines[2], "pr-2") || !strings.Contains(lines[2], "pr-1") {
+		t.Fatalf("child row lacks parent: %q", lines[2])
 	}
 }

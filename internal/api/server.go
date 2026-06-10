@@ -27,8 +27,11 @@ type Source struct {
 }
 
 type Branch struct {
-	Name     string `json:"name"`
-	Source   string `json:"source"`
+	Name   string `json:"name"`
+	Source string `json:"source"`
+	// Parent is the branch this one was created from (branch-from-branch);
+	// "" when created directly from the source.
+	Parent   string `json:"parent,omitempty"`
 	State    string `json:"state"`
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
@@ -52,9 +55,12 @@ type CreateSourceRequest struct {
 	Password  string `json:"password"`
 }
 
+// CreateBranchRequest creates a branch off a source (Source) or off another
+// branch (Parent) — exactly one of the two must be set.
 type CreateBranchRequest struct {
 	Name       string `json:"name"`
-	Source     string `json:"source"`
+	Source     string `json:"source,omitempty"`
+	Parent     string `json:"parent,omitempty"`
 	TTLSeconds int    `json:"ttl_seconds"`
 }
 

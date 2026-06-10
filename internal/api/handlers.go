@@ -35,6 +35,7 @@ func writeEngineError(w http.ResponseWriter, err error) {
 		code = http.StatusNotFound
 	case strings.Contains(msg, "UNIQUE constraint"),
 		strings.Contains(msg, "live branch"),
+		strings.Contains(msg, "child branch"),
 		strings.Contains(msg, "illegal branch transition"),
 		strings.Contains(msg, "not ready"):
 		code = http.StatusConflict
@@ -74,7 +75,7 @@ func (s *Server) branchJSON(b *registry.Branch) Branch {
 		}
 	}
 	return Branch{
-		Name: b.Name, Source: srcName, State: string(b.State), Host: b.Host, Port: b.Port,
+		Name: b.Name, Source: srcName, Parent: b.ParentBranchName, State: string(b.State), Host: b.Host, Port: b.Port,
 		User: user, Database: db, ProxyDatabase: db + "@" + b.Name,
 		ExpiresAt: b.ExpiresAt, CreatedAt: b.CreatedAt,
 	}
@@ -208,8 +209,12 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if req.Name == "" || req.Source == "" {
-		writeError(w, http.StatusBadRequest, "name and source are required")
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if (req.Source == "") == (req.Parent == "") {
+		writeError(w, http.StatusBadRequest, "exactly one of source or parent is required")
 		return
 	}
 	if req.TTLSeconds < 0 {
@@ -217,7 +222,15 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ttl := time.Duration(req.TTLSeconds) * time.Second
-	b, err := s.eng.CreateBranch(r.Context(), req.Name, req.Source, ttl)
+	var (
+		b   *registry.Branch
+		err error
+	)
+	if req.Parent != "" {
+		b, err = s.eng.CreateBranchFrom(r.Context(), req.Name, req.Parent, ttl)
+	} else {
+		b, err = s.eng.CreateBranch(r.Context(), req.Name, req.Source, ttl)
+	}
 	if err != nil {
 		writeEngineError(w, err)
 		return

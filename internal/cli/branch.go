@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
+	"github.com/abd-ulbasit/pgbranch/internal/registry"
 )
 
 func newBranchCmd() *cobra.Command {
@@ -18,17 +19,20 @@ func newBranchCmd() *cobra.Command {
 }
 
 func newBranchCreateCmd() *cobra.Command {
-	var from string
+	var from, fromBranch string
 	var ttl time.Duration
 	cmd := &cobra.Command{
 		Use:   "create NAME",
-		Short: "Create an instant copy-on-write branch",
+		Short: "Create an instant copy-on-write branch (off a source, or off another branch)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if (from == "") == (fromBranch == "") {
+				return fmt.Errorf("exactly one of --from (source) or --from-branch (parent branch) is required")
+			}
 			start := time.Now()
 			if c := serverClient(cmd); c != nil {
 				b, err := c.CreateBranch(cmd.Context(), api.CreateBranchRequest{
-					Name: args[0], Source: from, TTLSeconds: int(ttl / time.Second)})
+					Name: args[0], Source: from, Parent: fromBranch, TTLSeconds: int(ttl / time.Second)})
 				if err != nil {
 					return err
 				}
@@ -41,7 +45,11 @@ func newBranchCreateCmd() *cobra.Command {
 				return err
 			}
 			defer reg.Close()
-			b, err := e.CreateBranch(cmd.Context(), args[0], from, ttl)
+			create := func() (*registry.Branch, error) { return e.CreateBranch(cmd.Context(), args[0], from, ttl) }
+			if fromBranch != "" {
+				create = func() (*registry.Branch, error) { return e.CreateBranchFrom(cmd.Context(), args[0], fromBranch, ttl) }
+			}
+			b, err := create()
 			if err != nil {
 				return err
 			}
@@ -50,8 +58,8 @@ func newBranchCreateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&from, "from", "", "source to branch from")
+	cmd.Flags().StringVar(&fromBranch, "from-branch", "", "existing branch to branch from (branch-from-branch)")
 	cmd.Flags().DurationVar(&ttl, "ttl", 0, "auto-destroy after this duration (e.g. 24h); 0 = never")
-	cmd.MarkFlagRequired("from")
 	return cmd
 }
 
@@ -61,13 +69,16 @@ func newBranchLsCmd() *cobra.Command {
 		Use: "ls", Short: "List branches",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 2, 4, 2, ' ', 0)
-			header := "NAME\tSTATE\tPORT\tEXPIRES\tCREATED"
+			header := "NAME\tPARENT\tSTATE\tPORT\tEXPIRES\tCREATED"
 			if withUsage {
 				header += "\tSIZE"
 			}
 			fmt.Fprintln(w, header)
-			row := func(name, state string, port int, expiresAt, createdAt string, usage func() (int64, error)) {
-				fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s", name, state, port, orNever(expiresAt), createdAt)
+			row := func(name, parent, state string, port int, expiresAt, createdAt string, usage func() (int64, error)) {
+				if parent == "" {
+					parent = "-"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s", name, parent, state, port, orNever(expiresAt), createdAt)
 				if withUsage {
 					if n, err := usage(); err != nil {
 						fmt.Fprintf(w, "\t? (%v)", err)
@@ -83,7 +94,7 @@ func newBranchLsCmd() *cobra.Command {
 					return err
 				}
 				for _, b := range branches {
-					row(b.Name, b.State, b.Port, b.ExpiresAt, b.CreatedAt,
+					row(b.Name, b.Parent, b.State, b.Port, b.ExpiresAt, b.CreatedAt,
 						func() (int64, error) { return c.BranchUsage(cmd.Context(), b.Name) })
 				}
 				return w.Flush()
@@ -98,7 +109,7 @@ func newBranchLsCmd() *cobra.Command {
 				return err
 			}
 			for _, b := range branches {
-				row(b.Name, string(b.State), b.Port, b.ExpiresAt, b.CreatedAt,
+				row(b.Name, b.ParentBranchName, string(b.State), b.Port, b.ExpiresAt, b.CreatedAt,
 					func() (int64, error) { return e.BranchUsage(cmd.Context(), b.Name) })
 			}
 			return w.Flush()

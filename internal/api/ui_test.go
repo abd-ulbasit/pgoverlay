@@ -30,6 +30,10 @@ func TestUIServedWithoutAuth(t *testing.T) {
 	if !strings.Contains(string(body), "pgbranch") {
 		t.Fatalf("UI page does not mention pgbranch:\n%.200s", body)
 	}
+	// the create form offers a parent-branch dropdown (branch-from-branch)
+	if !strings.Contains(string(body), `id="bparent"`) {
+		t.Fatal("UI create form lacks the parent branch dropdown")
+	}
 
 	// API routes are not exempted by the UI route
 	if code, _ := do(t, ts, "", "GET", "/v1/branches", nil); code != http.StatusUnauthorized {

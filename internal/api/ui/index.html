@@ -72,6 +72,7 @@
 <form class="create" id="create">
   <input id="bname" placeholder="branch name" pattern="[a-z0-9][a-z0-9-]{0,40}" required>
   <select id="bsource" required></select>
+  <select id="bparent" title="create from another branch's current state instead of the source"></select>
   <input id="bttl" placeholder="ttl (e.g. 24h, blank = never)" size="22">
   <button type="submit">create branch</button>
 </form>
@@ -157,12 +158,38 @@ function renderSources(sources) {
   sel.innerHTML = sources.map(s => `<option ${s.name === prev ? "selected" : ""}>${esc(s.name)}</option>`).join("");
 }
 
+// branchTree orders branches parent-first (depth-first) and computes each
+// row's indent depth; branches whose parent is gone (or source-based) are
+// roots. parent comes from the API's parent field (parent_branch_name).
+function branchTree(branches) {
+  const names = new Set(branches.map(b => b.name));
+  const children = new Map(); // parent name -> [branch]
+  const roots = [];
+  for (const b of branches) {
+    const p = b.parent && names.has(b.parent) ? b.parent : "";
+    if (p) {
+      if (!children.has(p)) children.set(p, []);
+      children.get(p).push(b);
+    } else {
+      roots.push(b);
+    }
+  }
+  const out = [];
+  const walk = (b, depth) => {
+    out.push({ b, depth });
+    for (const c of children.get(b.name) || []) walk(c, depth + 1);
+  };
+  for (const b of roots) walk(b, 0);
+  return out;
+}
+
 function renderBranches(branches) {
   const tb = $("branches");
   tb.innerHTML = branches.length ? "" : `<tr><td class="empty" colspan="7">no branches yet</td></tr>`;
-  for (const b of branches) {
+  for (const { b, depth } of branchTree(branches)) {
+    const indent = depth ? `<span class="dim">${"&nbsp;&nbsp;".repeat(depth)}└ </span>` : "";
     tb.insertAdjacentHTML("beforeend", `<tr>
-      <td>${esc(b.name)}</td><td class="dim">${esc(b.source)}</td><td>${badge(b.state)}</td>
+      <td>${indent}${esc(b.name)}</td><td class="dim">${b.parent ? "↳ " + esc(b.parent) : esc(b.source)}</td><td>${badge(b.state)}</td>
       <td>${b.host ? esc(b.host) + ":" + b.port : '<span class="dim">—</span>'}
           <span class="dim">db ${esc(b.proxy_database)}</span></td>
       <td data-expires="${esc(b.expires_at)}">${countdown(b.expires_at)}</td>
@@ -175,6 +202,13 @@ function renderBranches(branches) {
     </tr>`);
     if (b.state === "ready" && !usageCache.has(b.name)) fetchUsage(b.name).catch(() => {});
   }
+  // parent dropdown: branch off a ready branch's current state instead of the source
+  const sel = $("bparent");
+  const prev = sel.value;
+  sel.innerHTML = `<option value="">(from source)</option>` +
+    branches.filter(b => b.state === "ready")
+      .map(b => `<option value="${esc(b.name)}" ${b.name === prev ? "selected" : ""}>from branch ${esc(b.name)}</option>`)
+      .join("");
 }
 
 async function refresh() {
@@ -218,10 +252,12 @@ $("create").addEventListener("submit", async ev => {
   try {
     const body = {
       name: $("bname").value.trim(),
-      source: $("bsource").value,
       ttl_seconds: parseTTLSeconds($("bttl").value),
     };
-    msg(`creating ${body.name}… (clone is instant, Postgres startup takes a few seconds)`, "ok");
+    // a chosen parent branch wins over the source (the API takes exactly one)
+    const parent = $("bparent").value;
+    if (parent) body.parent = parent; else body.source = $("bsource").value;
+    msg(`creating ${body.name}… (clone is instant, Postgres startup takes a few seconds${parent ? `; branching from ${parent} briefly restarts it` : ""})`, "ok");
     await api("/v1/branches", { method: "POST", body: JSON.stringify(body) });
     $("bname").value = "";
     msg(`branch ${body.name} ready`, "ok");

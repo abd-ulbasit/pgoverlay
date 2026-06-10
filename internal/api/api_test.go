@@ -449,6 +449,64 @@ func TestInvalidBranchNameBadRequest(t *testing.T) {
 	}
 }
 
+func TestCreateBranchFromParent(t *testing.T) {
+	ts, _ := newTestServer(t)
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "p", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create parent: code=%d body=%s", code, body)
+	}
+
+	code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "c", Parent: "p"})
+	if code != http.StatusCreated {
+		t.Fatalf("create from parent: code=%d body=%s", code, body)
+	}
+	b := mustUnmarshal[Branch](t, body)
+	if b.Name != "c" || b.Parent != "p" || b.State != "ready" {
+		t.Fatalf("child %+v", b)
+	}
+	if b.Source != "main" {
+		t.Fatalf("child source=%q want main (inherited from parent)", b.Source)
+	}
+	if b.ProxyDatabase != "postgres@c" {
+		t.Fatalf("proxy hint %q", b.ProxyDatabase)
+	}
+
+	// list carries the parent for every branch ("" for source-based)
+	code, body = do(t, ts, testToken, "GET", "/v1/branches", nil)
+	if code != http.StatusOK {
+		t.Fatalf("list: code=%d", code)
+	}
+	parents := map[string]string{}
+	for _, br := range mustUnmarshal[[]Branch](t, body) {
+		parents[br.Name] = br.Parent
+	}
+	if parents["p"] != "" || parents["c"] != "p" {
+		t.Fatalf("list parents=%v", parents)
+	}
+}
+
+func TestCreateBranchSourceParentMutuallyExclusive(t *testing.T) {
+	ts, _ := newTestServer(t)
+	addSource(t, ts)
+	for name, req := range map[string]CreateBranchRequest{
+		"both":    {Name: "x", Source: "main", Parent: "p"},
+		"neither": {Name: "x"},
+	} {
+		code, body := do(t, ts, testToken, "POST", "/v1/branches", req)
+		if code != http.StatusBadRequest {
+			t.Errorf("%s: code=%d body=%s want 400", name, code, body)
+		}
+		e := mustUnmarshal[map[string]string](t, body)
+		if !strings.Contains(e["error"], "source") || !strings.Contains(e["error"], "parent") {
+			t.Errorf("%s: error %q should explain the source/parent rule", name, e["error"])
+		}
+	}
+	// unknown parent -> 404
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "c", Parent: "ghost"}); code != http.StatusNotFound {
+		t.Fatalf("unknown parent: code=%d body=%s want 404", code, body)
+	}
+}
+
 func TestCreateSourceUnsupportedPGVersionRejected(t *testing.T) {
 	ts, _ := newTestServer(t)
 	code, body := do(t, ts, testToken, "POST", "/v1/sources", CreateSourceRequest{
