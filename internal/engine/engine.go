@@ -124,6 +124,31 @@ func (e *Engine) ReapExpired(ctx context.Context, now time.Time) (destroyed []st
 	return destroyed, errors.Join(errs...)
 }
 
+// RunReaper destroys expired branches every interval until ctx is done.
+// branchd runs it as a goroutine; logf (optional, nil = silent) receives
+// destroy/error reports.
+func (e *Engine) RunReaper(ctx context.Context, interval time.Duration, logf func(format string, args ...any)) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			destroyed, err := e.ReapExpired(ctx, now)
+			if len(destroyed) > 0 {
+				logf("reaper: destroyed expired branches %v", destroyed)
+			}
+			if err != nil {
+				logf("reaper: %v", err)
+			}
+		}
+	}
+}
+
 // Reconcile aligns the registry with reality at startup: stuck 'creating'
 // branches are failed and their resources cleaned; managed containers with
 // no registry row are removed.

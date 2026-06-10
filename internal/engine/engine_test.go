@@ -377,6 +377,27 @@ func TestRemoveSource(t *testing.T) {
 	}
 }
 
+func TestRunReaperDestroysExpired(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "short", "main", time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.RunReaper(ctx, 50*time.Millisecond, nil)
+	// expires_at has second resolution; the reaper should catch it within ~2s
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := r.GetBranchByName("short"); errors.Is(err, registry.ErrNotFound) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("reaper never destroyed the expired branch")
+}
+
 func TestReapExpired(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
