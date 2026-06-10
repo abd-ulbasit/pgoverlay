@@ -145,6 +145,11 @@ func startSourcePod(t *testing.T, ctx context.Context, drv *rt.KubeDriver, cs *k
 			t.Errorf("remove source pod: %v", err)
 		}
 	})
+	// The official image starts a *temporary* postgres during initdb:
+	// pg_isready can succeed against it, and an exec issued in the gap while
+	// it restarts as the final server fails with "socket ... No such file or
+	// directory". Gate on the image's init-complete log marker first.
+	waitForPodLog(t, ctx, cs, name, 2*time.Minute, "PostgreSQL init process complete")
 	waitExecOK(t, ctx, drv, name, 2*time.Minute, []string{"pg_isready", "-U", "postgres", "-h", "/var/run/postgresql"})
 	// stock pg_hba has no remote replication entry; pg_basebackup from the
 	// helper pod would be rejected without this
@@ -162,6 +167,31 @@ func startSourcePod(t *testing.T, ctx context.Context, drv *rt.KubeDriver, cs *k
 		t.Fatal("source pod has no IP")
 	}
 	return info.Host
+}
+
+// waitForPodLog polls the pod's log until it contains marker.
+func waitForPodLog(t *testing.T, ctx context.Context, cs *kubernetes.Clientset, pod string, timeout time.Duration, marker string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		raw, err := cs.CoreV1().Pods(kubeNS).GetLogs(pod, &corev1.PodLogOptions{}).DoRaw(ctx)
+		if err == nil {
+			last = string(raw)
+			if strings.Contains(last, marker) {
+				return
+			}
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("pod %s log never contained %q; last log tail: %s", pod, marker, tail(last, 500))
+}
+
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 func waitExecOK(t *testing.T, ctx context.Context, drv *rt.KubeDriver, pod string, timeout time.Duration, cmd []string) {
