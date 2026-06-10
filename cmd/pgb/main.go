@@ -1,7 +1,13 @@
 package main
 
-import "fmt"
+import (
+	"os"
+
+	"github.com/abd-ulbasit/pgbranch/internal/cli"
+)
 
 func main() {
-	fmt.Println("pgb: not yet implemented")
+	if err := cli.NewRootCmd().Execute(); err != nil {
+		os.Exit(1)
+	}
 }

@@ -116,6 +116,10 @@ func (r *Registry) GetSourceByName(name string) (*Source, error) {
 	return scanSource(r.db.QueryRow(`SELECT `+sourceCols+` FROM sources WHERE name=?`, name))
 }
 
+func (r *Registry) GetSourceByID(id string) (*Source, error) {
+	return scanSource(r.db.QueryRow(`SELECT `+sourceCols+` FROM sources WHERE id=?`, id))
+}
+
 var legalBranch = map[BranchState][]BranchState{
 	BranchCreating:   {BranchReady, BranchFailed},
 	BranchReady:      {BranchDestroying},
