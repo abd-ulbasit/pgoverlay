@@ -7,7 +7,7 @@ $ pgb branch create pr-1 --from main
 branch "pr-1" ready in 2.533s (port 32774)
 ```
 
-**Measured:** pgbranch branches a 1 GiB database in ~7.7 s and a 5 GiB database in ~62 s (p50 of 5 runs, Colima VM on Apple Silicon) — full results, methodology, and an honest accounting of where the time goes in [docs/benchmarks.md](docs/benchmarks.md). Creation time currently scales with data size: Postgres's pre-recovery fsync pass forces a copy-up of the dataset on the overlay backend (diagnosed, with the fix candidate, in the benchmarks doc).
+**Measured:** pgbranch branches a 1 GiB database in ~1.9 s and a 5 GiB database in ~1.9 s (p50 of 5 runs, Colima VM on Apple Silicon) — creation time is independent of database size, and a fresh branch costs ~33 MiB of disk, not a copy of the dataset. Full results, methodology, and the diagnosis of the copy-up bug this fixed are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## The problem
 
@@ -209,7 +209,7 @@ Phase 1 also branches only from sources, not from other branches (layer-DAG bran
 |  | pgbranch | Neon | DBLab (DLE) | pg_dump/restore |
 |---|---|---|---|---|
 | Branch creation | seconds, CoW | seconds, CoW | seconds, CoW | minutes–hours, full copy |
-| Disk per branch | rw overlay (currently ~1× source — see [benchmarks](docs/benchmarks.md)) | only changed pages | only changed pages | full copy |
+| Disk per branch | rw overlay, ~33 MiB + files written ([benchmarks](docs/benchmarks.md)) | only changed pages | only changed pages | full copy |
 | Works with your existing Postgres | yes (pg_basebackup from any PG) | no — data must live in Neon | yes | yes |
 | Self-hosted | yes | cloud service | yes | yes |
 | Infra requirements | Docker only | — | ZFS/LVM pool to provision | none |

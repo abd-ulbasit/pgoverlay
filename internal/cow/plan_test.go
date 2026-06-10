@@ -41,7 +41,7 @@ func TestEntrypointScriptContent(t *testing.T) {
 		"upperdir=/pgbranch/rw/upper",
 		"workdir=/pgbranch/rw/work",
 		"rm -f \"$PGDATA/postmaster.pid\"",
-		"exec docker-entrypoint.sh postgres",
+		"exec docker-entrypoint.sh postgres -c recovery_init_sync_method=syncfs",
 	} {
 		if !strings.Contains(EntrypointScript, want) {
 			t.Fatalf("entrypoint script missing %q", want)

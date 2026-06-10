@@ -10,4 +10,6 @@ mount -t overlay overlay \
 chown postgres:postgres "$PGDATA"
 chmod 0700 "$PGDATA"
 rm -f "$PGDATA/postmaster.pid"
-exec docker-entrypoint.sh postgres
+# syncfs avoids per-file O_RDWR fsync during pre-recovery sync (which would force
+# full OverlayFS copy-up); Linux-only and PG 14+, both guaranteed for branch containers.
+exec docker-entrypoint.sh postgres -c recovery_init_sync_method=syncfs
