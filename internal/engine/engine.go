@@ -4,7 +4,9 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/cow"
 	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
@@ -31,7 +33,7 @@ func (e *Engine) image(pgVersion string) string {
 
 // AddSource registers a source and seeds it from the given live Postgres.
 func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password string) error {
-	s.Volume = cow.SourceVolumeName(s.Name)
+	s.Volume = cow.SourceVolumeName(s.Name, 1)
 	if err := e.reg.CreateSource(s); err != nil {
 		return err
 	}
@@ -49,6 +51,77 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 		return fmt.Errorf("seed source %q: %w", s.Name, err)
 	}
 	return e.reg.SetSourceState(s.ID, registry.SourceReady, "seed complete")
+}
+
+// RefreshSource re-seeds a source into a fresh generation volume. Existing
+// branches keep the volume they were created from; only new branches see the
+// new generation. The previous generation's volume is GC'd once no live
+// branch references it. A failed seed leaves the current generation intact.
+func (e *Engine) RefreshSource(ctx context.Context, name, password string) error {
+	src, err := e.reg.GetSourceByName(name)
+	if err != nil {
+		return fmt.Errorf("source %q: %w", name, err)
+	}
+	if src.State != registry.SourceReady {
+		return fmt.Errorf("source %q is %s, not ready", name, src.State)
+	}
+	newVol := cow.SourceVolumeName(name, src.Generation+1)
+	if err := e.drv.CreateVolume(ctx, newVol, map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": name}); err != nil {
+		return err
+	}
+	err = pgctl.Seed(ctx, e.drv, pgctl.SeedSpec{
+		Image: e.image(src.PGVersion), Volume: newVol, Network: src.Network,
+		Host: src.ConnHost, Port: src.ConnPort, User: src.ConnUser, Password: password,
+	})
+	if err != nil {
+		e.drv.RemoveVolume(context.WithoutCancel(ctx), newVol)
+		return fmt.Errorf("refresh source %q: %w", name, err)
+	}
+	oldVol := src.Volume
+	if err := e.reg.BumpSourceGeneration(src.ID, newVol); err != nil {
+		return err
+	}
+	e.gcSourceVolume(ctx, src.ID, oldVol)
+	return nil
+}
+
+// RemoveSource deletes a source's volume and registry row. Refused while any
+// live branch still uses the source.
+func (e *Engine) RemoveSource(ctx context.Context, name string) error {
+	src, err := e.reg.GetSourceByName(name)
+	if err != nil {
+		return fmt.Errorf("source %q: %w", name, err)
+	}
+	n, err := e.reg.CountLiveBranchesBySource(src.ID)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return fmt.Errorf("source %q has %d live branch(es); destroy them first", name, n)
+	}
+	if err := e.drv.RemoveVolume(ctx, src.Volume); err != nil && src.State == registry.SourceReady {
+		// failed sources may have no volume (seed cleanup removed it)
+		return fmt.Errorf("remove source volume: %w", err)
+	}
+	return e.reg.DeleteSource(src.ID)
+}
+
+// ReapExpired destroys every ready/failed branch whose TTL has passed.
+// Called by branchd's reaper loop; now is injected for testability.
+func (e *Engine) ReapExpired(ctx context.Context, now time.Time) (destroyed []string, err error) {
+	expired, err := e.reg.ListExpiredBranches(now.UTC().Format(time.RFC3339))
+	if err != nil {
+		return nil, err
+	}
+	var errs []error
+	for _, b := range expired {
+		if derr := e.DestroyBranch(ctx, b.Name); derr != nil {
+			errs = append(errs, fmt.Errorf("reap %q: %w", b.Name, derr))
+			continue
+		}
+		destroyed = append(destroyed, b.Name)
+	}
+	return destroyed, errors.Join(errs...)
 }
 
 // Reconcile aligns the registry with reality at startup: stuck 'creating'

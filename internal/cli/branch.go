@@ -27,7 +27,7 @@ func newBranchCreateCmd() *cobra.Command {
 			}
 			defer reg.Close()
 			start := time.Now()
-			b, err := e.CreateBranch(cmd.Context(), args[0], from)
+			b, err := e.CreateBranch(cmd.Context(), args[0], from, 0)
 			if err != nil {
 				return err
 			}

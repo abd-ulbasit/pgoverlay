@@ -76,7 +76,7 @@ func TestEndToEndBranching(t *testing.T) {
 	t.Cleanup(func() { d.RemoveVolume(context.Background(), src.Volume) })
 
 	start := time.Now()
-	b1, err := e.CreateBranch(ctx, "pr-1", "main")
+	b1, err := e.CreateBranch(ctx, "pr-1", "main", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestEndToEndBranching(t *testing.T) {
 		t.Fatalf("source mutated! sum=%d", n)
 	}
 	// second branch is isolated from first
-	b2, err := e.CreateBranch(ctx, "pr-2", "main")
+	b2, err := e.CreateBranch(ctx, "pr-2", "main", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,7 @@ package cow
 
 import (
 	_ "embed"
+	"fmt"
 	"strings"
 )
 
@@ -22,7 +23,14 @@ type Plan struct {
 	Lowers       []string // in overlay order, topmost first
 }
 
-func SourceVolumeName(source string) string   { return "pgbranch-src-" + source }
+// SourceVolumeName names a source's seed volume for a given generation.
+// Generation 1 keeps the legacy Phase 1 name so existing volumes keep working.
+func SourceVolumeName(source string, gen int) string {
+	if gen <= 1 {
+		return "pgbranch-src-" + source
+	}
+	return fmt.Sprintf("pgbranch-src-%s-g%d", source, gen)
+}
 func BranchRWVolumeName(branch string) string { return "pgbranch-br-" + branch + "-rw" }
 
 func PlanBranch(branchName, sourceVolume string) Plan {

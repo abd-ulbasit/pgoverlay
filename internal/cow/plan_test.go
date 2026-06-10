@@ -5,6 +5,19 @@ import (
 	"testing"
 )
 
+func TestSourceVolumeName(t *testing.T) {
+	// gen 1 keeps the legacy P1 name for backward compat with existing volumes
+	if got := SourceVolumeName("main", 1); got != "pgbranch-src-main" {
+		t.Fatalf("gen1=%q", got)
+	}
+	if got := SourceVolumeName("main", 2); got != "pgbranch-src-main-g2" {
+		t.Fatalf("gen2=%q", got)
+	}
+	if got := SourceVolumeName("main", 10); got != "pgbranch-src-main-g10" {
+		t.Fatalf("gen10=%q", got)
+	}
+}
+
 func TestPlanBranch(t *testing.T) {
 	p := PlanBranch("pr-1", "pgbranch-src-main")
 	if p.RWVolume != "pgbranch-br-pr-1-rw" {
