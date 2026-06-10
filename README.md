@@ -24,7 +24,7 @@ pgbranch takes the middle path: plain Docker, plain Postgres images, and Overlay
 Requirements: Docker (Colima works on macOS), Go 1.26+ to build. The source database needs `wal_level=replica` and a user with `REPLICATION` privilege (pg_basebackup does the seeding).
 
 ```bash
-make build   # produces ./bin/pgb
+make build   # produces ./bin/pgb (CLI) and ./bin/branchd (daemon)
 ```
 
 Demo source (skip if you already have a Postgres reachable from containers):
@@ -65,6 +65,60 @@ docker rm -f demo-src
 ```
 
 `--host` must be reachable *from containers* (use `host.docker.internal` for a host-local DB, or `--network <net>` for a DB on a Docker network). The password is read from the env var named by `--password-env` (default `PGPASSWORD`). State lives in `~/.pgbranch` (override with `PGBRANCH_HOME`).
+
+Branches can self-destruct (`--ttl 24h`, reaped by `branchd`), be reset to their source snapshot (`pgb branch reset pr-1` — discards all writes, new container/port), and sources can be re-seeded (`pgb source refresh main` — existing branches keep their old snapshot; new branches see the fresh one) or removed (`pgb source rm main`).
+
+## Run the server (`branchd`)
+
+`branchd` is the daemon form: a REST API and a Postgres wire-protocol router in one process, sharing the engine the CLI embeds, plus a TTL reaper for abandoned branches.
+
+```bash
+make build                       # produces ./bin/pgb and ./bin/branchd
+PGBRANCH_TOKEN=$(openssl rand -hex 16) ./bin/branchd
+# 2026/06/10 12:00:00 REST API listening on :7070
+# 2026/06/10 12:00:00 pg router listening on :6432 (connect with dbname@branch)
+```
+
+Flags: `--api-addr :7070` (REST), `--pg-addr :6432` (router), `--reap-interval 30s` (TTL reaper tick). `PGBRANCH_TOKEN` is required — branchd refuses to start without it; every `/v1` request needs `Authorization: Bearer <token>` (`GET /healthz` is open). `SIGINT`/`SIGTERM` shut down gracefully and leave branch containers running.
+
+REST API:
+
+```bash
+AUTH="Authorization: Bearer $PGBRANCH_TOKEN"
+
+# sources (the password is used for pg_basebackup only — never stored)
+curl -H "$AUTH" -d '{"name":"main","host":"host.docker.internal","port":5432,
+  "user":"postgres","pg_version":"17","password":"secret"}' localhost:7070/v1/sources
+curl -H "$AUTH" localhost:7070/v1/sources
+curl -H "$AUTH" -d '{"password":"secret"}' localhost:7070/v1/sources/main/refresh
+curl -H "$AUTH" -X DELETE localhost:7070/v1/sources/main
+
+# branches (ttl_seconds=0 or omitted = never reaped)
+curl -H "$AUTH" -d '{"name":"pr-42","source":"main","ttl_seconds":86400}' localhost:7070/v1/branches
+curl -H "$AUTH" localhost:7070/v1/branches
+curl -H "$AUTH" localhost:7070/v1/branches/pr-42
+curl -H "$AUTH" -X POST localhost:7070/v1/branches/pr-42/reset
+curl -H "$AUTH" -X DELETE localhost:7070/v1/branches/pr-42
+```
+
+**One stable endpoint for every branch.** Instead of chasing per-branch host ports, connect to the router on `:6432` with the branch name suffixed to the database:
+
+```bash
+psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
+```
+
+The router reads the startup message, resolves `pr-42` to its container, rewrites the database back to `postgres`, and relays bytes transparently from then on — authentication (including SCRAM) happens between your client and the branch's Postgres, untouched.
+
+The CLI drives a running branchd in server mode:
+
+```bash
+export PGBRANCH_SERVER=http://localhost:7070   # or --server per command
+export PGBRANCH_TOKEN=<same token as branchd>
+pgb branch create pr-42 --from main --ttl 24h
+pgb connect pr-42    # prints the direct-port URL and the :6432 proxy URL
+```
+
+Honest caveat: the registry is SQLite, which is single-writer. Don't run local-mode CLI commands (no `--server`) against the same `PGBRANCH_HOME` while branchd is running — use server mode; that's the supported combination.
 
 ## How it works
 
@@ -116,8 +170,8 @@ Phase 1 also branches only from sources, not from other branches (layer-DAG bran
 
 ## Roadmap
 
-- **Phase 2** — `pgproxy` wire-protocol router (one stable endpoint, route by branch name), REST API + auth (`branchd` daemon reusing the same engine), TTL reaper for abandoned branches, branch reset, branch-from-branch.
-- **Phase 3** — Kubernetes runtime driver, Helm chart, GitHub App (a branch per PR, automatically).
+- **Phase 2** ✅ — `pgproxy` wire-protocol router (one stable endpoint, route by branch name), REST API + auth (`branchd` daemon reusing the same engine), TTL reaper for abandoned branches, branch reset, source refresh with generations. Branch-from-branch moved to a later phase.
+- **Phase 3** — Kubernetes runtime driver, Helm chart, GitHub App (a branch per PR, automatically), branch-from-branch.
 - **Phase 4** — data masking hooks, web UI, ZFS backend as an alternative CoW engine, published benchmarks, docs site.
 
 ## Development
