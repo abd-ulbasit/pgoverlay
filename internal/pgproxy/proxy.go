@@ -7,6 +7,7 @@ package pgproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -46,6 +47,12 @@ type Proxy struct {
 	Resolver BranchResolver
 	// DialTimeout bounds the backend dial. Defaults to 5s.
 	DialTimeout time.Duration
+	// TLSConfig, when set, makes the proxy answer SSLRequest with 'S' and
+	// upgrade the client connection via a server-side TLS handshake before
+	// the startup message. When nil (default) SSLRequest is answered 'N' and
+	// the session stays plaintext. Backend dials are always plaintext
+	// (branches are local/cluster-internal).
+	TLSConfig *tls.Config
 }
 
 func New(r BranchResolver) *Proxy {
@@ -69,10 +76,12 @@ func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 	}
 }
 
-// handleConn drives the startup phase: answer SSLRequest with 'N', drop
-// CancelRequest silently, then route the StartupMessage.
+// handleConn drives the startup phase: answer SSLRequest ('S' + TLS upgrade
+// when TLSConfig is set, else 'N'), drop CancelRequest silently, then route
+// the StartupMessage.
 func (p *Proxy) handleConn(client net.Conn) {
-	defer client.Close()
+	defer func() { client.Close() }() // closure: client may be re-bound to the TLS conn
+	inTLS := false
 	for {
 		code, payload, err := readStartupFrame(client)
 		if err != nil {
@@ -83,9 +92,33 @@ func (p *Proxy) handleConn(client net.Conn) {
 			// No session map in P2; close silently per protocol (the server
 			// never replies to a cancel request).
 			return
-		case sslRequestCode, gssEncRequestCode:
-			// No TLS/GSS in P2: answer 'N'; the client proceeds in
-			// plaintext with a regular StartupMessage or disconnects.
+		case sslRequestCode:
+			if p.TLSConfig == nil {
+				// No TLS configured: answer 'N'; the client proceeds in
+				// plaintext with a regular StartupMessage or disconnects.
+				if _, err := client.Write([]byte{'N'}); err != nil {
+					return
+				}
+				continue
+			}
+			if inTLS {
+				// A second SSLRequest inside the TLS session is a protocol
+				// violation (matches the PG server's behavior).
+				writeRefusal(client, "08P01", "pgbranch: SSLRequest received after TLS was already established")
+				return
+			}
+			if _, err := client.Write([]byte{'S'}); err != nil {
+				return
+			}
+			tlsConn := tls.Server(client, p.TLSConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				return
+			}
+			client = tlsConn
+			inTLS = true
+			continue
+		case gssEncRequestCode:
+			// No GSS encryption: answer 'N' (with or without TLS).
 			if _, err := client.Write([]byte{'N'}); err != nil {
 				return
 			}

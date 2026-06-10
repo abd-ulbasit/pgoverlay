@@ -2,9 +2,16 @@ package pgproxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -30,6 +37,10 @@ func local(port int) string { return net.JoinHostPort("127.0.0.1", strconv.Itoa(
 
 // startProxy runs a Proxy on an ephemeral listener and returns its address.
 func startProxy(t *testing.T, r BranchResolver) string {
+	return startProxyWith(t, New(r))
+}
+
+func startProxyWith(t *testing.T, p *Proxy) string {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -37,8 +48,51 @@ func startProxy(t *testing.T, r BranchResolver) string {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go New(r).Serve(ctx, lis)
+	go p.Serve(ctx, lis)
 	return lis.Addr().String()
+}
+
+// testTLSConfig builds a server tls.Config from a fresh self-signed
+// certificate for 127.0.0.1/localhost.
+func testTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "pgbranch-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}
+}
+
+// sendSSLRequest writes a hand-rolled SSLRequest (length 8, magic 80877103)
+// and returns the server's one-byte answer ('S' or 'N').
+func sendSSLRequest(t *testing.T, conn net.Conn) byte {
+	t.Helper()
+	ssl := make([]byte, 8)
+	binary.BigEndian.PutUint32(ssl[:4], 8)
+	binary.BigEndian.PutUint32(ssl[4:], 80877103)
+	if _, err := conn.Write(ssl); err != nil {
+		t.Fatal(err)
+	}
+	resp := make([]byte, 1)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp[0]
 }
 
 func dialProxy(t *testing.T, addr string) net.Conn {
@@ -207,19 +261,8 @@ func TestSSLRequestAnsweredWithN(t *testing.T) {
 	addr := startProxy(t, fakeResolver{"pr-1": local(port)})
 	conn := dialProxy(t, addr)
 
-	// hand-rolled SSLRequest: length 8, magic 80877103
-	ssl := make([]byte, 8)
-	binary.BigEndian.PutUint32(ssl[:4], 8)
-	binary.BigEndian.PutUint32(ssl[4:], 80877103)
-	if _, err := conn.Write(ssl); err != nil {
-		t.Fatal(err)
-	}
-	resp := make([]byte, 1)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp[0] != 'N' {
-		t.Fatalf("SSLRequest answered %q, want 'N'", resp[0])
+	if got := sendSSLRequest(t, conn); got != 'N' {
+		t.Fatalf("SSLRequest answered %q, want 'N'", got)
 	}
 
 	// client proceeds plaintext with a normal startup on the same conn
@@ -229,6 +272,88 @@ func TestSSLRequestAnsweredWithN(t *testing.T) {
 		t.Fatal(err)
 	} else if _, ok := msg.(*pgproto3.AuthenticationOk); !ok {
 		t.Fatalf("got %T, want *AuthenticationOk", msg)
+	}
+}
+
+// TestSSLRequestUpgradesToTLS: with TLSConfig set the proxy answers 'S',
+// completes a TLS handshake, and then routes the startup message exactly as
+// in plaintext mode — including the database param rewrite and the relay.
+func TestSSLRequestUpgradesToTLS(t *testing.T) {
+	startupCh := make(chan *pgproto3.StartupMessage, 1)
+	port := fakeBackend(t, func(conn net.Conn, be *pgproto3.Backend, sm *pgproto3.StartupMessage) {
+		startupCh <- sm
+		be.Send(&pgproto3.AuthenticationOk{})
+		be.Flush()
+	})
+	p := New(fakeResolver{"pr-1": local(port)})
+	p.TLSConfig = testTLSConfig(t)
+	addr := startProxyWith(t, p)
+	conn := dialProxy(t, addr)
+
+	if got := sendSSLRequest(t, conn); got != 'S' {
+		t.Fatalf("SSLRequest answered %q, want 'S'", got)
+	}
+	tconn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	if err := tconn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake: %v", err)
+	}
+
+	fe := pgproto3.NewFrontend(tconn, tconn)
+	sendStartup(t, fe, map[string]string{"user": "alice", "database": "postgres@pr-1"})
+	sm := <-startupCh
+	if got := sm.Parameters["database"]; got != "postgres" {
+		t.Errorf("backend database = %q, want %q", got, "postgres")
+	}
+	// backend -> client relay works through the TLS wrap
+	if msg, err := fe.Receive(); err != nil {
+		t.Fatal(err)
+	} else if _, ok := msg.(*pgproto3.AuthenticationOk); !ok {
+		t.Fatalf("got %T, want *AuthenticationOk", msg)
+	}
+}
+
+// A second SSLRequest after the TLS wrap is a protocol violation: the proxy
+// refuses with 08P01 and closes.
+func TestSecondSSLRequestAfterTLSRefused(t *testing.T) {
+	p := New(fakeResolver{})
+	p.TLSConfig = testTLSConfig(t)
+	addr := startProxyWith(t, p)
+	conn := dialProxy(t, addr)
+
+	if got := sendSSLRequest(t, conn); got != 'S' {
+		t.Fatalf("SSLRequest answered %q, want 'S'", got)
+	}
+	tconn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	if err := tconn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake: %v", err)
+	}
+
+	// hand-rolled second SSLRequest, this time inside the TLS session
+	ssl := make([]byte, 8)
+	binary.BigEndian.PutUint32(ssl[:4], 8)
+	binary.BigEndian.PutUint32(ssl[4:], 80877103)
+	if _, err := tconn.Write(ssl); err != nil {
+		t.Fatal(err)
+	}
+	fe := pgproto3.NewFrontend(tconn, tconn)
+	er := recvError(t, fe)
+	if er.Code != "08P01" {
+		t.Errorf("code = %q, want 08P01", er.Code)
+	}
+	if _, err := fe.Receive(); err == nil {
+		t.Error("connection should be closed after refusal")
+	}
+}
+
+// Without TLSConfig the proxy keeps answering 'N' (legacy behavior) even if
+// the client retries the SSLRequest.
+func TestSSLRequestRepeatedWithoutTLSStaysN(t *testing.T) {
+	addr := startProxy(t, fakeResolver{})
+	conn := dialProxy(t, addr)
+	for i := 0; i < 2; i++ {
+		if got := sendSSLRequest(t, conn); got != 'N' {
+			t.Fatalf("SSLRequest #%d answered %q, want 'N'", i+1, got)
+		}
 	}
 }
 

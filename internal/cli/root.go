@@ -24,7 +24,7 @@ func NewRootCmd() *cobra.Command {
 		SilenceErrors: false,
 	}
 	root.PersistentFlags().String("server", os.Getenv("PGBRANCH_SERVER"),
-		"branchd base URL (e.g. http://localhost:7070); enables server mode [env PGBRANCH_SERVER, token from PGBRANCH_TOKEN]")
+		"branchd base URL (http:// or https://, e.g. http://localhost:7070); enables server mode [env PGBRANCH_SERVER, token from PGBRANCH_TOKEN; PGBRANCH_TLS_SKIP_VERIFY=1 for self-signed certs]")
 	root.AddCommand(newSourceCmd(), newBranchCmd(), newConnectCmd())
 	return root
 }

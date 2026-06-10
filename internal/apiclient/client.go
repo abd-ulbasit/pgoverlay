@@ -5,25 +5,36 @@ package apiclient
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
 )
 
 type Client struct {
-	BaseURL string // e.g. http://localhost:7070
+	BaseURL string // e.g. http://localhost:7070 or https://branchd.example:7070
 	Token   string // bearer token (PGBRANCH_TOKEN)
 	HTTP    *http.Client
 }
 
+// New builds a client for the given base URL (http or https). For branchd
+// instances serving a self-signed certificate, PGBRANCH_TLS_SKIP_VERIFY=1
+// disables certificate verification (read once, here).
 func New(baseURL, token string) *Client {
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: http.DefaultClient}
+	httpClient := http.DefaultClient
+	if os.Getenv("PGBRANCH_TLS_SKIP_VERIFY") == "1" {
+		httpClient = &http.Client{Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}}
+	}
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: httpClient}
 }
 
 // StatusError is returned for non-2xx responses; it carries the HTTP status

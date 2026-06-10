@@ -2,7 +2,14 @@ package pgproxy_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"strings"
@@ -17,6 +24,30 @@ import (
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 	"github.com/abd-ulbasit/pgbranch/internal/runtime"
 )
+
+// selfSignedTLSConfig builds a server tls.Config for 127.0.0.1/localhost.
+func selfSignedTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "pgbranch-it"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+}
 
 // TestProxyIntegration routes a real pgx connection through the proxy to a
 // real branch: database=postgres@proxy-pr-1, SCRAM password auth relayed untouched.
@@ -113,4 +144,39 @@ func TestProxyIntegration(t *testing.T) {
 	if !strings.Contains(err.Error(), `"nope"`) {
 		t.Errorf("unknown-branch error %q does not name the branch", err)
 	}
+
+	// TLS: a second proxy with a self-signed cert; pgx sslmode=require sends
+	// SSLRequest -> 'S' -> TLS handshake -> startup routes, SCRAM relayed.
+	tlsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsProxy := pgproxy.New(&pgproxy.RegistryResolver{Reg: reg})
+	tlsProxy.TLSConfig = selfSignedTLSConfig(t)
+	go tlsProxy.Serve(proxyCtx, tlsLis)
+	tlsAddr := tlsLis.Addr().String()
+
+	tlsConn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://postgres:secret@%s/postgres@proxy-pr-1?sslmode=require", tlsAddr))
+	if err != nil {
+		t.Fatalf("connect through TLS proxy (sslmode=require): %v", err)
+	}
+	if err := tlsConn.QueryRow(ctx, `SELECT count(*) FROM accounts`).Scan(&n); err != nil {
+		t.Fatalf("query through TLS proxy: %v", err)
+	}
+	if n != 1000 {
+		t.Fatalf("rows through TLS proxy = %d, want 1000", n)
+	}
+	tlsConn.Close(ctx)
+
+	// sslmode=disable against the plaintext proxy is unchanged ('N' path was
+	// exercised above); against the TLS proxy, plaintext startup still works
+	// because TLS is opportunistic (client chooses via SSLRequest).
+	plainConn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://postgres:secret@%s/postgres@proxy-pr-1?sslmode=disable", tlsAddr))
+	if err != nil {
+		t.Fatalf("plaintext connect to TLS-enabled proxy: %v", err)
+	}
+	if err := plainConn.QueryRow(ctx, `SELECT 1`).Scan(&n); err != nil {
+		t.Fatalf("plaintext query on TLS-enabled proxy: %v", err)
+	}
+	plainConn.Close(ctx)
 }

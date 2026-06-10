@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -39,15 +40,36 @@ func main() {
 
 // uiURL renders a clickable address for the embedded web UI from the API
 // listen address (":7070" -> "http://localhost:7070/ui/").
-func uiURL(apiAddr string) string {
+func uiURL(apiAddr string, tlsEnabled bool) string {
+	scheme := "http"
+	if tlsEnabled {
+		scheme = "https"
+	}
 	host, port, err := net.SplitHostPort(apiAddr)
 	if err != nil {
-		return "http://" + apiAddr + "/ui/"
+		return scheme + "://" + apiAddr + "/ui/"
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "localhost"
 	}
-	return fmt.Sprintf("http://%s/ui/", net.JoinHostPort(host, port))
+	return fmt.Sprintf("%s://%s/ui/", scheme, net.JoinHostPort(host, port))
+}
+
+// tlsConfigFromFlags loads an optional PEM cert/key flag pair (--<name>-tls-cert
+// / --<name>-tls-key). Both empty = TLS off (nil config); one without the
+// other is a startup error.
+func tlsConfigFromFlags(certFile, keyFile, name string) (*tls.Config, error) {
+	if certFile == "" && keyFile == "" {
+		return nil, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf("--%s-tls-cert and --%s-tls-key must be set together", name, name)
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load --%s-tls-cert/--%s-tls-key: %w", name, name, err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
 }
 
 func run() error {
@@ -61,7 +83,20 @@ func run() error {
 	kubeconfig := flag.String("kubeconfig", "", "kubeconfig path (default: in-cluster config, then KUBECONFIG / ~/.kube/config)")
 	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default) or zfs (experimental, see docs/zfs.md)")
 	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgbranch datasets, e.g. tank/pgbranch (required with --cow zfs)")
+	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
+	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
+	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
+	pgTLSKey := flag.String("pg-tls-key", "", "PEM private key for the Postgres router (requires --pg-tls-cert)")
 	flag.Parse()
+
+	apiTLS, err := tlsConfigFromFlags(*apiTLSCert, *apiTLSKey, "api")
+	if err != nil {
+		return err
+	}
+	pgTLS, err := tlsConfigFromFlags(*pgTLSCert, *pgTLSKey, "pg")
+	if err != nil {
+		return err
+	}
 
 	token := os.Getenv("PGBRANCH_TOKEN")
 	if token == "" {
@@ -121,12 +156,19 @@ func run() error {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	// REST API
+	// REST API (plain listener, wrapped with TLS when --api-tls-* is set)
+	apiLis, err := net.Listen("tcp", *apiAddr)
+	if err != nil {
+		return fmt.Errorf("api listen: %w", err)
+	}
+	if apiTLS != nil {
+		apiLis = tls.NewListener(apiLis, apiTLS)
+	}
 	srv := &http.Server{Addr: *apiAddr, Handler: api.New(eng, reg, token).Handler()}
 	g.Go(func() error {
-		log.Printf("REST API listening on %s", *apiAddr)
-		log.Printf("web UI at %s", uiURL(*apiAddr))
-		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("REST API listening on %s (TLS %v)", *apiAddr, apiTLS != nil)
+		log.Printf("web UI at %s", uiURL(*apiAddr, apiTLS != nil))
+		if err := srv.Serve(apiLis); !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 		return nil
@@ -144,8 +186,10 @@ func run() error {
 		return fmt.Errorf("pg router listen: %w", err)
 	}
 	g.Go(func() error {
-		log.Printf("pg router listening on %s (connect with dbname@branch)", *pgAddr)
-		return pgproxy.New(&pgproxy.RegistryResolver{Reg: reg}).Serve(ctx, lis)
+		log.Printf("pg router listening on %s (connect with dbname@branch; TLS %v)", *pgAddr, pgTLS != nil)
+		px := pgproxy.New(&pgproxy.RegistryResolver{Reg: reg})
+		px.TLSConfig = pgTLS
+		return px.Serve(ctx, lis)
 	})
 
 	// TTL reaper

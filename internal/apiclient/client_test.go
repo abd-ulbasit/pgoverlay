@@ -192,3 +192,32 @@ func TestNotFoundErrorsAreDetectable(t *testing.T) {
 		t.Fatalf("409 must not be IsNotFound: %v", err)
 	}
 }
+
+// TestHTTPSBaseURL: the client works against https servers; with a
+// self-signed cert it fails verification by default and succeeds when
+// PGBRANCH_TLS_SKIP_VERIFY=1 is set (escape hatch for self-signed branchd).
+func TestHTTPSBaseURL(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]api.Branch{{Name: "pr-1"}})
+	}))
+	t.Cleanup(ts.Close)
+	if !strings.HasPrefix(ts.URL, "https://") {
+		t.Fatalf("test server URL %q is not https", ts.URL)
+	}
+
+	// default client: self-signed cert must be rejected
+	if _, err := New(ts.URL, "tok").ListBranches(context.Background()); err == nil {
+		t.Fatal("expected certificate verification error against self-signed server")
+	}
+
+	// escape hatch: PGBRANCH_TLS_SKIP_VERIFY=1
+	t.Setenv("PGBRANCH_TLS_SKIP_VERIFY", "1")
+	got, err := New(ts.URL, "tok").ListBranches(context.Background())
+	if err != nil {
+		t.Fatalf("with PGBRANCH_TLS_SKIP_VERIFY=1: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "pr-1" {
+		t.Fatalf("branches = %+v", got)
+	}
+}
