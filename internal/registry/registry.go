@@ -116,6 +116,76 @@ func (r *Registry) GetSourceByName(name string) (*Source, error) {
 	return scanSource(r.db.QueryRow(`SELECT `+sourceCols+` FROM sources WHERE name=?`, name))
 }
 
+var legalBranch = map[BranchState][]BranchState{
+	BranchCreating:   {BranchReady, BranchFailed},
+	BranchReady:      {BranchDestroying},
+	BranchFailed:     {BranchDestroying},
+	BranchDestroying: {BranchDestroyed},
+}
+
+func (r *Registry) CreateBranch(b *Branch) error {
+	b.ID, b.State = newID(), BranchCreating
+	_, err := r.db.Exec(`INSERT INTO branches (id,name,source_id,state,rw_volume) VALUES (?,?,?,?,?)`,
+		b.ID, b.Name, b.SourceID, b.State, b.RWVolume)
+	if err != nil {
+		return fmt.Errorf("create branch %q: %w", b.Name, err)
+	}
+	return r.journal("branch", b.ID, "", string(BranchCreating), "created")
+}
+
+func (r *Registry) TransitionBranch(id string, to BranchState, reason string) error {
+	b, err := r.getBranch(`id=?`, id)
+	if err != nil {
+		return err
+	}
+	for _, ok := range legalBranch[b.State] {
+		if ok == to {
+			return r.setState("branches", "branch", id, string(to), reason)
+		}
+	}
+	return fmt.Errorf("illegal branch transition %s -> %s", b.State, to)
+}
+
+func (r *Registry) MarkBranchReady(id, containerID string, port int) error {
+	if _, err := r.db.Exec(`UPDATE branches SET container_id=?, port=? WHERE id=?`, containerID, port, id); err != nil {
+		return err
+	}
+	return r.TransitionBranch(id, BranchReady, "instance running")
+}
+
+const branchCols = `id,name,source_id,state,container_id,rw_volume,port,created_at`
+
+func (r *Registry) getBranch(where string, args ...any) (*Branch, error) {
+	b := &Branch{}
+	err := r.db.QueryRow(`SELECT `+branchCols+` FROM branches WHERE `+where, args...).
+		Scan(&b.ID, &b.Name, &b.SourceID, &b.State, &b.ContainerID, &b.RWVolume, &b.Port, &b.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return b, err
+}
+
+func (r *Registry) GetBranchByName(name string) (*Branch, error) {
+	return r.getBranch(`name=? AND state!='destroyed'`, name)
+}
+
+func (r *Registry) ListLiveBranches() ([]*Branch, error) {
+	rows, err := r.db.Query(`SELECT ` + branchCols + ` FROM branches WHERE state!='destroyed' ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Branch
+	for rows.Next() {
+		b := &Branch{}
+		if err := rows.Scan(&b.ID, &b.Name, &b.SourceID, &b.State, &b.ContainerID, &b.RWVolume, &b.Port, &b.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 func (r *Registry) ListSources() ([]*Source, error) {
 	rows, err := r.db.Query(`SELECT ` + sourceCols + ` FROM sources ORDER BY created_at`)
 	if err != nil {
