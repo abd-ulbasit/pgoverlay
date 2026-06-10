@@ -66,11 +66,19 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 // ready. Every step registers a compensation that unwinds (in reverse order)
 // on failure; the caller owns the state transition to failed. The layer
 // steps depend on the cow backend (overlay volumes vs zfs snapshot+clone).
+//
+// Overlay branches stack on their own base chain: frozen layers (if any,
+// newest first) over the source volume — so resetting a branch created from
+// another branch returns it to that parent-derived base, not to the source.
 func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registry.Source) error {
 	if e.zfs() {
 		return e.provisionZFS(ctx, b, src)
 	}
-	plan := cow.PlanBranch(b.Name, b.SourceVolume)
+	chain, err := e.reg.LayerChain(b.ID)
+	if err != nil {
+		return err
+	}
+	plan := cow.PlanBranch(b.RWVolume, b.SourceVolume, layerVolumes(chain))
 
 	var undo []func()
 	fail := func(stepErr error) error {
@@ -88,30 +96,12 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	undo = append(undo, func() { e.drv.RemoveVolume(bg, plan.RWVolume) })
 
 	// 2. write entrypoint into the rw volume
-	if _, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
-		Image:  "alpine:3.21",
-		Cmd:    []string{"sh", "-c", `printf '%s' "$PGBRANCH_ENTRYPOINT" > /pgbranch/rw/entrypoint.sh && chmod 0755 /pgbranch/rw/entrypoint.sh && mkdir -p /pgbranch/rw/upper /pgbranch/rw/work`},
-		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScript},
-		Mounts: []runtime.Mount{{Volume: plan.RWVolume, Target: cow.RWPath}},
-	}); err != nil {
+	if err := e.installOverlayEntrypoint(ctx, plan.RWVolume); err != nil {
 		return fail(fmt.Errorf("install entrypoint: %w", err))
 	}
 
 	// 3. branch container
-	cid, err := e.drv.StartBranch(ctx, runtime.BranchSpec{
-		Name:  "pgbranch-br-" + b.Name,
-		Image: e.image(src.PGVersion),
-		Env: []string{
-			"PGDATA=" + cow.MergedPath,
-			"PGBRANCH_LOWERS=" + plan.LowerEnv(),
-		},
-		Mounts: []runtime.Mount{
-			{Volume: plan.SourceVolume, Target: "/pgbranch/lower0", ReadOnly: true},
-			{Volume: plan.RWVolume, Target: cow.RWPath},
-		},
-		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
-		Labels:     branchLabels(b),
-	})
+	cid, err := e.startOverlayBranch(ctx, b.Name, plan, e.image(src.PGVersion), branchLabels(b))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -122,6 +112,54 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 		return fail(err)
 	}
 	return nil
+}
+
+// layerVolumes projects a layer chain (topmost first) onto its volume names.
+func layerVolumes(chain []registry.Layer) []string {
+	if len(chain) == 0 {
+		return nil
+	}
+	out := make([]string, len(chain))
+	for i, l := range chain {
+		out[i] = l.Volume
+	}
+	return out
+}
+
+// installOverlayEntrypoint writes the overlay entrypoint script into a rw
+// volume and prepares its upper/work dirs.
+func (e *Engine) installOverlayEntrypoint(ctx context.Context, rwVolume string) error {
+	_, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
+		Image:  "alpine:3.21",
+		Cmd:    []string{"sh", "-c", `printf '%s' "$PGBRANCH_ENTRYPOINT" > /pgbranch/rw/entrypoint.sh && chmod 0755 /pgbranch/rw/entrypoint.sh && mkdir -p /pgbranch/rw/upper /pgbranch/rw/work`},
+		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScript},
+		Mounts: []runtime.Mount{{Volume: rwVolume, Target: cow.RWPath}},
+	})
+	return err
+}
+
+// startOverlayBranch starts a branch container assembling the overlay stack
+// from plan: source volume ro at lower0, frozen layer volumes (newest first)
+// ro at lower1..N, the rw volume at RWPath. PGBRANCH_LOWERS lists the overlay
+// lowerdirs newest-first with the source last (see cow.PlanBranch).
+func (e *Engine) startOverlayBranch(ctx context.Context, name string, plan cow.Plan, image string, labels map[string]string) (string, error) {
+	mounts := make([]runtime.Mount, 0, len(plan.LayerVolumes)+2)
+	mounts = append(mounts, runtime.Mount{Volume: plan.SourceVolume, Target: cow.LowerMountTarget(0), ReadOnly: true})
+	for i, lv := range plan.LayerVolumes {
+		mounts = append(mounts, runtime.Mount{Volume: lv, Target: cow.LowerMountTarget(i + 1), ReadOnly: true})
+	}
+	mounts = append(mounts, runtime.Mount{Volume: plan.RWVolume, Target: cow.RWPath})
+	return e.drv.StartBranch(ctx, runtime.BranchSpec{
+		Name:  "pgbranch-br-" + name,
+		Image: image,
+		Env: []string{
+			"PGDATA=" + cow.MergedPath,
+			"PGBRANCH_LOWERS=" + plan.LowerEnv(),
+		},
+		Mounts:     mounts,
+		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
+		Labels:     labels,
+	})
 }
 
 // provisionZFS is provision's layer half for the zfs backend: instead of an
@@ -251,6 +289,17 @@ func (e *Engine) applyMasking(ctx context.Context, cid string, src *registry.Sou
 	if err != nil {
 		return fmt.Errorf("load mask scripts: %w", err)
 	}
+	for _, sc := range scripts {
+		if err := e.drv.Exec(ctx, cid, psqlCmd(src, sc.SQL)); err != nil {
+			return fmt.Errorf("masking script %q: %w", sc.Name, err)
+		}
+	}
+	return nil
+}
+
+// psqlCmd builds an in-container psql invocation over the local socket
+// (peer/local auth — no password needed) with the source's user/database.
+func psqlCmd(src *registry.Source, sql string) []string {
 	user, db := src.ConnUser, src.ConnDB
 	if user == "" {
 		user = "postgres"
@@ -258,12 +307,7 @@ func (e *Engine) applyMasking(ctx context.Context, cid string, src *registry.Sou
 	if db == "" {
 		db = "postgres"
 	}
-	for _, sc := range scripts {
-		if err := e.drv.Exec(ctx, cid, []string{"psql", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", db, "-c", sc.SQL}); err != nil {
-			return fmt.Errorf("masking script %q: %w", sc.Name, err)
-		}
-	}
-	return nil
+	return []string{"psql", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", db, "-c", sql}
 }
 
 func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duration) error {
@@ -288,6 +332,20 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	// zfs children clone snapshots taken on the parent's dataset, so a zfs
+	// parent cannot go while children live (overlay parents can: the frozen
+	// layer volumes keep children alive).
+	if e.zfs() {
+		if n, err := e.reg.CountLiveBranchesByVolume(b.RWVolume); err != nil {
+			return err
+		} else if n > 0 {
+			return fmt.Errorf("branch %q has %d child branch(es) cloned from it; destroy them first", name, n)
+		}
+	}
+	chain, err := e.reg.LayerChain(b.ID)
+	if err != nil {
+		return err
+	}
 	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
 		return err
 	}
@@ -302,10 +360,29 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) error {
 	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroyed, ""); err != nil {
 		return err
 	}
-	// the destroyed branch may have been the last reference to an
-	// old-generation source volume
+	// the destroyed branch may have been the last reference to its frozen
+	// layer chain and/or an old-generation source volume
+	e.gcLayers(ctx, chain)
 	e.gcSourceVolume(ctx, b.SourceID, b.SourceVolume)
 	return nil
+}
+
+// gcLayers removes frozen layers with zero remaining references, walking the
+// chain topmost-first: any branch referencing a layer also references all of
+// that layer's ancestors, so the first still-referenced layer stops the
+// cascade. Best-effort, like gcSourceVolume.
+func (e *Engine) gcLayers(ctx context.Context, chain []registry.Layer) {
+	for _, l := range chain {
+		if n, err := e.reg.CountBranchesReferencingLayer(l.ID); err != nil || n > 0 {
+			return
+		}
+		if err := e.removeSourceLayer(ctx, l.Volume); err != nil {
+			return
+		}
+		if err := e.reg.DeleteLayer(l.ID); err != nil {
+			return
+		}
+	}
 }
 
 // gcSourceVolume removes an old-generation source volume once it is no
@@ -319,6 +396,11 @@ func (e *Engine) gcSourceVolume(ctx context.Context, sourceID, volume string) {
 		return // current generation stays
 	}
 	if n, err := e.reg.CountLiveBranchesByVolume(volume); err != nil || n > 0 {
+		return
+	}
+	// a zfs child's "source volume" is its parent's clone dataset — never GC
+	// a volume that is some live branch's writable layer
+	if n, err := e.reg.CountLiveBranchesByRWVolume(volume); err != nil || n > 0 {
 		return
 	}
 	e.removeSourceLayer(ctx, volume)

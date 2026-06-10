@@ -19,7 +19,7 @@ func TestSourceVolumeName(t *testing.T) {
 }
 
 func TestPlanBranch(t *testing.T) {
-	p := PlanBranch("pr-1", "pgbranch-src-main")
+	p := PlanBranch("pgbranch-br-pr-1-rw", "pgbranch-src-main", nil)
 	if p.RWVolume != "pgbranch-br-pr-1-rw" {
 		t.Fatalf("RWVolume=%q", p.RWVolume)
 	}
@@ -31,6 +31,71 @@ func TestPlanBranch(t *testing.T) {
 	}
 	if p.SourceVolume != "pgbranch-src-main" {
 		t.Fatalf("SourceVolume=%q", p.SourceVolume)
+	}
+	if len(p.LayerVolumes) != 0 {
+		t.Fatalf("LayerVolumes=%v want none", p.LayerVolumes)
+	}
+}
+
+// PlanBranch with frozen layers: layer volumes are given newest-first and
+// mount at /pgbranch/lower1..N; each frozen rw volume holds its writes in an
+// upper/ subdir, so its overlay lower path is <mount>/upper. lowerdir order
+// (= PGBRANCH_LOWERS) is NEWEST layer first, source volume LAST.
+func TestPlanBranchWithLayerChain(t *testing.T) {
+	cases := []struct {
+		name       string
+		layers     []string
+		wantLowers string
+	}{
+		{"no layers", nil, "/pgbranch/lower0/data"},
+		{"one layer", []string{"pgbranch-br-p-rw"},
+			"/pgbranch/lower1/upper:/pgbranch/lower0/data"},
+		{"two layers", []string{"pgbranch-br-p-rw-g2", "pgbranch-br-p-rw"},
+			"/pgbranch/lower1/upper:/pgbranch/lower2/upper:/pgbranch/lower0/data"},
+	}
+	for _, c := range cases {
+		p := PlanBranch("pgbranch-br-c-rw", "pgbranch-src-main", c.layers)
+		if got := p.LowerEnv(); got != c.wantLowers {
+			t.Errorf("%s: LowerEnv=%q want %q", c.name, got, c.wantLowers)
+		}
+		if got := strings.Join(p.Lowers, ":"); got != c.wantLowers {
+			t.Errorf("%s: Lowers=%v want %q", c.name, p.Lowers, c.wantLowers)
+		}
+		if len(p.LayerVolumes) != len(c.layers) {
+			t.Errorf("%s: LayerVolumes=%v want %v", c.name, p.LayerVolumes, c.layers)
+		}
+		for i := range c.layers {
+			if p.LayerVolumes[i] != c.layers[i] {
+				t.Errorf("%s: LayerVolumes[%d]=%q want %q (order must be preserved: newest first)", c.name, i, p.LayerVolumes[i], c.layers[i])
+			}
+		}
+		if p.SourceVolume != "pgbranch-src-main" || p.RWVolume != "pgbranch-br-c-rw" {
+			t.Errorf("%s: plan %+v", c.name, p)
+		}
+	}
+}
+
+// LowerMountTarget maps a lower index to its in-container mount point.
+func TestLowerMountTarget(t *testing.T) {
+	if got := LowerMountTarget(0); got != "/pgbranch/lower0" {
+		t.Fatalf("LowerMountTarget(0)=%q", got)
+	}
+	if got := LowerMountTarget(2); got != "/pgbranch/lower2" {
+		t.Fatalf("LowerMountTarget(2)=%q", got)
+	}
+}
+
+// BranchRWVolumeNameGen names the fresh rw volume a branch moves onto after
+// each freeze; gen 1 is the original (legacy) name.
+func TestBranchRWVolumeNameGen(t *testing.T) {
+	if got := BranchRWVolumeNameGen("pr-1", 1); got != "pgbranch-br-pr-1-rw" {
+		t.Fatalf("gen1=%q", got)
+	}
+	if got := BranchRWVolumeNameGen("pr-1", 2); got != "pgbranch-br-pr-1-rw-g2" {
+		t.Fatalf("gen2=%q", got)
+	}
+	if got := BranchRWVolumeNameGen("pr-1", 3); got != "pgbranch-br-pr-1-rw-g3" {
+		t.Fatalf("gen3=%q", got)
 	}
 }
 

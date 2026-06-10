@@ -109,7 +109,8 @@ func (p Planner) ZFSUsed(dataset string) []string {
 type Plan struct {
 	SourceVolume string   // mounted ro at /pgbranch/lower0
 	RWVolume     string   // upper+work live here
-	Lowers       []string // in overlay order, topmost first
+	LayerVolumes []string // frozen layer volumes, NEWEST first, mounted ro at /pgbranch/lower1..N
+	Lowers       []string // in overlay order, topmost (newest) first, source last
 }
 
 // SourceVolumeName names a source's seed volume for a given generation.
@@ -122,14 +123,41 @@ func SourceVolumeName(source string, gen int) string {
 }
 func BranchRWVolumeName(branch string) string { return "pgbranch-br-" + branch + "-rw" }
 
-func PlanBranch(branchName, sourceVolume string) Plan {
+// BranchRWVolumeNameGen names a branch's writable volume after gen-1 freezes:
+// every freeze turns the current rw volume into an immutable layer (keeping
+// its name) and moves the branch onto a fresh volume. Gen 1 is the original
+// (legacy) name.
+func BranchRWVolumeNameGen(branch string, gen int) string {
+	if gen <= 1 {
+		return BranchRWVolumeName(branch)
+	}
+	return fmt.Sprintf("%s-g%d", BranchRWVolumeName(branch), gen)
+}
+
+// LowerMountTarget is the in-container mount point of lower layer i
+// (0 = the source volume, 1..N = frozen layer volumes, newest first).
+func LowerMountTarget(i int) string { return fmt.Sprintf("/pgbranch/lower%d", i) }
+
+// PlanBranch lays out a branch's overlay: rwVolume holds upper/work,
+// layerVolumes are the branch's frozen layer chain (NEWEST first, possibly
+// empty), and the overlay lowerdir stacks newest layer first with the source
+// volume last.
+func PlanBranch(rwVolume, sourceVolume string, layerVolumes []string) Plan {
+	lowers := make([]string, 0, len(layerVolumes)+1)
+	for i := range layerVolumes {
+		// A frozen rw volume contains upper/, work/ and entrypoint.sh; only
+		// its upper/ subdir is overlay content.
+		lowers = append(lowers, LowerMountTarget(i+1)+"/upper")
+	}
+	// Seeding writes the cluster into a data/ subdir of the source volume
+	// (pg_basebackup creates it 0700-owned by uid 999), so the overlay
+	// lower is <mountpoint>/data.
+	lowers = append(lowers, LowerMountTarget(0)+"/data")
 	return Plan{
 		SourceVolume: sourceVolume,
-		RWVolume:     BranchRWVolumeName(branchName),
-		// Seeding writes the cluster into a data/ subdir of the source volume
-		// (pg_basebackup creates it 0700-owned by uid 999), so the overlay
-		// lower is <mountpoint>/data.
-		Lowers: []string{"/pgbranch/lower0/data"},
+		RWVolume:     rwVolume,
+		LayerVolumes: layerVolumes,
+		Lowers:       lowers,
 	}
 }
 

@@ -96,8 +96,9 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 	return nil
 }
 
-// RemoveSource deletes a source's volume and registry row. Refused while any
-// live branch still uses the source.
+// RemoveSource deletes a source's volume, its orphaned frozen layers, and
+// the registry rows. Refused while any live branch still uses the source or
+// (defensively) while any layer is still referenced.
 func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 	src, err := e.reg.GetSourceByName(name)
 	if err != nil {
@@ -110,10 +111,29 @@ func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 	if n > 0 {
 		return fmt.Errorf("source %q has %d live branch(es); destroy them first", name, n)
 	}
+	// with no live branches every layer must be zero-ref (references come
+	// from live branches only); GC any orphans best-effort GC left behind
+	layers, err := e.reg.ListLayersBySource(src.ID)
+	if err != nil {
+		return err
+	}
+	for _, l := range layers {
+		if n, err := e.reg.CountBranchesReferencingLayer(l.ID); err != nil {
+			return err
+		} else if n > 0 {
+			return fmt.Errorf("source %q has a frozen layer (%s) still referenced by %d live branch(es); destroy them first", name, l.Volume, n)
+		}
+	}
+	for _, l := range layers {
+		if err := e.removeSourceLayer(ctx, l.Volume); err != nil {
+			return fmt.Errorf("remove layer volume %q: %w", l.Volume, err)
+		}
+	}
 	if err := e.removeSourceLayer(ctx, src.Volume); err != nil && src.State == registry.SourceReady {
 		// failed sources may have no layer (seed cleanup removed it)
 		return fmt.Errorf("remove source layer: %w", err)
 	}
+	// DeleteSource cascades the layer rows
 	return e.reg.DeleteSource(src.ID)
 }
 

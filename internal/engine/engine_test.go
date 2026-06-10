@@ -13,17 +13,20 @@ import (
 )
 
 type fakeDriver struct {
-	volumes    map[string]bool
-	containers map[string]bool
-	failStart  bool
-	execErr    error
-	psqlErr    error                // returned by Exec for psql commands only (fails masking)
-	helperErr  error                // returned by RunHelper (fails seeding)
-	helperOut  string               // returned by RunHelper as captured output
-	helpers    []runtime.HelperSpec // every RunHelper call, in order
-	starts     int                  // StartBranch invocations
-	branches   []runtime.BranchSpec // every StartBranch call, in order
-	execs      [][]string           // every Exec call, in order
+	volumes       map[string]bool
+	containers    map[string]bool
+	failStart     bool
+	failStartAt   map[int]bool // fail the Nth StartBranch attempt (1-based, counts failures too)
+	startAttempts int
+	execErr       error
+	psqlErr       error                // returned by Exec for psql commands only (fails masking/checkpoint)
+	helperErr     error                // returned by RunHelper (fails seeding)
+	helperOut     string               // returned by RunHelper as captured output
+	helpers       []runtime.HelperSpec // every RunHelper call, in order
+	starts        int                  // successful StartBranch invocations
+	branches      []runtime.BranchSpec // every successful StartBranch call, in order
+	execs         [][]string           // every Exec call, in order
+	log           []string             // coarse op log for ordering assertions
 }
 
 func newFake() *fakeDriver {
@@ -32,6 +35,7 @@ func newFake() *fakeDriver {
 func (f *fakeDriver) EnsureImage(ctx context.Context, image string) error { return nil }
 func (f *fakeDriver) CreateVolume(ctx context.Context, name string, l map[string]string) error {
 	f.volumes[name] = true
+	f.log = append(f.log, "volume:"+name)
 	return nil
 }
 func (f *fakeDriver) RemoveVolume(ctx context.Context, name string) error {
@@ -43,20 +47,35 @@ func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (strin
 	return f.helperOut, f.helperErr
 }
 func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
-	if f.failStart {
+	f.startAttempts++
+	if f.failStart || f.failStartAt[f.startAttempts] {
 		return "", errors.New("boom")
 	}
 	f.starts++
 	f.branches = append(f.branches, s)
 	f.containers["cid-"+s.Name] = true
+	f.log = append(f.log, "start:"+s.Name)
 	return "cid-" + s.Name, nil
 }
 func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error {
 	f.execs = append(f.execs, cmd)
+	if len(cmd) > 0 {
+		f.log = append(f.log, "exec:"+cmd[0]+":"+id)
+	}
 	if len(cmd) > 0 && cmd[0] == "psql" && f.psqlErr != nil {
 		return f.psqlErr
 	}
 	return f.execErr
+}
+
+// logIndex returns the position of the first log entry containing substr.
+func (f *fakeDriver) logIndex(substr string) int {
+	for i, e := range f.log {
+		if strings.Contains(e, substr) {
+			return i
+		}
+	}
+	return -1
 }
 
 // psqlExecs returns the recorded Exec calls that ran psql (masking).
@@ -74,6 +93,7 @@ func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerI
 }
 func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 	delete(f.containers, id)
+	f.log = append(f.log, "stop:"+id)
 	return nil
 }
 func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, error) {

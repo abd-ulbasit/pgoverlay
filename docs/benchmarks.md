@@ -116,6 +116,27 @@ measured growth of an already-fully-copied-up rw layer — WAL plus dirtied heap
 pages only — and are not comparable to the post-fix probe, which pays
 whole-file copy-up at first write (see the note under Results).
 
+## Branch-from-branch
+
+Measured 2026-06-11 (Phase 5), one quick pass at ~1 GiB: a 1.12 GiB source
+(1M rows × ~1 KB, `pg_database_size` = 1,200,805,555 B), branch `b1` created,
+1% of rows updated on `b1` + `CHECKPOINT`, then `b2` created **from `b1`**
+three times (create/destroy cycles):
+
+| Database size | create-from-branch (p50 of 3) | individual runs |
+|---|---|---|
+| 1.12 GiB | **4.79 s** | 8.36 s, 4.79 s, 3.86 s |
+
+Branch-from-branch on the overlay backend is a *freeze*: the parent is
+checkpointed and stopped, its rw volume becomes an immutable layer, and both
+the parent and the child restart over that frozen layer chain — so a
+create-from-branch pays two Postgres startups (parent restart + child start)
+instead of one, roughly 2× a plain branch create (~1.9 s p50 above). No data
+is copied; the first (slowest) run replays the 1% UPDATE's WAL in both
+instances, later runs freeze a near-empty rw layer. The ZFS backend
+snapshots+clones the parent's dataset instead — no freeze or parent restart
+at all.
+
 ## Methodology
 
 Everything below is what `hack/benchmark.sh` does; run it yourself with

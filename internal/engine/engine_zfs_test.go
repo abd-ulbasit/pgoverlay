@@ -302,6 +302,121 @@ func TestZFSRefreshSourceCreatesNextGenerationDataset(t *testing.T) {
 	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/src-main-g1")
 }
 
+// ZFS branch-from-branch is block-level CoW: snapshot the parent's clone and
+// clone that. No freeze, no parent stop/restart, no layer rows.
+func TestZFSCreateBranchFromSnapshotsParentClone(t *testing.T) {
+	d := newFake()
+	e, r := zfsEngine(t, d)
+	src := readyZFSSource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.State != registry.BranchReady || b.ParentBranchName != "pr-1" {
+		t.Fatalf("child %+v", b)
+	}
+	if b.RWVolume != "tank/pgbranch/br-pr-2" || b.SourceVolume != "tank/pgbranch/br-pr-1" {
+		t.Fatalf("child datasets: rw=%q source=%q", b.RWVolume, b.SourceVolume)
+	}
+	// snapshot the PARENT'S CLONE, then clone it
+	findZFSHelper(t, d.helpers, "zfs snapshot tank/pgbranch/br-pr-1@br-pr-2")
+	findZFSHelper(t, d.helpers, "zfs clone tank/pgbranch/br-pr-1@br-pr-2 tank/pgbranch/br-pr-2")
+	// no freeze: the parent keeps running, is never checkpointed or restarted
+	if !d.containers["cid-pgbranch-br-pr-1"] {
+		t.Fatal("parent container was stopped")
+	}
+	if d.starts != 2 {
+		t.Fatalf("starts=%d want 2 (no parent restart)", d.starts)
+	}
+	for _, c := range d.psqlExecs() {
+		if c[len(c)-1] == "CHECKPOINT" {
+			t.Fatal("zfs branch-from-branch must not checkpoint the parent")
+		}
+	}
+	// block-level CoW needs no overlay layer rows
+	if layers, _ := r.ListLayersBySource(src.ID); len(layers) != 0 {
+		t.Fatalf("zfs mode created layer rows: %v", layers)
+	}
+	if b.BaseLayerID != "" {
+		t.Fatalf("zfs child has BaseLayerID %q", b.BaseLayerID)
+	}
+}
+
+// A zfs parent cannot be destroyed while children clone its snapshots; the
+// engine refuses instead of failing mid-destroy. And destroying the child
+// must never GC the parent's clone dataset as an "orphaned source volume".
+func TestZFSDestroyParentWithChildRefusedAndChildCleansUp(t *testing.T) {
+	d := newFake()
+	e, r := zfsEngine(t, d)
+	readyZFSSource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	err := e.DestroyBranch(context.Background(), "pr-1")
+	if err == nil || !strings.Contains(err.Error(), "child branch") {
+		t.Fatalf("destroy parent with live child: err=%v want child-branch refusal", err)
+	}
+	if b, _ := r.GetBranchByName("pr-1"); b.State != registry.BranchReady {
+		t.Fatalf("refused destroy mutated parent: %+v", b)
+	}
+
+	if err := e.DestroyBranch(context.Background(), "pr-2"); err != nil {
+		t.Fatal(err)
+	}
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-2")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-1@br-pr-2")
+	// the parent's live clone dataset must NOT have been destroyed by GC
+	for _, h := range d.helpers {
+		if strings.Contains(helperCmd(h), "zfs destroy -r tank/pgbranch/br-pr-1 ") ||
+			strings.HasSuffix(helperCmd(h), "zfs destroy -r tank/pgbranch/br-pr-1") {
+			t.Fatalf("child destroy GC'd the parent's clone: %q", helperCmd(h))
+		}
+	}
+	// with the child gone the parent destroys normally
+	if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
+		t.Fatal(err)
+	}
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-1")
+}
+
+// Resetting a zfs child re-clones from its parent's dataset, not the source.
+func TestZFSResetChildReclonesFromParent(t *testing.T) {
+	d := newFake()
+	e, r := zfsEngine(t, d)
+	readyZFSSource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ResetBranch(context.Background(), "pr-2"); err != nil {
+		t.Fatal(err)
+	}
+	count := func(substr string) (n int) {
+		for _, h := range d.helpers {
+			if strings.Contains(helperCmd(h), substr) {
+				n++
+			}
+		}
+		return
+	}
+	if n := count("zfs snapshot tank/pgbranch/br-pr-1@br-pr-2"); n != 2 {
+		t.Fatalf("parent snapshot invocations = %d, want 2 (create + reset)", n)
+	}
+	if n := count("zfs snapshot tank/pgbranch/src-main-g1@br-pr-2"); n != 0 {
+		t.Fatal("child reset snapshotted the SOURCE, want its parent")
+	}
+}
+
 func TestZFSDestroyHelpersAreIdempotent(t *testing.T) {
 	// destroy parity with `docker volume rm -f`: an already-absent dataset or
 	// snapshot must not fail the destroy (failed branches stay destroyable)
