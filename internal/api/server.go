@@ -35,11 +35,11 @@ type Branch struct {
 	Source string `json:"source"`
 	// Parent is the branch this one was created from (branch-from-branch);
 	// "" when created directly from the source.
-	Parent   string `json:"parent,omitempty"`
-	State string `json:"state"`
-	Host  string `json:"host"`
-	Port  int    `json:"port"`
-	User  string `json:"user"`
+	Parent string `json:"parent,omitempty"`
+	State  string `json:"state"`
+	Host   string `json:"host"`
+	Port   int    `json:"port"`
+	User   string `json:"user"`
 	// Password is the branch's own rotated password — present only when
 	// branchd runs with --rotate-branch-credentials; otherwise the branch
 	// inherits the source's credentials and the field is omitted.
