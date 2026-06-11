@@ -25,6 +25,14 @@ variable "cluster_name" {
   default = "pgbranch"
 }
 
+# EKS upgrades one minor version at a time: apply with -var cluster_version=
+# stepping 1.32 → 1.33 → ... when catching up across several versions.
+# Each node-group rollover RECYCLES the node — hostpath-mode branch data and
+# the branchd registry live on its disk and are lost (re-seed afterwards).
+variable "cluster_version" {
+  default = "1.36"
+}
+
 provider "aws" {
   region = var.region
 }
@@ -47,7 +55,7 @@ module "eks" {
   version = "~> 20.0"
 
   cluster_name    = var.cluster_name
-  cluster_version = "1.31"
+  cluster_version = var.cluster_version
 
   cluster_endpoint_public_access           = true
   enable_cluster_creator_admin_permissions = true
