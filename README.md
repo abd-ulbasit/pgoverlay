@@ -22,7 +22,7 @@ pgbranch takes the middle path: plain Docker, plain Postgres images, and Overlay
 
 ## Quickstart
 
-Requirements: Docker (Colima works on macOS), Go 1.26+ to build. The source database needs `wal_level=replica` and a user with `REPLICATION` privilege (pg_basebackup does the seeding).
+Requirements: Docker (Colima works on macOS), Go 1.26+ to build. The source database needs `wal_level=replica` and a user with `REPLICATION` privilege (pg_basebackup does the seeding) — or use `--via dump` for managed Postgres, see below.
 
 ```bash
 make build   # produces ./bin/pgb (CLI) and ./bin/branchd (daemon)
@@ -66,6 +66,17 @@ docker rm -f demo-src
 ```
 
 `--host` must be reachable *from containers* (use `host.docker.internal` for a host-local DB, or `--network <net>` for a DB on a Docker network). The password is read from the env var named by `--password-env` (default `PGPASSWORD`). State lives in `~/.pgbranch` (override with `PGBRANCH_HOME`).
+
+### Seeding from managed Postgres (Supabase, Neon, RDS)
+
+Managed providers don't allow physical replication connections, so `pg_basebackup` can't seed from them. `--via dump` seeds with `pg_dump` piped into a fresh cluster instead — it needs only a normal user (no `REPLICATION` privilege), and can be scoped to schemas:
+
+```bash
+PGPASSWORD=... ./bin/pgb source add prod --via dump --dump-schema public \
+  --host db.<ref>.supabase.co --port 5432 --user postgres --pg-version 17
+```
+
+`--pg-version` must be **>=** the remote server's major version (`pg_dump` cannot dump newer servers); branches run on `--pg-version`. A logical dump is slower than `pg_basebackup` at size, but branching afterwards is the same instant CoW either way.
 
 Branches can self-destruct (`--ttl 24h`, reaped by `branchd`), be reset to their source snapshot (`pgb branch reset pr-1` — discards all writes, new container/port), and sources can be re-seeded (`pgb source refresh main` — existing branches keep their old snapshot; new branches see the fresh one) or removed (`pgb source rm main`).
 

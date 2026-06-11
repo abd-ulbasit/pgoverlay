@@ -66,6 +66,21 @@ the branch's rw layer. `syncfs` replaces that per-file pass with one syscall
 and copies nothing up; it's what makes branch creation O(1) in data size
 (measured in [Benchmarks](benchmarks.md)).
 
+### Seeding: basebackup vs dump
+
+The seed itself has two methods. `pg_basebackup` (default) is a physical,
+crash-consistent copy: fast at size, but it requires `REPLICATION` privilege
+and a physical replication connection, which managed providers (Supabase,
+Neon, RDS, Cloud SQL) don't offer — and branches replay WAL on first start,
+as if the machine power-cycled at backup time. `--via dump` is a logical
+copy: a helper container runs `initdb` into the seed volume and pipes
+`pg_dump` from the remote into it, needing only a normal user, optionally
+scoped to schemas (`--dump-schema`). It is slower for large databases (full
+SQL restore, index rebuilds), but the resulting layer is a clean-shutdown
+cluster, so branches skip crash recovery entirely. Either way the seed is
+just a data dir in the source layer — everything downstream (overlay/zfs/csi
+branching, refresh generations, masking) is identical.
+
 ## The zfs backend (experimental)
 
 `branchd --cow zfs --zfs-dataset tank/pgbranch` swaps the layer mechanics:

@@ -5,7 +5,8 @@
 
 Requirements: Docker (Colima works on macOS), Go 1.26+ to build. The source
 database needs `wal_level=replica` and a user with `REPLICATION` privilege
-(`pg_basebackup` does the seeding).
+(`pg_basebackup` does the seeding) — or use `--via dump` for managed
+Postgres, see below.
 
 ```bash
 make build   # produces ./bin/pgb (CLI) and ./bin/branchd (daemon)
@@ -54,6 +55,24 @@ docker rm -f demo-src
 a host-local DB, or `--network <net>` for a DB on a Docker network). The
 password is read from the env var named by `--password-env` (default
 `PGPASSWORD`). State lives in `~/.pgbranch` (override with `PGBRANCH_HOME`).
+
+## Seeding from managed Postgres (Supabase, Neon, RDS)
+
+Managed providers don't allow physical replication connections, so
+`pg_basebackup` can't seed from them. `--via dump` seeds with `pg_dump` piped
+into a fresh cluster instead — it needs only a normal user (no `REPLICATION`
+privilege), and can be scoped to schemas with repeatable `--dump-schema`:
+
+```bash
+PGPASSWORD=... ./bin/pgb source add prod --via dump --dump-schema public \
+  --host db.<ref>.supabase.co --port 5432 --user postgres --pg-version 17
+```
+
+`--pg-version` must be **>=** the remote server's major version (`pg_dump`
+cannot dump newer servers); branches run on `--pg-version`. A logical dump is
+slower than `pg_basebackup` at size, but branching afterwards is the same
+instant CoW either way. Over the REST API the same knobs are
+`"via": "dump"` and `"dump_schemas": ["public"]` on `POST /v1/sources`.
 
 ## Supported Postgres versions
 
