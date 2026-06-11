@@ -164,15 +164,13 @@ func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 		defer s.wg.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		var err error
 		switch payload.Action {
 		case "opened", "reopened", "synchronize":
-			err = s.ensureBranch(ctx, log, &payload, branch)
+			s.handleEnsure(ctx, log, &payload, branch)
 		case "closed":
-			err = s.destroyBranch(ctx, log, branch)
-		}
-		if err != nil {
-			log.Error("handling event failed", "err", err)
+			if err := s.destroyBranch(ctx, log, branch); err != nil {
+				log.Error("handling event failed", "err", err)
+			}
 		}
 	}()
 
@@ -217,10 +215,35 @@ func sanitizeBranchName(ref string) string {
 	return strings.TrimRight(b.String()[:min(b.Len(), 41)], "-")
 }
 
+// handleEnsure brackets the branch operation with commit statuses on the PR
+// head SHA — pending before, success/failure after — and refreshes the
+// connect-info comment on success. GitHub-side failures are logged, never
+// fatal: the branch operation is the point of this service.
+func (s *Service) handleEnsure(ctx context.Context, log *slog.Logger, p *payload, branch string) {
+	verb := "creating"
+	if p.Action == "synchronize" && s.cfg.ResetOnPush {
+		verb = "resetting"
+	}
+	s.setStatus(ctx, log, p, "pending", fmt.Sprintf("%s branch %s", verb, branch))
+
+	b, err := s.ensureBranch(ctx, log, p, branch)
+	if err != nil {
+		log.Error("handling event failed", "err", err)
+		s.setStatus(ctx, log, p, "failure", err.Error())
+		return
+	}
+	desc := fmt.Sprintf("branch %s ready", branch)
+	if s.cfg.ProxyHost != "" {
+		desc += " — connect via " + s.cfg.ProxyHost
+	}
+	s.setStatus(ctx, log, p, "success", desc)
+	s.maybeComment(ctx, log, p, b)
+}
+
 // ensureBranch makes branch exist (creating it from the configured source if
 // missing). On synchronize with ResetOnPush, a pre-existing branch is reset
 // to the source snapshot; a freshly created one is already pristine.
-func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload, branch string) error {
+func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload, branch string) (*api.Branch, error) {
 	b, err := s.pg.GetBranch(ctx, branch)
 	switch {
 	case apiclient.IsNotFound(err):
@@ -228,21 +251,33 @@ func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload
 			Name: branch, Source: s.cfg.Source, TTLSeconds: s.cfg.TTLSeconds,
 		})
 		if err != nil {
-			return fmt.Errorf("create branch %s: %w", branch, err)
+			return nil, fmt.Errorf("create branch %s: %w", branch, err)
 		}
 		log.Info("branch created", "branch", branch, "source", s.cfg.Source)
 	case err != nil:
-		return fmt.Errorf("get branch %s: %w", branch, err)
+		return nil, fmt.Errorf("get branch %s: %w", branch, err)
 	case p.Action == "synchronize" && s.cfg.ResetOnPush:
 		if b, err = s.pg.ResetBranch(ctx, branch); err != nil {
-			return fmt.Errorf("reset branch %s: %w", branch, err)
+			return nil, fmt.Errorf("reset branch %s: %w", branch, err)
 		}
 		log.Info("branch reset on push", "branch", branch)
 	default:
 		log.Debug("branch already exists", "branch", branch)
 	}
-	s.maybeComment(ctx, log, p, b)
-	return nil
+	return b, nil
+}
+
+// setStatus posts a pgbranch/branch commit status on the PR head SHA when a
+// GitHub client is configured. Failures are logged, never fatal (same policy
+// as comments). Closed events never reach here: statuses on a closed PR
+// don't matter.
+func (s *Service) setStatus(ctx context.Context, log *slog.Logger, p *payload, state, desc string) {
+	if s.gh == nil || p.PullRequest.Head.SHA == "" {
+		return
+	}
+	if err := s.gh.SetStatus(ctx, p.Repository.FullName, p.PullRequest.Head.SHA, state, desc); err != nil {
+		log.Warn("setting commit status failed", "state", state, "err", err)
+	}
 }
 
 func (s *Service) destroyBranch(ctx context.Context, log *slog.Logger, branch string) error {

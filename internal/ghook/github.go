@@ -25,6 +25,35 @@ type GitHub struct {
 // means we already commented (post once per PR).
 const commentMarker = "<!-- pgbranch -->"
 
+// statusContext is the commit-status context CI can gate on.
+const statusContext = "pgbranch/branch"
+
+// SetStatus sets the pgbranch/branch commit status on a commit: pending
+// while a branch operation runs, then success or failure. CI consumers gate
+// on the context instead of polling the branch with psql retry loops.
+// Descriptions are truncated to GitHub's 140-character limit.
+func (g *GitHub) SetStatus(ctx context.Context, repo, sha, state, desc string) error {
+	body := map[string]string{
+		"state":       state,
+		"description": truncate(desc, 140),
+		"context":     statusContext,
+	}
+	path := fmt.Sprintf("/repos/%s/statuses/%s", repo, sha)
+	if err := g.do(ctx, "POST", path, body, nil); err != nil {
+		return fmt.Errorf("set status: %w", err)
+	}
+	return nil
+}
+
+// truncate caps s at n runes (GitHub counts characters, not bytes).
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
 // EnsureComment posts body as an issue comment on repo#number unless a
 // comment carrying the pgbranch marker already exists. Only the first page
 // (100 comments) is checked — at worst a busy PR gets a duplicate comment.
