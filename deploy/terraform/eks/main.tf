@@ -25,10 +25,14 @@ variable "cluster_name" {
   default = "pgbranch"
 }
 
-# EKS upgrades one minor version at a time: apply with -var cluster_version=
-# stepping 1.32 → 1.33 → ... when catching up across several versions.
-# Each node-group rollover RECYCLES the node — hostpath-mode branch data and
-# the branchd registry live on its disk and are lost (re-seed afterwards).
+# NEW clusters: never below 1.36 — pick the newest version in EKS standard
+# support (`aws eks describe-cluster-versions`). Older versions age into
+# AWS "extended support", billed ~6x the control-plane rate.
+#
+# EXISTING clusters upgrade one minor at a time: apply with
+# -var cluster_version= stepping 1.33 → 1.34 → ... Each node-group rollover
+# RECYCLES the node — hostpath-mode branch data and the branchd registry
+# live on its disk and are lost (re-seed afterwards).
 variable "cluster_version" {
   default = "1.36"
 }
