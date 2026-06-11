@@ -13,12 +13,37 @@ import (
 	"github.com/abd-ulbasit/pgbranch/internal/api"
 )
 
-// GitHub is a minimal REST client for the one thing this service does on
-// GitHub: a single connect-info comment per pull request. No SDK dependency.
+// TokenProvider supplies the bearer token for a GitHub API call. PAT mode is
+// a constant provider (StaticToken); App mode mints per-installation tokens
+// (AppAuth.Token) keyed by the webhook delivery's installation id.
+type TokenProvider func(ctx context.Context, installationID int64) (string, error)
+
+// StaticToken is the PAT-mode TokenProvider: always the same token,
+// whatever the installation.
+func StaticToken(token string) TokenProvider {
+	return func(context.Context, int64) (string, error) { return token, nil }
+}
+
+// GitHub is a minimal REST client for what this service does on GitHub: the
+// live connect-info comment and the pgbranch/branch commit status. No SDK
+// dependency.
 type GitHub struct {
 	BaseURL string // e.g. https://api.github.com (overridable for tests)
-	Token   string
+	Token   TokenProvider
 	HTTP    *http.Client
+
+	// installationID scopes App-mode tokens to the delivery being handled;
+	// bound per delivery via ForInstallation, ignored by StaticToken.
+	installationID int64
+}
+
+// ForInstallation returns a shallow copy of the client bound to the given
+// installation id (from the webhook payload). Safe for the PAT provider,
+// which ignores it.
+func (g *GitHub) ForInstallation(id int64) *GitHub {
+	c := *g
+	c.installationID = id
+	return &c
 }
 
 // commentMarker identifies the connect-info comment; its presence on a PR
@@ -96,7 +121,11 @@ func (g *GitHub) do(ctx context.Context, method, path string, in, out any) error
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+g.Token)
+	token, err := g.Token(ctx, g.installationID)
+	if err != nil {
+		return fmt.Errorf("github token: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	if in != nil {

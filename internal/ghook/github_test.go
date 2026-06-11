@@ -75,7 +75,7 @@ func newFakeGitHub(t *testing.T, existing ...string) *fakeGitHub {
 }
 
 func (f *fakeGitHub) client() *GitHub {
-	return &GitHub{BaseURL: f.srv.URL, Token: "gh-token", HTTP: f.srv.Client()}
+	return &GitHub{BaseURL: f.srv.URL, Token: StaticToken("gh-token"), HTTP: f.srv.Client()}
 }
 
 func TestOpenedPostsConnectInfoComment(t *testing.T) {
@@ -118,7 +118,7 @@ func TestGitHubFailureDoesNotFailWebhook(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer down.Close()
-	gh := &GitHub{BaseURL: down.URL, Token: "gh-token", HTTP: down.Client()}
+	gh := &GitHub{BaseURL: down.URL, Token: StaticToken("gh-token"), HTTP: down.Client()}
 	// comment failure is non-fatal: the branch operation still completes
 	deliver(t, newService(Config{}, pg.srv.URL, gh), fixture(t, "pr_opened.json"))
 	pg.assertCalls("GET /v1/branches/pr-7", "POST /v1/branches")

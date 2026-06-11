@@ -82,6 +82,11 @@ type payload struct {
 	Repository struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
+	// Installation is set when the webhook is delivered through a GitHub
+	// App; its id keys the installation-token mint in App auth mode.
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
 }
 
 func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -272,12 +277,23 @@ func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload
 // as comments). Closed events never reach here: statuses on a closed PR
 // don't matter.
 func (s *Service) setStatus(ctx context.Context, log *slog.Logger, p *payload, state, desc string) {
-	if s.gh == nil || p.PullRequest.Head.SHA == "" {
+	gh := s.github(p)
+	if gh == nil || p.PullRequest.Head.SHA == "" {
 		return
 	}
-	if err := s.gh.SetStatus(ctx, p.Repository.FullName, p.PullRequest.Head.SHA, state, desc); err != nil {
+	if err := gh.SetStatus(ctx, p.Repository.FullName, p.PullRequest.Head.SHA, state, desc); err != nil {
 		log.Warn("setting commit status failed", "state", state, "err", err)
 	}
+}
+
+// github returns the GitHub client bound to the delivery's installation id
+// (App auth mints per-installation tokens), or nil when GitHub credentials
+// aren't configured.
+func (s *Service) github(p *payload) *GitHub {
+	if s.gh == nil {
+		return nil
+	}
+	return s.gh.ForInstallation(p.Installation.ID)
 }
 
 func (s *Service) destroyBranch(ctx context.Context, log *slog.Logger, branch string) error {
@@ -297,10 +313,11 @@ func (s *Service) destroyBranch(ctx context.Context, log *slog.Logger, branch st
 // configured. Failures are logged, never fatal: the branch operation is the
 // point of this service, the comment is a convenience.
 func (s *Service) maybeComment(ctx context.Context, log *slog.Logger, p *payload, b *api.Branch) {
-	if s.gh == nil {
+	gh := s.github(p)
+	if gh == nil {
 		return
 	}
-	if err := s.gh.EnsureComment(ctx, p.Repository.FullName, p.Number, commentBody(s.cfg.ProxyHost, b)); err != nil {
+	if err := gh.EnsureComment(ctx, p.Repository.FullName, p.Number, commentBody(s.cfg.ProxyHost, b)); err != nil {
 		log.Warn("posting PR comment failed", "err", err)
 	}
 }

@@ -2,6 +2,7 @@ package ghook
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -15,8 +16,12 @@ type EnvConfig struct {
 	Listen         string // GHOOK_LISTEN, default :8080
 	PGBranchServer string // GHOOK_PGBRANCH_SERVER (required)
 	PGBranchToken  string // GHOOK_PGBRANCH_TOKEN
-	GitHubToken    string // GHOOK_GITHUB_TOKEN (empty = no PR comments)
+	GitHubToken    string // GHOOK_GITHUB_TOKEN (PAT mode; empty = no comments/statuses)
 	GitHubAPI      string // GHOOK_GITHUB_API, default https://api.github.com
+	// GitHub App auth (mutually exclusive with GitHubToken): the service
+	// mints installation tokens from the App's private key.
+	AppID         string // GHOOK_APP_ID
+	AppPrivateKey string // PEM, from GHOOK_APP_PRIVATE_KEY or GHOOK_APP_PRIVATE_KEY_FILE
 }
 
 // LoadEnv builds the configuration from getenv (os.Getenv in production,
@@ -70,6 +75,27 @@ func LoadEnv(getenv func(string) string) (*EnvConfig, error) {
 		ec.BranchNaming = v
 	default:
 		return nil, fmt.Errorf("GHOOK_BRANCH_NAMING: %q (want pr-number or git-branch)", v)
+	}
+
+	// GitHub App auth: app id + private key (inline or file), exclusive
+	// with the PAT.
+	ec.AppID = getenv("GHOOK_APP_ID")
+	ec.AppPrivateKey = getenv("GHOOK_APP_PRIVATE_KEY")
+	if f := getenv("GHOOK_APP_PRIVATE_KEY_FILE"); f != "" {
+		if ec.AppPrivateKey != "" {
+			return nil, fmt.Errorf("GHOOK_APP_PRIVATE_KEY and GHOOK_APP_PRIVATE_KEY_FILE are mutually exclusive")
+		}
+		pem, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("GHOOK_APP_PRIVATE_KEY_FILE: %w", err)
+		}
+		ec.AppPrivateKey = string(pem)
+	}
+	if (ec.AppID == "") != (ec.AppPrivateKey == "") {
+		return nil, fmt.Errorf("GHOOK_APP_ID and GHOOK_APP_PRIVATE_KEY (or _FILE) must be set together")
+	}
+	if ec.AppID != "" && ec.GitHubToken != "" {
+		return nil, fmt.Errorf("GHOOK_APP_ID/GHOOK_APP_PRIVATE_KEY and GHOOK_GITHUB_TOKEN are mutually exclusive — pick App or PAT auth")
 	}
 	return ec, nil
 }

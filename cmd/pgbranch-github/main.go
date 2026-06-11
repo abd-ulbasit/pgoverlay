@@ -39,10 +39,19 @@ func run() error {
 	}
 
 	var gh *ghook.GitHub
-	if cfg.GitHubToken != "" {
-		gh = &ghook.GitHub{BaseURL: cfg.GitHubAPI, Token: cfg.GitHubToken}
-	} else {
-		logger.Info("GHOOK_GITHUB_TOKEN unset: PR comments disabled")
+	switch {
+	case cfg.AppID != "":
+		key, err := ghook.ParseAppPrivateKey([]byte(cfg.AppPrivateKey))
+		if err != nil {
+			return err
+		}
+		app := ghook.NewAppAuth(cfg.AppID, key, cfg.GitHubAPI, nil)
+		gh = &ghook.GitHub{BaseURL: cfg.GitHubAPI, Token: app.Token}
+		logger.Info("GitHub App auth: minting installation tokens", "app_id", cfg.AppID)
+	case cfg.GitHubToken != "":
+		gh = &ghook.GitHub{BaseURL: cfg.GitHubAPI, Token: ghook.StaticToken(cfg.GitHubToken)}
+	default:
+		logger.Info("no GitHub credentials (GHOOK_APP_ID or GHOOK_GITHUB_TOKEN): PR comments and commit statuses disabled")
 	}
 
 	svc := ghook.New(cfg.Config, apiclient.New(cfg.PGBranchServer, cfg.PGBranchToken), gh, logger)

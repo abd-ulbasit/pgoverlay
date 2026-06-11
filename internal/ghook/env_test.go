@@ -1,6 +1,8 @@
 package ghook
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -60,6 +62,61 @@ func TestLoadEnvRequiredVars(t *testing.T) {
 		_, err := LoadEnv(env(m))
 		if err == nil || !strings.Contains(err.Error(), required) {
 			t.Errorf("missing %s: err = %v, want it named", required, err)
+		}
+	}
+}
+
+func TestLoadEnvAppAuth(t *testing.T) {
+	base := map[string]string{
+		"GHOOK_WEBHOOK_SECRET":  "wh",
+		"GHOOK_PGBRANCH_SERVER": "http://x:7070",
+		"GHOOK_SOURCE":          "main",
+	}
+	with := func(extra map[string]string) func(string) string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return env(m)
+	}
+
+	// inline key
+	ec, err := LoadEnv(with(map[string]string{
+		"GHOOK_APP_ID": "12345", "GHOOK_APP_PRIVATE_KEY": "-----BEGIN RSA PRIVATE KEY-----\n...",
+	}))
+	if err != nil {
+		t.Fatalf("app auth config must load: %v", err)
+	}
+	if ec.AppID != "12345" || !strings.HasPrefix(ec.AppPrivateKey, "-----BEGIN") {
+		t.Errorf("app config = %q / %q", ec.AppID, ec.AppPrivateKey)
+	}
+
+	// key from file
+	f := filepath.Join(t.TempDir(), "app.pem")
+	if err := os.WriteFile(f, []byte("-----BEGIN PRIVATE KEY-----\nfromfile"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ec, err = LoadEnv(with(map[string]string{"GHOOK_APP_ID": "12345", "GHOOK_APP_PRIVATE_KEY_FILE": f}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ec.AppPrivateKey, "fromfile") {
+		t.Errorf("AppPrivateKey = %q, want file contents", ec.AppPrivateKey)
+	}
+
+	// invalid combinations
+	for name, extra := range map[string]map[string]string{
+		"app id without key": {"GHOOK_APP_ID": "12345"},
+		"key without app id": {"GHOOK_APP_PRIVATE_KEY": "pem"},
+		"key and key file":   {"GHOOK_APP_ID": "1", "GHOOK_APP_PRIVATE_KEY": "pem", "GHOOK_APP_PRIVATE_KEY_FILE": f},
+		"app auth and PAT":   {"GHOOK_APP_ID": "1", "GHOOK_APP_PRIVATE_KEY": "pem", "GHOOK_GITHUB_TOKEN": "ghp_x"},
+		"missing key file":   {"GHOOK_APP_ID": "1", "GHOOK_APP_PRIVATE_KEY_FILE": filepath.Join(t.TempDir(), "nope.pem")},
+	} {
+		if _, err := LoadEnv(with(extra)); err == nil {
+			t.Errorf("%s: want error", name)
 		}
 	}
 }
