@@ -211,6 +211,31 @@ In CI, the composite action provisions the branch and waits for readiness:
 
 A zero-dependency JS package (`sdk/js`, `pgbranch-test`) covers Node test suites. Naming, TTL safety nets, and parallelism semantics: [docs/testing.md](docs/testing.md).
 
+## What changed in a branch?
+
+`pgb diff NAME` (API: `GET /v1/branches/{name}/diff`) compares a branch against the exact base it was cloned from — schema first (a unified diff of `pg_dump --schema-only` output), then per-table row-count deltas:
+
+```console
+$ pgb diff pr-42
+@@ -312,6 +312,14 @@
+ CREATE TABLE public.users (
+     id integer NOT NULL,
++    deleted_at timestamp with time zone,
+     email text
+ );
++CREATE TABLE public.audit_log (
++    id bigint NOT NULL,
++    entry jsonb
++);
+
+TABLE      BASE   BRANCH  DELTA
+audit_log  0      1204    +1204
+users      51230  51198   -32
+(row counts are planner estimates)
+```
+
+Under the hood the engine provisions a temporary branch from the target's recorded base (same source generation and frozen-layer chain — not the source's current state) and dumps both instances, so a diff takes a few seconds and never touches the source. Row counts come from `pg_class.reltuples`: planner estimates, exact enough to see what a migration did, not an audit. `--all` lists unchanged tables too.
+
 ## How it works
 
 `pgb source add` runs `pg_basebackup` in a one-shot helper container, streaming the source cluster into a named Docker volume. That volume becomes the read-only **lower layer** for every branch.

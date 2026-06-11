@@ -142,6 +142,24 @@ break — Vercel-style env templating (one `DATABASE_URL` template with the
 branch name substituted per preview) relies on every branch accepting the
 same source password, so those flows need inherit mode (the default).
 
+## Branch diff
+
+`DiffBranch` answers "what changed in this branch?" without ever touching
+the source: it provisions an internal **throwaway branch** (`diff-<6 hex>`)
+from the target's *own* recorded base — the same pinned source-generation
+volume and frozen-layer chain reset re-provisions onto, never the source's
+current generation — so the comparison baseline is exactly what the branch
+started from. Both instances are then dumped in-container over the local
+socket (`pg_dump --schema-only --no-owner --no-acl`, plus a
+`pg_class.reltuples` row-estimate query), the unified diff is computed
+host-side, and the throwaway is destroyed through the normal branch-destroy
+path. The throwaway is a regular registry row with a one-hour TTL, so if
+branchd dies mid-diff the reaper (or reconcile) cleans the stray. All cow
+backends work identically — the throwaway is just a branch. Caveat: row
+counts are planner estimates; a fresh clone reports the base's last ANALYZE
+and the target's stats may be stale, so deltas show direction and magnitude,
+not exact counts.
+
 ## Proxy routing
 
 Per-branch host ports are annoying, so branchd bundles a wire-protocol
