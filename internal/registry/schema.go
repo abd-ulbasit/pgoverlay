@@ -125,7 +125,7 @@ ALTER TABLE sources ADD COLUMN dump_schemas TEXT NOT NULL DEFAULT '';
 
 // v7 (Phase 6): per-branch credential rotation. When the engine runs with
 // --rotate-branch-credentials it ALTERs the role's password inside every
-// fresh/reset branch and stores the new password here. '' = inherit mode
+// fresh/reset branch and stores the new password here. Empty = inherit mode
 // (the branch keeps the source's credentials, the historical behavior).
 const migrateV7 = `
 ALTER TABLE branches ADD COLUMN password TEXT NOT NULL DEFAULT '';

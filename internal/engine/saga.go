@@ -2,9 +2,12 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/cow"
@@ -233,8 +236,9 @@ func branchLabels(b *registry.Branch) map[string]string {
 // awaitAndMark is the backend-independent tail of provisioning: wait for
 // postgres readiness (covers WAL recovery time), apply the source's masking
 // scripts inside the fresh clone (so the branch never serves unmasked data;
-// reset re-runs this because it re-clones), then record container + address
-// and mark ready. A failing masking script fails the branch.
+// reset re-runs this because it re-clones), rotate the branch's credentials
+// (when enabled), then record container + address and mark ready. A failing
+// masking script fails the branch.
 func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *registry.Source, cid string) error {
 	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
 		return fmt.Errorf("instance never became ready: %w", err)
@@ -242,11 +246,46 @@ func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *regi
 	if err := e.applyMasking(ctx, cid, src); err != nil {
 		return err
 	}
+	if err := e.rotateBranchCredentials(ctx, cid, b, src); err != nil {
+		return err
+	}
 	info, err := e.inspectAddr(ctx, cid)
 	if err != nil {
 		return err
 	}
 	return e.reg.MarkBranchReady(b.ID, cid, info.Host, info.Port)
+}
+
+// rotateBranchCredentials gives a fresh/reset branch its own password: a
+// 32-hex crypto/rand secret applied via in-branch psql over the local socket
+// (same exec path as masking — peer auth, no password needed) and persisted
+// on the branch row before the branch is marked ready. No-op in inherit mode
+// (rotation off). Runs on create, reset and branch-from-branch children;
+// parent restarts (freeze/csi quiesce) never pass through here, so a parent
+// keeps its existing password.
+func (e *Engine) rotateBranchCredentials(ctx context.Context, cid string, b *registry.Branch, src *registry.Source) error {
+	if !e.rotateCredentials {
+		return nil
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Errorf("rotate credentials: %w", err)
+	}
+	pw := hex.EncodeToString(buf)
+	user := src.ConnUser
+	if user == "" {
+		user = "postgres"
+	}
+	// the role name is identifier-quoted; the password is pure hex, so the
+	// literal needs no escaping
+	stmt := fmt.Sprintf(`ALTER ROLE "%s" WITH PASSWORD '%s'`, strings.ReplaceAll(user, `"`, `""`), pw)
+	if err := e.drv.Exec(ctx, cid, psqlCmd(src, stmt)); err != nil {
+		return fmt.Errorf("rotate credentials for branch %q: %w", b.Name, err)
+	}
+	if err := e.reg.SetBranchPassword(b.ID, pw); err != nil {
+		return fmt.Errorf("persist rotated password for branch %q: %w", b.Name, err)
+	}
+	return nil
 }
 
 // inspectAddr inspects cid until the runtime reports a routable address.

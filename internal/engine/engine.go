@@ -21,16 +21,34 @@ type Engine struct {
 	drv          runtime.Driver
 	defaultImage string
 	planner      cow.Planner
+	// rotateCredentials gives every fresh/reset branch its own password
+	// (ALTER ROLE inside the branch, after masking, before ready) instead of
+	// inheriting the source's credentials. branchd --rotate-branch-credentials.
+	rotateCredentials bool
+}
+
+// Option configures optional engine behavior at construction time.
+type Option func(*Engine)
+
+// WithCredentialRotation turns on per-branch credential rotation: every
+// branch create and reset generates a fresh password, applies it inside the
+// branch and stores it on the branch row (returned by the API as `password`).
+func WithCredentialRotation() Option {
+	return func(e *Engine) { e.rotateCredentials = true }
 }
 
 // New builds an engine on the default OverlayFS backend.
-func New(reg *registry.Registry, drv runtime.Driver, defaultImage string) *Engine {
-	return NewWithPlanner(reg, drv, defaultImage, cow.Planner{Backend: cow.BackendOverlay})
+func New(reg *registry.Registry, drv runtime.Driver, defaultImage string, opts ...Option) *Engine {
+	return NewWithPlanner(reg, drv, defaultImage, cow.Planner{Backend: cow.BackendOverlay}, opts...)
 }
 
 // NewWithPlanner selects the copy-on-write backend (branchd --cow).
-func NewWithPlanner(reg *registry.Registry, drv runtime.Driver, defaultImage string, planner cow.Planner) *Engine {
-	return &Engine{reg: reg, drv: drv, defaultImage: defaultImage, planner: planner}
+func NewWithPlanner(reg *registry.Registry, drv runtime.Driver, defaultImage string, planner cow.Planner, opts ...Option) *Engine {
+	e := &Engine{reg: reg, drv: drv, defaultImage: defaultImage, planner: planner}
+	for _, o := range opts {
+		o(e)
+	}
+	return e
 }
 
 func (e *Engine) image(pgVersion string) string {

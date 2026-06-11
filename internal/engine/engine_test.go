@@ -125,14 +125,14 @@ func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, 
 	return out, nil
 }
 
-func testEngine(t *testing.T, d runtime.Driver) (*Engine, *registry.Registry) {
+func testEngine(t *testing.T, d runtime.Driver, opts ...Option) (*Engine, *registry.Registry) {
 	t.Helper()
 	r, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { r.Close() })
-	return New(r, d, "postgres:17"), r
+	return New(r, d, "postgres:17", opts...), r
 }
 
 func readySource(t *testing.T, r *registry.Registry) *registry.Source {

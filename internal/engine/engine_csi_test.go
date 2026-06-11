@@ -17,14 +17,14 @@ import (
 // clone (no overlay lowers), and cloning a live parent branch briefly stops
 // it for a crash-consistent clone.
 
-func csiEngine(t *testing.T, d runtime.Driver) (*Engine, *registry.Registry) {
+func csiEngine(t *testing.T, d runtime.Driver, opts ...Option) (*Engine, *registry.Registry) {
 	t.Helper()
 	r, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { r.Close() })
-	return NewWithPlanner(r, d, "postgres:17", cow.Planner{Backend: cow.BackendCSI}), r
+	return NewWithPlanner(r, d, "postgres:17", cow.Planner{Backend: cow.BackendCSI}, opts...), r
 }
 
 func TestCSICreateBranchClonesAndStartsDirectPod(t *testing.T) {

@@ -169,6 +169,12 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err := e.applyMasking(ctx, childCID, src); err != nil {
 		return fail(err)
 	}
+	// the child gets its own credentials (rotation mode); the parent's
+	// restart above deliberately does not re-rotate — its data carries its
+	// existing password
+	if err := e.rotateBranchCredentials(ctx, childCID, child, src); err != nil {
+		return fail(err)
+	}
 	childInfo, err := e.inspectAddr(ctx, childCID)
 	if err != nil {
 		return fail(err)
