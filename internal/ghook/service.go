@@ -173,9 +173,7 @@ func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 		case "opened", "reopened", "synchronize":
 			s.handleEnsure(ctx, log, &payload, branch)
 		case "closed":
-			if err := s.destroyBranch(ctx, log, branch); err != nil {
-				log.Error("handling event failed", "err", err)
-			}
+			s.handleClosed(ctx, log, &payload, branch)
 		}
 	}()
 
@@ -221,55 +219,88 @@ func sanitizeBranchName(ref string) string {
 }
 
 // handleEnsure brackets the branch operation with commit statuses on the PR
-// head SHA — pending before, success/failure after — and refreshes the
-// connect-info comment on success. GitHub-side failures are logged, never
-// fatal: the branch operation is the point of this service.
+// head SHA — pending before, success/failure after — and keeps the live
+// comment current (creating/resetting → ready / reset @ sha). GitHub-side
+// failures are logged, never fatal: the branch operation is the point of
+// this service.
 func (s *Service) handleEnsure(ctx context.Context, log *slog.Logger, p *payload, branch string) {
 	verb := "creating"
 	if p.Action == "synchronize" && s.cfg.ResetOnPush {
 		verb = "resetting"
 	}
 	s.setStatus(ctx, log, p, "pending", fmt.Sprintf("%s branch %s", verb, branch))
+	s.upsertComment(ctx, log, p, commentBody(s.cfg.ProxyHost, branch, verb, nil))
 
-	b, err := s.ensureBranch(ctx, log, p, branch)
+	b, didReset, err := s.ensureBranch(ctx, log, p, branch)
 	if err != nil {
 		log.Error("handling event failed", "err", err)
 		s.setStatus(ctx, log, p, "failure", err.Error())
 		return
+	}
+	state := "ready"
+	if didReset {
+		state = "reset @ " + shortSHA(p.PullRequest.Head.SHA)
 	}
 	desc := fmt.Sprintf("branch %s ready", branch)
 	if s.cfg.ProxyHost != "" {
 		desc += " — connect via " + s.cfg.ProxyHost
 	}
 	s.setStatus(ctx, log, p, "success", desc)
-	s.maybeComment(ctx, log, p, b)
+	s.upsertComment(ctx, log, p, commentBody(s.cfg.ProxyHost, branch, state, b))
+}
+
+// handleClosed destroys the branch and rewrites the live comment to record
+// that (without a connect string — there is nothing left to connect to). No
+// status: statuses on a closed PR don't matter.
+func (s *Service) handleClosed(ctx context.Context, log *slog.Logger, p *payload, branch string) {
+	if err := s.destroyBranch(ctx, log, branch); err != nil {
+		log.Error("handling event failed", "err", err)
+		return
+	}
+	gh := s.github(p)
+	if gh == nil {
+		return
+	}
+	body := commentBody(s.cfg.ProxyHost, branch, "destroyed", nil)
+	if err := gh.UpdateComment(ctx, p.Repository.FullName, p.Number, body); err != nil {
+		log.Warn("updating PR comment failed", "err", err)
+	}
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // ensureBranch makes branch exist (creating it from the configured source if
 // missing). On synchronize with ResetOnPush, a pre-existing branch is reset
-// to the source snapshot; a freshly created one is already pristine.
-func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload, branch string) (*api.Branch, error) {
-	b, err := s.pg.GetBranch(ctx, branch)
+// to the source snapshot (didReset reports that); a freshly created one is
+// already pristine.
+func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload, branch string) (b *api.Branch, didReset bool, err error) {
+	b, err = s.pg.GetBranch(ctx, branch)
 	switch {
 	case apiclient.IsNotFound(err):
 		b, err = s.pg.CreateBranch(ctx, api.CreateBranchRequest{
 			Name: branch, Source: s.cfg.Source, TTLSeconds: s.cfg.TTLSeconds,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("create branch %s: %w", branch, err)
+			return nil, false, fmt.Errorf("create branch %s: %w", branch, err)
 		}
 		log.Info("branch created", "branch", branch, "source", s.cfg.Source)
 	case err != nil:
-		return nil, fmt.Errorf("get branch %s: %w", branch, err)
+		return nil, false, fmt.Errorf("get branch %s: %w", branch, err)
 	case p.Action == "synchronize" && s.cfg.ResetOnPush:
 		if b, err = s.pg.ResetBranch(ctx, branch); err != nil {
-			return nil, fmt.Errorf("reset branch %s: %w", branch, err)
+			return nil, false, fmt.Errorf("reset branch %s: %w", branch, err)
 		}
 		log.Info("branch reset on push", "branch", branch)
+		didReset = true
 	default:
 		log.Debug("branch already exists", "branch", branch)
 	}
-	return b, nil
+	return b, didReset, nil
 }
 
 // setStatus posts a pgbranch/branch commit status on the PR head SHA when a
@@ -309,15 +340,15 @@ func (s *Service) destroyBranch(ctx context.Context, log *slog.Logger, branch st
 	return nil
 }
 
-// maybeComment posts the connect-info comment when a GitHub client is
-// configured. Failures are logged, never fatal: the branch operation is the
-// point of this service, the comment is a convenience.
-func (s *Service) maybeComment(ctx context.Context, log *slog.Logger, p *payload, b *api.Branch) {
+// upsertComment writes body to the PR's live marker comment when a GitHub
+// client is configured. Failures are logged, never fatal: the branch
+// operation is the point of this service, the comment is a convenience.
+func (s *Service) upsertComment(ctx context.Context, log *slog.Logger, p *payload, body string) {
 	gh := s.github(p)
 	if gh == nil {
 		return
 	}
-	if err := gh.EnsureComment(ctx, p.Repository.FullName, p.Number, commentBody(s.cfg.ProxyHost, b)); err != nil {
+	if err := gh.UpsertComment(ctx, p.Repository.FullName, p.Number, body); err != nil {
 		log.Warn("posting PR comment failed", "err", err)
 	}
 }

@@ -2,10 +2,13 @@ package ghook
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/abd-ulbasit/pgbranch/internal/api"
 )
 
 // recordedStatus is one POST /statuses/{sha} call seen by the fake.
@@ -13,41 +16,69 @@ type recordedStatus struct {
 	SHA, State, Description, Context string
 }
 
+// ghComment is one issue comment held by the fake.
+type ghComment struct {
+	ID   int64  `json:"id"`
+	Body string `json:"body"`
+}
+
 // fakeGitHub serves the issue-comments and commit-status endpoints for
-// acme/widgets#7.
+// acme/widgets#7. It is stateful: POSTed comments show up in later lists,
+// PATCH rewrites them in place — so a live upsert flow exercises POST once
+// then PATCH.
 type fakeGitHub struct {
 	t        *testing.T
-	existing []string // bodies returned by the list endpoint
-	posted   []string // bodies received by the create endpoint
+	comments []ghComment // current comments (list endpoint state)
+	posted   []string    // bodies received by the create endpoint
+	patched  []string    // bodies received by the edit endpoint, in order
 	statuses []recordedStatus
 	lastReq  *http.Request
+	lastList *http.Request // last GET of the comment list
 	srv      *httptest.Server
 }
 
 func newFakeGitHub(t *testing.T, existing ...string) *fakeGitHub {
-	f := &fakeGitHub{t: t, existing: existing}
-	mux := http.NewServeMux()
-	type comment struct {
-		Body string `json:"body"`
+	f := &fakeGitHub{t: t}
+	for i, b := range existing {
+		f.comments = append(f.comments, ghComment{ID: int64(100 + i), Body: b})
 	}
+	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/acme/widgets/issues/7/comments", func(w http.ResponseWriter, r *http.Request) {
-		f.lastReq = r
-		var out []comment
-		for _, b := range f.existing {
-			out = append(out, comment{Body: b})
+		f.lastReq, f.lastList = r, r
+		out := f.comments
+		if out == nil {
+			out = []ghComment{}
 		}
 		json.NewEncoder(w).Encode(out)
 	})
 	mux.HandleFunc("POST /repos/acme/widgets/issues/7/comments", func(w http.ResponseWriter, r *http.Request) {
 		f.lastReq = r
-		var c comment
+		var c ghComment
 		if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
 			t.Errorf("bad comment body: %v", err)
 		}
+		c.ID = int64(1000 + len(f.comments))
 		f.posted = append(f.posted, c.Body)
-		f.existing = append(f.existing, c.Body)
+		f.comments = append(f.comments, c)
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(c)
+	})
+	mux.HandleFunc("PATCH /repos/acme/widgets/issues/comments/{id}", func(w http.ResponseWriter, r *http.Request) {
+		f.lastReq = r
+		var c ghComment
+		if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+			t.Errorf("bad comment body: %v", err)
+		}
+		for i := range f.comments {
+			if fmt.Sprint(f.comments[i].ID) == r.PathValue("id") {
+				f.comments[i].Body = c.Body
+				f.patched = append(f.patched, c.Body)
+				json.NewEncoder(w).Encode(f.comments[i])
+				return
+			}
+		}
+		t.Errorf("PATCH of unknown comment id %s", r.PathValue("id"))
+		w.WriteHeader(http.StatusNotFound)
 	})
 	mux.HandleFunc("POST /repos/acme/widgets/statuses/{sha}", func(w http.ResponseWriter, r *http.Request) {
 		f.lastReq = r
@@ -78,17 +109,29 @@ func (f *fakeGitHub) client() *GitHub {
 	return &GitHub{BaseURL: f.srv.URL, Token: StaticToken("gh-token"), HTTP: f.srv.Client()}
 }
 
-func TestOpenedPostsConnectInfoComment(t *testing.T) {
+// Opened on a PR without our comment: the live comment is POSTed once
+// ("creating", no connect info yet) and then PATCHed in place to "ready"
+// with the connect string — never a second comment.
+func TestOpenedPostsThenPatchesLiveComment(t *testing.T) {
 	pg := newFakePG(t, false)
 	gh := newFakeGitHub(t)
 	deliver(t, newService(Config{ProxyHost: "pg.example.com:30432"}, pg.srv.URL, gh.client()), fixture(t, "pr_opened.json"))
+
 	if len(gh.posted) != 1 {
 		t.Fatalf("posted comments = %v, want exactly one", gh.posted)
 	}
-	body := gh.posted[0]
-	for _, want := range []string{commentMarker, "-h pg.example.com", "-p 30432", "appdb@pr-7", "`pr-7`"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("comment body missing %q:\n%s", want, body)
+	for _, want := range []string{commentMarker, "`pr-7`", "creating"} {
+		if !strings.Contains(gh.posted[0], want) {
+			t.Errorf("creating comment missing %q:\n%s", want, gh.posted[0])
+		}
+	}
+	if len(gh.patched) != 1 {
+		t.Fatalf("patched comments = %v, want exactly one (the ready update)", gh.patched)
+	}
+	final := gh.patched[0]
+	for _, want := range []string{commentMarker, "`pr-7`", "ready", "-h pg.example.com", "-p 30432", "appdb@pr-7"} {
+		if !strings.Contains(final, want) {
+			t.Errorf("ready comment missing %q:\n%s", want, final)
 		}
 	}
 	if got := gh.lastReq.Header.Get("Authorization"); got != "Bearer gh-token" {
@@ -99,16 +142,79 @@ func TestOpenedPostsConnectInfoComment(t *testing.T) {
 	}
 }
 
-func TestMarkerCommentDeduplicates(t *testing.T) {
+// A pre-existing marker comment is updated in place (PATCH), never
+// duplicated (no POST).
+func TestExistingMarkerCommentIsPatchedNotDuplicated(t *testing.T) {
 	pg := newFakePG(t, true)
 	gh := newFakeGitHub(t, "unrelated comment", "Connect info\n"+commentMarker)
 	deliver(t, newService(Config{ProxyHost: "pg.example.com"}, pg.srv.URL, gh.client()), fixture(t, "pr_opened.json"))
 	if len(gh.posted) != 0 {
 		t.Fatalf("posted comments = %v, want none (marker present)", gh.posted)
 	}
+	if len(gh.patched) == 0 || !strings.Contains(gh.patched[len(gh.patched)-1], "ready") {
+		t.Fatalf("patched = %v, want the marker comment updated to ready", gh.patched)
+	}
+	if !strings.Contains(gh.comments[1].Body, "ready") {
+		t.Fatalf("marker comment not rewritten in place: %q", gh.comments[1].Body)
+	}
 	// list endpoint must paginate at 100 per page
-	if got := gh.lastReq.URL.Query().Get("per_page"); got != "100" {
+	if got := gh.lastList.URL.Query().Get("per_page"); got != "100" {
 		t.Errorf("per_page = %q, want 100", got)
+	}
+}
+
+func TestResetCommentShowsShortSHA(t *testing.T) {
+	pg := newFakePG(t, true)
+	gh := newFakeGitHub(t, commentMarker+" old body")
+	deliver(t, newService(Config{ResetOnPush: true, ProxyHost: "pg.example.com"}, pg.srv.URL, gh.client()),
+		fixture(t, "pr_synchronize.json")) // head sha 9f8e7d6c5b4a3210
+	final := gh.patched[len(gh.patched)-1]
+	if !strings.Contains(final, "reset @ 9f8e7d6") {
+		t.Fatalf("reset comment missing short sha:\n%s", final)
+	}
+	if !strings.Contains(final, "appdb@pr-7") {
+		t.Fatalf("reset comment lost the connect string:\n%s", final)
+	}
+}
+
+// Closing the PR rewrites the comment to "destroyed" — connect string gone
+// (the branch it pointed at no longer exists) — and posts no status.
+func TestClosedUpdatesCommentToDestroyed(t *testing.T) {
+	pg := newFakePG(t, true)
+	gh := newFakeGitHub(t, commentMarker+" branch pr-7 ready, psql -h pg.example.com")
+	deliver(t, newService(Config{ProxyHost: "pg.example.com"}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
+
+	pg.assertCalls("DELETE /v1/branches/pr-7")
+	if len(gh.patched) != 1 {
+		t.Fatalf("patched = %v, want exactly one destroyed update", gh.patched)
+	}
+	body := gh.patched[0]
+	if !strings.Contains(body, "destroyed") || !strings.Contains(body, commentMarker) {
+		t.Errorf("destroyed comment = %q", body)
+	}
+	if strings.Contains(body, "psql") {
+		t.Errorf("destroyed comment still shows a connect string:\n%s", body)
+	}
+	if len(gh.statuses) != 0 {
+		t.Errorf("statuses = %+v, want none on closed (branch is gone)", gh.statuses)
+	}
+	if len(gh.posted) != 0 {
+		t.Errorf("posted = %v, want none on closed", gh.posted)
+	}
+}
+
+func TestCommentBodyIncludesExpiry(t *testing.T) {
+	b := &api.Branch{Name: "pr-7", User: "app", ProxyDatabase: "appdb@pr-7",
+		ExpiresAt: "2026-06-14T12:00:00Z"}
+	body := commentBody("pg.example.com:30432", "pr-7", "ready", b)
+	for _, want := range []string{"2026-06-14T12:00:00Z", "-h pg.example.com", "-p 30432"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q:\n%s", want, body)
+		}
+	}
+	b.ExpiresAt = ""
+	if body := commentBody("pg.example.com", "pr-7", "ready", b); strings.Contains(strings.ToLower(body), "expires") {
+		t.Errorf("no-TTL branch shows an expiry:\n%s", body)
 	}
 }
 
@@ -206,11 +312,16 @@ func TestEnsureFailurePostsFailureStatus(t *testing.T) {
 	}
 }
 
-func TestClosedDoesNotTouchGitHub(t *testing.T) {
+// Closed on a PR that never got our comment: nothing to update, nothing is
+// created (a fresh "destroyed" comment on a closed PR is just noise), and no
+// status is posted.
+func TestClosedWithoutMarkerCommentCreatesNothing(t *testing.T) {
 	pg := newFakePG(t, true)
-	gh := newFakeGitHub(t) // any call → t.Errorf via mux assertions below
+	gh := newFakeGitHub(t, "unrelated comment")
 	deliver(t, newService(Config{}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
-	if gh.lastReq != nil {
-		t.Fatalf("unexpected GitHub call on closed: %s", gh.lastReq.URL)
+	pg.assertCalls("DELETE /v1/branches/pr-7")
+	if len(gh.posted) != 0 || len(gh.patched) != 0 || len(gh.statuses) != 0 {
+		t.Fatalf("posted=%v patched=%v statuses=%+v, want no GitHub writes on closed without a marker comment",
+			gh.posted, gh.patched, gh.statuses)
 	}
 }

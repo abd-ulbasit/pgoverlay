@@ -46,8 +46,9 @@ func (g *GitHub) ForInstallation(id int64) *GitHub {
 	return &c
 }
 
-// commentMarker identifies the connect-info comment; its presence on a PR
-// means we already commented (post once per PR).
+// commentMarker identifies the live connect-info comment; the upsert finds
+// it on later events and rewrites it in place (one comment per PR, always
+// current).
 const commentMarker = "<!-- pgbranch -->"
 
 // statusContext is the commit-status context CI can gate on.
@@ -79,25 +80,58 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// EnsureComment posts body as an issue comment on repo#number unless a
-// comment carrying the pgbranch marker already exists. Only the first page
-// (100 comments) is checked — at worst a busy PR gets a duplicate comment.
-func (g *GitHub) EnsureComment(ctx context.Context, repo string, number int, body string) error {
+// UpsertComment makes the marker comment on repo#number carry body: PATCH
+// in place when it exists, POST otherwise.
+func (g *GitHub) UpsertComment(ctx context.Context, repo string, number int, body string) error {
+	id, err := g.findMarkerComment(ctx, repo, number)
+	if err != nil {
+		return err
+	}
+	if id != 0 {
+		return g.patchComment(ctx, repo, id, body)
+	}
 	path := fmt.Sprintf("/repos/%s/issues/%d/comments", repo, number)
+	if err := g.do(ctx, "POST", path, map[string]string{"body": body}, nil); err != nil {
+		return fmt.Errorf("create comment: %w", err)
+	}
+	return nil
+}
 
+// UpdateComment rewrites the marker comment when present and does nothing
+// when it isn't — closing a PR that never got a comment shouldn't create
+// one just to say the branch is gone.
+func (g *GitHub) UpdateComment(ctx context.Context, repo string, number int, body string) error {
+	id, err := g.findMarkerComment(ctx, repo, number)
+	if err != nil || id == 0 {
+		return err
+	}
+	return g.patchComment(ctx, repo, id, body)
+}
+
+// findMarkerComment returns the id of the comment carrying the pgbranch
+// marker, or 0 when there is none. Only the first page (100 comments) is
+// checked — at worst a busy PR gets a duplicate comment.
+func (g *GitHub) findMarkerComment(ctx context.Context, repo string, number int) (int64, error) {
+	path := fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100", repo, number)
 	var existing []struct {
+		ID   int64  `json:"id"`
 		Body string `json:"body"`
 	}
-	if err := g.do(ctx, "GET", path+"?per_page=100", nil, &existing); err != nil {
-		return fmt.Errorf("list comments: %w", err)
+	if err := g.do(ctx, "GET", path, nil, &existing); err != nil {
+		return 0, fmt.Errorf("list comments: %w", err)
 	}
 	for _, c := range existing {
 		if strings.Contains(c.Body, commentMarker) {
-			return nil // already commented on this PR
+			return c.ID, nil
 		}
 	}
-	if err := g.do(ctx, "POST", path, map[string]string{"body": body}, nil); err != nil {
-		return fmt.Errorf("create comment: %w", err)
+	return 0, nil
+}
+
+func (g *GitHub) patchComment(ctx context.Context, repo string, id int64, body string) error {
+	path := fmt.Sprintf("/repos/%s/issues/comments/%d", repo, id)
+	if err := g.do(ctx, "PATCH", path, map[string]string{"body": body}, nil); err != nil {
+		return fmt.Errorf("update comment: %w", err)
 	}
 	return nil
 }
@@ -153,9 +187,36 @@ func (g *GitHub) do(ctx context.Context, method, path string, in, out any) error
 	return json.Unmarshal(data, out)
 }
 
-// commentBody renders the connect-info comment for a branch. The marker
-// makes the comment discoverable for dedup on later events.
-func commentBody(proxyHost string, b *api.Branch) string {
+// commentBody renders the live status comment for a branch: a small table
+// with the branch name, its state (creating/resetting/ready/reset @ sha/
+// destroyed), the psql connect string and the expiry when a TTL is set.
+// The marker makes the comment discoverable for the in-place update on
+// later events. b is nil while the branch operation is still running (and
+// after destroy), so connect info is omitted then.
+func commentBody(proxyHost, branch, state string, b *api.Branch) string {
+	var sb strings.Builder
+	sb.WriteString(commentMarker + "\n")
+	sb.WriteString("**pgbranch** — Postgres branch for this pull request.\n\n")
+	sb.WriteString("| | |\n|---|---|\n")
+	fmt.Fprintf(&sb, "| Branch | `%s` |\n", branch)
+	fmt.Fprintf(&sb, "| State | %s |\n", state)
+	if b != nil {
+		fmt.Fprintf(&sb, "| Connect | `%s` |\n", psqlCommand(proxyHost, b))
+		if b.ExpiresAt != "" {
+			fmt.Fprintf(&sb, "| Expires | %s |\n", b.ExpiresAt)
+		}
+	}
+	if state == "destroyed" {
+		sb.WriteString("\nThe branch was destroyed when the pull request closed.\n")
+	} else {
+		sb.WriteString("\nThe database name routes through the pgbranch proxy to the branch. " +
+			"The branch is destroyed when the pull request is closed.\n")
+	}
+	return sb.String()
+}
+
+// psqlCommand renders the proxy connect string shown in comments.
+func psqlCommand(proxyHost string, b *api.Branch) string {
 	host, port := proxyHost, ""
 	if h, p, err := net.SplitHostPort(proxyHost); err == nil {
 		host, port = h, p
@@ -164,16 +225,5 @@ func commentBody(proxyHost string, b *api.Branch) string {
 	if port != "" {
 		psql += " -p " + port
 	}
-	psql += fmt.Sprintf(" -U %s -d '%s'", b.User, b.ProxyDatabase)
-	return fmt.Sprintf(`%s
-**pgbranch** created the Postgres branch `+"`%s`"+` for this pull request.
-
-Connect through the pgbranch proxy (the database name routes to the branch):
-
-`+"```"+`
-%s
-`+"```"+`
-
-The branch is destroyed when the pull request is closed.
-`, commentMarker, b.Name, psql)
+	return psql + fmt.Sprintf(" -U %s -d '%s'", b.User, b.ProxyDatabase)
 }
