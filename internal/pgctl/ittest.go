@@ -56,7 +56,14 @@ func StartSourcePGVersion(t *testing.T, ctx context.Context, major string) (host
 			ContainerFilePath: "/docker-entrypoint-initdb.d/zz-replication.sh",
 			FileMode:          0o755,
 		}},
-		WaitingFor: wait.ForListeningPort("5432/tcp").WithStartupTimeout(60 * time.Second),
+		// The stock entrypoint starts a temp server for initdb, stops it, then
+		// starts the real one — so the "ready" log must appear twice. Waiting on
+		// the listening port alone races on hosts where docker-proxy accepts the
+		// mapped port before postgres is up (e.g. GitHub Actions runners).
+		WaitingFor: wait.ForAll(
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			wait.ForListeningPort("5432/tcp"),
+		).WithStartupTimeoutDefault(60 * time.Second),
 	}
 	c, err := tc.GenericContainer(ctx, tc.GenericContainerRequest{ContainerRequest: req, Started: true})
 	if err != nil {
