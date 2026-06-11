@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
+	"github.com/abd-ulbasit/pgbranch/internal/engine"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 )
 
@@ -20,7 +21,7 @@ func TestCommandTree(t *testing.T) {
 		{"source", "add"}, {"source", "ls"}, {"source", "rm"}, {"source", "refresh"},
 		{"source", "set-mask"}, {"source", "get-mask"},
 		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"},
-		{"connect"},
+		{"connect"}, {"diff"},
 	} {
 		cmd, _, err := root.Find(path)
 		if err != nil || cmd.Name() != path[len(path)-1] {
@@ -430,5 +431,58 @@ func TestServerModeBranchLsShowsParent(t *testing.T) {
 	}
 	if !strings.Contains(lines[2], "pr-2") || !strings.Contains(lines[2], "pr-1") {
 		t.Fatalf("child row lacks parent: %q", lines[2])
+	}
+}
+
+func TestServerModeDiff(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/branches/pr-7/diff" {
+			t.Errorf("%s %s", r.Method, r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(engine.DiffResult{
+			SchemaDiff: "@@ -1,2 +1,3 @@\n CREATE TABLE users (\n+    extra text,\n     id integer\n",
+			Tables: []engine.TableDelta{
+				{Table: "diffdemo", BaseRows: 0, BranchRows: 100, Delta: 100},
+				{Table: "untouched", BaseRows: 50, BranchRows: 50, Delta: 0},
+				{Table: "users", BaseRows: 1000, BranchRows: 990, Delta: -10},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	out := run(t, "diff", "pr-7", "--server", ts.URL)
+	want := `@@ -1,2 +1,3 @@
+ CREATE TABLE users (
++    extra text,
+     id integer
+
+TABLE     BASE  BRANCH  DELTA
+diffdemo  0     100     +100
+users     1000  990     -10
+(row counts are planner estimates)
+`
+	if out != want {
+		t.Errorf("pgb diff output:\n%q\nwant:\n%q", out, want)
+	}
+
+	// --all also lists tables without row-count changes
+	out = run(t, "diff", "pr-7", "--all", "--server", ts.URL)
+	if !strings.Contains(out, "untouched  50    50      0") {
+		t.Errorf("pgb diff --all missing unchanged table:\n%s", out)
+	}
+}
+
+func TestServerModeDiffNoChanges(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(engine.DiffResult{Tables: []engine.TableDelta{
+			{Table: "users", BaseRows: 10, BranchRows: 10, Delta: 0},
+		}})
+	}))
+	defer ts.Close()
+
+	out := run(t, "diff", "pr-7", "--server", ts.URL)
+	want := "schema: no differences\ntables: no row-count changes\n"
+	if out != want {
+		t.Errorf("pgb diff output: %q want %q", out, want)
 	}
 }
