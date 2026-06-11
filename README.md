@@ -169,6 +169,8 @@ psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
 
 `pgbranch-github` (`cmd/pgbranch-github`, image `pgbranch/ghook` via `make docker-build-ghook`) turns pull requests into branches: a signed GitHub webhook creates `pr-<number>` when a PR opens, optionally resets it on every push, destroys it on close, and can post a one-time connect-info comment on the PR. The Helm chart ships it as an optional sub-deployment (`--set ghook.enabled=true ...`). Setup, permissions, and the full `GHOOK_*` environment reference live in [docs/github-app.md](docs/github-app.md).
 
+See it end-to-end on a real pull request — a migration that passes on an empty dev database, fails against the PR's masked clone of production (37 legacy duplicate emails), gets fixed, and the branch is destroyed on merge: [pgbranch-demo PR #1](https://github.com/abd-ulbasit/pgbranch-demo/pull/1).
+
 ## How it works
 
 `pgb source add` runs `pg_basebackup` in a one-shot helper container, streaming the source cluster into a named Docker volume. That volume becomes the read-only **lower layer** for every branch.
