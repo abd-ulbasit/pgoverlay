@@ -120,6 +120,28 @@ new branches use the new one. An old generation is garbage-collected when the
 last branch referencing it is destroyed. Branches never follow the source —
 a branch is a point-in-time snapshot by design.
 
+## Per-branch credentials
+
+By default a branch **inherits its source's credentials**: the data
+directory is a byte-for-byte clone, so the same role/password just works.
+`branchd --rotate-branch-credentials` (chart: `rotateBranchCredentials`)
+switches to per-branch passwords: on every branch create and reset the
+engine generates a 32-hex `crypto/rand` secret and applies it inside the
+branch — `ALTER ROLE … WITH PASSWORD` over the same local-socket psql path
+masking uses, after masking and before the branch is marked ready — then
+stores it on the branch row (registry v7). The API returns it as `password`
+(omitted in inherit mode), `pgb connect` embeds it in the printed DSNs, and
+`pgb branch ls` never shows it. Branch-from-branch children get their own
+password; the parent's freeze/quiesce restart deliberately does not
+re-rotate (its data already carries its password). A reset rotates again —
+the old branch password stops working.
+
+The trade-off: with rotation a leaked branch DSN exposes only that branch,
+never the production-shaped source. But static-credential preview flows
+break — Vercel-style env templating (one `DATABASE_URL` template with the
+branch name substituted per preview) relies on every branch accepting the
+same source password, so those flows need inherit mode (the default).
+
 ## Proxy routing
 
 Per-branch host ports are annoying, so branchd bundles a wire-protocol

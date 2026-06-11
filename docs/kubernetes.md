@@ -4,49 +4,27 @@
 > README stays the canonical copy of this walkthrough.
 
 branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm
-chart deploys the whole thing:
+chart deploys the whole thing, in one of two storage modes: **csi** —
+branches as PVC clones, schedulable on any node, the recommended
+production-ish deployment — or **hostpath**, the single-node/dev mode.
+
+## Recommended: csi mode
+
+When the cluster has a CSI driver that can clone volumes, deploy in csi
+mode — branches live in PersistentVolumeClaims (surviving node loss), pods
+schedule on any node and need no extra capabilities:
 
 ```bash
 make docker-build                          # builds pgbranch/branchd:dev (push it, or `kind load` for local clusters)
 helm install pgbranch deploy/helm/pgbranch \
   --namespace pgbranch-system --create-namespace \
-  --set node=<storage-node-name> \
-  --set token=$(openssl rand -hex 16)
+  --set node=<node-for-branchd-state> \
+  --set token=$(openssl rand -hex 16) \
+  --set storage.mode=csi \
+  --set storage.storageClass=<class-with-clone-support>
 ```
 
-## Values that matter
-
-- **`node` (required)** — the name of the node branchd itself runs on
-  (`kubectl get nodes`); its sqlite registry lives there in a `hostPath`. In
-  the default `hostpath` storage mode it is also the **storage node**: all
-  CoW data lives under `dataRoot` (default `/var/lib/pgbranch`) on this one
-  node as plain directories, and every branch/helper pod is pinned there.
-- **`storage.mode`** — `hostpath` (default, single-node) or `csi`
-  (multi-node, branches as PVC clones — see below).
-- **`token` / `existingSecret`** — the REST API bearer token. Either let the
-  chart render a Secret from `token`, or point `existingSecret` at a
-  pre-created Secret with key `token`.
-- **`proxy.service.type`** — set to `NodePort` (with
-  `proxy.service.nodePort`) to reach branches from outside the cluster
-  without a port-forward.
-
-## Storage modes: hostpath vs csi
-
-| | `hostpath` (default) | `csi` |
-|---|---|---|
-| Branch data | directories under `dataRoot` on ONE node | PersistentVolumeClaims |
-| Branch creation | empty rw dir + in-container OverlayFS | PVC `dataSource` clone (CoW on capable drivers) |
-| Pod placement | every pod pinned to `node` | any node — the scheduler decides |
-| Branch pod privileges | `CAP_SYS_ADMIN` (overlay mount) | none |
-| Storage requirements | none (a disk) | a CSI driver supporting **PVC cloning** or **VolumeSnapshots** |
-| Scope | dev/test on one node (kind, a beefy VM) | multi-node clusters |
-
-**Choose `hostpath`** when everything fits one node and you want zero
-storage infrastructure — it is the simplest honest setup, and what
-`make k8s-it` exercises on kind.
-
-**Choose `csi`** when branches should spread across nodes or `SYS_ADMIN` is
-off the table. Requirements:
+Requirements:
 
 - A StorageClass whose CSI driver supports **PVC cloning** (PVC
   `dataSource: PersistentVolumeClaim`) — e.g. AWS EBS, Ceph RBD,
@@ -57,14 +35,11 @@ off the table. Requirements:
 - `storage.volumeSize` sizes every pgbranch PVC (default 10Gi; clones are
   thin on CoW drivers).
 
-```bash
-helm install pgbranch deploy/helm/pgbranch \
-  --namespace pgbranch-system --create-namespace \
-  --set node=<node-for-branchd-state> \
-  --set token=$(openssl rand -hex 16) \
-  --set storage.mode=csi \
-  --set storage.storageClass=<class-with-clone-support>
-```
+In csi mode the chart also puts branchd's own state (the sqlite registry)
+on a PVC automatically, so the registry is as durable as the branches it
+tracks. `persistence.enabled` is a tri-state string: `""` (auto — on with
+csi, off with hostpath), `"true"`, `"false"`; `persistence.size` (default
+1Gi) and `persistence.storageClass` tune the claim.
 
 How csi mode works (branchd `--kube-storage csi --csi-storage-class …`,
 which forces the `csi` CoW backend): the source is seeded into a PVC via
@@ -84,11 +59,67 @@ while a helper pod holds it is driver-specific; pgbranch only clones source
 PVCs with no pod attached (seeding helpers are one-shot), so this does not
 come up in normal flows.
 
+## Single-node / dev: hostpath
+
+The default mode needs zero storage infrastructure — all CoW data is plain
+directories under `dataRoot` on ONE designated node, and every branch/helper
+pod is pinned there (branch pods carry `CAP_SYS_ADMIN` for the in-container
+overlay mount). It is the simplest honest setup, and what `make k8s-it`
+exercises on kind:
+
+```bash
+helm install pgbranch deploy/helm/pgbranch \
+  --namespace pgbranch-system --create-namespace \
+  --set node=<storage-node-name> \
+  --set token=$(openssl rand -hex 16)
+```
+
+> **Data-loss warning:** hostpath mode keeps all CoW data *and* the sqlite
+> registry on the storage node's disk, and a node rollover (e.g. an EKS
+> upgrade rolling the node group) recycles that disk — branches and the
+> registry are gone. Branches are disposable by design, so for dev/test the
+> recovery is just re-seed and re-branch ([docs/eks.md](eks.md) walks the
+> procedure); if branch survival across node loss matters, use csi mode.
+
+## Values that matter
+
+- **`node` (required)** — the name of the node branchd itself runs on
+  (`kubectl get nodes`); its sqlite registry lives there in a `hostPath`
+  (unless `persistence` puts it on a PVC). In the default `hostpath`
+  storage mode it is also the **storage node**: all CoW data lives under
+  `dataRoot` (default `/var/lib/pgbranch`) on this one node as plain
+  directories, and every branch/helper pod is pinned there.
+- **`storage.mode`** — `csi` (recommended, multi-node, branches as PVC
+  clones) or `hostpath` (default, single-node/dev — see above).
+- **`persistence.*`** — branchd's registry on a PVC (auto-on in csi mode).
+- **`token` / `existingSecret`** — the REST API bearer token. Either let the
+  chart render a Secret from `token`, or point `existingSecret` at a
+  pre-created Secret with key `token`.
+- **`proxy.service.type`** — set to `NodePort` (with
+  `proxy.service.nodePort`) to reach branches from outside the cluster
+  without a port-forward.
+- **`rotateBranchCredentials`** — give every branch its own generated
+  password instead of inheriting the source's (see
+  [architecture](architecture.md)).
+
+## Storage modes: hostpath vs csi
+
+| | `hostpath` (default) | `csi` |
+|---|---|---|
+| Branch data | directories under `dataRoot` on ONE node | PersistentVolumeClaims |
+| Branch creation | empty rw dir + in-container OverlayFS | PVC `dataSource` clone (CoW on capable drivers) |
+| Pod placement | every pod pinned to `node` | any node — the scheduler decides |
+| Branch pod privileges | `CAP_SYS_ADMIN` (overlay mount) | none |
+| Node loss | branches + registry lost (see warning above) | PVCs survive; registry too with `persistence` |
+| Storage requirements | none (a disk) | a CSI driver supporting **PVC cloning** or **VolumeSnapshots** |
+| Scope | dev/test on one node (kind, a beefy VM) | multi-node clusters, production-ish use |
+
 ## What the chart creates
 
 A single-replica Deployment (branchd's registry is SQLite — single writer,
 so one replica, `Recreate` strategy, state in `hostPath <dataRoot>/state` on
-the storage node), a namespace-scoped Role (pods create/delete/get/list/
+the storage node — or in a PVC when `persistence` is on, which is automatic
+in csi mode), a namespace-scoped Role (pods create/delete/get/list/
 watch, pods/exec, pods/log — plus persistentvolumeclaims and volumesnapshots
 when `storage.mode=csi`; branchd manages resources only in its own
 namespace), and two Services: `pgbranch-api` (REST, :7070) and

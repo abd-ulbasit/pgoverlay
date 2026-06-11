@@ -91,7 +91,7 @@ PGBRANCH_TOKEN=$(openssl rand -hex 16) ./bin/branchd
 # 2026/06/10 12:00:00 pg router listening on :6432 (connect with dbname@branch)
 ```
 
-Flags: `--api-addr :7070` (REST), `--pg-addr :6432` (router), `--reap-interval 30s` (TTL reaper tick). `PGBRANCH_TOKEN` is required — branchd refuses to start without it; every `/v1` request needs `Authorization: Bearer <token>` (`GET /healthz` is open). `SIGINT`/`SIGTERM` shut down gracefully and leave branch containers running.
+Flags: `--api-addr :7070` (REST), `--pg-addr :6432` (router), `--reap-interval 30s` (TTL reaper tick), `--rotate-branch-credentials` (give every branch its own generated password instead of inheriting the source's — returned as `password` in branch responses; see [docs/architecture.md](docs/architecture.md)). `PGBRANCH_TOKEN` is required — branchd refuses to start without it; every `/v1` request needs `Authorization: Bearer <token>` (`GET /healthz` is open). `SIGINT`/`SIGTERM` shut down gracefully and leave branch containers running.
 
 REST API:
 

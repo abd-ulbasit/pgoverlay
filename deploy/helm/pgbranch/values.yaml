@@ -1,6 +1,8 @@
-# pgbranch runs all CoW data on ONE designated storage node (dev/test scope;
-# multi-node via CSI is future work). branchd, its sqlite state, and every
-# branch/helper pod are pinned to this node via nodeName + hostPath.
+# pgbranch has two storage modes (docs/kubernetes.md): csi — branches as PVC
+# clones, schedulable on any node, the recommended production-ish deployment
+# — and hostpath (default), which keeps all CoW data on ONE designated
+# storage node (single-node/dev scope). branchd itself is always pinned to
+# `node`; in hostpath mode every branch/helper pod is pinned there too.
 
 # REQUIRED: name of the storage node (kubectl get nodes).
 node: ""
