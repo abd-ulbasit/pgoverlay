@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Only fast, runner-friendly suites run here. The kind/K8s suites (k8s-it,
+# csi-it) and the Postgres version matrix are run locally via the Makefile —
+# they need a kind cluster and many image pulls, which would make CI slow.
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+      - run: go test ./... -count=1
+
+  integration:
+    runs-on: ubuntu-latest # Docker preinstalled; overlay tests use --cap-add SYS_ADMIN
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: pre-pull images
+        run: |
+          docker pull -q postgres:17
+          docker pull -q alpine:3.21
+      - run: PGBRANCH_IT=1 go test ./... -count=1 -timeout 25m
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: make helm-test

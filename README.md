@@ -1,5 +1,7 @@
 # pgbranch
 
+[![ci](https://github.com/abd-ulbasit/pgbranch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/abd-ulbasit/pgbranch/actions/workflows/ci.yml)
+
 `git branch` for Postgres: seed once from any running database, then spin up isolated, writable copies without ever touching the source.
 
 ```
