@@ -567,6 +567,87 @@ func TestRefreshSourceSeedFailureKeepsCurrentGeneration(t *testing.T) {
 	}
 }
 
+// dumpHelpers returns the recorded RunHelper specs whose script runs pg_dump.
+func (f *fakeDriver) dumpHelpers() []runtime.HelperSpec {
+	var out []runtime.HelperSpec
+	for _, h := range f.helpers {
+		if len(h.Cmd) == 3 && h.Cmd[0] == "bash" && strings.Contains(h.Cmd[2], "pg_dump") {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+func TestAddSourceViaDumpUsesSeedDump(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	s := &registry.Source{Name: "main", PGVersion: "17", ConnHost: "db.supabase.co", ConnPort: 5432,
+		ConnUser: "postgres", ConnDB: "appdb", SeedVia: registry.SeedViaDump, DumpSchemas: []string{"public"}}
+	if err := e.AddSource(context.Background(), s, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustSource(t, r); got.State != registry.SourceReady || got.SeedVia != registry.SeedViaDump {
+		t.Fatalf("source after dump seed: %+v", got)
+	}
+	dumps := d.dumpHelpers()
+	if len(dumps) != 1 {
+		t.Fatalf("dump helpers=%d want 1 (helpers: %v)", len(dumps), d.helpers)
+	}
+	h := dumps[0]
+	if h.Image != "postgres:17" || h.User != "postgres" {
+		t.Fatalf("dump helper image/user: %+v", h)
+	}
+	if !strings.Contains(strings.Join(h.Env, "\n"), "PGB_DB=appdb") {
+		t.Fatalf("dump helper env missing database: %v", h.Env)
+	}
+	if !strings.Contains(h.Cmd[2], "-n 'public'") {
+		t.Fatalf("dump helper script missing schema scope:\n%s", h.Cmd[2])
+	}
+	if len(h.Mounts) != 1 || h.Mounts[0].Volume != "pgbranch-src-main" {
+		t.Fatalf("dump helper mounts: %+v", h.Mounts)
+	}
+}
+
+func TestRefreshSourceKeepsDumpMethod(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	s := &registry.Source{Name: "main", PGVersion: "17", ConnHost: "h", ConnPort: 5432,
+		ConnUser: "postgres", SeedVia: registry.SeedViaDump}
+	if err := e.AddSource(context.Background(), s, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RefreshSource(context.Background(), "main", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustSource(t, r); got.Generation != 2 {
+		t.Fatalf("generation=%d want 2", got.Generation)
+	}
+	if n := len(d.dumpHelpers()); n != 2 {
+		t.Fatalf("dump helpers=%d want 2 (add + refresh both via pg_dump)", n)
+	}
+}
+
+func TestAddSourceBasebackupUnaffected(t *testing.T) {
+	d := newFake()
+	e, _ := testEngine(t, d)
+	s := &registry.Source{Name: "main", PGVersion: "17", ConnHost: "h", ConnPort: 5432, ConnUser: "postgres"}
+	if err := e.AddSource(context.Background(), s, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(d.dumpHelpers()); n != 0 {
+		t.Fatalf("basebackup source ran %d dump helpers", n)
+	}
+	var basebackup bool
+	for _, h := range d.helpers {
+		if len(h.Cmd) > 0 && h.Cmd[0] == "pg_basebackup" {
+			basebackup = true
+		}
+	}
+	if !basebackup {
+		t.Fatalf("pg_basebackup helper not recorded: %v", d.helpers)
+	}
+}
+
 func TestRemoveSource(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)

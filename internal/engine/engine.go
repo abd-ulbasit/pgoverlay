@@ -40,6 +40,23 @@ func (e *Engine) image(pgVersion string) string {
 	return "postgres:" + pgVersion
 }
 
+// seedSource runs the source's seeding method (pg_basebackup or pg_dump,
+// per Source.SeedVia) into the given layer. Backend-neutral: the layer is
+// resolved through seedTarget (overlay volume, zfs mountpoint, csi PVC).
+func (e *Engine) seedSource(ctx context.Context, s *registry.Source, layer, password string) error {
+	seedVol, seedKind := e.seedTarget(layer)
+	spec := pgctl.SeedSpec{
+		Image: e.image(s.PGVersion), Volume: seedVol, MountKind: seedKind, Network: s.Network,
+		Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser, Password: password,
+	}
+	if s.SeedVia == registry.SeedViaDump {
+		return pgctl.SeedDump(ctx, e.drv, pgctl.SeedDumpSpec{
+			SeedSpec: spec, Database: s.ConnDB, Schemas: s.DumpSchemas,
+		})
+	}
+	return pgctl.Seed(ctx, e.drv, spec)
+}
+
 // AddSource registers a source and seeds it from the given live Postgres.
 func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password string) error {
 	s.Volume = e.planner.SourceLayerName(s.Name, 1)
@@ -50,12 +67,7 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 		e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed")
 		return err
 	}
-	seedVol, seedKind := e.seedTarget(s.Volume)
-	err := pgctl.Seed(ctx, e.drv, pgctl.SeedSpec{
-		Image: e.image(s.PGVersion), Volume: seedVol, MountKind: seedKind, Network: s.Network,
-		Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser, Password: password,
-	})
-	if err != nil {
+	if err := e.seedSource(ctx, s, s.Volume, password); err != nil {
 		e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume)
 		e.reg.SetSourceState(s.ID, registry.SourceFailed, err.Error())
 		return fmt.Errorf("seed source %q: %w", s.Name, err)
@@ -79,12 +91,7 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 	if err := e.createSourceLayer(ctx, newVol, map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": name}); err != nil {
 		return err
 	}
-	seedVol, seedKind := e.seedTarget(newVol)
-	err = pgctl.Seed(ctx, e.drv, pgctl.SeedSpec{
-		Image: e.image(src.PGVersion), Volume: seedVol, MountKind: seedKind, Network: src.Network,
-		Host: src.ConnHost, Port: src.ConnPort, User: src.ConnUser, Password: password,
-	})
-	if err != nil {
+	if err := e.seedSource(ctx, src, newVol, password); err != nil {
 		e.removeSourceLayer(context.WithoutCancel(ctx), newVol)
 		return fmt.Errorf("refresh source %q: %w", name, err)
 	}
