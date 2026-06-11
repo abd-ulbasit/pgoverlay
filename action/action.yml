@@ -1,0 +1,70 @@
+# Create a copy-on-write Postgres branch on a pgbranch server and wait until
+# it is ready. Usage:
+#
+#   - uses: abd-ulbasit/pgbranch/action@main
+#     id: branch
+#     with:
+#       server: ${{ vars.PGBRANCH_SERVER }}
+#       token: ${{ secrets.PGBRANCH_TOKEN }}
+#       source: main
+#   - run: psql "host=${{ steps.branch.outputs.host }} port=${{ steps.branch.outputs.port }} ..."
+#
+# Pair with abd-ulbasit/pgbranch/action/destroy@main in an `if: always()`
+# step; the TTL reaps leaked branches as a fallback.
+name: pgbranch branch
+description: Create a copy-on-write Postgres branch on a pgbranch server and wait until it is ready
+author: abd-ulbasit
+branding:
+  icon: git-branch
+  color: blue
+
+inputs:
+  server:
+    description: branchd base URL (e.g. https://pgbranch.example.com)
+    required: true
+  token:
+    description: pgbranch API bearer token (store it as a secret)
+    required: true
+  source:
+    description: source to branch from
+    required: false
+    default: main
+  name:
+    description: >-
+      branch name (must match ^[a-z0-9][a-z0-9-]{0,40}$); default is a
+      generated t-gha-<run id>-<random>
+    required: false
+    default: ""
+  ttl:
+    description: branch TTL in seconds, a safety net for leaked branches (0 = never reaped)
+    required: false
+    default: "3600"
+
+outputs:
+  branch:
+    description: the branch name (pass it to the destroy action)
+    value: ${{ steps.create.outputs.branch }}
+  host:
+    description: direct Postgres host of the branch
+    value: ${{ steps.create.outputs.host }}
+  port:
+    description: direct Postgres port of the branch
+    value: ${{ steps.create.outputs.port }}
+  database:
+    description: database name
+    value: ${{ steps.create.outputs.database }}
+  # no password output: branch credentials are inherited from the source,
+  # which the workflow already holds as its own secret
+
+runs:
+  using: composite
+  steps:
+    - id: create
+      shell: bash
+      env:
+        PGBRANCH_SERVER: ${{ inputs.server }}
+        PGBRANCH_TOKEN: ${{ inputs.token }}
+        PGBRANCH_SOURCE: ${{ inputs.source }}
+        PGBRANCH_BRANCH: ${{ inputs.name }}
+        PGBRANCH_TTL: ${{ inputs.ttl }}
+      run: '"$GITHUB_ACTION_PATH/entrypoint.sh"'

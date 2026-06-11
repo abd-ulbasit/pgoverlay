@@ -1,0 +1,36 @@
+# Delete a pgbranch branch by name. Run it with `if: always()` so the branch
+# goes away even when the tests fail:
+#
+#   - uses: abd-ulbasit/pgbranch/action/destroy@main
+#     if: always()
+#     with:
+#       server: ${{ vars.PGBRANCH_SERVER }}
+#       token: ${{ secrets.PGBRANCH_TOKEN }}
+#       branch: ${{ steps.branch.outputs.branch }}
+name: pgbranch destroy
+description: Delete a pgbranch branch by name (404 counts as success)
+author: abd-ulbasit
+branding:
+  icon: trash-2
+  color: blue
+
+inputs:
+  server:
+    description: branchd base URL (e.g. https://pgbranch.example.com)
+    required: true
+  token:
+    description: pgbranch API bearer token (store it as a secret)
+    required: true
+  branch:
+    description: branch name to delete (the create action's `branch` output)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PGBRANCH_SERVER: ${{ inputs.server }}
+        PGBRANCH_TOKEN: ${{ inputs.token }}
+        PGBRANCH_BRANCH: ${{ inputs.branch }}
+      run: '"$GITHUB_ACTION_PATH/entrypoint.sh"'
