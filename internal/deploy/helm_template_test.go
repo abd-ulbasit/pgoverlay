@@ -27,6 +27,101 @@ func helmTemplate(t *testing.T, sets ...string) (string, error) {
 	return string(out), err
 }
 
+// csiSets is the minimal valid csi storage configuration.
+func csiSets(extra ...string) []string {
+	return append([]string{
+		"storage.mode=csi",
+		"storage.storageClass=fast-clone",
+	}, extra...)
+}
+
+// Registry-on-a-PVC: persistence.enabled is a tri-state string — "" (auto:
+// ON with storage.mode=csi, OFF with hostpath), "true", "false". When on,
+// branchd's state dir is a PVC mount instead of hostPath <dataRoot>/state.
+
+func TestHelmPersistenceDefaultOffOnHostpath(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "kind: PersistentVolumeClaim") {
+		t.Error("hostpath default rendered a state PVC")
+	}
+	if !strings.Contains(out, "path: /var/lib/pgbranch/state") {
+		t.Error("hostpath default lost the hostPath state volume")
+	}
+	if strings.Contains(out, "claimName:") {
+		t.Error("hostpath default mounts a PVC claim")
+	}
+}
+
+func TestHelmPersistenceAutoOnWithCSI(t *testing.T) {
+	out, err := helmTemplate(t, csiSets()...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "kind: PersistentVolumeClaim") {
+		t.Error("csi mode did not auto-enable the state PVC")
+	}
+	if !strings.Contains(out, "claimName: test-release-pgbranch-state") {
+		t.Errorf("deployment state volume is not the PVC claim:\n%s", out)
+	}
+	if strings.Contains(out, "path: /var/lib/pgbranch/state") {
+		t.Error("csi mode still renders the hostPath state volume")
+	}
+	// default size
+	if !strings.Contains(out, "storage: 1Gi") {
+		t.Error("default persistence.size 1Gi not rendered")
+	}
+}
+
+func TestHelmPersistenceExplicitTrueOnHostpath(t *testing.T) {
+	out, err := helmTemplate(t, "persistence.enabled=true")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "kind: PersistentVolumeClaim") || !strings.Contains(out, "claimName:") {
+		t.Errorf("persistence.enabled=true on hostpath did not render the PVC:\n%s", out)
+	}
+	if strings.Contains(out, "path: /var/lib/pgbranch/state") {
+		t.Error("explicit persistence still renders the hostPath state volume")
+	}
+}
+
+func TestHelmPersistenceExplicitFalseOnCSI(t *testing.T) {
+	out, err := helmTemplate(t, csiSets("persistence.enabled=false")...)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "kind: PersistentVolumeClaim") {
+		t.Error("explicit persistence.enabled=false with csi must stay off")
+	}
+	if !strings.Contains(out, "path: /var/lib/pgbranch/state") {
+		t.Error("disabled persistence lost the hostPath state volume")
+	}
+}
+
+func TestHelmPersistenceSizeAndStorageClass(t *testing.T) {
+	out, err := helmTemplate(t,
+		"persistence.enabled=true", "persistence.size=5Gi", "persistence.storageClass=fast")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	for _, want := range []string{"storage: 5Gi", "storageClassName: fast"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered manifests missing %q", want)
+		}
+	}
+	// no storageClassName line when unset (cluster default class)
+	out, err = helmTemplate(t, "persistence.enabled=true")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "storageClassName:") {
+		t.Error("empty persistence.storageClass must omit storageClassName")
+	}
+}
+
 func TestHelmRotateBranchCredentialsArg(t *testing.T) {
 	out, err := helmTemplate(t)
 	if err != nil {

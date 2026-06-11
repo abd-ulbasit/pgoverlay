@@ -52,6 +52,21 @@ has "$out" 'volumesnapshots' csi
 has "$out" 'snapshot.storage.k8s.io' csi
 hasnt "$out" 'SYS_ADMIN' csi
 
+# registry-on-a-PVC: auto-on with csi (state PVC + claim, no hostPath state),
+# explicitly off stays off, hostpath default stays hostPath
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set storage.mode=csi --set storage.storageClass=fast-clone)
+has "$out" 'kind: PersistentVolumeClaim' csi-persistence
+has "$out" 'claimName: rel-pgbranch-state' csi-persistence
+hasnt "$out" 'path: /var/lib/pgbranch/state' csi-persistence
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set storage.mode=csi --set storage.storageClass=fast-clone \
+  --set persistence.enabled=false)
+hasnt "$out" 'kind: PersistentVolumeClaim' csi-no-persistence
+has "$out" 'path: /var/lib/pgbranch/state' csi-no-persistence
+out=$(helm template pgbranch "$CHART" --set node=storage-1 --set token=s3cret)
+hasnt "$out" 'kind: PersistentVolumeClaim' default
+
 # csi without the optional values renders no empty flags
 out=$(helm template rel "$CHART" --set node=n --set token=t \
   --set storage.mode=csi --set storage.storageClass=fast-clone)

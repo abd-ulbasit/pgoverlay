@@ -19,6 +19,19 @@ app.kubernetes.io/name: pgbranch
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
+{{/* Whether branchd's state dir is a PVC ("true"/"false" string).
+     persistence.enabled is tri-state: "" = auto (on with storage.mode=csi,
+     off with hostpath), "true"/"false" = explicit override — so an explicit
+     false with csi stays false. */}}
+{{- define "pgbranch.persistenceEnabled" -}}
+{{- $e := .Values.persistence.enabled | toString -}}
+{{- if eq $e "" -}}
+{{- eq .Values.storage.mode "csi" -}}
+{{- else -}}
+{{- eq $e "true" -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Secret holding the API bearer token (key "token"). */}}
 {{- define "pgbranch.tokenSecretName" -}}
 {{- .Values.existingSecret | default (printf "%s-token" (include "pgbranch.fullname" .)) -}}

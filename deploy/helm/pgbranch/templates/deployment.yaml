@@ -82,6 +82,11 @@ spec:
           {{- end }}
       volumes:
         - name: state
+          {{- if eq (include "pgbranch.persistenceEnabled" .) "true" }}
+          persistentVolumeClaim:
+            claimName: {{ include "pgbranch.fullname" . }}-state
+          {{- else }}
           hostPath:
             path: {{ .Values.dataRoot }}/state
             type: DirectoryOrCreate
+          {{- end }}

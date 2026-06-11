@@ -34,6 +34,22 @@ storage:
   # 10Gi; CSI drivers thin-provision, so roomy is cheap).
   volumeSize: ""
 
+# Durability of branchd's own state (the sqlite registry). When enabled the
+# state dir is a PersistentVolumeClaim instead of hostPath <dataRoot>/state,
+# so the registry survives node loss/rollover. `enabled` is a TRI-STATE
+# string, not a bool:
+#  - "" (default): auto — ON when storage.mode=csi (branch data already
+#    lives in PVCs; the registry should be as durable), OFF with hostpath
+#    (state shares the storage node's disk with the CoW data anyway).
+#  - "true": force on (hostpath too — needs a StorageClass that can place
+#    the volume on/reachable from `node`).
+#  - "false": force off even in csi mode (registry stays on the node).
+persistence:
+  enabled: ""
+  size: 1Gi
+  # StorageClass for the state PVC; empty = the cluster's default class.
+  storageClass: ""
+
 image:
   repository: pgbranch/branchd
   tag: dev
