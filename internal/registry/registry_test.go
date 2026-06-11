@@ -164,8 +164,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 6 {
-		t.Fatalf("user_version=%d want 6", v)
+	if v != 7 {
+		t.Fatalf("user_version=%d want 7", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -219,6 +219,10 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	}
 	if len(s.DumpSchemas) != 0 {
 		t.Fatalf("v6 backfill: DumpSchemas=%v want empty", s.DumpSchemas)
+	}
+	// v7: pre-existing branches inherit credentials (no per-branch password)
+	if b.Password != "" {
+		t.Fatalf("v7 backfill: Password=%q want empty", b.Password)
 	}
 	// re-opening an already-migrated DB is a no-op
 	r2, err := Open(path)
@@ -705,6 +709,54 @@ func TestCommitFreeze(t *testing.T) {
 	}
 	if p, _ := r.GetBranchByName("p"); p.RWVolume != "pgbranch-br-p-rw-g3" {
 		t.Fatalf("failed CommitFreeze mutated parent: %+v", p)
+	}
+}
+
+// v7: per-branch rotated credentials live on the branch row. Fresh branches
+// have no password (inherit mode); SetBranchPassword stores the rotated one
+// and it round-trips through every read path.
+func TestBranchPasswordRoundTrip(t *testing.T) {
+	r := openTest(t)
+	src := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(src); err != nil {
+		t.Fatal(err)
+	}
+	b := &Branch{Name: "pr-1", SourceID: src.ID, RWVolume: "rw", SourceVolume: "v"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != "" {
+		t.Fatalf("fresh branch Password=%q want empty", got.Password)
+	}
+	if err := r.SetBranchPassword(b.ID, "a1b2c3d4"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != "a1b2c3d4" {
+		t.Fatalf("Password=%q want a1b2c3d4", got.Password)
+	}
+	// list path carries it too
+	live, err := r.ListLiveBranches()
+	if err != nil || len(live) != 1 || live[0].Password != "a1b2c3d4" {
+		t.Fatalf("list: %v err=%v", live, err)
+	}
+	// rotation on reset overwrites
+	if err := r.SetBranchPassword(b.ID, "ffff0000"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = r.GetBranchByName("pr-1"); got.Password != "ffff0000" {
+		t.Fatalf("Password=%q want ffff0000 after overwrite", got.Password)
+	}
+	// unknown branch id
+	if err := r.SetBranchPassword("nope", "x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetBranchPassword(nope) err=%v want ErrNotFound", err)
 	}
 }
 

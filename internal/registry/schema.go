@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -121,4 +121,12 @@ ALTER TABLE branches ADD COLUMN parent_branch_name TEXT NOT NULL DEFAULT '';
 const migrateV6 = `
 ALTER TABLE sources ADD COLUMN seed_via TEXT NOT NULL DEFAULT 'basebackup';
 ALTER TABLE sources ADD COLUMN dump_schemas TEXT NOT NULL DEFAULT '';
+`
+
+// v7 (Phase 6): per-branch credential rotation. When the engine runs with
+// --rotate-branch-credentials it ALTERs the role's password inside every
+// fresh/reset branch and stores the new password here. '' = inherit mode
+// (the branch keeps the source's credentials, the historical behavior).
+const migrateV7 = `
+ALTER TABLE branches ADD COLUMN password TEXT NOT NULL DEFAULT '';
 `

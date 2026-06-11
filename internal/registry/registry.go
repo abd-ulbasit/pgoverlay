@@ -76,6 +76,7 @@ type Branch struct {
 	Host                                      string // address the instance listens on (127.0.0.1 for docker, pod IP for k8s)
 	BaseLayerID                               string // top of the layer chain the branch bases on; "" = the source volume directly
 	ParentBranchName                          string // display-only: branch this one was created from ("" = created from the source)
+	Password                                  string // rotated per-branch password; "" = credentials inherited from the source
 	Port                                      int
 	State                                     BranchState
 	CreatedAt                                 string
@@ -261,6 +262,22 @@ func (r *Registry) TransitionBranch(id string, to BranchState, reason string) er
 	return fmt.Errorf("illegal branch transition %s -> %s", b.State, to)
 }
 
+// SetBranchPassword stores a branch's rotated per-branch password ("" =
+// credentials inherited from the source). Called by the engine after the
+// in-branch ALTER ROLE succeeded, before the branch is marked ready.
+func (r *Registry) SetBranchPassword(id, password string) error {
+	res, err := r.db.Exec(`UPDATE branches SET password=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, password, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *Registry) MarkBranchReady(id, containerID, host string, port int) error {
 	if _, err := r.db.Exec(`UPDATE branches SET container_id=?, host=?, port=? WHERE id=?`, containerID, host, port, id); err != nil {
 		return err
@@ -268,13 +285,13 @@ func (r *Registry) MarkBranchReady(id, containerID, host string, port int) error
 	return r.TransitionBranch(id, BranchReady, "instance running")
 }
 
-const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,host,base_layer_id,parent_branch_name,port,created_at`
+const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,host,base_layer_id,parent_branch_name,password,port,created_at`
 
 func scanBranch(row interface{ Scan(...any) error }) (*Branch, error) {
 	b := &Branch{}
 	var baseLayer sql.NullString
 	err := row.Scan(&b.ID, &b.Name, &b.SourceID, &b.State, &b.ContainerID, &b.RWVolume,
-		&b.SourceVolume, &b.ExpiresAt, &b.Host, &baseLayer, &b.ParentBranchName, &b.Port, &b.CreatedAt)
+		&b.SourceVolume, &b.ExpiresAt, &b.Host, &baseLayer, &b.ParentBranchName, &b.Password, &b.Port, &b.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
