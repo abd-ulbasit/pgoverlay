@@ -2,6 +2,12 @@
 {{- if not (or .Values.ghook.webhookSecret .Values.ghook.existingSecret) }}
 {{- fail "set ghook.webhookSecret or ghook.existingSecret (webhook HMAC secret)" }}
 {{- end }}
+{{- if and .Values.ghook.appId .Values.ghook.githubToken }}
+{{- fail "ghook.appId/ghook.appPrivateKey and ghook.githubToken are mutually exclusive — pick App or PAT auth" }}
+{{- end }}
+{{- if and .Values.ghook.appId (not (or .Values.ghook.appPrivateKey .Values.ghook.existingSecret)) }}
+{{- fail "ghook.appId needs ghook.appPrivateKey (or an existingSecret carrying app-private-key)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -65,13 +71,24 @@ spec:
             - name: GHOOK_GITHUB_API
               value: {{ . | quote }}
             {{- end }}
-            # optional: enables the connect-info PR comment when present
+            {{- if .Values.ghook.appId }}
+            # GitHub App auth: the service mints installation tokens itself
+            - name: GHOOK_APP_ID
+              value: {{ .Values.ghook.appId | quote }}
+            - name: GHOOK_APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgbranch.ghook.secretName" . }}
+                  key: app-private-key
+            {{- else }}
+            # optional PAT: enables the live PR comment and commit statuses
             - name: GHOOK_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pgbranch.ghook.secretName" . }}
                   key: github-token
                   optional: true
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.ghook.port }}

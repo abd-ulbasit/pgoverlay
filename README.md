@@ -178,7 +178,7 @@ psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
 
 ## Branch per pull request
 
-`pgbranch-github` (`cmd/pgbranch-github`, image `pgbranch/ghook` via `make docker-build-ghook`) turns pull requests into branches: a signed GitHub webhook creates `pr-<number>` when a PR opens, optionally resets it on every push, destroys it on close, and can post a one-time connect-info comment on the PR. The Helm chart ships it as an optional sub-deployment (`--set ghook.enabled=true ...`). Setup, permissions, and the full `GHOOK_*` environment reference live in [docs/github-app.md](docs/github-app.md).
+`pgbranch-github` (`cmd/pgbranch-github`, image `pgbranch/ghook` via `make docker-build-ghook`) turns pull requests into branches: a signed GitHub webhook creates `pr-<number>` when a PR opens, optionally resets it on every push, and destroys it on close. It reports back as a `pgbranch/branch` commit status (pending → success/failure, so CI can gate on branch readiness) plus a live connect-info comment kept current on the PR, authenticating either as a GitHub App (installation tokens minted from the App key) or with a plain PAT. The Helm chart ships it as an optional sub-deployment (`--set ghook.enabled=true ...`). Setup, permissions, and the full `GHOOK_*` environment reference live in [docs/github-app.md](docs/github-app.md).
 
 See it end-to-end on a real pull request — a migration that passes on an empty dev database, fails against the PR's masked clone of production (37 legacy duplicate emails), gets fixed, and the branch is destroyed on merge: [pgbranch-demo PR #1](https://github.com/abd-ulbasit/pgbranch-demo/pull/1).
 

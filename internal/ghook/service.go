@@ -2,8 +2,9 @@
 // lifecycle events to pgbranch branches (branch-per-PR): opened/reopened →
 // ensure branch pr-<number> exists, synchronize → ensure (and optionally
 // reset), closed → destroy. It talks to branchd through internal/apiclient
-// and, when a GitHub token is configured, posts a one-time connect-info
-// comment on the PR.
+// and, when GitHub credentials are configured (App or PAT), reports back to
+// the PR: a pgbranch/branch commit status around every branch operation and
+// a live connect-info comment kept current in place.
 package ghook
 
 import (

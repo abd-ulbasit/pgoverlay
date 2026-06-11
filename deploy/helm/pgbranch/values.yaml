@@ -87,8 +87,23 @@ ghook:
   #    (and optionally "github-token")
   webhookSecret: ""
   existingSecret: ""
-  # GitHub API token (issues:write) enabling the one-time connect-info PR
-  # comment; leave empty to disable commenting.
+  # GitHub credentials enable the live connect-info PR comment and the
+  # pgbranch/branch commit status. Two auth modes, mutually exclusive:
+  #
+  #  - GitHub App (recommended): set appId + appPrivateKey; the service
+  #    mints short-lived installation tokens itself (nothing to rotate, bot
+  #    identity for comments/statuses). The App needs Pull requests: read,
+  #    Commit statuses: write, Issues: write. See docs/github-app.md.
+  #  - PAT (quick path): set githubToken to a token with the same scopes.
+  #
+  # Leave all three empty to disable comments and statuses (branch
+  # operations still run).
+  appId: ""
+  # PEM private key of the GitHub App (stored in the chart Secret as
+  # app-private-key, wired as GHOOK_APP_PRIVATE_KEY). With
+  # ghook.existingSecret, put the key under "app-private-key" there instead.
+  appPrivateKey: ""
+  # GitHub API token (PAT mode); mutually exclusive with appId.
   githubToken: ""
   # REQUIRED when enabled: pgbranch source to create PR branches from.
   source: ""

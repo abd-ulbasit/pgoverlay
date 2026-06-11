@@ -1,7 +1,8 @@
 // pgbranch-github is the branch-per-PR webhook service: it receives GitHub
 // pull_request webhooks and drives branchd through its REST API — opened or
 // reopened PRs get a branch pr-<number>, pushes optionally reset it, closing
-// the PR destroys it. Optionally posts a one-time connect-info comment.
+// the PR destroys it. With GitHub credentials (App or PAT) it also sets the
+// pgbranch/branch commit status and keeps a live connect-info comment.
 //
 // Configuration is environment-only (GHOOK_*); see docs/github-app.md.
 // Shutdown (SIGINT/SIGTERM) is graceful: in-flight deliveries finish.
