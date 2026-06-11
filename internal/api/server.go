@@ -14,16 +14,20 @@ import (
 // used for the seed connection only — never stored, never returned.
 
 type Source struct {
-	Name       string `json:"name"`
-	PGVersion  string `json:"pg_version"`
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	User       string `json:"user"`
-	Database   string `json:"database"`
-	Network    string `json:"network,omitempty"`
-	State      string `json:"state"`
-	Generation int    `json:"generation"`
-	CreatedAt  string `json:"created_at"`
+	Name      string `json:"name"`
+	PGVersion string `json:"pg_version"`
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	User      string `json:"user"`
+	Database  string `json:"database"`
+	Network   string `json:"network,omitempty"`
+	// Via is the seeding method: "basebackup" (pg_basebackup) or "dump"
+	// (pg_dump — managed Postgres without REPLICATION privilege).
+	Via         string   `json:"via"`
+	DumpSchemas []string `json:"dump_schemas,omitempty"`
+	State       string   `json:"state"`
+	Generation  int      `json:"generation"`
+	CreatedAt   string   `json:"created_at"`
 }
 
 type Branch struct {
@@ -53,6 +57,11 @@ type CreateSourceRequest struct {
 	Network   string `json:"network"`
 	PGVersion string `json:"pg_version"`
 	Password  string `json:"password"`
+	// Via selects the seeding method: "basebackup" (default) or "dump".
+	Via string `json:"via,omitempty"`
+	// DumpSchemas scopes a via=dump seed to the given schemas (empty = the
+	// whole database). Only valid with via=dump.
+	DumpSchemas []string `json:"dump_schemas,omitempty"`
 }
 
 // CreateBranchRequest creates a branch off a source (Source) or off another

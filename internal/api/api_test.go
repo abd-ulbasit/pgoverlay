@@ -511,6 +511,65 @@ func TestCreateBranchSourceParentMutuallyExclusive(t *testing.T) {
 	}
 }
 
+func TestCreateSourceViaDumpRoundTrips(t *testing.T) {
+	ts, _ := newTestServer(t)
+	code, body := do(t, ts, testToken, "POST", "/v1/sources", CreateSourceRequest{
+		Name: "main", Host: "db.proj.supabase.co", Port: 5432, User: "postgres",
+		Database: "appdb", PGVersion: "17", Password: "secret",
+		Via: "dump", DumpSchemas: []string{"public", "audit"},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create source: code=%d body=%s", code, body)
+	}
+	src := mustUnmarshal[Source](t, body)
+	if src.Via != "dump" {
+		t.Fatalf("via=%q want dump", src.Via)
+	}
+	if len(src.DumpSchemas) != 2 || src.DumpSchemas[0] != "public" || src.DumpSchemas[1] != "audit" {
+		t.Fatalf("dump_schemas=%v want [public audit]", src.DumpSchemas)
+	}
+	// the list endpoint carries the method too
+	code, body = do(t, ts, testToken, "GET", "/v1/sources", nil)
+	if code != http.StatusOK {
+		t.Fatalf("list: code=%d", code)
+	}
+	list := mustUnmarshal[[]Source](t, body)
+	if len(list) != 1 || list[0].Via != "dump" || len(list[0].DumpSchemas) != 2 {
+		t.Fatalf("listed source: %+v", list)
+	}
+}
+
+func TestCreateSourceDefaultsToBasebackup(t *testing.T) {
+	ts, _ := newTestServer(t)
+	src := addSource(t, ts) // sends no via
+	if src.Via != "basebackup" {
+		t.Fatalf("via=%q want basebackup default", src.Via)
+	}
+	if len(src.DumpSchemas) != 0 {
+		t.Fatalf("dump_schemas=%v want empty", src.DumpSchemas)
+	}
+}
+
+func TestCreateSourceInvalidViaRejected(t *testing.T) {
+	ts, _ := newTestServer(t)
+	code, body := do(t, ts, testToken, "POST", "/v1/sources", CreateSourceRequest{
+		Name: "main", Host: "db.internal", Password: "secret", Via: "rsync",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 (body=%s)", code, body)
+	}
+	if !strings.Contains(string(body), "rsync") || !strings.Contains(string(body), "dump") {
+		t.Errorf("body %s should name the invalid value and the valid ones", body)
+	}
+	// dump_schemas without via=dump is inconsistent input
+	code, body = do(t, ts, testToken, "POST", "/v1/sources", CreateSourceRequest{
+		Name: "main", Host: "db.internal", Password: "secret", DumpSchemas: []string{"public"},
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("dump_schemas without via=dump: code=%d want 400 (body=%s)", code, body)
+	}
+}
+
 func TestCreateSourceUnsupportedPGVersionRejected(t *testing.T) {
 	ts, _ := newTestServer(t)
 	code, body := do(t, ts, testToken, "POST", "/v1/sources", CreateSourceRequest{

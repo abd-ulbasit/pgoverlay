@@ -28,13 +28,28 @@ func passwordFromEnv(env string) (string, error) {
 }
 
 func newSourceAddCmd() *cobra.Command {
-	var host, user, db, network, pgVersion, passwordEnv string
+	var host, user, db, network, pgVersion, passwordEnv, via string
+	var dumpSchemas []string
 	var port int
 	cmd := &cobra.Command{
 		Use:   "add NAME",
-		Short: "Register a source and seed it from a running Postgres (needs REPLICATION privilege)",
-		Args:  cobra.ExactArgs(1),
+		Short: "Register a source and seed it from a running Postgres",
+		Long: `Register a source and seed it from a running Postgres.
+
+Seeding methods (--via):
+  basebackup  pg_basebackup, a physical copy (default). Needs a user with
+              REPLICATION privilege and wal_level=replica on the source.
+  dump        pg_dump piped into a freshly initialized cluster, a logical
+              copy. Needs only a normal user (no REPLICATION) and works with
+              managed Postgres (Supabase, Neon, RDS, Cloud SQL). Optionally
+              scoped with repeatable --dump-schema. --pg-version must be >=
+              the remote server's major version (pg_dump cannot dump newer
+              servers); branches run on --pg-version.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(dumpSchemas) > 0 && via != registry.SeedViaDump {
+				return fmt.Errorf("--dump-schema is only valid with --via dump")
+			}
 			password, err := passwordFromEnv(passwordEnv)
 			if err != nil {
 				return err
@@ -43,6 +58,7 @@ func newSourceAddCmd() *cobra.Command {
 				s, err := c.CreateSource(cmd.Context(), api.CreateSourceRequest{
 					Name: args[0], Host: host, Port: port, User: user,
 					Database: db, Network: network, PGVersion: pgVersion, Password: password,
+					Via: via, DumpSchemas: dumpSchemas,
 				})
 				if err != nil {
 					return err
@@ -56,7 +72,8 @@ func newSourceAddCmd() *cobra.Command {
 			}
 			defer reg.Close()
 			s := &registry.Source{Name: args[0], PGVersion: pgVersion,
-				ConnHost: host, ConnPort: port, ConnUser: user, ConnDB: db, Network: network}
+				ConnHost: host, ConnPort: port, ConnUser: user, ConnDB: db, Network: network,
+				SeedVia: via, DumpSchemas: dumpSchemas}
 			if err := e.AddSource(cmd.Context(), s, password); err != nil {
 				return err
 			}
@@ -66,11 +83,13 @@ func newSourceAddCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&host, "host", "", "source Postgres host (as reachable from containers; use host.docker.internal for a host-local DB)")
 	cmd.Flags().IntVar(&port, "port", 5432, "source Postgres port")
-	cmd.Flags().StringVar(&user, "user", "postgres", "user with REPLICATION privilege")
-	cmd.Flags().StringVar(&db, "database", "postgres", "database name recorded for connection strings")
+	cmd.Flags().StringVar(&user, "user", "postgres", "seed user (REPLICATION privilege for --via basebackup; a normal user suffices for --via dump)")
+	cmd.Flags().StringVar(&db, "database", "postgres", "database name recorded for connection strings (and dumped with --via dump)")
 	cmd.Flags().StringVar(&network, "network", "", "docker network from which the source is reachable")
-	cmd.Flags().StringVar(&pgVersion, "pg-version", "17", "source Postgres major version, 14-18 (branch image must match)")
+	cmd.Flags().StringVar(&pgVersion, "pg-version", "17", "source Postgres major version, 14-18 (branch image must match; with --via dump it must be >= the remote major)")
 	cmd.Flags().StringVar(&passwordEnv, "password-env", "PGPASSWORD", "env var holding the source password")
+	cmd.Flags().StringVar(&via, "via", registry.SeedViaBasebackup, `seeding method: "basebackup" or "dump" (managed Postgres: Supabase/Neon/RDS)`)
+	cmd.Flags().StringArrayVar(&dumpSchemas, "dump-schema", nil, "schema to dump (repeatable; --via dump only; default: the whole database)")
 	cmd.MarkFlagRequired("host")
 	return cmd
 }

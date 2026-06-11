@@ -36,6 +36,12 @@ func TestCommandTree(t *testing.T) {
 	if f, _, _ := root.Find([]string{"branch", "create"}); f.Flags().Lookup("from-branch") == nil {
 		t.Fatal("branch create --from-branch flag missing")
 	}
+	if f, _, _ := root.Find([]string{"source", "add"}); f.Flags().Lookup("via") == nil {
+		t.Fatal("source add --via flag missing")
+	}
+	if f, _, _ := root.Find([]string{"source", "add"}); f.Flags().Lookup("dump-schema") == nil {
+		t.Fatal("source add --dump-schema flag missing")
+	}
 	// help renders without side effects
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -301,6 +307,49 @@ func TestBranchCreateFromFlagsMutuallyExclusive(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "--from") || !strings.Contains(err.Error(), "--from-branch") {
 			t.Errorf("%s: err=%v, want one explaining --from/--from-branch exclusivity", name, err)
 		}
+	}
+}
+
+func TestSourceAddDumpSchemaRequiresViaDump(t *testing.T) {
+	t.Setenv("PGPASSWORD", "secret")
+	for name, args := range map[string][]string{
+		"default via": {"source", "add", "main", "--host", "h", "--dump-schema", "public"},
+		"basebackup":  {"source", "add", "main", "--host", "h", "--via", "basebackup", "--dump-schema", "public"},
+	} {
+		root := NewRootCmd()
+		root.SetOut(&bytes.Buffer{})
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(args)
+		err := root.Execute()
+		if err == nil || !strings.Contains(err.Error(), "--dump-schema") || !strings.Contains(err.Error(), "--via dump") {
+			t.Errorf("%s: err=%v, want one explaining --dump-schema needs --via dump", name, err)
+		}
+	}
+}
+
+func TestServerModeSourceAddViaDump(t *testing.T) {
+	var got api.CreateSourceRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(api.Source{Name: got.Name, Via: got.Via, State: "ready"})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGPASSWORD", "secret")
+
+	run(t, "source", "add", "prod", "--via", "dump",
+		"--dump-schema", "public", "--dump-schema", "audit",
+		"--host", "db.proj.supabase.co", "--user", "postgres", "--pg-version", "17",
+		"--server", ts.URL)
+	if got.Name != "prod" || got.Via != "dump" {
+		t.Fatalf("request %+v", got)
+	}
+	if len(got.DumpSchemas) != 2 || got.DumpSchemas[0] != "public" || got.DumpSchemas[1] != "audit" {
+		t.Fatalf("dump_schemas=%v want [public audit]", got.DumpSchemas)
+	}
+	if got.Password != "secret" {
+		t.Fatalf("password=%q", got.Password)
 	}
 }
 

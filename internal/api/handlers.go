@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -56,6 +57,7 @@ func sourceJSON(s *registry.Source) Source {
 	return Source{
 		Name: s.Name, PGVersion: s.PGVersion, Host: s.ConnHost, Port: s.ConnPort,
 		User: s.ConnUser, Database: s.ConnDB, Network: s.Network,
+		Via: s.SeedVia, DumpSchemas: s.DumpSchemas,
 		State: string(s.State), Generation: s.Generation, CreatedAt: s.CreatedAt,
 	}
 }
@@ -99,9 +101,22 @@ func (s *Server) createSource(w http.ResponseWriter, r *http.Request) {
 	if req.Database == "" {
 		req.Database = "postgres"
 	}
+	if req.Via == "" {
+		req.Via = registry.SeedViaBasebackup
+	}
+	if req.Via != registry.SeedViaBasebackup && req.Via != registry.SeedViaDump {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid via %q: want %q or %q",
+			req.Via, registry.SeedViaBasebackup, registry.SeedViaDump))
+		return
+	}
+	if len(req.DumpSchemas) > 0 && req.Via != registry.SeedViaDump {
+		writeError(w, http.StatusBadRequest, "dump_schemas is only valid with via=dump")
+		return
+	}
 	src := &registry.Source{
 		Name: req.Name, PGVersion: req.PGVersion, ConnHost: req.Host,
 		ConnPort: req.Port, ConnUser: req.User, ConnDB: req.Database, Network: req.Network,
+		SeedVia: req.Via, DumpSchemas: req.DumpSchemas,
 	}
 	if err := s.eng.AddSource(r.Context(), src, req.Password); err != nil {
 		writeEngineError(w, err)
