@@ -182,6 +182,35 @@ psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
 
 See it end-to-end on a real pull request — a migration that passes on an empty dev database, fails against the PR's masked clone of production (37 legacy duplicate emails), gets fixed, and the branch is destroyed on merge: [pgbranch-demo PR #1](https://github.com/abd-ulbasit/pgbranch-demo/pull/1).
 
+## Branches in your test suite
+
+Every test gets its own copy-on-write branch — full production-shaped data, isolated writes, destroyed when the test ends. In Go (`pgbranchtest` is self-contained: no pgbranch internals, no extra dependencies; the test is skipped when `PGBRANCH_SERVER` is unset):
+
+```go
+func TestOrderTotals(t *testing.T) {
+    t.Parallel()
+    b := pgbranchtest.Acquire(t)        // branch created, ready, destroyed via t.Cleanup
+    db, _ := sql.Open("pgx", b.DSN)
+    // ...
+}
+```
+
+In CI, the composite action provisions the branch and waits for readiness:
+
+```yaml
+- uses: abd-ulbasit/pgbranch/action@main
+  id: branch
+  with:
+    server: ${{ vars.PGBRANCH_SERVER }}
+    token: ${{ secrets.PGBRANCH_TOKEN }}
+- run: go test ./...   # steps.branch.outputs.{host,port,database}
+- uses: abd-ulbasit/pgbranch/action/destroy@main
+  if: always()
+  with: { server: "${{ vars.PGBRANCH_SERVER }}", token: "${{ secrets.PGBRANCH_TOKEN }}", branch: "${{ steps.branch.outputs.branch }}" }
+```
+
+A zero-dependency JS package (`sdk/js`, `pgbranch-test`) covers Node test suites. Naming, TTL safety nets, and parallelism semantics: [docs/testing.md](docs/testing.md).
+
 ## How it works
 
 `pgb source add` runs `pg_basebackup` in a one-shot helper container, streaming the source cluster into a named Docker volume. That volume becomes the read-only **lower layer** for every branch.
@@ -255,6 +284,7 @@ PG 13 and older are unsupported because branch startup passes `-c recovery_init_
 `docs/` is a small MkDocs site — no hosting or CI, build it locally with `pip install mkdocs-material && mkdocs serve`:
 
 - [Quickstart](docs/quickstart.md) — Docker on a laptop: CLI, `branchd`, REST API, router, web UI.
+- [Testing](docs/testing.md) — a real database for every test: Go/JS SDKs and the GitHub Action.
 - [Kubernetes](docs/kubernetes.md) — Helm chart, the storage-node model.
 - [GitHub App](docs/github-app.md) — a database branch per pull request.
 - [Benchmarks](docs/benchmarks.md) — measured numbers, methodology, and the copy-up diagnosis.
