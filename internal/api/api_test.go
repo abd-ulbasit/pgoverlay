@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -78,7 +79,7 @@ func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, 
 
 const testToken = "sekrit"
 
-func newTestServer(t *testing.T) (*httptest.Server, *fakeDriver) {
+func newTestServer(t *testing.T, opts ...engine.Option) (*httptest.Server, *fakeDriver) {
 	t.Helper()
 	d := newFake()
 	reg, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -86,7 +87,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *fakeDriver) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { reg.Close() })
-	eng := engine.New(reg, d, "postgres:17")
+	eng := engine.New(reg, d, "postgres:17", opts...)
 	ts := httptest.NewServer(New(eng, reg, testToken).Handler())
 	t.Cleanup(ts.Close)
 	return ts, d
@@ -229,6 +230,58 @@ func TestSourceAndBranchLifecycle(t *testing.T) {
 	}
 	if code, _ = do(t, ts, testToken, "GET", "/v1/branches/pr-1", nil); code != http.StatusNotFound {
 		t.Fatalf("destroyed branch still resolves: code=%d", code)
+	}
+}
+
+// Branch responses carry `password` only when the engine rotates per-branch
+// credentials; inherit mode (default) must not even render the key.
+func TestBranchPasswordOnlyInRotateMode(t *testing.T) {
+	hex32 := regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+	// rotate mode: create/get/list/reset all carry the rotated password
+	ts, _ := newTestServer(t, engine.WithCredentialRotation())
+	addSource(t, ts)
+	code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-1", Source: "main"})
+	if code != http.StatusCreated {
+		t.Fatalf("create: code=%d body=%s", code, body)
+	}
+	b := mustUnmarshal[Branch](t, body)
+	if !hex32.MatchString(b.Password) {
+		t.Fatalf("create password=%q want 32 hex chars", b.Password)
+	}
+	created := b.Password
+	code, body = do(t, ts, testToken, "GET", "/v1/branches/pr-1", nil)
+	if code != http.StatusOK {
+		t.Fatalf("get: code=%d", code)
+	}
+	if got := mustUnmarshal[Branch](t, body); got.Password != created {
+		t.Fatalf("get password=%q want %q", got.Password, created)
+	}
+	code, body = do(t, ts, testToken, "GET", "/v1/branches", nil)
+	if code != http.StatusOK {
+		t.Fatalf("list: code=%d", code)
+	}
+	if list := mustUnmarshal[[]Branch](t, body); len(list) != 1 || list[0].Password != created {
+		t.Fatalf("list password: %+v", list)
+	}
+	// reset re-rotates
+	code, body = do(t, ts, testToken, "POST", "/v1/branches/pr-1/reset", nil)
+	if code != http.StatusOK {
+		t.Fatalf("reset: code=%d body=%s", code, body)
+	}
+	if got := mustUnmarshal[Branch](t, body); !hex32.MatchString(got.Password) || got.Password == created {
+		t.Fatalf("reset password=%q (created %q) want a fresh 32-hex secret", got.Password, created)
+	}
+
+	// inherit mode: the key is absent entirely (omitempty)
+	ts2, _ := newTestServer(t)
+	addSource(t, ts2)
+	code, body = do(t, ts2, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-1", Source: "main"})
+	if code != http.StatusCreated {
+		t.Fatalf("create (inherit): code=%d body=%s", code, body)
+	}
+	if strings.Contains(string(body), `"password"`) {
+		t.Fatalf("inherit mode rendered a password key: %s", body)
 	}
 }
 
