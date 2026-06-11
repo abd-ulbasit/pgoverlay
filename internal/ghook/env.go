@@ -65,5 +65,11 @@ func LoadEnv(getenv func(string) string) (*EnvConfig, error) {
 			ec.Repos = append(ec.Repos, r)
 		}
 	}
+	switch v := getenv("GHOOK_BRANCH_NAMING"); v {
+	case "", "pr-number", "git-branch":
+		ec.BranchNaming = v
+	default:
+		return nil, fmt.Errorf("GHOOK_BRANCH_NAMING: %q (want pr-number or git-branch)", v)
+	}
 	return ec, nil
 }

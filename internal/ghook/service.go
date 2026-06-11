@@ -33,6 +33,13 @@ type Config struct {
 	ResetOnPush   bool     // synchronize resets the branch when true
 	Repos         []string // "owner/name" allow-list; empty allows all
 	ProxyHost     string   // host[:port] of the pgbranch proxy, for comments
+	// BranchNaming picks the pgbranch branch name for a pull request:
+	//   "pr-number" (default): pr-<number>
+	//   "git-branch": the PR's head ref, sanitized (e.g. feat/login -> feat-login).
+	// git-branch lets preview platforms derive the name from the git ref
+	// they already know (Vercel's VERCEL_GIT_COMMIT_REF is present from the
+	// very first build, before the PR association exists).
+	BranchNaming string
 }
 
 type Service struct {
@@ -69,6 +76,7 @@ type payload struct {
 	PullRequest struct {
 		Head struct {
 			SHA string `json:"sha"`
+			Ref string `json:"ref"`
 		} `json:"head"`
 	} `json:"pull_request"`
 	Repository struct {
@@ -136,7 +144,7 @@ func (s *Service) repoAllowed(fullName string) bool {
 func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 	log := s.log.With("action", p.Action, "repo", p.Repository.FullName,
 		"pr", p.Number, "head_sha", p.PullRequest.Head.SHA)
-	branch := fmt.Sprintf("pr-%d", p.Number)
+	branch := s.branchName(p)
 
 	switch p.Action {
 	case "opened", "reopened", "synchronize", "closed":
@@ -171,6 +179,42 @@ func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"branch": branch, "status": "accepted"})
+}
+
+// branchName derives the pgbranch branch name for a pull request according
+// to Config.BranchNaming. git-branch mode falls back to pr-<number> when the
+// sanitized ref comes up empty.
+func (s *Service) branchName(p *payload) string {
+	if s.cfg.BranchNaming == "git-branch" {
+		if n := sanitizeBranchName(p.PullRequest.Head.Ref); n != "" {
+			return n
+		}
+	}
+	return fmt.Sprintf("pr-%d", p.Number)
+}
+
+// sanitizeBranchName maps a git ref to a valid pgbranch branch name
+// (^[a-z0-9][a-z0-9-]{0,40}$): lowercase, runs of other characters collapse
+// to single dashes, edges trimmed, truncated to 41 chars.
+func sanitizeBranchName(ref string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(ref) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			if dash && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			dash = false
+			b.WriteRune(r)
+		default:
+			dash = true
+		}
+		if b.Len() >= 41 {
+			break
+		}
+	}
+	return strings.TrimRight(b.String()[:min(b.Len(), 41)], "-")
 }
 
 // ensureBranch makes branch exist (creating it from the configured source if

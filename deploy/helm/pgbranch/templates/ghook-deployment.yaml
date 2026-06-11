@@ -53,6 +53,10 @@ spec:
             - name: GHOOK_REPOS
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.ghook.branchNaming }}
+            - name: GHOOK_BRANCH_NAMING
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.ghook.proxyHost }}
             - name: GHOOK_PROXY_HOST
               value: {{ . | quote }}

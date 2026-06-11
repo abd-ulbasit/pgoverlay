@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
@@ -104,6 +105,34 @@ func TestOpenedCreatesMissingBranch(t *testing.T) {
 	want := api.CreateBranchRequest{Name: "pr-7", Source: "staging", TTLSeconds: 259200}
 	if pg.create != want {
 		t.Fatalf("create request = %+v, want %+v", pg.create, want)
+	}
+}
+
+// git-branch naming: the pgbranch branch is keyed by the PR's head ref
+// (sanitized), so preview platforms can derive it from the git ref alone —
+// available from the very first build, before any PR association exists.
+func TestGitBranchNamingUsesSanitizedHeadRef(t *testing.T) {
+	pg := newFakePG(t, false)
+	svc := newService(Config{Source: "main", BranchNaming: "git-branch"}, pg.srv.URL, nil)
+
+	deliver(t, svc, fixture(t, "pr_opened.json")) // head.ref = feat/Health_Endpoint
+	pg.assertCalls("GET /v1/branches/feat-health-endpoint", "POST /v1/branches")
+	if pg.create.Name != "feat-health-endpoint" {
+		t.Fatalf("created %q, want feat-health-endpoint", pg.create.Name)
+	}
+}
+
+func TestSanitizeBranchName(t *testing.T) {
+	cases := map[string]string{
+		"feat/Health_Endpoint":        "feat-health-endpoint",
+		"FIX--weird///chars!!":        "fix-weird-chars",
+		"-/-":                         "",
+		"a" + strings.Repeat("b", 60): "a" + strings.Repeat("b", 40),
+	}
+	for in, want := range cases {
+		if got := sanitizeBranchName(in); got != want {
+			t.Errorf("sanitize(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
