@@ -132,6 +132,63 @@ func TestServerModeConnectPrintsDirectAndProxyURLs(t *testing.T) {
 	}
 }
 
+// Rotate mode: the server returns a per-branch password; connect must embed
+// it in both printed DSNs so they are copy-pasteable.
+func TestServerModeConnectIncludesRotatedPassword(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(api.Branch{
+			Name: "pr-9", State: "ready", Host: "10.0.0.7", Port: 32788,
+			User: "postgres", Password: "feedfacefeedfacefeedfacefeedface",
+			Database: "postgres", ProxyDatabase: "postgres@pr-9",
+		})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "connect", "pr-9", "--server", ts.URL)
+	if !strings.Contains(out, "postgres://postgres:feedfacefeedfacefeedfacefeedface@10.0.0.7:32788/postgres") {
+		t.Fatalf("direct URL missing password in %q", out)
+	}
+	if !strings.Contains(out, "postgres:feedfacefeedfacefeedfacefeedface@") ||
+		!strings.Contains(out, ":6432/postgres@pr-9") {
+		t.Fatalf("proxy URL missing password in %q", out)
+	}
+}
+
+// Inherit mode keeps the historical password-less DSNs.
+func TestServerModeConnectNoPasswordInheritMode(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(api.Branch{
+			Name: "pr-9", State: "ready", Host: "10.0.0.7", Port: 32788,
+			User: "postgres", Database: "postgres", ProxyDatabase: "postgres@pr-9",
+		})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "connect", "pr-9", "--server", ts.URL)
+	if !strings.Contains(out, "postgres://postgres@10.0.0.7:32788/postgres") {
+		t.Fatalf("direct URL changed in inherit mode: %q", out)
+	}
+}
+
+// branch ls never shows the password, even when the server sends one.
+func TestServerModeBranchLsHidesPassword(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]api.Branch{{
+			Name: "pr-9", State: "ready", Port: 32788, CreatedAt: "2026-06-10",
+			Password: "feedfacefeedfacefeedfacefeedface",
+		}})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "branch", "ls", "--server", ts.URL)
+	if strings.Contains(out, "feedface") {
+		t.Fatalf("branch ls leaked the password: %q", out)
+	}
+}
+
 func TestServerModeConnectFallsBackToServerHost(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(api.Branch{

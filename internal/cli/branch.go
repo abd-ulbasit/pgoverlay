@@ -221,8 +221,11 @@ func newConnectCmd() *cobra.Command {
 				if directHost == "" {
 					directHost = serverHost
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", b.User, directHost, b.Port, b.Database)
-				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:6432/%s\n", b.User, serverHost, b.ProxyDatabase)
+				// rotate mode: the server returns a per-branch password —
+				// include it so the DSNs are copy-pasteable
+				auth := userInfo(b.User, b.Password)
+				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", auth, directHost, b.Port, b.Database)
+				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:6432/%s\n", auth, serverHost, b.ProxyDatabase)
 				return nil
 			}
 			_, reg, err := open()
@@ -238,8 +241,17 @@ func newConnectCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", s.ConnUser, b.Host, b.Port, s.ConnDB)
+			fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", userInfo(s.ConnUser, b.Password), b.Host, b.Port, s.ConnDB)
 			return nil
 		},
 	}
+}
+
+// userInfo renders the DSN userinfo part: user, or user:password when the
+// branch carries its own rotated password.
+func userInfo(user, password string) string {
+	if password == "" {
+		return user
+	}
+	return user + ":" + url.QueryEscape(password)
 }
