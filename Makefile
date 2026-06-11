@@ -1,4 +1,4 @@
-.PHONY: build test it k8s-it csi-it matrix lint docker-build docker-build-ghook helm-test
+.PHONY: build test it k8s-it csi-it matrix lint docker-build docker-build-ghook helm-test js-sdk-test
 
 build:
 	go build -o bin/pgb ./cmd/pgb
@@ -38,3 +38,11 @@ docker-build-ghook:
 
 helm-test:
 	hack/helm-test.sh
+
+# JS test-suite SDK (sdk/js, npm package pgbranch-test). Needs Node 18+;
+# override with `make js-sdk-test NODE=/path/to/node NPM=/path/to/npm`.
+NODE ?= node
+NPM ?= npm
+js-sdk-test:
+	cd sdk/js && $(NODE) --test test/*.test.mjs
+	cd sdk/js && $(NPM) pack --dry-run
