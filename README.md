@@ -143,7 +143,7 @@ branchd serves a small embedded web UI at `http://localhost:7070/ui/` (the exact
 
 ## Run on Kubernetes
 
-branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm chart deploys the whole thing:
+branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm chart deploys the whole thing — for a soup-to-nuts AWS walkthrough (Terraform, images, LoadBalancers, version upgrades, and the production bugs found doing it) see [docs/eks.md](docs/eks.md):
 
 ```bash
 make docker-build                          # builds pgbranch/branchd:dev (push it, or `kind load` for local clusters)
