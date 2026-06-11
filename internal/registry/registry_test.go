@@ -164,8 +164,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 5 {
-		t.Fatalf("user_version=%d want 5", v)
+	if v != 6 {
+		t.Fatalf("user_version=%d want 6", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -212,6 +212,13 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	// v5: layers table exists and is usable on the upgraded DB
 	if err := r.CreateLayer(&Layer{SourceID: "src1", Volume: "frozen-v"}); err != nil {
 		t.Fatalf("v5 layers unusable after upgrade: %v", err)
+	}
+	// v6: pre-existing sources were seeded with pg_basebackup, whole database
+	if s.SeedVia != SeedViaBasebackup {
+		t.Fatalf("v6 backfill: SeedVia=%q want %q", s.SeedVia, SeedViaBasebackup)
+	}
+	if len(s.DumpSchemas) != 0 {
+		t.Fatalf("v6 backfill: DumpSchemas=%v want empty", s.DumpSchemas)
 	}
 	// re-opening an already-migrated DB is a no-op
 	r2, err := Open(path)
@@ -740,6 +747,38 @@ func TestDeleteSourceRemovesLayers(t *testing.T) {
 	}
 	if _, err := r.GetLayer(l1.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("layer survives source delete: %v", err)
+	}
+}
+
+func TestSourceSeedViaAndDumpSchemasRoundTrip(t *testing.T) {
+	r := openTest(t)
+	// dump-seeded source round-trips method and schema scope
+	s := &Source{Name: "dumped", PGVersion: "17", Volume: "v",
+		SeedVia: SeedViaDump, DumpSchemas: []string{"public", "audit"}}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetSourceByName("dumped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SeedVia != SeedViaDump {
+		t.Fatalf("SeedVia=%q want %q", got.SeedVia, SeedViaDump)
+	}
+	if len(got.DumpSchemas) != 2 || got.DumpSchemas[0] != "public" || got.DumpSchemas[1] != "audit" {
+		t.Fatalf("DumpSchemas=%v want [public audit]", got.DumpSchemas)
+	}
+	// empty SeedVia defaults to basebackup, empty schemas stay empty
+	s2 := &Source{Name: "plain", PGVersion: "17", Volume: "v2"}
+	if err := r.CreateSource(s2); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := r.GetSourceByName("plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2.SeedVia != SeedViaBasebackup || len(got2.DumpSchemas) != 0 {
+		t.Fatalf("default source: SeedVia=%q DumpSchemas=%v", got2.SeedVia, got2.DumpSchemas)
 	}
 }
 

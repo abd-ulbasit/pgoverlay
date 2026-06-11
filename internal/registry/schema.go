@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -111,4 +111,14 @@ CREATE TABLE layers (
 );
 ALTER TABLE branches ADD COLUMN base_layer_id TEXT NULL;
 ALTER TABLE branches ADD COLUMN parent_branch_name TEXT NOT NULL DEFAULT '';
+`
+
+// v6 (Phase 6): dump-based seeding for managed Postgres (Supabase, Neon, RDS)
+// that allows no physical replication connections. seed_via records how a
+// source is (re-)seeded: 'basebackup' (pg_basebackup, the historical default)
+// or 'dump' (pg_dump piped into a fresh initdb'd cluster). dump_schemas is the
+// comma-joined schema scope of a dump-seeded source (empty = whole database).
+const migrateV6 = `
+ALTER TABLE sources ADD COLUMN seed_via TEXT NOT NULL DEFAULT 'basebackup';
+ALTER TABLE sources ADD COLUMN dump_schemas TEXT NOT NULL DEFAULT '';
 `

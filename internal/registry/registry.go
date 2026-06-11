@@ -52,9 +52,17 @@ func validatePGVersion(v string) error {
 		ErrUnsupportedPGVersion, v, strings.Join(supportedPGVersions, ", "))
 }
 
+// Seeding methods: how a source's data dir is built from the live Postgres.
+const (
+	SeedViaBasebackup = "basebackup" // pg_basebackup (needs REPLICATION privilege)
+	SeedViaDump       = "dump"       // pg_dump into a fresh initdb'd cluster (managed Postgres)
+)
+
 type Source struct {
 	ID, Name, PGVersion, Volume         string
 	ConnHost, ConnUser, ConnDB, Network string
+	SeedVia                             string   // SeedViaBasebackup (default) or SeedViaDump
+	DumpSchemas                         []string // dump mode only: schemas to dump (empty = whole database)
 	ConnPort                            int
 	Generation                          int
 	State                               SourceState
@@ -149,11 +157,15 @@ func (r *Registry) CreateSource(s *Source) error {
 	if err := validatePGVersion(s.PGVersion); err != nil {
 		return err
 	}
+	if s.SeedVia == "" {
+		s.SeedVia = SeedViaBasebackup
+	}
 	s.ID, s.State = newID(), SourceSeeding
 	_, err := r.db.Exec(`INSERT INTO sources
-		(id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,state)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		s.ID, s.Name, s.PGVersion, s.Volume, s.ConnHost, s.ConnPort, s.ConnUser, s.ConnDB, s.Network, s.State)
+		(id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,seed_via,dump_schemas,state)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		s.ID, s.Name, s.PGVersion, s.Volume, s.ConnHost, s.ConnPort, s.ConnUser, s.ConnDB, s.Network,
+		s.SeedVia, strings.Join(s.DumpSchemas, ","), s.State)
 	if err != nil {
 		return fmt.Errorf("create source %q: %w", s.Name, err)
 	}
@@ -186,15 +198,19 @@ func (r *Registry) journal(entity, id, from, to, reason string) error {
 
 func scanSource(row interface{ Scan(...any) error }) (*Source, error) {
 	s := &Source{}
+	var dumpSchemas string
 	err := row.Scan(&s.ID, &s.Name, &s.PGVersion, &s.Volume, &s.ConnHost, &s.ConnPort,
-		&s.ConnUser, &s.ConnDB, &s.Network, &s.State, &s.Generation, &s.CreatedAt)
+		&s.ConnUser, &s.ConnDB, &s.Network, &s.SeedVia, &dumpSchemas, &s.State, &s.Generation, &s.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
+	}
+	if dumpSchemas != "" {
+		s.DumpSchemas = strings.Split(dumpSchemas, ",")
 	}
 	return s, err
 }
 
-const sourceCols = `id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,state,generation,created_at`
+const sourceCols = `id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,seed_via,dump_schemas,state,generation,created_at`
 
 func (r *Registry) GetSourceByName(name string) (*Source, error) {
 	// failed rows may share a name with a live retry; prefer the live one
