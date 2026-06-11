@@ -657,3 +657,56 @@ func TestCreateSourceUnsupportedPGVersionRejected(t *testing.T) {
 		t.Errorf("body %s should explain the unsupported version", body)
 	}
 }
+
+func TestBranchDiffEndpoint(t *testing.T) {
+	ts, d := newTestServer(t)
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create: code=%d body=%s", code, body)
+	}
+
+	code, body := do(t, ts, testToken, "GET", "/v1/branches/pr-1/diff", nil)
+	if code != http.StatusOK {
+		t.Fatalf("diff: code=%d body=%s", code, body)
+	}
+	got := mustUnmarshal[engine.DiffResult](t, body)
+	// the fake driver serves the base dump without the "added" table
+	if !strings.Contains(got.SchemaDiff, "+CREATE TABLE added (x integer);\n") {
+		t.Errorf("schema_diff missing the added table:\n%s", got.SchemaDiff)
+	}
+	want := []engine.TableDelta{
+		{Table: "added", BaseRows: 0, BranchRows: 7, Delta: 7},
+		{Table: "users", BaseRows: 100, BranchRows: 100, Delta: 0},
+	}
+	if len(got.Tables) != len(want) {
+		t.Fatalf("tables = %+v, want %+v", got.Tables, want)
+	}
+	for i := range want {
+		if got.Tables[i] != want[i] {
+			t.Errorf("tables[%d] = %+v, want %+v", i, got.Tables[i], want[i])
+		}
+	}
+	// raw JSON shape (field names are the wire contract)
+	for _, field := range []string{`"schema_diff"`, `"table"`, `"base_rows"`, `"branch_rows"`, `"delta"`} {
+		if !strings.Contains(string(body), field) {
+			t.Errorf("diff JSON missing %s: %s", field, body)
+		}
+	}
+
+	if code, body := do(t, ts, testToken, "GET", "/v1/branches/nope/diff", nil); code != http.StatusNotFound {
+		t.Fatalf("unknown branch diff: code=%d body=%s", code, body)
+	}
+	if code, _ := do(t, ts, "", "GET", "/v1/branches/pr-1/diff", nil); code != http.StatusUnauthorized {
+		t.Fatalf("diff without token: code=%d want 401", code)
+	}
+
+	// a non-ready branch is refused with 409
+	d.failStart = true
+	if code, _ := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-2", Source: "main"}); code == http.StatusCreated {
+		t.Fatal("pr-2 create should have failed")
+	}
+	d.failStart = false
+	if code, body := do(t, ts, testToken, "GET", "/v1/branches/pr-2/diff", nil); code != http.StatusConflict {
+		t.Fatalf("non-ready branch diff: code=%d body=%s, want 409", code, body)
+	}
+}

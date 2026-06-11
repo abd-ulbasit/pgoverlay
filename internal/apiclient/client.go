@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
+	"github.com/abd-ulbasit/pgbranch/internal/engine"
 )
 
 type Client struct {
@@ -168,6 +169,18 @@ func (c *Client) BranchUsage(ctx context.Context, name string) (int64, error) {
 		return 0, err
 	}
 	return out.Bytes, nil
+}
+
+// DiffBranch returns what changed in a branch relative to its base (unified
+// schema diff + per-table row-estimate deltas). The server provisions a
+// throwaway clone of the branch's base and pg_dumps both instances per call —
+// expect ~5-10s.
+func (c *Client) DiffBranch(ctx context.Context, name string) (*engine.DiffResult, error) {
+	var out engine.DiffResult
+	if err := c.do(ctx, "GET", "/v1/branches/"+url.PathEscape(name)+"/diff", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func (c *Client) DestroyBranch(ctx context.Context, name string) error {

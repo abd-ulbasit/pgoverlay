@@ -287,6 +287,20 @@ func (s *Server) branchUsage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]int64{"bytes": n})
 }
 
+// branchDiff reports what changed in a branch relative to its base: a
+// unified schema diff plus per-table row-estimate deltas (engine.DiffResult).
+// This is a LONG request — the engine provisions a throwaway clone of the
+// branch's base and pg_dumps both instances, so expect ~5-10s of latency;
+// clients should use a generous timeout. 404 unknown branch, 409 not ready.
+func (s *Server) branchDiff(w http.ResponseWriter, r *http.Request) {
+	res, err := s.eng.DiffBranch(r.Context(), r.PathValue("name"))
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 func (s *Server) destroyBranch(w http.ResponseWriter, r *http.Request) {
 	if err := s.eng.DestroyBranch(r.Context(), r.PathValue("name")); err != nil {
 		writeEngineError(w, err)

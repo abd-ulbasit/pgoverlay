@@ -110,6 +110,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("GET /v1/branches", s.listBranches)
 	v1.HandleFunc("GET /v1/branches/{name}", s.getBranch)
 	v1.HandleFunc("GET /v1/branches/{name}/usage", s.branchUsage)
+	v1.HandleFunc("GET /v1/branches/{name}/diff", s.branchDiff)
 	v1.HandleFunc("DELETE /v1/branches/{name}", s.destroyBranch)
 	v1.HandleFunc("POST /v1/branches/{name}/reset", s.resetBranch)
 

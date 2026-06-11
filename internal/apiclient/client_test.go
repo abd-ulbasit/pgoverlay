@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
+	"github.com/abd-ulbasit/pgbranch/internal/engine"
 )
 
 // newStub records the last request and replies with the given status/body.
@@ -219,5 +220,27 @@ func TestHTTPSBaseURL(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != "pr-1" {
 		t.Fatalf("branches = %+v", got)
+	}
+}
+
+func TestDiffBranch(t *testing.T) {
+	ts, req, _ := newStub(t, http.StatusOK, engine.DiffResult{
+		SchemaDiff: "@@ -1 +1,2 @@\n stay\n+added\n",
+		Tables:     []engine.TableDelta{{Table: "added", BranchRows: 7, Delta: 7}},
+	})
+	c := New(ts.URL, "tok")
+
+	res, err := c.DiffBranch(context.Background(), "pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Method != "GET" || req.URL.Path != "/v1/branches/pr-1/diff" {
+		t.Fatalf("%s %s", req.Method, req.URL.Path)
+	}
+	if !strings.Contains(res.SchemaDiff, "+added") {
+		t.Fatalf("schema diff = %q", res.SchemaDiff)
+	}
+	if len(res.Tables) != 1 || res.Tables[0] != (engine.TableDelta{Table: "added", BranchRows: 7, Delta: 7}) {
+		t.Fatalf("tables = %+v", res.Tables)
 	}
 }
