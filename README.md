@@ -4,10 +4,9 @@
 
 `git branch` for Postgres: seed once from any running database, then spin up isolated, writable copies without ever touching the source.
 
-```
-$ pgb branch create pr-1 --from main
-branch "pr-1" ready in 2.533s (port 32774)
-```
+![pgbranch demo](docs/demo.gif)
+
+*branching a 1 GiB database, recorded for real — see [docs/benchmarks.md](docs/benchmarks.md)*
 
 **Measured:** pgbranch branches a 1 GiB database in ~1.9 s and a 5 GiB database in ~1.9 s (p50 of 5 runs, Colima VM on Apple Silicon) — creation time is independent of database size, and a fresh branch costs ~33 MiB of disk, not a copy of the dataset. Full results, methodology, and the diagnosis of the copy-up bug this fixed are in [docs/benchmarks.md](docs/benchmarks.md).
 
