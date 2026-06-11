@@ -32,6 +32,9 @@ func (f *recordingDriver) StartBranch(ctx context.Context, s runtime.BranchSpec)
 	return "", nil
 }
 func (f *recordingDriver) Exec(ctx context.Context, id string, cmd []string) error { return nil }
+func (f *recordingDriver) ExecOutput(ctx context.Context, id string, cmd []string) (string, error) {
+	return "", nil
+}
 func (f *recordingDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
 	return runtime.ContainerInfo{}, nil
 }

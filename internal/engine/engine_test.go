@@ -19,16 +19,19 @@ type fakeDriver struct {
 	failStartAt   map[int]bool // fail the Nth StartBranch attempt (1-based, counts failures too)
 	startAttempts int
 	execErr       error
-	psqlErr       error                // returned by Exec for psql commands only (fails masking/checkpoint)
-	helperErr     error                // returned by RunHelper (fails seeding)
-	cloneErr      error                // returned by CloneVolume
-	clones        [][2]string          // every CloneVolume call (src, dst), in order
-	helperOut     string               // returned by RunHelper as captured output
-	helpers       []runtime.HelperSpec // every RunHelper call, in order
-	starts        int                  // successful StartBranch invocations
-	branches      []runtime.BranchSpec // every successful StartBranch call, in order
-	execs         [][]string           // every Exec call, in order
-	log           []string             // coarse op log for ordering assertions
+	psqlErr       error                                         // returned by Exec for psql commands only (fails masking/checkpoint)
+	helperErr     error                                         // returned by RunHelper (fails seeding)
+	cloneErr      error                                         // returned by CloneVolume
+	clones        [][2]string                                   // every CloneVolume call (src, dst), in order
+	helperOut     string                                        // returned by RunHelper as captured output
+	helpers       []runtime.HelperSpec                          // every RunHelper call, in order
+	starts        int                                           // successful StartBranch invocations
+	branches      []runtime.BranchSpec                          // every successful StartBranch call, in order
+	execs         [][]string                                    // every Exec call, in order
+	execOuts      [][]string                                    // every ExecOutput call, in order
+	execOutIDs    []string                                      // container id of every ExecOutput call, in order
+	execOutFn     func(id string, cmd []string) (string, error) // canned ExecOutput behavior (nil = "")
+	log           []string                                      // coarse op log for ordering assertions
 
 	// kubelet status-sync race simulation: the first N Inspect calls
 	// report no Host (pod exec-ready before status.podIP is published).
@@ -83,6 +86,17 @@ func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error {
 		return f.psqlErr
 	}
 	return f.execErr
+}
+func (f *fakeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (string, error) {
+	f.execOuts = append(f.execOuts, cmd)
+	f.execOutIDs = append(f.execOutIDs, id)
+	if len(cmd) > 0 {
+		f.log = append(f.log, "execout:"+cmd[0]+":"+id)
+	}
+	if f.execOutFn != nil {
+		return f.execOutFn(id, cmd)
+	}
+	return "", nil
 }
 
 // logIndex returns the position of the first log entry containing substr.

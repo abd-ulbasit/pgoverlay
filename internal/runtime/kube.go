@@ -344,9 +344,17 @@ func (d *KubeDriver) StartBranch(ctx context.Context, spec BranchSpec) (string, 
 // Exec runs cmd in the pod's first container and fails on non-zero exit with
 // captured output, matching the docker driver's contract.
 func (d *KubeDriver) Exec(ctx context.Context, id string, cmd []string) error {
+	_, err := d.ExecOutput(ctx, id, cmd)
+	return err
+}
+
+// ExecOutput runs cmd in the pod's first container over the SPDY exec
+// subresource and returns the captured stdout; stderr is kept separate and
+// embedded in the error on failure (non-zero exit surfaces as a stream error).
+func (d *KubeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (string, error) {
 	pod, err := d.cs.CoreV1().Pods(d.namespace).Get(ctx, id, metav1.GetOptions{})
 	if err != nil {
-		return err
+		return "", err
 	}
 	req := d.cs.CoreV1().RESTClient().Post().
 		Resource("pods").Namespace(d.namespace).Name(id).SubResource("exec").
@@ -358,13 +366,13 @@ func (d *KubeDriver) Exec(ctx context.Context, id string, cmd []string) error {
 		}, scheme.ParameterCodec)
 	ex, err := remotecommand.NewSPDYExecutor(d.cfg, "POST", req.URL())
 	if err != nil {
-		return err
+		return "", err
 	}
-	var buf bytes.Buffer
-	if err := ex.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &buf, Stderr: &buf}); err != nil {
-		return fmt.Errorf("exec %v: %w: %s", cmd, err, buf.String())
+	var stdout, stderr bytes.Buffer
+	if err := ex.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout, Stderr: &stderr}); err != nil {
+		return stdout.String(), fmt.Errorf("exec %v: %w: %s%s", cmd, err, stderr.String(), stdout.String())
 	}
-	return nil
+	return stdout.String(), nil
 }
 
 func (d *KubeDriver) Inspect(ctx context.Context, id string) (ContainerInfo, error) {

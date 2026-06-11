@@ -213,25 +213,34 @@ func (d *DockerDriver) StartBranch(ctx context.Context, spec BranchSpec) (string
 }
 
 func (d *DockerDriver) Exec(ctx context.Context, id string, cmd []string) error {
+	_, err := d.ExecOutput(ctx, id, cmd)
+	return err
+}
+
+// ExecOutput runs cmd in the container and returns its stdout. The exec API
+// multiplexes stdout/stderr over one attached stream (stdcopy); stderr is
+// kept separate so captured output (e.g. a pg_dump) stays clean, and is
+// embedded in the error on non-zero exit.
+func (d *DockerDriver) ExecOutput(ctx context.Context, id string, cmd []string) (string, error) {
 	ex, err := d.cli.ContainerExecCreate(ctx, id, container.ExecOptions{Cmd: cmd, AttachStdout: true, AttachStderr: true})
 	if err != nil {
-		return err
+		return "", err
 	}
 	att, err := d.cli.ContainerExecAttach(ctx, ex.ID, container.ExecStartOptions{})
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer att.Close()
-	var buf bytes.Buffer
-	stdcopy.StdCopy(&buf, &buf, att.Reader)
+	var stdout, stderr bytes.Buffer
+	stdcopy.StdCopy(&stdout, &stderr, att.Reader)
 	insp, err := d.cli.ContainerExecInspect(ctx, ex.ID)
 	if err != nil {
-		return err
+		return stdout.String(), err
 	}
 	if insp.ExitCode != 0 {
-		return fmt.Errorf("exec %v exited %d: %s", cmd, insp.ExitCode, buf.String())
+		return stdout.String(), fmt.Errorf("exec %v exited %d: %s%s", cmd, insp.ExitCode, stderr.String(), stdout.String())
 	}
-	return nil
+	return stdout.String(), nil
 }
 
 func (d *DockerDriver) Inspect(ctx context.Context, id string) (ContainerInfo, error) {

@@ -27,6 +27,7 @@ type fakeDriver struct {
 	failStart  bool
 	starts     int
 	execs      [][]string // every Exec call, in order
+	execOutErr error      // returned by every ExecOutput call when set
 }
 
 func newFake() *fakeDriver {
@@ -61,6 +62,27 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error {
 	f.execs = append(f.execs, cmd)
 	return nil
+}
+
+// ExecOutput returns canned in-container command output: schema dumps that
+// differ between the throwaway base clone (its container name carries the
+// diff- prefix) and the target branch, plus row-estimate lines, so the diff
+// endpoint has something realistic to assemble.
+func (f *fakeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (string, error) {
+	if f.execOutErr != nil {
+		return "", f.execOutErr
+	}
+	isBase := strings.Contains(id, "pgbranch-br-diff-")
+	if len(cmd) > 0 && cmd[0] == "pg_dump" {
+		if isBase {
+			return "CREATE TABLE users (id integer);\n", nil
+		}
+		return "CREATE TABLE users (id integer);\nCREATE TABLE added (x integer);\n", nil
+	}
+	if isBase {
+		return "users|100\n", nil
+	}
+	return "added|7\nusers|100\n", nil
 }
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
 	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil

@@ -69,6 +69,12 @@ type Driver interface {
 	RunHelper(ctx context.Context, spec HelperSpec) (output string, err error)
 	StartBranch(ctx context.Context, spec BranchSpec) (id string, err error)
 	Exec(ctx context.Context, containerID string, cmd []string) error // error on non-zero exit
+	// ExecOutput is Exec with the command's stdout captured and returned
+	// (stderr goes into the error on failure). Used where the engine needs
+	// in-container command output (pg_dump, row-count probes) against a
+	// RUNNING instance — RunHelper can also capture output but spins a new
+	// container, which cannot reach an instance's local socket.
+	ExecOutput(ctx context.Context, containerID string, cmd []string) (string, error)
 	Inspect(ctx context.Context, containerID string) (ContainerInfo, error)
 	StopRemove(ctx context.Context, containerID string) error
 	ListManaged(ctx context.Context) ([]ContainerInfo, error) // label pgbranch.managed=true
