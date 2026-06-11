@@ -42,6 +42,9 @@ spec:
             - --csi-volume-size={{ . }}
             {{- end }}
             {{- end }}
+            {{- if .Values.rotateBranchCredentials }}
+            - --rotate-branch-credentials
+            {{- end }}
             - --api-addr=:{{ .Values.api.port }}
             - --pg-addr=:{{ .Values.proxy.port }}
             - --reap-interval={{ .Values.reapInterval }}

@@ -139,6 +139,7 @@ func run() error {
 	csiVolumeSize := flag.String("csi-volume-size", "", "size of every pgbranch PVC, e.g. 50Gi (default 10Gi; --kube-storage csi only)")
 	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default), zfs (experimental, see docs/zfs.md) or csi (forced by --kube-storage csi)")
 	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgbranch datasets, e.g. tank/pgbranch (required with --cow zfs)")
+	rotateCreds := flag.Bool("rotate-branch-credentials", false, "give every branch its own generated password instead of inheriting the source's (returned as `password` in branch API responses; see docs/architecture.md)")
 	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
@@ -211,8 +212,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("init %s runtime: %w", *runtimeName, err)
 	}
+	var engOpts []engine.Option
+	if *rotateCreds {
+		engOpts = append(engOpts, engine.WithCredentialRotation())
+	}
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
-		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")})
+		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")}, engOpts...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

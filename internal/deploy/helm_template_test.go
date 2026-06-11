@@ -27,6 +27,23 @@ func helmTemplate(t *testing.T, sets ...string) (string, error) {
 	return string(out), err
 }
 
+func TestHelmRotateBranchCredentialsArg(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "--rotate-branch-credentials") {
+		t.Error("rotation arg rendered by default (must be opt-in)")
+	}
+	out, err = helmTemplate(t, "rotateBranchCredentials=true")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "--rotate-branch-credentials") {
+		t.Error("rotateBranchCredentials=true did not render the branchd arg")
+	}
+}
+
 // ghookSets is the minimal valid ghook configuration.
 func ghookSets(extra ...string) []string {
 	return append([]string{

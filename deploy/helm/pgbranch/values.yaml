@@ -63,6 +63,13 @@ proxy:
 # TTL reaper tick interval (branchd --reap-interval).
 reapInterval: 30s
 
+# Per-branch credential rotation (branchd --rotate-branch-credentials): every
+# branch gets its own generated password instead of inheriting the source's.
+# The API then returns it as `password` and `pgb connect` prints it. Leave
+# off for static-credential preview flows (e.g. Vercel-style env templating)
+# that need every branch to accept the same source password.
+rotateBranchCredentials: false
+
 # branchd writes its sqlite registry to a hostPath on the storage node, so it
 # must run as root for write access to that directory (simplest correct
 # choice for the single-node scope; the branchd image has no other users).
