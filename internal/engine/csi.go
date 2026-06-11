@@ -149,7 +149,7 @@ func (e *Engine) restartCSIBranch(ctx context.Context, b *registry.Branch, src *
 		e.drv.StopRemove(ctx, cid)
 		return failed(err)
 	}
-	info, err := e.drv.Inspect(ctx, cid)
+	info, err := e.inspectAddr(ctx, cid)
 	if err != nil {
 		return failed(err)
 	}

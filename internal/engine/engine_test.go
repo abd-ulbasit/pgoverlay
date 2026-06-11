@@ -29,6 +29,11 @@ type fakeDriver struct {
 	branches      []runtime.BranchSpec // every successful StartBranch call, in order
 	execs         [][]string           // every Exec call, in order
 	log           []string             // coarse op log for ordering assertions
+
+	// kubelet status-sync race simulation: the first N Inspect calls
+	// report no Host (pod exec-ready before status.podIP is published).
+	emptyHostInspects int
+	inspects          int
 }
 
 func newFake() *fakeDriver {
@@ -101,6 +106,10 @@ func (f *fakeDriver) psqlExecs() [][]string {
 	return out
 }
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
+	f.inspects++
+	if f.inspects <= f.emptyHostInspects {
+		return runtime.ContainerInfo{ID: id, Running: f.containers[id], Port: 54321}, nil
+	}
 	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
 }
 func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
@@ -169,6 +178,27 @@ func TestReconcileCleansOrphans(t *testing.T) {
 	}
 	if d.containers["cid-ghost"] {
 		t.Fatal("ghost container not removed")
+	}
+}
+
+// Kubernetes pods answer exec probes before kubelet publishes status.podIP;
+// the engine must keep inspecting until an address appears instead of
+// recording host "" (which the proxy would dial as ":5432").
+func TestCreateBranchWaitsForAddress(t *testing.T) {
+	d := newFake()
+	d.emptyHostInspects = 2
+	e, r := testEngine(t, d)
+	readySource(t, r)
+
+	b, err := e.CreateBranch(context.Background(), "pr-1", "main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Host != "127.0.0.1" {
+		t.Fatalf("Host=%q want 127.0.0.1 (engine must retry empty-host inspects)", b.Host)
+	}
+	if d.inspects < 3 {
+		t.Fatalf("inspects=%d, want >=3 (two empty-host reads then the real one)", d.inspects)
 	}
 }
 

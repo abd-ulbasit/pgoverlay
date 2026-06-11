@@ -57,11 +57,7 @@ func (f *fakeGitHub) client() *GitHub {
 func TestOpenedPostsConnectInfoComment(t *testing.T) {
 	pg := newFakePG(t, false)
 	gh := newFakeGitHub(t)
-	h := newService(Config{ProxyHost: "pg.example.com:30432"}, pg.srv.URL, gh.client()).Handler()
-
-	if rr := signedPost(t, h, fixture(t, "pr_opened.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, newService(Config{ProxyHost: "pg.example.com:30432"}, pg.srv.URL, gh.client()), fixture(t, "pr_opened.json"))
 	if len(gh.posted) != 1 {
 		t.Fatalf("posted comments = %v, want exactly one", gh.posted)
 	}
@@ -82,11 +78,7 @@ func TestOpenedPostsConnectInfoComment(t *testing.T) {
 func TestMarkerCommentDeduplicates(t *testing.T) {
 	pg := newFakePG(t, true)
 	gh := newFakeGitHub(t, "unrelated comment", "Connect info\n"+commentMarker)
-	h := newService(Config{ProxyHost: "pg.example.com"}, pg.srv.URL, gh.client()).Handler()
-
-	if rr := signedPost(t, h, fixture(t, "pr_opened.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, newService(Config{ProxyHost: "pg.example.com"}, pg.srv.URL, gh.client()), fixture(t, "pr_opened.json"))
 	if len(gh.posted) != 0 {
 		t.Fatalf("posted comments = %v, want none (marker present)", gh.posted)
 	}
@@ -103,22 +95,15 @@ func TestGitHubFailureDoesNotFailWebhook(t *testing.T) {
 	}))
 	defer down.Close()
 	gh := &GitHub{BaseURL: down.URL, Token: "gh-token", HTTP: down.Client()}
-	h := newService(Config{}, pg.srv.URL, gh).Handler()
-
-	if rr := signedPost(t, h, fixture(t, "pr_opened.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d want 200 (comment failure is non-fatal)", rr.Code)
-	}
+	// comment failure is non-fatal: the branch operation still completes
+	deliver(t, newService(Config{}, pg.srv.URL, gh), fixture(t, "pr_opened.json"))
 	pg.assertCalls("GET /v1/branches/pr-7", "POST /v1/branches")
 }
 
 func TestClosedDoesNotTouchGitHub(t *testing.T) {
 	pg := newFakePG(t, true)
 	gh := newFakeGitHub(t) // any call → t.Errorf via mux assertions below
-	h := newService(Config{}, pg.srv.URL, gh.client()).Handler()
-
-	if rr := signedPost(t, h, fixture(t, "pr_closed.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, newService(Config{}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
 	if gh.lastReq != nil {
 		t.Fatalf("unexpected GitHub call on closed: %s", gh.lastReq.URL)
 	}

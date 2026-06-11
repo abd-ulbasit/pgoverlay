@@ -242,11 +242,37 @@ func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *regi
 	if err := e.applyMasking(ctx, cid, src); err != nil {
 		return err
 	}
-	info, err := e.drv.Inspect(ctx, cid)
+	info, err := e.inspectAddr(ctx, cid)
 	if err != nil {
 		return err
 	}
 	return e.reg.MarkBranchReady(b.ID, cid, info.Host, info.Port)
+}
+
+// inspectAddr inspects cid until the runtime reports a routable address.
+// Kubernetes pods are exec-ready (pg_isready answers) seconds before the
+// kubelet's status sync publishes status.podIP, so a single Inspect right
+// after readiness can capture an empty host — the proxy would then dial
+// ":5432". Docker returns an address immediately; the first iteration wins.
+func (e *Engine) inspectAddr(ctx context.Context, cid string) (runtime.ContainerInfo, error) {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		info, err := e.drv.Inspect(ctx, cid)
+		if err != nil {
+			return info, err
+		}
+		if info.Host != "" {
+			return info, nil
+		}
+		if time.Now().After(deadline) {
+			return info, fmt.Errorf("instance %s reported no address within 30s", cid)
+		}
+		select {
+		case <-ctx.Done():
+			return info, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // ResetBranch throws away a ready branch's writes and reprovisions it from

@@ -17,6 +17,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
 	"github.com/abd-ulbasit/pgbranch/internal/apiclient"
@@ -38,7 +40,12 @@ type Service struct {
 	pg  *apiclient.Client
 	gh  *GitHub // nil when commenting is disabled
 	log *slog.Logger
+	wg  sync.WaitGroup // in-flight detached branch operations
 }
+
+// Wait blocks until all detached branch operations have finished. Call after
+// the HTTP server has shut down so in-flight work completes before exit.
+func (s *Service) Wait() { s.wg.Wait() }
 
 func New(cfg Config, pg *apiclient.Client, gh *GitHub, log *slog.Logger) *Service {
 	return &Service{cfg: cfg, pg: pg, gh: gh, log: log}
@@ -129,27 +136,41 @@ func (s *Service) repoAllowed(fullName string) bool {
 func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 	log := s.log.With("action", p.Action, "repo", p.Repository.FullName,
 		"pr", p.Number, "head_sha", p.PullRequest.Head.SHA)
-	ctx := r.Context()
 	branch := fmt.Sprintf("pr-%d", p.Number)
 
-	var err error
 	switch p.Action {
-	case "opened", "reopened", "synchronize":
-		err = s.ensureBranch(ctx, log, p, branch)
-	case "closed":
-		err = s.destroyBranch(ctx, log, branch)
+	case "opened", "reopened", "synchronize", "closed":
 	default:
 		log.Debug("ignoring pull_request action")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if err != nil {
-		log.Error("handling event failed", "err", err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
+
+	// GitHub abandons webhook deliveries after ~10s, and an abandoned
+	// request's canceled context would abort branchd's saga mid-flight —
+	// branch creation/reset at pod speed routinely exceeds that deadline.
+	// Ack the delivery now and run the operation detached.
+	payload := *p
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		var err error
+		switch payload.Action {
+		case "opened", "reopened", "synchronize":
+			err = s.ensureBranch(ctx, log, &payload, branch)
+		case "closed":
+			err = s.destroyBranch(ctx, log, branch)
+		}
+		if err != nil {
+			log.Error("handling event failed", "err", err)
+		}
+	}()
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"branch": branch})
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"branch": branch, "status": "accepted"})
 }
 
 // ensureBranch makes branch exist (creating it from the configured source if

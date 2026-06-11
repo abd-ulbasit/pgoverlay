@@ -83,14 +83,23 @@ func signedPost(t *testing.T, h http.Handler, body []byte) *httptest.ResponseRec
 	return post(t, h, "pull_request", sign(testSecret, body), body)
 }
 
+// deliver posts a signed pull_request event, asserts the immediate 202 ack
+// (branch operations run detached — GitHub abandons deliveries after ~10s),
+// and waits for the detached work to finish so calls can be asserted.
+func deliver(t *testing.T, svc *Service, body []byte) {
+	t.Helper()
+	rr := signedPost(t, svc.Handler(), body)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("code=%d body=%s, want 202", rr.Code, rr.Body)
+	}
+	svc.Wait()
+}
+
 func TestOpenedCreatesMissingBranch(t *testing.T) {
 	pg := newFakePG(t, false)
-	h := newService(Config{Source: "staging", TTLSeconds: 259200}, pg.srv.URL, nil).Handler()
+	svc := newService(Config{Source: "staging", TTLSeconds: 259200}, pg.srv.URL, nil)
 
-	rr := signedPost(t, h, fixture(t, "pr_opened.json"))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, svc, fixture(t, "pr_opened.json"))
 	pg.assertCalls("GET /v1/branches/pr-7", "POST /v1/branches")
 	want := api.CreateBranchRequest{Name: "pr-7", Source: "staging", TTLSeconds: 259200}
 	if pg.create != want {
@@ -100,64 +109,44 @@ func TestOpenedCreatesMissingBranch(t *testing.T) {
 
 func TestReopenedExistingBranchIsNoop(t *testing.T) {
 	pg := newFakePG(t, true)
-	h := newService(Config{}, pg.srv.URL, nil).Handler()
+	svc := newService(Config{}, pg.srv.URL, nil)
 
 	body := bytes.Replace(fixture(t, "pr_opened.json"), []byte(`"opened"`), []byte(`"reopened"`), 1)
-	if rr := signedPost(t, h, body); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, svc, body)
 	pg.assertCalls("GET /v1/branches/pr-7")
 }
 
 func TestSynchronizeDefaultEnsuresWithoutReset(t *testing.T) {
 	pg := newFakePG(t, true)
-	h := newService(Config{}, pg.srv.URL, nil).Handler()
-
-	if rr := signedPost(t, h, fixture(t, "pr_synchronize.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, newService(Config{}, pg.srv.URL, nil), fixture(t, "pr_synchronize.json"))
 	pg.assertCalls("GET /v1/branches/pr-7") // no reset, no create
 
 	// missing branch is (re)created even on synchronize
 	pg2 := newFakePG(t, false)
-	h2 := newService(Config{}, pg2.srv.URL, nil).Handler()
-	if rr := signedPost(t, h2, fixture(t, "pr_synchronize.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, newService(Config{}, pg2.srv.URL, nil), fixture(t, "pr_synchronize.json"))
 	pg2.assertCalls("GET /v1/branches/pr-7", "POST /v1/branches")
 }
 
 func TestSynchronizeWithResetOnPushResetsExistingBranch(t *testing.T) {
 	pg := newFakePG(t, true)
-	h := newService(Config{ResetOnPush: true}, pg.srv.URL, nil).Handler()
-
-	if rr := signedPost(t, h, fixture(t, "pr_synchronize.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, newService(Config{ResetOnPush: true}, pg.srv.URL, nil), fixture(t, "pr_synchronize.json"))
 	pg.assertCalls("GET /v1/branches/pr-7", "POST /v1/branches/pr-7/reset")
 
 	// freshly created branch needs no reset
 	pg2 := newFakePG(t, false)
-	h2 := newService(Config{ResetOnPush: true}, pg2.srv.URL, nil).Handler()
-	if rr := signedPost(t, h2, fixture(t, "pr_synchronize.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, newService(Config{ResetOnPush: true}, pg2.srv.URL, nil), fixture(t, "pr_synchronize.json"))
 	pg2.assertCalls("GET /v1/branches/pr-7", "POST /v1/branches")
 }
 
 func TestClosedDestroysBranchAndToleratesMissing(t *testing.T) {
 	pg := newFakePG(t, true)
-	h := newService(Config{}, pg.srv.URL, nil).Handler()
+	svc := newService(Config{}, pg.srv.URL, nil)
 
-	if rr := signedPost(t, h, fixture(t, "pr_closed.json")); rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
-	}
+	deliver(t, svc, fixture(t, "pr_closed.json"))
 	pg.assertCalls("DELETE /v1/branches/pr-7")
 
-	// already gone → still OK
-	if rr := signedPost(t, h, fixture(t, "pr_closed.json")); rr.Code != http.StatusOK {
-		t.Fatalf("destroy of missing branch: code=%d body=%s", rr.Code, rr.Body)
-	}
+	// already gone → still acked
+	deliver(t, svc, fixture(t, "pr_closed.json"))
 }
 
 func TestRepoAllowListFiltersEvents(t *testing.T) {
@@ -170,22 +159,18 @@ func TestRepoAllowListFiltersEvents(t *testing.T) {
 	pg.assertCalls()
 
 	// allow-listed repo goes through
-	h2 := newService(Config{Repos: []string{"acme/widgets"}}, pg.srv.URL, nil).Handler()
-	if rr := signedPost(t, h2, fixture(t, "pr_opened.json")); rr.Code != http.StatusOK {
-		t.Fatalf("allowed repo: code=%d want 200", rr.Code)
-	}
+	deliver(t, newService(Config{Repos: []string{"acme/widgets"}}, pg.srv.URL, nil), fixture(t, "pr_opened.json"))
 	pg.assertCalls("GET /v1/branches/pr-7", "POST /v1/branches")
 }
 
-func TestPGBranchFailureSurfacesAs502(t *testing.T) {
+// Branch-operation failures are logged by the detached worker, never
+// surfaced to GitHub: the delivery was already acked with 202 (re-delivery
+// wouldn't help, and slow operations must not look like webhook outages).
+func TestPGBranchFailureStillAcked(t *testing.T) {
 	pg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "kaboom"})
 	}))
 	defer pg.Close()
-	h := newService(Config{}, pg.URL, nil).Handler()
-
-	if rr := signedPost(t, h, fixture(t, "pr_opened.json")); rr.Code != http.StatusBadGateway {
-		t.Fatalf("code=%d want 502", rr.Code)
-	}
+	deliver(t, newService(Config{}, pg.URL, nil), fixture(t, "pr_opened.json"))
 }

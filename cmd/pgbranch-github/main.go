@@ -72,6 +72,7 @@ func run() error {
 	if err := srv.Shutdown(shCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	svc.Wait()
 	logger.Info("pgbranch-github stopped")
 	return nil
 }

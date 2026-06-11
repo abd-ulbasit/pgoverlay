@@ -169,11 +169,11 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err := e.applyMasking(ctx, childCID, src); err != nil {
 		return fail(err)
 	}
-	childInfo, err := e.drv.Inspect(ctx, childCID)
+	childInfo, err := e.inspectAddr(ctx, childCID)
 	if err != nil {
 		return fail(err)
 	}
-	parentInfo, err := e.drv.Inspect(ctx, parentCID)
+	parentInfo, err := e.inspectAddr(ctx, parentCID)
 	if err != nil {
 		return fail(err)
 	}
@@ -210,7 +210,7 @@ func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src
 		failed(err)
 		return
 	}
-	info, err := e.drv.Inspect(ctx, cid)
+	info, err := e.inspectAddr(ctx, cid)
 	if err != nil {
 		failed(err)
 		return
