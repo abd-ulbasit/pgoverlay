@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -129,4 +129,18 @@ ALTER TABLE sources ADD COLUMN dump_schemas TEXT NOT NULL DEFAULT '';
 // (the branch keeps the source's credentials, the historical behavior).
 const migrateV7 = `
 ALTER TABLE branches ADD COLUMN password TEXT NOT NULL DEFAULT '';
+`
+
+// v8 (Phase 7): a per-registry key/value meta table. Its first key,
+// 'instance_id', is a stable id minted on first Open (see ensureInstanceID).
+// Managed Docker/K8s resources are tagged pgbranch.instance=<id> so reconcile
+// only ever reclaims resources belonging to ITS registry — concurrent
+// pgbranch instances (and the IT suite's parallel packages) sharing one Docker
+// daemon no longer GC each other's live containers/volumes. The next migration
+// is v9.
+const migrateV8 = `
+CREATE TABLE meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `

@@ -164,8 +164,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 7 {
-		t.Fatalf("user_version=%d want 7", v)
+	if v != 8 {
+		t.Fatalf("user_version=%d want 8", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -857,5 +857,45 @@ func TestCreateSourcePGVersionValidation(t *testing.T) {
 		if !strings.Contains(err.Error(), v) || !strings.Contains(err.Error(), "14") {
 			t.Errorf("pg_version %q: error %q should name the version and the supported range", v, err)
 		}
+	}
+}
+
+func TestInstanceIDStableAcrossOpens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inst.db")
+	r1, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id1 := r1.InstanceID()
+	if len(id1) != 16 {
+		t.Fatalf("instance id %q is not 16 hex chars", id1)
+	}
+	if err := r1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r2.Close() })
+	if id2 := r2.InstanceID(); id2 != id1 {
+		t.Fatalf("instance id changed across opens of the same file: %q != %q", id2, id1)
+	}
+}
+
+func TestInstanceIDDistinctAcrossFiles(t *testing.T) {
+	ra, err := Open(filepath.Join(t.TempDir(), "a.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ra.Close() })
+	rb, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { rb.Close() })
+	if ra.InstanceID() == rb.InstanceID() {
+		t.Fatalf("distinct registry files share an instance id: %q", ra.InstanceID())
 	}
 }

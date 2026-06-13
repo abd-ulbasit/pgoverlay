@@ -89,7 +89,10 @@ type Layer struct {
 	ID, SourceID, Volume, ParentLayerID string
 }
 
-type Registry struct{ db *sql.DB }
+type Registry struct {
+	db         *sql.DB
+	instanceID string // stable per-registry id; tags managed resources for GC scoping
+}
 
 func Open(path string) (*Registry, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
@@ -101,8 +104,37 @@ func Open(path string) (*Registry, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	return &Registry{db: db}, nil
+	id, err := ensureInstanceID(db)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("instance id: %w", err)
+	}
+	return &Registry{db: db, instanceID: id}, nil
 }
+
+// ensureInstanceID returns the registry's stable instance id, minting one (a
+// 16-hex crypto/rand value) on first Open and persisting it in meta. Idempotent:
+// the INSERT OR IGNORE keeps the first id even under a concurrent open of the
+// same file, and subsequent opens read the stored value back.
+func ensureInstanceID(db *sql.DB) (string, error) {
+	id := make([]byte, 8)
+	if _, err := rand.Read(id); err != nil {
+		return "", err
+	}
+	if _, err := db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('instance_id', ?)`, hex.EncodeToString(id)); err != nil {
+		return "", err
+	}
+	var stored string
+	if err := db.QueryRow(`SELECT value FROM meta WHERE key='instance_id'`).Scan(&stored); err != nil {
+		return "", err
+	}
+	return stored, nil
+}
+
+// InstanceID returns this registry's stable instance id. The engine stamps it
+// onto every managed Docker/K8s resource (label pgbranch.instance) so reconcile
+// reclaims only resources owned by this registry.
+func (r *Registry) InstanceID() string { return r.instanceID }
 
 // migrate applies pending versioned migrations (PRAGMA user_version). Each
 // migration runs in its own transaction; foreign keys are disabled for the
