@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -293,7 +294,20 @@ func (s *Server) branchUsage(w http.ResponseWriter, r *http.Request) {
 // branch's base and pg_dumps both instances, so expect ~5-10s of latency;
 // clients should use a generous timeout. 404 unknown branch, 409 not ready.
 func (s *Server) branchDiff(w http.ResponseWriter, r *http.Request) {
-	res, err := s.eng.DiffBranch(r.Context(), r.PathValue("name"))
+	var opts []engine.DiffOption
+	// ?data=N turns on bounded data sampling (up to N branch-only rows per
+	// grown table). data=0/absent leaves sampling off.
+	if v := r.URL.Query().Get("data"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "data must be a non-negative integer")
+			return
+		}
+		if n > 0 {
+			opts = append(opts, engine.WithDataSample(n))
+		}
+	}
+	res, err := s.eng.DiffBranch(r.Context(), r.PathValue("name"), opts...)
 	if err != nil {
 		writeEngineError(w, err)
 		return

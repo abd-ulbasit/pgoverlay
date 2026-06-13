@@ -267,6 +267,151 @@ func TestDiffBranchRequiresReadyTarget(t *testing.T) {
 	}
 }
 
+// TestDiffBranchNoDataSampleByDefault: without WithDataSample, no table
+// carries SampleRows and no PK/jsonb queries are issued.
+func TestDiffBranchNoDataSampleByDefault(t *testing.T) {
+	d := newFake()
+	d.execOutFn = diffFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := e.DiffBranch(context.Background(), "pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, td := range res.Tables {
+		if td.SampleRows != nil {
+			t.Errorf("table %s has SampleRows without WithDataSample: %v", td.Table, td.SampleRows)
+		}
+	}
+	for _, c := range d.execOuts {
+		if joined := strings.Join(c, " "); strings.Contains(joined, "to_jsonb") || strings.Contains(joined, "indisprimary") {
+			t.Errorf("unexpected sampling query without WithDataSample: %q", joined)
+		}
+	}
+}
+
+// dataSampleFake serves schema dumps, row estimates, PK lookups and jsonb row
+// samples. diffdemo grows (base 0 -> branch rows) and has PK x; nopk also
+// grows but has no PK (skipped); users shrinks (never sampled).
+func dataSampleFake() func(id string, cmd []string) (string, error) {
+	return func(id string, cmd []string) (string, error) {
+		isBase := strings.Contains(id, "pgbranch-br-diff-")
+		joined := strings.Join(cmd, " ")
+		switch {
+		case len(cmd) > 0 && cmd[0] == "pg_dump":
+			return "CREATE TABLE diffdemo (x int);\n", nil
+		case strings.Contains(joined, "reltuples"):
+			if isBase {
+				return "diffdemo|0\nnopk|0\nusers|100\n", nil
+			}
+			return "diffdemo|3\nnopk|5\nusers|90\n", nil
+		case strings.Contains(joined, "indisprimary"):
+			// PK columns by table; nopk returns nothing
+			switch {
+			case strings.Contains(joined, "'diffdemo'"):
+				return "x\n", nil
+			case strings.Contains(joined, "'nopk'"):
+				return "", nil
+			}
+			return "", nil
+		case strings.Contains(joined, "to_jsonb"):
+			if isBase {
+				// base has only x=1
+				return `{"x": 1}` + "\n", nil
+			}
+			// branch has x=1,2,3 — x=2,3 are branch-only
+			return `{"x": 1}` + "\n" + `{"x": 2}` + "\n" + `{"x": 3}` + "\n", nil
+		}
+		return "", nil
+	}
+}
+
+func TestDiffBranchDataSampleBranchOnlyByPK(t *testing.T) {
+	d := newFake()
+	d.execOutFn = dataSampleFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := e.DiffBranch(context.Background(), "pr-1", WithDataSample(20))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byName := map[string]TableDelta{}
+	for _, td := range res.Tables {
+		byName[td.Table] = td
+	}
+
+	// diffdemo grew: branch-only rows x=2,3 (x=1 exists on both)
+	demo := byName["diffdemo"]
+	if len(demo.SampleRows) != 2 {
+		t.Fatalf("diffdemo SampleRows = %v, want 2 branch-only rows", demo.SampleRows)
+	}
+	gotX := []float64{}
+	for _, row := range demo.SampleRows {
+		x, ok := row["x"].(float64)
+		if !ok {
+			t.Fatalf("diffdemo row missing numeric x: %v", row)
+		}
+		gotX = append(gotX, x)
+	}
+	if !(gotX[0] == 2 && gotX[1] == 3) {
+		t.Errorf("diffdemo branch-only x = %v, want [2 3]", gotX)
+	}
+
+	// nopk grew but has no primary key: skipped (nil samples)
+	if byName["nopk"].SampleRows != nil {
+		t.Errorf("nopk has SampleRows despite no PK: %v", byName["nopk"].SampleRows)
+	}
+
+	// users shrank: not a grown table, never sampled
+	if byName["users"].SampleRows != nil {
+		t.Errorf("users (shrank) has SampleRows: %v", byName["users"].SampleRows)
+	}
+
+	// the sample SELECT ordered by the PK and capped with LIMIT
+	var sawJSONB bool
+	for _, c := range d.execOuts {
+		j := strings.Join(c, " ")
+		if strings.Contains(j, "to_jsonb") {
+			sawJSONB = true
+			if !strings.Contains(j, `ORDER BY "x"`) || !strings.Contains(j, "LIMIT 20") {
+				t.Errorf("jsonb sample query not ordered/capped: %q", j)
+			}
+		}
+	}
+	if !sawJSONB {
+		t.Error("no to_jsonb sample query issued")
+	}
+}
+
+// WithDataSample(0) falls back to the default cap rather than disabling.
+func TestWithDataSampleDefaultCap(t *testing.T) {
+	d := newFake()
+	d.execOutFn = dataSampleFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.DiffBranch(context.Background(), "pr-1", WithDataSample(0)); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range d.execOuts {
+		j := strings.Join(c, " ")
+		if strings.Contains(j, "to_jsonb") && !strings.Contains(j, fmt.Sprintf("LIMIT %d", defaultSampleRows)) {
+			t.Errorf("WithDataSample(0) did not use default cap: %q", j)
+		}
+	}
+}
+
 func TestStripDumpNoise(t *testing.T) {
 	in := "--\nCREATE TABLE t (id int);\n\\restrict aB3xQ\nSET x=1;\n\\unrestrict zZ9kP\n"
 	got := stripDumpNoise(in)

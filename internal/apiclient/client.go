@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
@@ -174,10 +175,15 @@ func (c *Client) BranchUsage(ctx context.Context, name string) (int64, error) {
 // DiffBranch returns what changed in a branch relative to its base (unified
 // schema diff + per-table row-estimate deltas). The server provisions a
 // throwaway clone of the branch's base and pg_dumps both instances per call —
-// expect ~5-10s.
-func (c *Client) DiffBranch(ctx context.Context, name string) (*engine.DiffResult, error) {
+// expect ~5-10s. dataSample, when > 0, asks the server for up to that many
+// branch-only sample rows per grown table (?data=N); 0 disables sampling.
+func (c *Client) DiffBranch(ctx context.Context, name string, dataSample int) (*engine.DiffResult, error) {
+	path := "/v1/branches/" + url.PathEscape(name) + "/diff"
+	if dataSample > 0 {
+		path += "?data=" + strconv.Itoa(dataSample)
+	}
 	var out engine.DiffResult
-	if err := c.do(ctx, "GET", "/v1/branches/"+url.PathEscape(name)+"/diff", nil, &out); err != nil {
+	if err := c.do(ctx, "GET", path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

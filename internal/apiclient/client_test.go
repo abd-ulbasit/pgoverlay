@@ -230,17 +230,30 @@ func TestDiffBranch(t *testing.T) {
 	})
 	c := New(ts.URL, "tok")
 
-	res, err := c.DiffBranch(context.Background(), "pr-1")
+	res, err := c.DiffBranch(context.Background(), "pr-1", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if req.Method != "GET" || req.URL.Path != "/v1/branches/pr-1/diff" {
 		t.Fatalf("%s %s", req.Method, req.URL.Path)
 	}
+	if req.URL.RawQuery != "" {
+		t.Fatalf("dataSample 0 sent a query: %q", req.URL.RawQuery)
+	}
 	if !strings.Contains(res.SchemaDiff, "+added") {
 		t.Fatalf("schema diff = %q", res.SchemaDiff)
 	}
-	if len(res.Tables) != 1 || res.Tables[0] != (engine.TableDelta{Table: "added", BranchRows: 7, Delta: 7}) {
+	want := engine.TableDelta{Table: "added", BranchRows: 7, Delta: 7}
+	if len(res.Tables) != 1 || res.Tables[0].Table != want.Table ||
+		res.Tables[0].BranchRows != want.BranchRows || res.Tables[0].Delta != want.Delta {
 		t.Fatalf("tables = %+v", res.Tables)
+	}
+
+	// dataSample > 0 appends ?data=N
+	if _, err := c.DiffBranch(context.Background(), "pr-1", 5); err != nil {
+		t.Fatal(err)
+	}
+	if req.URL.RawQuery != "data=5" {
+		t.Fatalf("query = %q, want data=5", req.URL.RawQuery)
 	}
 }

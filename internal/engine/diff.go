@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -22,6 +23,12 @@ type TableDelta struct {
 	BaseRows   int64  `json:"base_rows"`
 	BranchRows int64  `json:"branch_rows"`
 	Delta      int64  `json:"delta"`
+	// SampleRows is a bounded set of branch-only rows (present on the branch,
+	// absent on the base, matched by primary key) — populated only when the
+	// diff is requested with data sampling (engine.WithDataSample) and only for
+	// tables whose branch row-estimate exceeds the base estimate. Tables with
+	// no primary key are skipped (sampling needs a stable key to diff by).
+	SampleRows []map[string]any `json:"sample_rows,omitempty"`
 }
 
 // DiffResult is what changed in a branch relative to its base: a unified
@@ -36,6 +43,34 @@ type DiffResult struct {
 // "relname|reltuples" line per table.
 const rowEstimateSQL = `SELECT relname || '|' || reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY relname`
 
+// diffOptions holds the optional tuning for DiffBranch.
+type diffOptions struct {
+	// sample is the per-table cap on branch-only sample rows; 0 disables
+	// data sampling entirely.
+	sample int
+}
+
+// DiffOption tunes DiffBranch.
+type DiffOption func(*diffOptions)
+
+// defaultSampleRows is the per-table sample cap used when WithDataSample is
+// requested with a non-positive n.
+const defaultSampleRows = 20
+
+// WithDataSample turns on bounded data sampling: for each table whose branch
+// row-estimate exceeds its base estimate, DiffBranch returns up to n
+// branch-only rows (matched by primary key) in TableDelta.SampleRows. A
+// non-positive n uses the default cap (20). Tables without a primary key are
+// skipped. Off by default.
+func WithDataSample(n int) DiffOption {
+	return func(o *diffOptions) {
+		if n <= 0 {
+			n = defaultSampleRows
+		}
+		o.sample = n
+	}
+}
+
 // DiffBranch reports what changed in a ready branch relative to its base. It
 // provisions an internal throwaway branch ("diff-<6 hex>") from the target's
 // OWN base — the recorded source volume/generation and frozen-layer chain,
@@ -46,8 +81,12 @@ const rowEstimateSQL = `SELECT relname || '|' || reltuples::bigint FROM pg_class
 // cleans strays if branchd dies mid-diff) and is destroyed before returning,
 // success or not. Expect a few seconds of wall time: a full branch provision
 // plus two dumps.
-func (e *Engine) DiffBranch(ctx context.Context, name string) (_ *DiffResult, err error) {
+func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption) (_ *DiffResult, err error) {
 	defer e.observeOp("diff", &err)()
+	var o diffOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
 		return nil, err
@@ -108,10 +147,145 @@ func (e *Engine) DiffBranch(ctx context.Context, name string) (_ *DiffResult, er
 		return nil, fmt.Errorf("diff %q: branch row estimates: %w", name, err)
 	}
 
-	return &DiffResult{
+	res := &DiffResult{
 		SchemaDiff: diffutil.Unified(stripDumpNoise(baseDump), stripDumpNoise(branchDump)),
 		Tables:     tableDeltas(baseRows, branchRows),
-	}, nil
+	}
+	if o.sample > 0 {
+		if err := e.sampleNewRows(ctx, res, b.ContainerID, twRow.ContainerID, src, o.sample); err != nil {
+			return nil, fmt.Errorf("diff %q: sample rows: %w", name, err)
+		}
+	}
+	return res, nil
+}
+
+// sampleNewRows fills TableDelta.SampleRows for every grown table (branch
+// estimate > base estimate). For each it reads the table's primary-key columns
+// from the branch, pulls up to capN rows ordered by PK as jsonb from BOTH
+// instances, and keeps the branch rows whose PK is absent on the base (capped
+// at capN), computed host-side because base and branch are separate instances.
+// No-PK tables are skipped.
+func (e *Engine) sampleNewRows(ctx context.Context, res *DiffResult, branchCID, baseCID string, src *registry.Source, capN int) error {
+	for i := range res.Tables {
+		td := &res.Tables[i]
+		if td.BranchRows <= td.BaseRows {
+			continue
+		}
+		pk, err := e.primaryKeyColumns(ctx, branchCID, src, td.Table)
+		if err != nil {
+			return err
+		}
+		if len(pk) == 0 {
+			continue // no PK: nothing stable to diff by, skip sampling
+		}
+		branchRows, err := e.sampleTableRows(ctx, branchCID, src, td.Table, pk, capN)
+		if err != nil {
+			return err
+		}
+		baseRows, err := e.sampleTableRows(ctx, baseCID, src, td.Table, pk, capN)
+		if err != nil {
+			return err
+		}
+		baseKeys := make(map[string]bool, len(baseRows))
+		for _, r := range baseRows {
+			baseKeys[rowKey(r, pk)] = true
+		}
+		var only []map[string]any
+		for _, r := range branchRows {
+			if len(only) >= capN {
+				break
+			}
+			if !baseKeys[rowKey(r, pk)] {
+				only = append(only, r)
+			}
+		}
+		td.SampleRows = only
+	}
+	return nil
+}
+
+// pkColumnsSQL lists a table's primary-key column names in key order, one per
+// line. It resolves the relation through the user schemas (excluding system
+// ones), matching the row-estimate query's table universe.
+const pkColumnsSQL = `SELECT a.attname FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=ANY(i.indkey) WHERE i.indisprimary AND c.relname=%s AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY array_position(i.indkey, a.attnum)`
+
+// primaryKeyColumns returns the table's primary-key column names (empty when
+// the table has no primary key).
+func (e *Engine) primaryKeyColumns(ctx context.Context, cid string, src *registry.Source, table string) ([]string, error) {
+	sql := fmt.Sprintf(pkColumnsSQL, quoteLiteral(table))
+	out, err := e.psqlOutput(ctx, cid, src, sql)
+	if err != nil {
+		return nil, err
+	}
+	var cols []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			cols = append(cols, line)
+		}
+	}
+	return cols, nil
+}
+
+// sampleTableRows pulls up to capN rows of table ordered by its primary key,
+// each as a single-line jsonb object, and parses them into maps.
+func (e *Engine) sampleTableRows(ctx context.Context, cid string, src *registry.Source, table string, pk []string, capN int) ([]map[string]any, error) {
+	order := make([]string, len(pk))
+	for i, c := range pk {
+		order[i] = quoteIdent(c)
+	}
+	sql := fmt.Sprintf("SELECT to_jsonb(t.*) FROM %s t ORDER BY %s LIMIT %d",
+		quoteIdent(table), strings.Join(order, ", "), capN)
+	out, err := e.psqlOutput(ctx, cid, src, sql)
+	if err != nil {
+		return nil, err
+	}
+	var rows []map[string]any
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			return nil, fmt.Errorf("decode sample row %q: %w", line, err)
+		}
+		rows = append(rows, m)
+	}
+	return rows, nil
+}
+
+// rowKey is the host-side join key for a sampled row: its primary-key values,
+// JSON-encoded so heterogeneous types compare structurally.
+func rowKey(row map[string]any, pk []string) string {
+	parts := make([]string, len(pk))
+	for i, c := range pk {
+		b, _ := json.Marshal(row[c])
+		parts[i] = string(b)
+	}
+	return strings.Join(parts, "\x00")
+}
+
+// psqlOutput runs a single SQL statement in the instance over the local socket
+// in unaligned tuples-only mode and returns the raw output.
+func (e *Engine) psqlOutput(ctx context.Context, cid string, src *registry.Source, sql string) (string, error) {
+	user, db := src.ConnUser, src.ConnDB
+	if user == "" {
+		user = "postgres"
+	}
+	if db == "" {
+		db = "postgres"
+	}
+	cmd := []string{"psql", "-tA", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", db, "-h", "/var/run/postgresql", "-c", sql}
+	return e.drv.ExecOutput(ctx, cid, cmd)
+}
+
+// quoteLiteral wraps s as a SQL string literal (single quotes doubled).
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// quoteIdent wraps s as a SQL identifier (double quotes doubled).
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 // stripDumpNoise removes pg_dump lines that differ between two dumps of the

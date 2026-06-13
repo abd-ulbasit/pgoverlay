@@ -624,6 +624,49 @@ func TestServerModeTokenRevoke(t *testing.T) {
 	}
 }
 
+// pgb diff --data passes ?data=N and renders the branch-only sample rows as
+// compact JSON, noting grown tables skipped for lacking a primary key.
+func TestServerModeDiffWithDataSample(t *testing.T) {
+	var gotQuery string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		json.NewEncoder(w).Encode(engine.DiffResult{
+			Tables: []engine.TableDelta{
+				{Table: "diffdemo", BaseRows: 0, BranchRows: 2, Delta: 2, SampleRows: []map[string]any{
+					{"id": float64(1), "email": "a@x"},
+					{"id": float64(2), "email": "b@x"},
+				}},
+				{Table: "nopk", BaseRows: 0, BranchRows: 5, Delta: 5}, // grew, no samples
+				{Table: "users", BaseRows: 10, BranchRows: 9, Delta: -1},
+			},
+		})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "diff", "pr-7", "--data", "--sample", "5", "--server", ts.URL)
+	if gotQuery != "data=5" {
+		t.Fatalf("query = %q, want data=5", gotQuery)
+	}
+	for _, want := range []string{
+		"new rows in diffdemo",
+		`{"email":"a@x","id":1}`,
+		`{"email":"b@x","id":2}`,
+		"nopk", // skipped note names it
+		"without a primary key are skipped",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("pgb diff --data output missing %q:\n%s", want, out)
+		}
+	}
+	// without --data no sampling query is sent
+	gotQuery = "unset"
+	run(t, "diff", "pr-7", "--server", ts.URL)
+	if gotQuery != "" {
+		t.Fatalf("query without --data = %q, want empty (no sampling)", gotQuery)
+	}
+}
+
 func TestServerModeDiffNoChanges(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(engine.DiffResult{Tables: []engine.TableDelta{

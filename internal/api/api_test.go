@@ -74,16 +74,31 @@ func (f *fakeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (s
 		return "", f.execOutErr
 	}
 	isBase := strings.Contains(id, "pgbranch-br-diff-")
+	joined := strings.Join(cmd, " ")
 	if len(cmd) > 0 && cmd[0] == "pg_dump" {
 		if isBase {
 			return "CREATE TABLE users (id integer);\n", nil
 		}
 		return "CREATE TABLE users (id integer);\nCREATE TABLE added (x integer);\n", nil
 	}
-	if isBase {
-		return "users|100\n", nil
+	switch {
+	case strings.Contains(joined, "reltuples"):
+		if isBase {
+			return "users|100\n", nil
+		}
+		return "added|7\nusers|100\n", nil
+	case strings.Contains(joined, "indisprimary"):
+		if strings.Contains(joined, "'added'") {
+			return "x\n", nil // added has PK x
+		}
+		return "", nil
+	case strings.Contains(joined, "to_jsonb"):
+		if isBase {
+			return "", nil // base has no rows in the new table
+		}
+		return `{"x": 1}` + "\n" + `{"x": 2}` + "\n", nil
 	}
-	return "added|7\nusers|100\n", nil
+	return "", nil
 }
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
 	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
@@ -770,8 +785,10 @@ func TestBranchDiffEndpoint(t *testing.T) {
 		t.Fatalf("tables = %+v, want %+v", got.Tables, want)
 	}
 	for i := range want {
-		if got.Tables[i] != want[i] {
-			t.Errorf("tables[%d] = %+v, want %+v", i, got.Tables[i], want[i])
+		g := got.Tables[i]
+		if g.Table != want[i].Table || g.BaseRows != want[i].BaseRows ||
+			g.BranchRows != want[i].BranchRows || g.Delta != want[i].Delta || g.SampleRows != nil {
+			t.Errorf("tables[%d] = %+v, want %+v", i, g, want[i])
 		}
 	}
 	// raw JSON shape (field names are the wire contract)
@@ -786,6 +803,33 @@ func TestBranchDiffEndpoint(t *testing.T) {
 	}
 	if code, _ := do(t, ts, "", "GET", "/v1/branches/pr-1/diff", nil); code != http.StatusUnauthorized {
 		t.Fatalf("diff without token: code=%d want 401", code)
+	}
+
+	// ?data=N turns on bounded data sampling: the grown table "added" comes
+	// back with its branch-only rows (x=1,2); without it SampleRows is absent.
+	if strings.Contains(string(body), `"sample_rows"`) {
+		t.Errorf("diff without ?data leaked sample_rows: %s", body)
+	}
+	code, body = do(t, ts, testToken, "GET", "/v1/branches/pr-1/diff?data=20", nil)
+	if code != http.StatusOK {
+		t.Fatalf("diff?data: code=%d body=%s", code, body)
+	}
+	sampled := mustUnmarshal[engine.DiffResult](t, body)
+	var added *engine.TableDelta
+	for i := range sampled.Tables {
+		if sampled.Tables[i].Table == "added" {
+			added = &sampled.Tables[i]
+		}
+	}
+	if added == nil || len(added.SampleRows) != 2 {
+		t.Fatalf("added sample rows = %+v, want 2 branch-only rows", added)
+	}
+	if !strings.Contains(string(body), `"sample_rows"`) {
+		t.Errorf("diff?data did not emit sample_rows: %s", body)
+	}
+	// a bad data value is a 400
+	if code, _ := do(t, ts, testToken, "GET", "/v1/branches/pr-1/diff?data=-3", nil); code != http.StatusBadRequest {
+		t.Errorf("diff?data=-3: code=%d want 400", code)
 	}
 
 	// a non-ready branch is refused with 409
