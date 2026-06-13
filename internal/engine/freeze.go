@@ -32,7 +32,8 @@ import (
 // CSI backend: the child's PVC is a clone of the parent's PVC. No freeze or
 // layer rows either, but the parent is briefly stopped around the clone for
 // crash consistency (see provisionCSI).
-func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, ttl time.Duration) (*registry.Branch, error) {
+func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, ttl time.Duration) (_ *registry.Branch, err error) {
+	defer e.observeOp("from_branch", &err)()
 	if err := validateBranchName(name); err != nil {
 		return nil, err
 	}

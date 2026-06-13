@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/cow"
+	"github.com/abd-ulbasit/pgbranch/internal/metrics"
 	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 	"github.com/abd-ulbasit/pgbranch/internal/runtime"
@@ -25,6 +26,9 @@ type Engine struct {
 	// (ALTER ROLE inside the branch, after masking, before ready) instead of
 	// inheriting the source's credentials. branchd --rotate-branch-credentials.
 	rotateCredentials bool
+	// metrics observes saga durations, errors and reaper/reconcile counters.
+	// nil = no instrumentation (every call is nil-safe); branchd wires it.
+	metrics *metrics.Metrics
 }
 
 // Option configures optional engine behavior at construction time.
@@ -35,6 +39,13 @@ type Option func(*Engine)
 // branch and stores it on the branch row (returned by the API as `password`).
 func WithCredentialRotation() Option {
 	return func(e *Engine) { e.rotateCredentials = true }
+}
+
+// WithMetrics attaches a metrics sink the engine uses to observe saga
+// durations/errors, masking duration, in-flight ops and reaper/reconcile
+// counters. nil is accepted (every metric call is nil-safe).
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(e *Engine) { e.metrics = m }
 }
 
 // New builds an engine on the default OverlayFS backend.
@@ -227,6 +238,7 @@ func (e *Engine) RunReaper(ctx context.Context, interval time.Duration, logf fun
 			return
 		case now := <-t.C:
 			destroyed, err := e.ReapExpired(ctx, now)
+			e.metrics.IncReaperRun(len(destroyed))
 			if len(destroyed) > 0 {
 				logf("reaper: destroyed expired branches %v", destroyed)
 			}
@@ -241,6 +253,7 @@ func (e *Engine) RunReaper(ctx context.Context, interval time.Duration, logf fun
 // branches are failed and their resources cleaned; managed containers with
 // no registry row are removed.
 func (e *Engine) Reconcile(ctx context.Context) error {
+	e.metrics.IncReconcileRun()
 	branches, err := e.reg.ListLiveBranches()
 	if err != nil {
 		return err
@@ -256,6 +269,7 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 			}
 			e.removeBranchLayer(ctx, b)
 			e.reg.TransitionBranch(b.ID, registry.BranchFailed, "reconcile: interrupted create")
+			e.metrics.IncReconcileAction("fail_stuck")
 		}
 	}
 	managed, err := e.drv.ListManaged(ctx)
@@ -265,6 +279,7 @@ func (e *Engine) Reconcile(ctx context.Context) error {
 	for _, c := range managed {
 		if !known[c.ID] {
 			e.drv.StopRemove(ctx, c.ID)
+			e.metrics.IncReconcileAction("remove_orphan_container")
 		}
 	}
 	return nil

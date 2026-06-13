@@ -46,7 +46,8 @@ const rowEstimateSQL = `SELECT relname || '|' || reltuples::bigint FROM pg_class
 // cleans strays if branchd dies mid-diff) and is destroyed before returning,
 // success or not. Expect a few seconds of wall time: a full branch provision
 // plus two dumps.
-func (e *Engine) DiffBranch(ctx context.Context, name string) (*DiffResult, error) {
+func (e *Engine) DiffBranch(ctx context.Context, name string) (_ *DiffResult, err error) {
+	defer e.observeOp("diff", &err)()
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
 		return nil, err

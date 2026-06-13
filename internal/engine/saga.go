@@ -32,10 +32,27 @@ func validateBranchName(name string) error {
 	return nil
 }
 
+// observeOp brackets a saga entry point: it increments the in-flight gauge,
+// and on return records the op's duration and (on error) the error counter,
+// then decrements in-flight. Returns a deferred closure; call as
+// `defer e.observeOp("create", &err)()`. All metric calls are nil-safe.
+func (e *Engine) observeOp(op string, errp *error) func() {
+	e.metrics.IncInflight()
+	start := time.Now()
+	return func() {
+		e.metrics.ObserveOp(op, time.Since(start).Seconds())
+		if errp != nil && *errp != nil {
+			e.metrics.IncOpError(op)
+		}
+		e.metrics.DecInflight()
+	}
+}
+
 // CreateBranch is a saga: every step registers a compensation that runs
 // (in reverse order) if a later step fails. No orphans, ever.
 // ttl 0 means the branch never expires.
-func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl time.Duration) (*registry.Branch, error) {
+func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl time.Duration) (_ *registry.Branch, err error) {
+	defer e.observeOp("create", &err)()
 	if err := validateBranchName(name); err != nil {
 		return nil, err
 	}
@@ -317,7 +334,8 @@ func (e *Engine) inspectAddr(ctx context.Context, cid string) (runtime.Container
 // ResetBranch throws away a ready branch's writes and reprovisions it from
 // its recorded source volume on the same registry row (ready -> resetting ->
 // ready; new container id and host port).
-func (e *Engine) ResetBranch(ctx context.Context, name string) (*registry.Branch, error) {
+func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Branch, err error) {
+	defer e.observeOp("reset", &err)()
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
 		return nil, err
@@ -357,6 +375,11 @@ func (e *Engine) applyMasking(ctx context.Context, cid string, src *registry.Sou
 	if err != nil {
 		return fmt.Errorf("load mask scripts: %w", err)
 	}
+	if len(scripts) == 0 {
+		return nil
+	}
+	start := time.Now()
+	defer func() { e.metrics.ObserveMasking(time.Since(start).Seconds()) }()
 	for _, sc := range scripts {
 		if err := e.drv.Exec(ctx, cid, psqlCmd(src, sc.SQL)); err != nil {
 			return fmt.Errorf("masking script %q: %w", sc.Name, err)
@@ -395,7 +418,8 @@ func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duratio
 	return lastErr
 }
 
-func (e *Engine) DestroyBranch(ctx context.Context, name string) error {
+func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
+	defer e.observeOp("destroy", &err)()
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
 		return err

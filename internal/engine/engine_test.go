@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abd-ulbasit/pgbranch/internal/metrics"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type fakeDriver struct {
@@ -213,6 +215,32 @@ func TestCreateBranchWaitsForAddress(t *testing.T) {
 	}
 	if d.inspects < 3 {
 		t.Fatalf("inspects=%d, want >=3 (two empty-host reads then the real one)", d.inspects)
+	}
+}
+
+func TestCreateBranchObservesOpMetric(t *testing.T) {
+	d := newFake()
+	m := metrics.New()
+	r, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	e := New(r, d, "postgres:17", WithMetrics(m))
+	readySource(t, r)
+
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	// the create histogram recorded exactly one observation
+	want := `
+# HELP pgbranch_branch_op_duration_seconds Duration of branch operations by op (create|reset|destroy|from_branch|diff).
+# TYPE pgbranch_branch_op_duration_seconds histogram
+pgbranch_branch_op_duration_seconds_count{op="create"} 1
+`
+	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
+		"pgbranch_branch_op_duration_seconds_count"); err != nil {
+		t.Fatal(err)
 	}
 }
 

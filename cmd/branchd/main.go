@@ -27,6 +27,7 @@ import (
 	"github.com/abd-ulbasit/pgbranch/internal/config"
 	"github.com/abd-ulbasit/pgbranch/internal/cow"
 	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgbranch/internal/metrics"
 	"github.com/abd-ulbasit/pgbranch/internal/pgproxy"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 	"github.com/abd-ulbasit/pgbranch/internal/runtime"
@@ -212,12 +213,26 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("init %s runtime: %w", *runtimeName, err)
 	}
-	var engOpts []engine.Option
+	m := metrics.New()
+	m.SetStateCounter(reg)
+	engOpts := []engine.Option{engine.WithMetrics(m)}
 	if *rotateCreds {
 		engOpts = append(engOpts, engine.WithCredentialRotation())
 	}
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
 		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")}, engOpts...)
+
+	// readiness: the registry is reachable (trivial query) and the driver
+	// responds (cheap ListManaged). branchd's liveness stays /healthz.
+	ready := func(ctx context.Context) error {
+		if err := reg.Ping(ctx); err != nil {
+			return fmt.Errorf("registry unreachable: %w", err)
+		}
+		if _, err := drv.ListManaged(ctx); err != nil {
+			return fmt.Errorf("driver unresponsive: %w", err)
+		}
+		return nil
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -236,7 +251,7 @@ func run() error {
 	if apiTLS != nil {
 		apiLis = tls.NewListener(apiLis, apiTLS)
 	}
-	srv := &http.Server{Addr: *apiAddr, Handler: api.New(eng, reg, token).Handler()}
+	srv := &http.Server{Addr: *apiAddr, Handler: api.New(eng, reg, token, m.Handler(), ready).Handler()}
 	g.Go(func() error {
 		log.Printf("REST API listening on %s (TLS %v)", *apiAddr, apiTLS != nil)
 		log.Printf("web UI at %s", uiURL(*apiAddr, apiTLS != nil))
