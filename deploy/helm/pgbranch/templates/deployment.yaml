@@ -5,8 +5,11 @@ metadata:
   labels:
     {{- include "pgbranch.labels" . | nindent 4 }}
 spec:
-  # sqlite registry = single writer; keep one replica and recreate on upgrade.
-  replicas: 1
+  # sqlite registry = single writer. replicaCount defaults to 1; >1 is an HA
+  # standby set guarded by leader election (only the leader writes), NOT
+  # horizontal scaling. Recreate keeps the RWO PVC from being double-attached
+  # mid-rollout.
+  replicas: {{ .Values.replicaCount }}
   strategy:
     type: Recreate
   selector:
@@ -60,6 +63,11 @@ spec:
             {{- end }}
             - --reconcile-interval={{ .Values.reconcileInterval }}
             - --stuck-timeout={{ .Values.stuckTimeout }}
+            {{- if eq (include "pgbranch.leaderElectionEnabled" .) "true" }}
+            # HA: contend for the pgbranch-branchd Lease; only the leader
+            # reconciles + accepts mutating /v1 requests (see docs/ha.md).
+            - --leader-elect
+            {{- end }}
           env:
             - name: PGBRANCH_TOKEN
               valueFrom:
@@ -73,6 +81,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if eq (include "pgbranch.leaderElectionEnabled" .) "true" }}
+            # leader-election identity (the Lease holder)
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
           ports:
             - name: api
               containerPort: {{ .Values.api.port }}

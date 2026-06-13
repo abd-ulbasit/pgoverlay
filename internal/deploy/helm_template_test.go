@@ -235,6 +235,58 @@ func TestHelmProxyTLSWiredWhenCertSecretSet(t *testing.T) {
 	}
 }
 
+// HA leader election: off with the single-replica default (no --leader-elect,
+// no POD_NAME, no leases RBAC), on when replicaCount>1 OR leaderElection.enabled.
+func TestHelmLeaderElectionDefaultOff(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "replicas: 1") {
+		t.Error("default replicaCount is not 1")
+	}
+	for _, unwanted := range []string{"--leader-elect", "name: POD_NAME\n", `resources: ["leases"]`} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("single-replica default rendered %q (leader election must be off)", unwanted)
+		}
+	}
+}
+
+func TestHelmLeaderElectionOnWithReplicas(t *testing.T) {
+	out, err := helmTemplate(t, "replicaCount=2")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"replicas: 2",
+		"--leader-elect",
+		"name: POD_NAME\n",
+		"fieldPath: metadata.name",
+		"coordination.k8s.io",
+		`resources: ["leases"]`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("replicaCount=2 manifests missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestHelmLeaderElectionOnWhenEnabledFlagSet(t *testing.T) {
+	out, err := helmTemplate(t, "leaderElection.enabled=true")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	// single replica but explicit enablement still wires election + RBAC
+	if !strings.Contains(out, "replicas: 1") {
+		t.Error("leaderElection.enabled alone should not change replica count")
+	}
+	for _, want := range []string{"--leader-elect", "name: POD_NAME\n", `resources: ["leases"]`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("leaderElection.enabled=true manifests missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // The deployer RBAC is a namespaced Role (not a ClusterRole): branchd manages
 // pods in its own namespace only.
 func TestHelmDeployerRoleIsNamespaced(t *testing.T) {

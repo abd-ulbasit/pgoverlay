@@ -32,6 +32,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{/* Whether leader election is effectively on ("true"/"false" string): when
+     leaderElection.enabled OR replicaCount > 1. Running >1 replica without
+     leader election would let multiple instances reconcile/write the shared
+     registry, so replicas>1 implies it. */}}
+{{- define "pgbranch.leaderElectionEnabled" -}}
+{{- if or .Values.leaderElection.enabled (gt (int .Values.replicaCount) 1) -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
 {{/* Secret holding the API bearer token (key "token"). */}}
 {{- define "pgbranch.tokenSecretName" -}}
 {{- .Values.existingSecret | default (printf "%s-token" (include "pgbranch.fullname" .)) -}}

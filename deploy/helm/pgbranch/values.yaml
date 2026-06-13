@@ -52,6 +52,25 @@ persistence:
   # StorageClass for the state PVC; empty = the cluster's default class.
   storageClass: ""
 
+# Number of branchd replicas. Default 1 (single writer). The registry is a
+# sqlite file on an RWO PVC / hostPath, so >1 replica is an HA standby setup,
+# NOT horizontal scaling: only the leader reconciles and accepts mutating /v1
+# requests; standbys serve reads + probes and fail over via the Lease. With
+# replicaCount > 1 (or leaderElection.enabled) the chart turns on leader
+# election automatically — see leaderElection below and docs/ha.md.
+#
+# Co-scheduling caveat: an RWO PVC binds to one node, so all replicas must
+# schedule there (the chart already pins branchd to `node`). For replicas on
+# different nodes use an RWX volume / a CSI driver that supports it.
+replicaCount: 1
+
+# HA leader election (branchd --leader-elect). When on (or replicaCount > 1),
+# replicas contend for a coordination.k8s.io Lease (pgbranch-branchd) in the
+# release namespace; the chart adds the leases RBAC and wires POD_NAME. Off by
+# default for the single-replica deployment. See docs/ha.md.
+leaderElection:
+  enabled: false
+
 image:
   repository: pgbranch/branchd
   tag: dev

@@ -25,6 +25,13 @@ rules:
     resources: ["volumesnapshots"]
     verbs: ["create", "delete", "get", "list"]
   {{- end }}
+  {{- if eq (include "pgbranch.leaderElectionEnabled" .) "true" }}
+  # HA leader election: branchd reads/writes the pgbranch-branchd Lease in its
+  # own namespace to elect a single reconciling/writing leader.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "watch", "list"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
