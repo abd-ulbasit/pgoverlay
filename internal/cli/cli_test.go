@@ -22,6 +22,7 @@ func TestCommandTree(t *testing.T) {
 		{"source", "set-mask"}, {"source", "get-mask"},
 		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"},
 		{"connect"}, {"diff"}, {"doctor"}, {"gc"},
+		{"token", "create"}, {"token", "ls"}, {"token", "revoke"},
 	} {
 		cmd, _, err := root.Find(path)
 		if err != nil || cmd.Name() != path[len(path)-1] {
@@ -546,6 +547,80 @@ func TestServerModeGCApplies(t *testing.T) {
 	}
 	if !strings.Contains(out, "expired-1") || !strings.Contains(out, "applied") {
 		t.Fatalf("gc output %q", out)
+	}
+}
+
+func TestServerModeTokenCreate(t *testing.T) {
+	var got api.CreateTokenRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.URL.Path != "/v1/tokens" {
+			t.Errorf("%s %s", r.Method, r.URL.Path)
+		}
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(api.CreateTokenResponse{Token: "feedfacefeedfacefeedfacefeedface"})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "token", "create", "ci", "--role", "operator", "--server", ts.URL)
+	if got.Name != "ci" || got.Role != "operator" {
+		t.Fatalf("request %+v", got)
+	}
+	if !strings.Contains(out, "feedfacefeedfacefeedfacefeedface") {
+		t.Fatalf("token not printed: %q", out)
+	}
+}
+
+func TestTokenCreateRejectsBadRole(t *testing.T) {
+	root := NewRootCmd()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"token", "create", "ci", "--role", "superuser", "--server", "http://unused"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--role") {
+		t.Fatalf("err=%v, want one rejecting the invalid role", err)
+	}
+}
+
+func TestServerModeTokenLs(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/tokens" {
+			t.Errorf("%s %s", r.Method, r.URL.Path)
+		}
+		json.NewEncoder(w).Encode([]api.Token{
+			{Name: "ci", Role: "operator", CreatedAt: "2026-06-13"},
+			{Name: "dash", Role: "viewer", CreatedAt: "2026-06-13"},
+		})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "token", "ls", "--server", ts.URL)
+	if !strings.Contains(out, "ci") || !strings.Contains(out, "operator") ||
+		!strings.Contains(out, "dash") || !strings.Contains(out, "viewer") {
+		t.Fatalf("token ls output %q", out)
+	}
+	if !strings.Contains(out, "NAME") || !strings.Contains(out, "ROLE") {
+		t.Fatalf("token ls missing header: %q", out)
+	}
+}
+
+func TestServerModeTokenRevoke(t *testing.T) {
+	var gotMethod, gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "token", "revoke", "ci", "--server", ts.URL)
+	if gotMethod != "DELETE" || gotPath != "/v1/tokens/ci" {
+		t.Fatalf("%s %s", gotMethod, gotPath)
+	}
+	if !strings.Contains(out, "revoked") {
+		t.Fatalf("output %q", out)
 	}
 }
 

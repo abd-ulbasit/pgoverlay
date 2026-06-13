@@ -214,3 +214,24 @@ func (c *Client) ReconcileApply(ctx context.Context) (*engine.ReconcilePlan, err
 	}
 	return &p, nil
 }
+
+// CreateToken mints an API token of the given role and returns its plaintext
+// value (shown once). Admin-only on the server.
+func (c *Client) CreateToken(ctx context.Context, name, role string) (string, error) {
+	var resp api.CreateTokenResponse
+	if err := c.do(ctx, "POST", "/v1/tokens", api.CreateTokenRequest{Name: name, Role: role}, &resp); err != nil {
+		return "", err
+	}
+	return resp.Token, nil
+}
+
+// ListTokens returns token metadata (never the plaintext). Admin-only.
+func (c *Client) ListTokens(ctx context.Context) ([]api.Token, error) {
+	var out []api.Token
+	return out, c.do(ctx, "GET", "/v1/tokens", nil, &out)
+}
+
+// RevokeToken deletes a token by name. Admin-only.
+func (c *Client) RevokeToken(ctx context.Context, name string) error {
+	return c.do(ctx, "DELETE", "/v1/tokens/"+url.PathEscape(name), nil, nil)
+}
