@@ -59,9 +59,9 @@ Enter
 Sleep 600ms
 Type "pgb branch create exp --from-branch demo"
 Enter
-Sleep 9s
+Sleep 18s
 
 Type "pgb branch ls"
 Enter
-Sleep 3s
+Sleep 4s
 Sleep 1500ms
