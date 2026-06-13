@@ -1,0 +1,56 @@
+# Namespaced RBAC for a CI / preview-environment deployer.
+#
+# Instead of handing your PR-preview pipeline a cluster-admin kubeconfig, give
+# it this ServiceAccount, scoped to ONE namespace, with only the permissions a
+# `helm upgrade --install` of the pgbranch chart (plus app deploys) needs in
+# that namespace. There is deliberately NO ClusterRole here — the deployer can
+# touch nothing outside `pgbranch-preview`.
+#
+# Apply once (cluster-admin, one-time), then mint a token for CI:
+#   kubectl apply -f deploy/preview-deployer-rbac.yaml
+#   kubectl -n pgbranch-preview create token preview-deployer --duration=24h
+# Hand that short-lived token (not a kubeconfig with cluster-admin) to CI.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgbranch-preview
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preview-deployer
+  namespace: pgbranch-preview
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: preview-deployer
+  namespace: pgbranch-preview
+rules:
+  # Core workload + config objects a Helm release of pgbranch (and the preview
+  # app) creates in this namespace.
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
+  # The chart ships a namespaced Role + RoleBinding for branchd itself; the
+  # deployer must be able to create them (but only Roles, never ClusterRoles).
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: preview-deployer
+  namespace: pgbranch-preview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: preview-deployer
+subjects:
+  - kind: ServiceAccount
+    name: preview-deployer
+    namespace: pgbranch-preview

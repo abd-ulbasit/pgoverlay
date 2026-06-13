@@ -77,6 +77,13 @@ proxy:
   service:
     type: ClusterIP
     nodePort: "" # set when type is NodePort, e.g. 30432
+  # Wire-protocol TLS for the Postgres router. Point certSecret at a Secret
+  # with tls.crt and tls.key (e.g. a cert-manager Certificate's secret); it is
+  # mounted into branchd and passed to --pg-tls-cert/--pg-tls-key, so the proxy
+  # answers SSLRequest with 'S' and serves TLS. Empty = plaintext (the proxy
+  # answers 'N'). See docs/kubernetes.md for cert-manager issuance.
+  tls:
+    certSecret: ""
 
 # Reconcile loop tick interval (branchd --reconcile-interval): each pass reaps
 # expired branches, fails stuck rows, removes orphaned containers and GCs

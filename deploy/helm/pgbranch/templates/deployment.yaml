@@ -53,6 +53,11 @@ spec:
             {{- end }}
             - --api-addr=:{{ .Values.api.port }}
             - --pg-addr=:{{ .Values.proxy.port }}
+            {{- with .Values.proxy.tls.certSecret }}
+            # wire-protocol TLS for the Postgres router (secret mounted below)
+            - --pg-tls-cert=/etc/pgbranch/proxy-tls/tls.crt
+            - --pg-tls-key=/etc/pgbranch/proxy-tls/tls.key
+            {{- end }}
             - --reconcile-interval={{ .Values.reconcileInterval }}
             - --stuck-timeout={{ .Values.stuckTimeout }}
           env:
@@ -89,6 +94,11 @@ spec:
           volumeMounts:
             - name: state
               mountPath: {{ .Values.dataRoot }}/state
+            {{- with .Values.proxy.tls.certSecret }}
+            - name: proxy-tls
+              mountPath: /etc/pgbranch/proxy-tls
+              readOnly: true
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -103,3 +113,8 @@ spec:
             path: {{ .Values.dataRoot }}/state
             type: DirectoryOrCreate
           {{- end }}
+        {{- with .Values.proxy.tls.certSecret }}
+        - name: proxy-tls
+          secret:
+            secretName: {{ . }}
+        {{- end }}

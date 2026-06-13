@@ -142,6 +142,22 @@ Two ways to wire the deploy, both demonstrated in
   deploys the app image to the cluster pointed at the branch and posts the
   preview URL. See the demo repo's `.github/workflows/pr-preview.yml`.
 
+> **Don't give CI a cluster-admin kubeconfig.** The preview pipeline only ever
+> deploys into one namespace, so scope it there. Apply the namespaced
+> ServiceAccount + Role in [`deploy/preview-deployer-rbac.yaml`](../deploy/preview-deployer-rbac.yaml)
+> once (it grants only the verbs a `helm upgrade --install` of the chart and an
+> app deploy need in `pgbranch-preview` — no ClusterRole), then mint a
+> short-lived token for the workflow instead of a long-lived admin credential:
+>
+> ```bash
+> kubectl apply -f deploy/preview-deployer-rbac.yaml
+> kubectl -n pgbranch-preview create token preview-deployer --duration=24h
+> ```
+>
+> For branchd's own REST API, mint a *scoped* bearer rather than reusing the
+> built-in `PGBRANCH_TOKEN` admin: `pgb token create ci --role operator` gives
+> CI exactly branch create/reset/destroy (`pgb token` is admin-only).
+
 > Reachability note: managed platforms live on the public internet, so the
 > Postgres proxy must be publicly reachable (e.g. a cloud LoadBalancer). A
 > private cluster (Tailscale/VPN-only) can serve the *webhook* publicly but

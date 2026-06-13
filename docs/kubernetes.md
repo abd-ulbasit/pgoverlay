@@ -101,6 +101,37 @@ helm install pgbranch deploy/helm/pgbranch \
 - **`rotateBranchCredentials`** — give every branch its own generated
   password instead of inheriting the source's (see
   [architecture](architecture.md)).
+- **`proxy.tls.certSecret`** — enable wire-protocol TLS on the Postgres
+  router (see below). Empty (default) = plaintext: the proxy answers the
+  client's `SSLRequest` with `N`.
+
+## Proxy TLS (cert-manager)
+
+The Postgres router serves TLS when `proxy.tls.certSecret` points at a Secret
+holding `tls.crt` and `tls.key`; the chart mounts it into branchd and passes
+`--pg-tls-cert`/`--pg-tls-key`, so the proxy answers `SSLRequest` with `S`.
+
+Issue the cert with cert-manager (any `Issuer`/`ClusterIssuer` works — a CA
+issuer for in-cluster trust, or an ACME issuer for a publicly reachable LB):
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pgbranch-proxy-tls
+  namespace: pgbranch-system
+spec:
+  secretName: pgbranch-proxy-tls           # <- the Secret the chart consumes
+  dnsNames: ["pgbranch-proxy.example.com"] # how clients address the proxy
+  issuerRef:
+    name: my-issuer
+    kind: ClusterIssuer
+```
+
+Then install/upgrade with `--set proxy.tls.certSecret=pgbranch-proxy-tls`.
+cert-manager renews the Secret in place; restart branchd (or rely on its
+Recreate strategy on the next chart upgrade) to pick up the rotated cert.
+Clients then connect with `sslmode=require` (or stricter) through `dbname@branch`.
 
 ## Storage modes: hostpath vs csi
 

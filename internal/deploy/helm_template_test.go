@@ -201,3 +201,51 @@ func TestHelmGhookAppIdWithoutKeyFails(t *testing.T) {
 		t.Fatalf("helm template succeeded with appId but no private key:\n%s", out)
 	}
 }
+
+// Proxy wire-TLS: unset by default (the proxy answers SSLRequest with 'N'),
+// and when proxy.tls.certSecret is set the secret is mounted and the
+// --pg-tls-cert/--pg-tls-key args are wired to it.
+func TestHelmProxyTLSDefaultOff(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "--pg-tls-cert") {
+		t.Error("proxy TLS args rendered by default (must be opt-in)")
+	}
+	if strings.Contains(out, "name: proxy-tls") {
+		t.Error("proxy-tls volume rendered by default")
+	}
+}
+
+func TestHelmProxyTLSWiredWhenCertSecretSet(t *testing.T) {
+	out, err := helmTemplate(t, "proxy.tls.certSecret=branchd-proxy-tls")
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"--pg-tls-cert=/etc/pgbranch/proxy-tls/tls.crt",
+		"--pg-tls-key=/etc/pgbranch/proxy-tls/tls.key",
+		"mountPath: /etc/pgbranch/proxy-tls",
+		"secretName: branchd-proxy-tls",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("proxy TLS wiring missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// The deployer RBAC is a namespaced Role (not a ClusterRole): branchd manages
+// pods in its own namespace only.
+func TestHelmDeployerRoleIsNamespaced(t *testing.T) {
+	out, err := helmTemplate(t)
+	if err != nil {
+		t.Fatalf("helm template: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "kind: Role") {
+		t.Error("chart did not render a namespaced Role")
+	}
+	if strings.Contains(out, "kind: ClusterRole") {
+		t.Error("chart rendered a ClusterRole; deployer RBAC must stay namespaced")
+	}
+}
