@@ -104,9 +104,16 @@ PGBRANCH_TOKEN=$(openssl rand -hex 16) ./bin/branchd
 ```
 
 Flags: `--api-addr :7070` (REST), `--pg-addr :6432` (router),
-`--reap-interval 30s` (TTL reaper tick), `--cow overlay|zfs` (CoW backend —
-zfs is [experimental](zfs.md)). `PGBRANCH_TOKEN` is required; every `/v1`
-request needs `Authorization: Bearer <token>` (`GET /healthz` is open).
+`--reconcile-interval 60s` (unified reconcile loop tick: TTL reap + leak GC;
+`--reap-interval` is a deprecated alias), `--stuck-timeout 10m` (age past which
+a half-built branch row is failed and cleaned), `--cow overlay|zfs` (CoW
+backend — zfs is [experimental](zfs.md)). `PGBRANCH_TOKEN` is required; every
+`/v1` request needs `Authorization: Bearer <token>` (`GET /healthz` is open).
+
+Reconcile is also exposed on demand: `pgb doctor` prints the drift plan
+read-only (non-zero exit if anything needs cleaning), `pgb gc` applies it.
+Both work locally and against a server (`GET /v1/reconcile/plan`,
+`POST /v1/reconcile`).
 
 ### REST API
 

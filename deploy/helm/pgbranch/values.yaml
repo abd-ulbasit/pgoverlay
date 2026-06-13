@@ -78,8 +78,14 @@ proxy:
     type: ClusterIP
     nodePort: "" # set when type is NodePort, e.g. 30432
 
-# TTL reaper tick interval (branchd --reap-interval).
-reapInterval: 30s
+# Reconcile loop tick interval (branchd --reconcile-interval): each pass reaps
+# expired branches, fails stuck rows, removes orphaned containers and GCs
+# dangling layers/volumes.
+reconcileInterval: 60s
+
+# Age past which a creating/resetting branch row is considered stuck and failed
+# by reconcile (branchd --stuck-timeout).
+stuckTimeout: 10m
 
 # Per-branch credential rotation (branchd --rotate-branch-credentials): every
 # branch gets its own generated password instead of inheriting the source's.

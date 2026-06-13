@@ -53,7 +53,8 @@ spec:
             {{- end }}
             - --api-addr=:{{ .Values.api.port }}
             - --pg-addr=:{{ .Values.proxy.port }}
-            - --reap-interval={{ .Values.reapInterval }}
+            - --reconcile-interval={{ .Values.reconcileInterval }}
+            - --stuck-timeout={{ .Values.stuckTimeout }}
           env:
             - name: PGBRANCH_TOKEN
               valueFrom:

@@ -128,7 +128,9 @@ func resolveStorage(o storageOptions) (cow.Backend, error) {
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
-	reapInterval := flag.Duration("reap-interval", 30*time.Second, "TTL reaper tick interval")
+	reconcileInterval := flag.Duration("reconcile-interval", 60*time.Second, "reconcile loop tick interval (TTL reap + leak GC + drift convergence)")
+	reapInterval := flag.Duration("reap-interval", 0, "DEPRECATED alias for --reconcile-interval (folded into the unified reconcile loop)")
+	stuckTimeout := flag.Duration("stuck-timeout", 10*time.Minute, "age past which a creating/resetting branch row is considered stuck and failed by reconcile")
 	runtimeName := flag.String("runtime", "docker", "container runtime: docker or kube")
 	kubeNamespace := flag.String("kube-namespace", "", `namespace for branch/helper pods (default: POD_NAMESPACE when in-cluster, else "pgbranch")`)
 	kubeNode := flag.String("kube-node", "", "storage node name (required with --runtime kube --kube-storage hostpath; all CoW data lives on this node)")
@@ -146,6 +148,13 @@ func run() error {
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
 	pgTLSKey := flag.String("pg-tls-key", "", "PEM private key for the Postgres router (requires --pg-tls-cert)")
 	flag.Parse()
+
+	// --reap-interval is a deprecated alias: when set (non-zero) it folds into
+	// the single reconcile loop's interval. We never run two loops.
+	if *reapInterval > 0 {
+		log.Printf("warning: --reap-interval is deprecated; using its value (%s) as --reconcile-interval", *reapInterval)
+		*reconcileInterval = *reapInterval
+	}
 
 	apiTLS, err := tlsConfigFromFlags(*apiTLSCert, *apiTLSKey, "api")
 	if err != nil {
@@ -237,10 +246,6 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := eng.Reconcile(ctx); err != nil {
-		return fmt.Errorf("reconcile: %w", err)
-	}
-
 	g, ctx := errgroup.WithContext(ctx)
 
 	// REST API (plain listener, wrapped with TLS when --api-tls-* is set)
@@ -251,7 +256,7 @@ func run() error {
 	if apiTLS != nil {
 		apiLis = tls.NewListener(apiLis, apiTLS)
 	}
-	srv := &http.Server{Addr: *apiAddr, Handler: api.New(eng, reg, token, m.Handler(), ready).Handler()}
+	srv := &http.Server{Addr: *apiAddr, Handler: api.New(eng, reg, token, m.Handler(), ready, *stuckTimeout).Handler()}
 	g.Go(func() error {
 		log.Printf("REST API listening on %s (TLS %v)", *apiAddr, apiTLS != nil)
 		log.Printf("web UI at %s", uiURL(*apiAddr, apiTLS != nil))
@@ -279,9 +284,11 @@ func run() error {
 		return px.Serve(ctx, lis)
 	})
 
-	// TTL reaper
+	// unified reconcile loop: TTL reap + stuck-row failure + orphan-container
+	// removal + dangling layer/volume GC, on one ticker (runs once immediately
+	// so startup drift converges without waiting a full interval).
 	g.Go(func() error {
-		eng.RunReaper(ctx, *reapInterval, log.Printf)
+		eng.RunReconcile(ctx, *reconcileInterval, *stuckTimeout, log.Printf)
 		return nil
 	})
 
