@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/abd-ulbasit/pgbranch/internal/diffutil"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 	"github.com/abd-ulbasit/pgbranch/internal/runtime"
 )
@@ -263,5 +264,24 @@ func TestDiffBranchRequiresReadyTarget(t *testing.T) {
 
 	if _, err := e.DiffBranch(context.Background(), "nope"); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound for unknown branch", err)
+	}
+}
+
+func TestStripDumpNoise(t *testing.T) {
+	in := "--\nCREATE TABLE t (id int);\n\\restrict aB3xQ\nSET x=1;\n\\unrestrict zZ9kP\n"
+	got := stripDumpNoise(in)
+	if strings.Contains(got, "restrict") {
+		t.Fatalf("restrict/unrestrict lines not stripped:\n%s", got)
+	}
+	for _, keep := range []string{"CREATE TABLE t (id int);", "SET x=1;"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("stripped a real line %q:\n%s", keep, got)
+		}
+	}
+	// two dumps differing only by the random nonce token must diff to empty
+	a := "CREATE TABLE t (id int);\n\\restrict TOKENAAA\n"
+	b := "CREATE TABLE t (id int);\n\\restrict TOKENBBB\n"
+	if d := diffutil.Unified(stripDumpNoise(a), stripDumpNoise(b)); d != "" {
+		t.Fatalf("nonce-only difference produced a diff:\n%s", d)
 	}
 }

@@ -108,9 +108,26 @@ func (e *Engine) DiffBranch(ctx context.Context, name string) (*DiffResult, erro
 	}
 
 	return &DiffResult{
-		SchemaDiff: diffutil.Unified(baseDump, branchDump),
+		SchemaDiff: diffutil.Unified(stripDumpNoise(baseDump), stripDumpNoise(branchDump)),
 		Tables:     tableDeltas(baseRows, branchRows),
 	}, nil
+}
+
+// stripDumpNoise removes pg_dump lines that differ between two dumps of the
+// same schema for reasons unrelated to structure. pg_dump 16+ brackets its
+// output with `\restrict <token>` / `\unrestrict <token>` session-lock
+// directives whose token is randomised per run, so they would otherwise show
+// as a spurious diff hunk every time.
+func stripDumpNoise(dump string) string {
+	lines := strings.Split(dump, "\n")
+	out := lines[:0]
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, `\restrict `) || strings.HasPrefix(ln, `\unrestrict `) {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
 }
 
 // pgDumpSchemaCmd builds the in-container schema-only dump over the local
