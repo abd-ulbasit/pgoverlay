@@ -164,8 +164,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 8 {
-		t.Fatalf("user_version=%d want 8", v)
+	if v != 9 {
+		t.Fatalf("user_version=%d want 9", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -223,6 +223,10 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	// v7: pre-existing branches inherit credentials (no per-branch password)
 	if b.Password != "" {
 		t.Fatalf("v7 backfill: Password=%q want empty", b.Password)
+	}
+	// v9: api_tokens table exists and is usable on the upgraded DB
+	if _, err := r.CreateAPIToken("ci", RoleOperator); err != nil {
+		t.Fatalf("v9 api_tokens unusable after upgrade: %v", err)
 	}
 	// re-opening an already-migrated DB is a no-op
 	r2, err := Open(path)

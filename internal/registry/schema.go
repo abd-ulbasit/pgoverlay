@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -142,5 +142,19 @@ const migrateV8 = `
 CREATE TABLE meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+`
+
+// v9 (Phase 7): API tokens for role-based authz. Only a SHA-256 hex digest of
+// each token is stored — the plaintext is shown once at creation and never
+// persisted. role is one of admin/operator/viewer. The built-in PGBRANCH_TOKEN
+// env value is treated as admin and is NOT stored here.
+const migrateV9 = `
+CREATE TABLE api_tokens (
+  id TEXT PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  token_hash TEXT NOT NULL,
+  role TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 `
