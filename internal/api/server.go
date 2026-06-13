@@ -83,6 +83,26 @@ type RefreshSourceRequest struct {
 	Password string `json:"password"`
 }
 
+// CreateTokenRequest mints an API token with the given name and role
+// (admin|operator|viewer). The plaintext token is returned once in the
+// response and never recoverable afterwards.
+type CreateTokenRequest struct {
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+// CreateTokenResponse carries the freshly minted plaintext token (shown once).
+type CreateTokenResponse struct {
+	Token string `json:"token"`
+}
+
+// Token is a stored token's metadata — never the plaintext or its hash.
+type Token struct {
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	CreatedAt string `json:"created_at"`
+}
+
 // MaskScript is one per-source masking statement, applied in order inside
 // every new/reset branch before it is marked ready.
 type MaskScript struct {
@@ -120,22 +140,30 @@ func New(eng *engine.Engine, reg *registry.Registry, token string, metricsHandle
 const DefaultStuckTimeout = 10 * time.Minute
 
 func (s *Server) Handler() http.Handler {
+	// Per-route minimum role (admin > operator > viewer). GETs are viewer;
+	// branch lifecycle mutations + applying reconcile are operator; source and
+	// token management are admin. Every route requires at least viewer (a valid
+	// token); /healthz, /readyz and /metrics sit outside this mux unauthenticated.
+	admin, operator, viewer := registry.RoleAdmin, registry.RoleOperator, registry.RoleViewer
 	v1 := http.NewServeMux()
-	v1.HandleFunc("POST /v1/sources", s.createSource)
-	v1.HandleFunc("GET /v1/sources", s.listSources)
-	v1.HandleFunc("DELETE /v1/sources/{name}", s.removeSource)
-	v1.HandleFunc("POST /v1/sources/{name}/refresh", s.refreshSource)
-	v1.HandleFunc("PUT /v1/sources/{name}/mask", s.setMaskScripts)
-	v1.HandleFunc("GET /v1/sources/{name}/mask", s.getMaskScripts)
-	v1.HandleFunc("POST /v1/branches", s.createBranch)
-	v1.HandleFunc("GET /v1/branches", s.listBranches)
-	v1.HandleFunc("GET /v1/branches/{name}", s.getBranch)
-	v1.HandleFunc("GET /v1/branches/{name}/usage", s.branchUsage)
-	v1.HandleFunc("GET /v1/branches/{name}/diff", s.branchDiff)
-	v1.HandleFunc("DELETE /v1/branches/{name}", s.destroyBranch)
-	v1.HandleFunc("POST /v1/branches/{name}/reset", s.resetBranch)
-	v1.HandleFunc("GET /v1/reconcile/plan", s.reconcilePlan)
-	v1.HandleFunc("POST /v1/reconcile", s.reconcileApply)
+	v1.HandleFunc("POST /v1/sources", s.requireRole(admin, s.createSource))
+	v1.HandleFunc("GET /v1/sources", s.requireRole(viewer, s.listSources))
+	v1.HandleFunc("DELETE /v1/sources/{name}", s.requireRole(admin, s.removeSource))
+	v1.HandleFunc("POST /v1/sources/{name}/refresh", s.requireRole(admin, s.refreshSource))
+	v1.HandleFunc("PUT /v1/sources/{name}/mask", s.requireRole(admin, s.setMaskScripts))
+	v1.HandleFunc("GET /v1/sources/{name}/mask", s.requireRole(viewer, s.getMaskScripts))
+	v1.HandleFunc("POST /v1/branches", s.requireRole(operator, s.createBranch))
+	v1.HandleFunc("GET /v1/branches", s.requireRole(viewer, s.listBranches))
+	v1.HandleFunc("GET /v1/branches/{name}", s.requireRole(viewer, s.getBranch))
+	v1.HandleFunc("GET /v1/branches/{name}/usage", s.requireRole(viewer, s.branchUsage))
+	v1.HandleFunc("GET /v1/branches/{name}/diff", s.requireRole(viewer, s.branchDiff))
+	v1.HandleFunc("DELETE /v1/branches/{name}", s.requireRole(operator, s.destroyBranch))
+	v1.HandleFunc("POST /v1/branches/{name}/reset", s.requireRole(operator, s.resetBranch))
+	v1.HandleFunc("GET /v1/reconcile/plan", s.requireRole(viewer, s.reconcilePlan))
+	v1.HandleFunc("POST /v1/reconcile", s.requireRole(operator, s.reconcileApply))
+	v1.HandleFunc("POST /v1/tokens", s.requireRole(admin, s.createToken))
+	v1.HandleFunc("GET /v1/tokens", s.requireRole(admin, s.listTokens))
+	v1.HandleFunc("DELETE /v1/tokens/{name}", s.requireRole(admin, s.revokeToken))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -151,7 +179,9 @@ func (s *Server) Handler() http.Handler {
 	// static UI assets carry no secrets and are served without auth; every
 	// API call the page makes goes through /v1 and needs the bearer token.
 	mux.Handle("GET /ui/", uiHandler())
-	mux.Handle("/v1/", s.auth(v1))
+	// Each /v1 handler is individually wrapped with requireRole (bearer auth +
+	// minimum-role check), so the mux is mounted directly.
+	mux.Handle("/v1/", v1)
 	return mux
 }
 

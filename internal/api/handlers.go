@@ -340,3 +340,49 @@ func (s *Server) reconcileApply(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, taken)
 }
+
+// createToken mints an API token (admin-only) and returns the plaintext once.
+func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
+	var req CreateTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if !registry.ValidRole(req.Role) {
+		writeError(w, http.StatusBadRequest, "invalid role: want admin, operator or viewer")
+		return
+	}
+	plaintext, err := s.reg.CreateAPIToken(req.Name, req.Role)
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, CreateTokenResponse{Token: plaintext})
+}
+
+// listTokens returns token metadata (admin-only) — never the plaintext or hash.
+func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) {
+	tokens, err := s.reg.ListAPITokens()
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	out := make([]Token, 0, len(tokens))
+	for _, t := range tokens {
+		out = append(out, Token{Name: t.Name, Role: t.Role, CreatedAt: t.CreatedAt})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// revokeToken deletes a token by name (admin-only).
+func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
+	if err := s.reg.RevokeAPIToken(r.PathValue("name")); err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
