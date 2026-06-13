@@ -351,6 +351,71 @@ func (r *Registry) ListExpiredBranches(now string) ([]*Branch, error) {
 	return r.listBranches(`state IN ('ready','failed') AND expires_at != '' AND expires_at < ?`, now)
 }
 
+// ListStuckBranches returns branches still in a transient provisioning state
+// (creating/resetting) whose last update predates the given deadline (RFC3339
+// UTC, lexicographically comparable). A branch that has been creating/resetting
+// longer than the stuck timeout is presumed abandoned (branchd died mid-saga)
+// and reconcile fails it and cleans its resources. updated_at is the cutoff —
+// a branch that legitimately takes a while to provision keeps bumping it.
+func (r *Registry) ListStuckBranches(before string) ([]*Branch, error) {
+	rows, err := r.db.Query(`SELECT `+branchCols+` FROM branches
+		WHERE state IN ('creating','resetting') AND updated_at < ? ORDER BY created_at`, before)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Branch
+	for rows.Next() {
+		b, err := scanBranch(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// LiveVolumeSet returns the set of every volume name a live branch or a live
+// source still depends on: every live branch's rw volume and source volume,
+// every current source-generation volume, and every layer volume. Reconcile's
+// volume GC keeps only volumes in this set; everything else carrying the
+// pgbranch.managed label is an orphan. Computed in one snapshot so a volume
+// can never be GC'd out from under a concurrently provisioning branch whose
+// row was already committed.
+func (r *Registry) LiveVolumeSet() (map[string]bool, error) {
+	live := map[string]bool{}
+	add := func(query string) error {
+		rows, err := r.db.Query(query)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var v string
+			if err := rows.Scan(&v); err != nil {
+				return err
+			}
+			if v != "" {
+				live[v] = true
+			}
+		}
+		return rows.Err()
+	}
+	if err := add(`SELECT rw_volume FROM branches WHERE state != 'destroyed'`); err != nil {
+		return nil, err
+	}
+	if err := add(`SELECT source_volume FROM branches WHERE state != 'destroyed'`); err != nil {
+		return nil, err
+	}
+	if err := add(`SELECT volume FROM sources`); err != nil {
+		return nil, err
+	}
+	if err := add(`SELECT volume FROM layers`); err != nil {
+		return nil, err
+	}
+	return live, nil
+}
+
 func (r *Registry) listBranches(where string, args ...any) ([]*Branch, error) {
 	rows, err := r.db.Query(`SELECT `+branchCols+` FROM branches WHERE `+where+` ORDER BY created_at`, args...)
 	if err != nil {
@@ -494,9 +559,19 @@ func (r *Registry) DeleteLayer(id string) error {
 	return nil
 }
 
+// ListLayers returns every frozen layer across all sources. Reconcile walks
+// it to GC layers whose refcount has dropped to zero.
+func (r *Registry) ListLayers() ([]*Layer, error) {
+	return r.listLayers(`SELECT ` + layerCols + ` FROM layers`)
+}
+
 // ListLayersBySource returns every layer frozen under the given source.
 func (r *Registry) ListLayersBySource(sourceID string) ([]*Layer, error) {
-	rows, err := r.db.Query(`SELECT `+layerCols+` FROM layers WHERE source_id=?`, sourceID)
+	return r.listLayers(`SELECT `+layerCols+` FROM layers WHERE source_id=?`, sourceID)
+}
+
+func (r *Registry) listLayers(query string, args ...any) ([]*Layer, error) {
+	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}

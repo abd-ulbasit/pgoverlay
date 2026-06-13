@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -45,6 +46,9 @@ type kubeStorage interface {
 	createVolume(ctx context.Context, name string, labels map[string]string) error
 	removeVolume(ctx context.Context, name string) error
 	cloneVolume(ctx context.Context, src, dst string, labels map[string]string) error
+	// listVolumes returns the names of every pgbranch-managed volume (hostPath:
+	// dirs under the data root; csi: PVCs labelled pgbranch.managed=true).
+	listVolumes(ctx context.Context) ([]string, error)
 	// podVolumes translates driver mounts to pod volumes + container mounts.
 	podVolumes(ms []Mount) ([]corev1.Volume, []corev1.VolumeMount)
 	// nodeName pins pods to the storage node ("" = let the scheduler place).
@@ -161,6 +165,12 @@ func (d *KubeDriver) CreateVolume(ctx context.Context, name string, labels map[s
 	return nil
 }
 
+// ListManagedVolumes returns every pgbranch-managed volume name (delegated to
+// the storage strategy: hostPath dirs or labelled PVCs).
+func (d *KubeDriver) ListManagedVolumes(ctx context.Context) ([]string, error) {
+	return d.storage.listVolumes(ctx)
+}
+
 // RemoveVolume deletes the volume. Idempotent (removing a missing volume
 // succeeds).
 func (d *KubeDriver) RemoveVolume(ctx context.Context, name string) error {
@@ -256,6 +266,26 @@ func (s *hostPathStorage) cloneVolume(ctx context.Context, src, dst string, labe
 		dstDir, dstDir, srcDir, dstDir, dstDir, volumeLabelsFile)
 	_, err = s.runRootHelper(ctx, cmd, []string{"PGBRANCH_VOLUME_LABELS=" + string(j)})
 	return err
+}
+
+// listVolumes enumerates the volume dirs under the data root (each dir name is
+// a managed volume; the .pgbranch-labels.json marker is skipped). A missing
+// data root (nothing created yet) lists nothing.
+func (s *hostPathStorage) listVolumes(ctx context.Context) ([]string, error) {
+	// `ls -1` over the data root; tolerate an empty/missing root.
+	out, err := s.runRootHelper(ctx, "ls -1 "+dataRootMountPath+" 2>/dev/null || true", nil)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == volumeLabelsFile {
+			continue
+		}
+		names = append(names, line)
+	}
+	return names, nil
 }
 
 // runRootHelper runs sh -c cmd in a helper pod with the whole data root

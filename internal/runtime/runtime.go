@@ -78,4 +78,10 @@ type Driver interface {
 	Inspect(ctx context.Context, containerID string) (ContainerInfo, error)
 	StopRemove(ctx context.Context, containerID string) error
 	ListManaged(ctx context.Context) ([]ContainerInfo, error) // label pgbranch.managed=true
+	// ListManagedVolumes returns the names of every volume carrying the
+	// pgbranch.managed=true label (docker named volumes / kube PVCs). Reconcile
+	// uses it to find orphaned rw and source-layer volumes. The zfs backend
+	// manages datasets, not driver volumes, so its driver may return an empty
+	// list (zfs orphans are GC'd via the per-branch/source paths instead).
+	ListManagedVolumes(ctx context.Context) ([]string, error)
 }

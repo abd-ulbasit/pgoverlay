@@ -140,6 +140,13 @@ func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, 
 	}
 	return out, nil
 }
+func (f *fakeDriver) ListManagedVolumes(ctx context.Context) ([]string, error) {
+	var out []string
+	for name := range f.volumes {
+		out = append(out, name)
+	}
+	return out, nil
+}
 
 func testEngine(t *testing.T, d runtime.Driver, opts ...Option) (*Engine, *registry.Registry) {
 	t.Helper()
@@ -176,7 +183,7 @@ func TestReconcileCleansOrphans(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	// registry says creating, but no container exists -> failed + cleaned
+	// registry says creating, stuck past the timeout -> failed + cleaned
 	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-stuck-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
@@ -185,7 +192,9 @@ func TestReconcileCleansOrphans(t *testing.T) {
 	// container exists but registry has no row -> removed
 	d.containers["cid-ghost"] = true
 
-	if err := e.Reconcile(context.Background()); err != nil {
+	// now far in the future so the just-created row is past the stuck timeout.
+	_, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
+	if err != nil {
 		t.Fatal(err)
 	}
 	got, _ := r.GetBranchByName("stuck")
@@ -194,6 +203,9 @@ func TestReconcileCleansOrphans(t *testing.T) {
 	}
 	if d.containers["cid-ghost"] {
 		t.Fatal("ghost container not removed")
+	}
+	if d.volumes["pgbranch-br-stuck-rw"] {
+		t.Fatal("stuck branch rw volume not removed")
 	}
 }
 
@@ -756,7 +768,7 @@ func TestRunReaperDestroysExpired(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go e.RunReaper(ctx, 50*time.Millisecond, nil)
+	go e.RunReconcile(ctx, 50*time.Millisecond, 10*time.Minute, nil)
 	// expires_at has second resolution; the reaper should catch it within ~2s
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {

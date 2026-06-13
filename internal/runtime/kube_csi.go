@@ -155,6 +155,20 @@ func (s *csiStorage) cloneVolume(ctx context.Context, src, dst string, labels ma
 	return nil
 }
 
+// listVolumes returns the names of every pgbranch-managed PVC in the namespace.
+func (s *csiStorage) listVolumes(ctx context.Context) ([]string, error) {
+	list, err := s.d.cs.CoreV1().PersistentVolumeClaims(s.d.namespace).List(ctx,
+		metav1.ListOptions{LabelSelector: "pgbranch.managed=true"})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(list.Items))
+	for _, pvc := range list.Items {
+		out = append(out, pvc.Name)
+	}
+	return out, nil
+}
+
 // removeVolume deletes the PVC (and, in snapshot mode, the clone's
 // VolumeSnapshot) and waits until both are gone so a same-name recreate
 // (branch reset) cannot collide with the asynchronous deletion. Idempotent:

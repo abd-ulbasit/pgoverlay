@@ -205,8 +205,10 @@ func (e *Engine) BranchUsage(ctx context.Context, name string) (int64, error) {
 	return n, nil
 }
 
-// ReapExpired destroys every ready/failed branch whose TTL has passed.
-// Called by branchd's reaper loop; now is injected for testability.
+// ReapExpired destroys every ready/failed branch whose TTL has passed and
+// returns the names destroyed. Retained as a thin primitive over the unified
+// reconcile loop (see reconcile.go) for callers that only want the TTL pass;
+// now is injected for testability. The reconcile loop in branchd folds this in.
 func (e *Engine) ReapExpired(ctx context.Context, now time.Time) (destroyed []string, err error) {
 	expired, err := e.reg.ListExpiredBranches(now.UTC().Format(time.RFC3339))
 	if err != nil {
@@ -221,66 +223,4 @@ func (e *Engine) ReapExpired(ctx context.Context, now time.Time) (destroyed []st
 		destroyed = append(destroyed, b.Name)
 	}
 	return destroyed, errors.Join(errs...)
-}
-
-// RunReaper destroys expired branches every interval until ctx is done.
-// branchd runs it as a goroutine; logf (optional, nil = silent) receives
-// destroy/error reports.
-func (e *Engine) RunReaper(ctx context.Context, interval time.Duration, logf func(format string, args ...any)) {
-	if logf == nil {
-		logf = func(string, ...any) {}
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-t.C:
-			destroyed, err := e.ReapExpired(ctx, now)
-			e.metrics.IncReaperRun(len(destroyed))
-			if len(destroyed) > 0 {
-				logf("reaper: destroyed expired branches %v", destroyed)
-			}
-			if err != nil {
-				logf("reaper: %v", err)
-			}
-		}
-	}
-}
-
-// Reconcile aligns the registry with reality at startup: stuck 'creating'
-// branches are failed and their resources cleaned; managed containers with
-// no registry row are removed.
-func (e *Engine) Reconcile(ctx context.Context) error {
-	e.metrics.IncReconcileRun()
-	branches, err := e.reg.ListLiveBranches()
-	if err != nil {
-		return err
-	}
-	known := map[string]bool{}
-	for _, b := range branches {
-		if b.ContainerID != "" {
-			known[b.ContainerID] = true
-		}
-		if b.State == registry.BranchCreating {
-			if b.ContainerID != "" {
-				e.drv.StopRemove(ctx, b.ContainerID)
-			}
-			e.removeBranchLayer(ctx, b)
-			e.reg.TransitionBranch(b.ID, registry.BranchFailed, "reconcile: interrupted create")
-			e.metrics.IncReconcileAction("fail_stuck")
-		}
-	}
-	managed, err := e.drv.ListManaged(ctx)
-	if err != nil {
-		return err
-	}
-	for _, c := range managed {
-		if !known[c.ID] {
-			e.drv.StopRemove(ctx, c.ID)
-			e.metrics.IncReconcileAction("remove_orphan_container")
-		}
-	}
-	return nil
 }
