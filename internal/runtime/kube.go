@@ -76,6 +76,22 @@ func kubeRestConfig(kubeconfig string) (*rest.Config, error) {
 	return cfg, err
 }
 
+// NewKubeClient builds a kubernetes.Interface from the same in-cluster /
+// kubeconfig loading path the kube driver uses (kubeconfig=="" → in-cluster,
+// then KUBECONFIG / ~/.kube/config). branchd reuses it for the leader-election
+// Lease so HA shares the driver's cluster credentials.
+func NewKubeClient(kubeconfig string) (kubernetes.Interface, error) {
+	cfg, err := kubeRestConfig(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("kube config: %w", err)
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("kube client: %w", err)
+	}
+	return cs, nil
+}
+
 // NewKubeDriver connects to the cluster with the hostPath storage strategy
 // (all data under dataRoot on the named storage node).
 func NewKubeDriver(kubeconfig, namespace, nodeName, dataRoot string) (*KubeDriver, error) {

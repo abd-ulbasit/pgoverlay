@@ -27,6 +27,7 @@ import (
 	"github.com/abd-ulbasit/pgbranch/internal/config"
 	"github.com/abd-ulbasit/pgbranch/internal/cow"
 	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgbranch/internal/ha"
 	"github.com/abd-ulbasit/pgbranch/internal/metrics"
 	"github.com/abd-ulbasit/pgbranch/internal/pgproxy"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
@@ -147,6 +148,7 @@ func run() error {
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
 	pgTLSKey := flag.String("pg-tls-key", "", "PEM private key for the Postgres router (requires --pg-tls-cert)")
+	leaderElect := flag.Bool("leader-elect", false, "HA: contend for a coordination.k8s.io Lease (pgbranch-branchd) so only the leader runs reconcile and accepts mutating /v1 requests (kube runtime only; off = single-instance, always leader)")
 	flag.Parse()
 
 	// --reap-interval is a deprecated alias: when set (non-zero) it folds into
@@ -200,6 +202,7 @@ func run() error {
 		return errors.New("--zfs-dataset is required with --cow zfs (the dataset prefix pgbranch owns, e.g. tank/pgbranch)")
 	}
 	var drv runtime.Driver
+	var kubeNS string // resolved branchd namespace (kube runtime); also the Lease namespace
 	switch *runtimeName {
 	case "docker":
 		drv, err = runtime.NewDockerDriver()
@@ -211,6 +214,7 @@ func run() error {
 		if ns == "" {
 			ns = "pgbranch"
 		}
+		kubeNS = ns
 		if backend == cow.BackendCSI {
 			drv, err = runtime.NewKubeDriverCSI(*kubeconfig, ns, runtime.CSIConfig{
 				StorageClass: *csiStorageClass, SnapshotClass: *csiSnapshotClass, VolumeSize: *csiVolumeSize,
@@ -221,6 +225,9 @@ func run() error {
 	}
 	if err != nil {
 		return fmt.Errorf("init %s runtime: %w", *runtimeName, err)
+	}
+	if *leaderElect && *runtimeName != "kube" {
+		return errors.New("--leader-elect requires --runtime kube (it contends for a coordination.k8s.io Lease)")
 	}
 	m := metrics.New()
 	m.SetStateCounter(reg)
@@ -256,7 +263,8 @@ func run() error {
 	if apiTLS != nil {
 		apiLis = tls.NewListener(apiLis, apiTLS)
 	}
-	srv := &http.Server{Addr: *apiAddr, Handler: api.New(eng, reg, token, m.Handler(), ready, *stuckTimeout).Handler()}
+	apiSrv := api.New(eng, reg, token, m.Handler(), ready, *stuckTimeout)
+	srv := &http.Server{Addr: *apiAddr, Handler: apiSrv.Handler()}
 	g.Go(func() error {
 		log.Printf("REST API listening on %s (TLS %v)", *apiAddr, apiTLS != nil)
 		log.Printf("web UI at %s", uiURL(*apiAddr, apiTLS != nil))
@@ -287,10 +295,33 @@ func run() error {
 	// unified reconcile loop: TTL reap + stuck-row failure + orphan-container
 	// removal + dangling layer/volume GC, on one ticker (runs once immediately
 	// so startup drift converges without waiting a full interval).
-	g.Go(func() error {
-		eng.RunReconcile(ctx, *reconcileInterval, *stuckTimeout, log.Printf)
-		return nil
-	})
+	//
+	// reconcileLoop is the leader-only work: with --leader-elect off it runs for
+	// the whole process (the API gate defaults to leader=true). With it on, the
+	// election callbacks start it on gaining leadership and cancel it on losing.
+	reconcileLoop := func(loopCtx context.Context) {
+		eng.RunReconcile(loopCtx, *reconcileInterval, *stuckTimeout, log.Printf)
+	}
+	if *leaderElect {
+		cs, err := runtime.NewKubeClient(*kubeconfig)
+		if err != nil {
+			return fmt.Errorf("leader election kube client: %w", err)
+		}
+		identity := ha.Identity()
+		// Non-leader until the Lease is acquired: close the mutating gate now so
+		// a replica that has not yet won rejects writes with 503.
+		apiSrv.LeaderGate().Set(false)
+		cb := ha.NewCallbacks(apiSrv.LeaderGate(), reconcileLoop)
+		log.Printf("leader election enabled: contending for Lease %s/%s as %q", kubeNS, ha.LeaseName, identity)
+		g.Go(func() error {
+			return ha.Run(ctx, cs, kubeNS, identity, cb)
+		})
+	} else {
+		g.Go(func() error {
+			reconcileLoop(ctx)
+			return nil
+		})
+	}
 
 	err = g.Wait()
 	log.Println("branchd stopped (branch containers keep running)")
