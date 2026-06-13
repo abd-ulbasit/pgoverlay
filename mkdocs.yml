@@ -25,6 +25,7 @@ nav:
   - Running on EKS: eks.md
   - GitHub App: github-app.md
   - Observability: observability.md
+  - High availability: ha.md
   - Benchmarks: benchmarks.md
   - ZFS backend (experimental): zfs.md
   - Architecture: architecture.md
