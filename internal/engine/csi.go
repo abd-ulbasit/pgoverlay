@@ -145,6 +145,7 @@ func (e *Engine) restartCSIBranch(ctx context.Context, b *registry.Branch, src *
 	if err != nil {
 		return failed(err)
 	}
+	e.reg.SetBranchContainer(b.ID, cid) // own the in-flight container before the readiness wait (reconcile-safe)
 	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
 		e.drv.StopRemove(ctx, cid)
 		return failed(err)

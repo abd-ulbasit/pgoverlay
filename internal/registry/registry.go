@@ -344,6 +344,15 @@ func (r *Registry) SetBranchPassword(id, password string) error {
 	return nil
 }
 
+// SetBranchContainer records a branch's container ID without changing its
+// state. Provisioning calls this as soon as the container is started — before
+// the readiness wait — so a concurrent reconcile sees the in-flight container
+// as owned (in its "known" set) and does not reap it as an orphan.
+func (r *Registry) SetBranchContainer(id, containerID string) error {
+	_, err := r.db.Exec(`UPDATE branches SET container_id=? WHERE id=?`, containerID, id)
+	return err
+}
+
 func (r *Registry) MarkBranchReady(id, containerID, host string, port int) error {
 	if _, err := r.db.Exec(`UPDATE branches SET container_id=?, host=?, port=? WHERE id=?`, containerID, host, port, id); err != nil {
 		return err

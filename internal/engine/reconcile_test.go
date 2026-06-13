@@ -101,6 +101,36 @@ func TestReconcileRemovesOrphanContainer(t *testing.T) {
 	}
 }
 
+// A branch still provisioning (state creating) whose container was recorded
+// via SetBranchContainer before the readiness wait must NOT be reaped. This is
+// the within-instance race the api IT exposed: a fast reconcile loop fires
+// while a branch is mid-create, and the in-flight container is owned.
+func TestReconcileSkipsInflightProvisioningContainer(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := &registry.Branch{Name: "inflight", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-inflight-rw"}
+	if err := r.CreateBranch(b); err != nil { // state = creating
+		t.Fatal(err)
+	}
+	// provisioning started the container and recorded it before readiness:
+	if err := r.SetBranchContainer(b.ID, "cid-inflight"); err != nil {
+		t.Fatal(err)
+	}
+	d.addOrphanContainer("cid-inflight", r.InstanceID())
+
+	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasAction(taken, ActionRemoveOrphanContainer, "cid-inflight") {
+		t.Fatalf("in-flight provisioning container was reaped: %+v", taken.Actions)
+	}
+	if !d.containers["cid-inflight"] {
+		t.Fatal("in-flight container removed")
+	}
+}
+
 // A frozen layer with refcount 0 is GC'd (volume + row); a layer still in a
 // live branch's chain is kept.
 func TestReconcileGCsDanglingLayerKeepsReferenced(t *testing.T) {

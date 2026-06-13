@@ -144,6 +144,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 		return fail(fmt.Errorf("restart parent %q: %w", parent.Name, err))
 	}
 	undo = append(undo, func() { e.drv.StopRemove(bg, parentCID) })
+	e.reg.SetBranchContainer(parent.ID, parentCID) // own the in-flight container before the readiness wait (reconcile-safe)
 	if err := e.waitReady(ctx, parentCID, 90*time.Second); err != nil {
 		return fail(fmt.Errorf("parent %q never became ready after freeze: %w", parent.Name, err))
 	}
@@ -161,6 +162,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
 	undo = append(undo, func() { e.drv.StopRemove(bg, childCID) })
+	e.reg.SetBranchContainer(child.ID, childCID) // own the in-flight container before the readiness wait (reconcile-safe)
 	if err := e.waitReady(ctx, childCID, 90*time.Second); err != nil {
 		return fail(fmt.Errorf("instance never became ready: %w", err))
 	}
@@ -208,6 +210,9 @@ func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src
 			fmt.Sprintf("freeze failed (%v); parent restore failed: %v", cause, err))
 	}
 	cid, err := e.startOverlayBranch(ctx, parent.Name, origPlan, e.image(src.PGVersion), e.branchLabels(parent))
+	if err == nil {
+		e.reg.SetBranchContainer(parent.ID, cid) // own the in-flight container before the readiness wait
+	}
 	if err != nil {
 		failed(err)
 		return

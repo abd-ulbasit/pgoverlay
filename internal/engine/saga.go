@@ -269,6 +269,11 @@ func (e *Engine) instanceLabels(labels map[string]string) map[string]string {
 // (when enabled), then record container + address and mark ready. A failing
 // masking script fails the branch.
 func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *registry.Source, cid string) error {
+	// Record the container before the readiness wait so a concurrent reconcile
+	// treats this in-flight container as owned (not an orphan to reap).
+	if err := e.reg.SetBranchContainer(b.ID, cid); err != nil {
+		return err
+	}
 	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
 		return fmt.Errorf("instance never became ready: %w", err)
 	}
