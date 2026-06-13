@@ -1,0 +1,38 @@
+{
+  "name": "pgbranch-connect",
+  "version": "0.1.0",
+  "description": "Resolve a Postgres connection string for a pgbranch branch — fetches per-branch credentials so apps keep static config with credential rotation on",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.mjs"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abd-ulbasit/pgbranch.git",
+    "directory": "sdk/js-connect"
+  },
+  "keywords": [
+    "postgres",
+    "database",
+    "branch",
+    "pgbranch",
+    "connection-string",
+    "credentials"
+  ]
+}

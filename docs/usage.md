@@ -26,6 +26,29 @@ A note that informs several patterns below — **credential modes**:
   password. Safer for shared/long-lived branches, but a consumer must fetch
   the per-branch password (from the REST API) rather than hold a static one.
 
+**Rotation *and* static config — the connect helper.** With rotation on, an
+app can't hold a fixed `PGPASSWORD`. The `pgbranchconnect` helper resolves
+this: the static config the app holds is the branchd API endpoint plus a
+read-only (`viewer`) token; it fetches the branch's current credentials at
+startup. App and webhook agree on the branch name with no coordination (both
+derive it from the git ref).
+
+```go
+res, _ := pgbranchconnect.Resolve(ctx, pgbranchconnect.Options{
+    Server: os.Getenv("PGBRANCH_API"), Token: os.Getenv("PGBRANCH_TOKEN"), // viewer token
+    Ref: os.Getenv("GIT_REF"), ProxyHost: "proxy.example.com:6432",
+})
+db, _ := sql.Open("pgx", res.ProxyDSN)
+```
+
+```js
+import { resolve } from "pgbranch-connect";
+const { proxyDsn } = await resolve({
+  server: process.env.PGBRANCH_API, token: process.env.PGBRANCH_TOKEN,
+  ref: process.env.GIT_REF, proxyHost: "proxy.example.com:6432",
+});
+```
+
 ---
 
 ## 1. Local development
