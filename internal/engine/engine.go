@@ -92,7 +92,7 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 	if err := e.reg.CreateSource(s); err != nil {
 		return err
 	}
-	if err := e.createSourceLayer(ctx, s.Volume, map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": s.Name}); err != nil {
+	if err := e.createSourceLayer(ctx, s.Volume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": s.Name})); err != nil {
 		e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed")
 		return err
 	}
@@ -117,7 +117,7 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 		return fmt.Errorf("source %q is %s, not ready", name, src.State)
 	}
 	newVol := e.planner.SourceLayerName(name, src.Generation+1)
-	if err := e.createSourceLayer(ctx, newVol, map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": name}); err != nil {
+	if err := e.createSourceLayer(ctx, newVol, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": name})); err != nil {
 		return err
 	}
 	if err := e.seedSource(ctx, src, newVol, password); err != nil {

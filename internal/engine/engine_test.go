@@ -16,6 +16,8 @@ import (
 
 type fakeDriver struct {
 	volumes       map[string]bool
+	volumeLabels  map[string]map[string]string // labels passed to CreateVolume/CloneVolume per volume
+	containerLbls map[string]map[string]string // labels last passed to StartBranch per container id
 	containers    map[string]bool
 	failStart     bool
 	failStartAt   map[int]bool // fail the Nth StartBranch attempt (1-based, counts failures too)
@@ -42,11 +44,31 @@ type fakeDriver struct {
 }
 
 func newFake() *fakeDriver {
-	return &fakeDriver{volumes: map[string]bool{}, containers: map[string]bool{}}
+	return &fakeDriver{
+		volumes:       map[string]bool{},
+		volumeLabels:  map[string]map[string]string{},
+		containerLbls: map[string]map[string]string{},
+		containers:    map[string]bool{},
+	}
+}
+
+// addOrphanContainer registers a managed container tagged with instanceID and
+// no backing registry row — what reconcile sees as an orphan to reclaim.
+func (f *fakeDriver) addOrphanContainer(id, instanceID string) {
+	f.containers[id] = true
+	f.containerLbls[id] = map[string]string{runtime.LabelInstance: instanceID}
+}
+
+// addOrphanVolume registers a managed volume tagged with instanceID so the
+// instance-scoped ListManagedVolumes returns it (reconcile orphan-volume GC).
+func (f *fakeDriver) addOrphanVolume(name, instanceID string) {
+	f.volumes[name] = true
+	f.volumeLabels[name] = map[string]string{runtime.LabelInstance: instanceID}
 }
 func (f *fakeDriver) EnsureImage(ctx context.Context, image string) error { return nil }
 func (f *fakeDriver) CreateVolume(ctx context.Context, name string, l map[string]string) error {
 	f.volumes[name] = true
+	f.volumeLabels[name] = l
 	f.log = append(f.log, "volume:"+name)
 	return nil
 }
@@ -60,6 +82,7 @@ func (f *fakeDriver) CloneVolume(ctx context.Context, src, dst string, l map[str
 		return f.cloneErr
 	}
 	f.volumes[dst] = true
+	f.volumeLabels[dst] = l
 	f.clones = append(f.clones, [2]string{src, dst})
 	f.log = append(f.log, "clone:"+src+">"+dst)
 	return nil
@@ -75,9 +98,11 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 	}
 	f.starts++
 	f.branches = append(f.branches, s)
-	f.containers["cid-"+s.Name] = true
+	id := "cid-" + s.Name
+	f.containers[id] = true
+	f.containerLbls[id] = s.Labels
 	f.log = append(f.log, "start:"+s.Name)
-	return "cid-" + s.Name, nil
+	return id, nil
 }
 func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error {
 	f.execs = append(f.execs, cmd)
@@ -136,14 +161,21 @@ func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, error) {
 	var out []runtime.ContainerInfo
 	for id := range f.containers {
-		out = append(out, runtime.ContainerInfo{ID: id, Running: true})
+		out = append(out, runtime.ContainerInfo{ID: id, Running: true, Labels: f.containerLbls[id]})
 	}
 	return out, nil
 }
-func (f *fakeDriver) ListManagedVolumes(ctx context.Context) ([]string, error) {
+
+// ListManagedVolumes returns only volumes whose recorded labels carry
+// pgbranch.instance=instanceID — mirroring the real drivers' instance-scoped
+// filter. A volume created without labels (set directly in a test) is treated
+// as belonging to no instance and is never returned.
+func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
 	var out []string
 	for name := range f.volumes {
-		out = append(out, name)
+		if f.volumeLabels[name][runtime.LabelInstance] == instanceID {
+			out = append(out, name)
+		}
 	}
 	return out, nil
 }
@@ -190,7 +222,7 @@ func TestReconcileCleansOrphans(t *testing.T) {
 	}
 	d.volumes["pgbranch-br-stuck-rw"] = true
 	// container exists but registry has no row -> removed
-	d.containers["cid-ghost"] = true
+	d.addOrphanContainer("cid-ghost", r.InstanceID())
 
 	// now far in the future so the just-created row is past the stuck timeout.
 	_, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)

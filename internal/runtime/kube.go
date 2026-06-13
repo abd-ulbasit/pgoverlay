@@ -46,9 +46,10 @@ type kubeStorage interface {
 	createVolume(ctx context.Context, name string, labels map[string]string) error
 	removeVolume(ctx context.Context, name string) error
 	cloneVolume(ctx context.Context, src, dst string, labels map[string]string) error
-	// listVolumes returns the names of every pgbranch-managed volume (hostPath:
-	// dirs under the data root; csi: PVCs labelled pgbranch.managed=true).
-	listVolumes(ctx context.Context) ([]string, error)
+	// listVolumes returns the names of every pgbranch-managed volume owned by
+	// instanceID (hostPath: dirs under the data root whose .pgbranch-labels.json
+	// carries the id; csi: PVCs labelled pgbranch.managed=true,pgbranch.instance=<id>).
+	listVolumes(ctx context.Context, instanceID string) ([]string, error)
 	// podVolumes translates driver mounts to pod volumes + container mounts.
 	podVolumes(ms []Mount) ([]corev1.Volume, []corev1.VolumeMount)
 	// nodeName pins pods to the storage node ("" = let the scheduler place).
@@ -167,8 +168,8 @@ func (d *KubeDriver) CreateVolume(ctx context.Context, name string, labels map[s
 
 // ListManagedVolumes returns every pgbranch-managed volume name (delegated to
 // the storage strategy: hostPath dirs or labelled PVCs).
-func (d *KubeDriver) ListManagedVolumes(ctx context.Context) ([]string, error) {
-	return d.storage.listVolumes(ctx)
+func (d *KubeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
+	return d.storage.listVolumes(ctx, instanceID)
 }
 
 // RemoveVolume deletes the volume. Idempotent (removing a missing volume
@@ -268,25 +269,48 @@ func (s *hostPathStorage) cloneVolume(ctx context.Context, src, dst string, labe
 	return err
 }
 
-// listVolumes enumerates the volume dirs under the data root (each dir name is
-// a managed volume; the .pgbranch-labels.json marker is skipped). A missing
-// data root (nothing created yet) lists nothing.
-func (s *hostPathStorage) listVolumes(ctx context.Context) ([]string, error) {
-	// `ls -1` over the data root; tolerate an empty/missing root.
-	out, err := s.runRootHelper(ctx, "ls -1 "+dataRootMountPath+" 2>/dev/null || true", nil)
+// listVolumes enumerates the volume dirs under the data root and returns only
+// those whose .pgbranch-labels.json records pgbranch.instance=<instanceID>.
+// Each managed volume dir is emitted on its own line followed by its label
+// file's contents on the next (NUL-padded marker lines bracket each entry); a
+// dir whose marker is missing or names a different instance is foreign and
+// skipped. A missing data root (nothing created yet) lists nothing.
+func (s *hostPathStorage) listVolumes(ctx context.Context, instanceID string) ([]string, error) {
+	// For every entry under the data root, print "<name>\n", then its label
+	// JSON on one line, then a sentinel. Tolerate an empty/missing root.
+	script := fmt.Sprintf(
+		`for d in %s/*/; do [ -d "$d" ] || continue; n=$(basename "$d"); printf '%%s\n' "$n"; cat "$d/%s" 2>/dev/null; printf '\n%s\n'; done 2>/dev/null || true`,
+		dataRootMountPath, volumeLabelsFile, listVolumesSentinel)
+	out, err := s.runRootHelper(ctx, script, nil)
 	if err != nil {
 		return nil, err
 	}
 	var names []string
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || line == volumeLabelsFile {
+	for _, entry := range strings.Split(out, listVolumesSentinel) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
 			continue
 		}
-		names = append(names, line)
+		lines := strings.SplitN(entry, "\n", 2)
+		name := strings.TrimSpace(lines[0])
+		if name == "" || name == volumeLabelsFile {
+			continue
+		}
+		var labels map[string]string
+		if len(lines) == 2 {
+			_ = json.Unmarshal([]byte(strings.TrimSpace(lines[1])), &labels)
+		}
+		if labels[LabelInstance] == instanceID {
+			names = append(names, name)
+		}
 	}
 	return names, nil
 }
+
+// listVolumesSentinel brackets each volume entry in the hostPath listVolumes
+// helper output so a name can be split cleanly from its (possibly empty) label
+// JSON; chosen to never collide with a volume name or JSON content.
+const listVolumesSentinel = "\x00--pgbranch-vol--\x00"
 
 // runRootHelper runs sh -c cmd in a helper pod with the whole data root
 // mounted at dataRootMountPath (needed to create/remove volume dirs).

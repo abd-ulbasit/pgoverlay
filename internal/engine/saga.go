@@ -113,7 +113,7 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	bg := context.WithoutCancel(ctx)
 
 	// 1. rw volume (upper/work + entrypoint script live here)
-	if err := e.drv.CreateVolume(ctx, plan.RWVolume, map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID}); err != nil {
+	if err := e.drv.CreateVolume(ctx, plan.RWVolume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID})); err != nil {
 		return fail(fmt.Errorf("create rw volume: %w", err))
 	}
 	undo = append(undo, func() { e.drv.RemoveVolume(bg, plan.RWVolume) })
@@ -124,7 +124,7 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	}
 
 	// 3. branch container
-	cid, err := e.startOverlayBranch(ctx, b.Name, plan, e.image(src.PGVersion), branchLabels(b))
+	cid, err := e.startOverlayBranch(ctx, b.Name, plan, e.image(src.PGVersion), e.branchLabels(b))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -230,7 +230,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 		Env:        []string{"PGDATA=" + cow.DirectDataPath},
 		Mounts:     []runtime.Mount{cloneMount},
 		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
-		Labels:     branchLabels(b),
+		Labels:     e.branchLabels(b),
 	})
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
@@ -243,11 +243,23 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	return nil
 }
 
-func branchLabels(b *registry.Branch) map[string]string {
-	return map[string]string{
+func (e *Engine) branchLabels(b *registry.Branch) map[string]string {
+	return e.instanceLabels(map[string]string{
 		"pgbranch.managed": "true", "pgbranch.role": "branch",
 		"pgbranch.branch.id": b.ID, "pgbranch.branch.name": b.Name,
+	})
+}
+
+// instanceLabels stamps the owning registry's instance id onto a label map so
+// reconcile reclaims only resources belonging to THIS registry. Every managed
+// resource (volumes, branch containers/pods) is labelled through here — the one
+// place the pgbranch.instance label is added — so no call site can omit it.
+func (e *Engine) instanceLabels(labels map[string]string) map[string]string {
+	if labels == nil {
+		labels = map[string]string{}
 	}
+	labels[runtime.LabelInstance] = e.reg.InstanceID()
+	return labels
 }
 
 // awaitAndMark is the backend-independent tail of provisioning: wait for

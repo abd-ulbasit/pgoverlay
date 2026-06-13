@@ -99,7 +99,7 @@ func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, 
 	}
 	return out, nil
 }
-func (f *fakeDriver) ListManagedVolumes(ctx context.Context) ([]string, error) {
+func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
 	var out []string
 	for name := range f.volumes {
 		out = append(out, name)

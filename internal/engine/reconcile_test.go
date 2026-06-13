@@ -82,9 +82,9 @@ func TestReconcileRemovesOrphanContainer(t *testing.T) {
 	}
 	d.volumes["pgbranch-br-live-rw"] = true
 	markReady(t, r, b, "cid-live")
-	d.containers["cid-live"] = true
+	d.addOrphanContainer("cid-live", r.InstanceID())
 	// an orphan with no row.
-	d.containers["cid-ghost"] = true
+	d.addOrphanContainer("cid-ghost", r.InstanceID())
 
 	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
 	if err != nil {
@@ -170,7 +170,7 @@ func TestReconcileGCsOrphanVolumeKeepsInUse(t *testing.T) {
 	d.containers["cid-live"] = true
 
 	// orphan volume: no branch, no source, no layer references it.
-	d.volumes["pgbranch-br-orphan-rw"] = true
+	d.addOrphanVolume("pgbranch-br-orphan-rw", r.InstanceID())
 
 	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
 	if err != nil {
@@ -204,8 +204,8 @@ func TestPlanReconcileDryRunDoesNotApply(t *testing.T) {
 	}
 	d.volumes["pgbranch-br-stuck-rw"] = true
 	// orphan container + orphan volume.
-	d.containers["cid-ghost"] = true
-	d.volumes["pgbranch-br-orphan-rw"] = true
+	d.addOrphanContainer("cid-ghost", r.InstanceID())
+	d.addOrphanVolume("pgbranch-br-orphan-rw", r.InstanceID())
 
 	before := len(d.log)
 	plan, err := e.PlanReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
@@ -244,6 +244,53 @@ func TestPlanReconcileCleanNoDrift(t *testing.T) {
 	}
 	if plan.Drift() {
 		t.Fatalf("clean system reported drift: %+v", plan.Actions)
+	}
+}
+
+// Reconcile is instance-scoped: an engine bound to registry A must reclaim its
+// OWN orphaned managed container and volume, but must leave a managed container
+// and volume tagged with a different instance id (a sibling pgbranch sharing
+// the daemon) untouched. This is the regression guard for the CI bug where one
+// IT package's reconcile deleted another package's live resources.
+func TestReconcileIgnoresForeignInstanceResources(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	const foreign = "ffffffffffffffff" // some other registry's instance id
+
+	// our own orphans (tagged with this registry's instance id) -> reclaimed.
+	d.addOrphanContainer("cid-mine", r.InstanceID())
+	d.addOrphanVolume("pgbranch-br-mine-rw", r.InstanceID())
+	// a sibling instance's live resources -> must be left alone.
+	d.addOrphanContainer("cid-foreign", foreign)
+	d.addOrphanVolume("pgbranch-br-foreign-rw", foreign)
+
+	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// own resources reclaimed.
+	if !hasAction(taken, ActionRemoveOrphanContainer, "cid-mine") {
+		t.Fatalf("own orphan container not reclaimed: %+v", taken.Actions)
+	}
+	if !hasAction(taken, ActionGCVolume, "pgbranch-br-mine-rw") {
+		t.Fatalf("own orphan volume not reclaimed: %+v", taken.Actions)
+	}
+	if d.containers["cid-mine"] || d.volumes["pgbranch-br-mine-rw"] {
+		t.Fatal("own orphans survived reconcile")
+	}
+	// foreign resources untouched in plan and in the driver.
+	if hasAction(taken, ActionRemoveOrphanContainer, "cid-foreign") {
+		t.Fatalf("foreign container reclaimed: %+v", taken.Actions)
+	}
+	if hasAction(taken, ActionGCVolume, "pgbranch-br-foreign-rw") {
+		t.Fatalf("foreign volume reclaimed: %+v", taken.Actions)
+	}
+	if !d.containers["cid-foreign"] {
+		t.Fatal("foreign instance's container was removed")
+	}
+	if !d.volumes["pgbranch-br-foreign-rw"] {
+		t.Fatal("foreign instance's volume was removed")
 	}
 }
 

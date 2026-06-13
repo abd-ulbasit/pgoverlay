@@ -155,10 +155,11 @@ func (s *csiStorage) cloneVolume(ctx context.Context, src, dst string, labels ma
 	return nil
 }
 
-// listVolumes returns the names of every pgbranch-managed PVC in the namespace.
-func (s *csiStorage) listVolumes(ctx context.Context) ([]string, error) {
+// listVolumes returns the names of every pgbranch-managed PVC in the namespace
+// owned by instanceID.
+func (s *csiStorage) listVolumes(ctx context.Context, instanceID string) ([]string, error) {
 	list, err := s.d.cs.CoreV1().PersistentVolumeClaims(s.d.namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: "pgbranch.managed=true"})
+		metav1.ListOptions{LabelSelector: "pgbranch.managed=true," + LabelInstance + "=" + instanceID})
 	if err != nil {
 		return nil, err
 	}

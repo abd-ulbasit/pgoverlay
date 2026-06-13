@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgbranch/internal/runtime"
 )
 
 // ActionKind enumerates the convergence steps a reconcile pass can take. The
@@ -94,7 +95,14 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 	if err != nil {
 		return plan, err
 	}
+	instanceID := e.reg.InstanceID()
 	for _, c := range managed {
+		// Only reclaim containers this registry owns. A managed container whose
+		// pgbranch.instance label is absent or names another instance belongs to
+		// a different pgbranch on the same daemon — leave it alone.
+		if c.Labels[runtime.LabelInstance] != instanceID {
+			continue
+		}
 		if !known[c.ID] {
 			plan.add(ActionRemoveOrphanContainer, c.ID, "managed container with no live branch row")
 		}
@@ -118,7 +126,7 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 	// (d) managed volumes owned by no live branch/source → GC. The zfs backend
 	// manages datasets, not driver volumes, so its driver reports no volumes
 	// and this is a no-op (zfs orphans are GC'd via the layer/branch paths).
-	vols, err := e.drv.ListManagedVolumes(ctx)
+	vols, err := e.drv.ListManagedVolumes(ctx, instanceID)
 	if err != nil {
 		return plan, err
 	}

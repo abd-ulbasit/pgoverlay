@@ -3,6 +3,12 @@ package runtime
 
 import "context"
 
+// LabelInstance tags every managed resource with the owning registry's
+// instance id (registry.InstanceID()). Reconcile reclaims only resources
+// carrying ITS id, so concurrent pgbranch instances sharing one Docker daemon
+// (and the parallel IT suite) never GC each other's live containers/volumes.
+const LabelInstance = "pgbranch.instance"
+
 // MountKind selects how Mount.Volume is interpreted.
 type MountKind string
 
@@ -78,10 +84,12 @@ type Driver interface {
 	Inspect(ctx context.Context, containerID string) (ContainerInfo, error)
 	StopRemove(ctx context.Context, containerID string) error
 	ListManaged(ctx context.Context) ([]ContainerInfo, error) // label pgbranch.managed=true
-	// ListManagedVolumes returns the names of every volume carrying the
-	// pgbranch.managed=true label (docker named volumes / kube PVCs). Reconcile
-	// uses it to find orphaned rw and source-layer volumes. The zfs backend
-	// manages datasets, not driver volumes, so its driver may return an empty
-	// list (zfs orphans are GC'd via the per-branch/source paths instead).
-	ListManagedVolumes(ctx context.Context) ([]string, error)
+	// ListManagedVolumes returns the names of every volume carrying both the
+	// pgbranch.managed=true label AND pgbranch.instance=<instanceID> (docker
+	// named volumes / kube PVCs). Reconcile uses it to find orphaned rw and
+	// source-layer volumes owned by THIS registry; scoping by instance id keeps
+	// one instance from GC'ing another's volumes on a shared daemon. The zfs
+	// backend manages datasets, not driver volumes, so its driver may return an
+	// empty list (zfs orphans are GC'd via the per-branch/source paths instead).
+	ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error)
 }

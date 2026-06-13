@@ -72,7 +72,7 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 
 	// 1. clone the base PVC into the branch's own PVC
 	if err := e.drv.CloneVolume(ctx, b.SourceVolume, b.RWVolume,
-		map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID}); err != nil {
+		e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID})); err != nil {
 		return fail(fmt.Errorf("clone volume: %w", err))
 	}
 	undo = append(undo, func() { e.drv.RemoveVolume(bg, b.RWVolume) })
@@ -92,7 +92,7 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 	}
 
 	// 4. branch container on the clone
-	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), branchLabels(b))
+	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), e.branchLabels(b))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -141,7 +141,7 @@ func (e *Engine) restartCSIBranch(ctx context.Context, b *registry.Branch, src *
 		e.reg.TransitionBranch(b.ID, registry.BranchFailed, msg)
 		return err
 	}
-	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), branchLabels(b))
+	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), e.branchLabels(b))
 	if err != nil {
 		return failed(err)
 	}

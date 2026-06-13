@@ -278,8 +278,11 @@ func (d *DockerDriver) ListManaged(ctx context.Context) ([]ContainerInfo, error)
 	return out, nil
 }
 
-func (d *DockerDriver) ListManagedVolumes(ctx context.Context) ([]string, error) {
-	f := filters.NewArgs(filters.Arg("label", "pgbranch.managed=true"))
+func (d *DockerDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
+	f := filters.NewArgs(
+		filters.Arg("label", "pgbranch.managed=true"),
+		filters.Arg("label", LabelInstance+"="+instanceID),
+	)
 	resp, err := d.cli.VolumeList(ctx, volume.ListOptions{Filters: f})
 	if err != nil {
 		return nil, err

@@ -129,7 +129,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	}
 
 	// 3. fresh rw volume for the parent (the swap), with the entrypoint
-	if err := e.drv.CreateVolume(ctx, newRW, map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": parent.ID}); err != nil {
+	if err := e.drv.CreateVolume(ctx, newRW, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": parent.ID})); err != nil {
 		return fail(fmt.Errorf("create parent rw volume: %w", err))
 	}
 	undo = append(undo, func() { e.drv.RemoveVolume(bg, newRW) })
@@ -139,7 +139,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 
 	// 4. restart the parent over the frozen chain and wait for it: the
 	// parent must come back before the child starts
-	parentCID, err := e.startOverlayBranch(ctx, parent.Name, parentPlan, image, branchLabels(parent))
+	parentCID, err := e.startOverlayBranch(ctx, parent.Name, parentPlan, image, e.branchLabels(parent))
 	if err != nil {
 		return fail(fmt.Errorf("restart parent %q: %w", parent.Name, err))
 	}
@@ -149,14 +149,14 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	}
 
 	// 5. child resources over the same chain
-	if err := e.drv.CreateVolume(ctx, childPlan.RWVolume, map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": child.ID}); err != nil {
+	if err := e.drv.CreateVolume(ctx, childPlan.RWVolume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": child.ID})); err != nil {
 		return fail(fmt.Errorf("create rw volume: %w", err))
 	}
 	undo = append(undo, func() { e.drv.RemoveVolume(bg, childPlan.RWVolume) })
 	if err := e.installOverlayEntrypoint(ctx, childPlan.RWVolume); err != nil {
 		return fail(fmt.Errorf("install entrypoint: %w", err))
 	}
-	childCID, err := e.startOverlayBranch(ctx, child.Name, childPlan, image, branchLabels(child))
+	childCID, err := e.startOverlayBranch(ctx, child.Name, childPlan, image, e.branchLabels(child))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -207,7 +207,7 @@ func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src
 		e.reg.TransitionBranch(parent.ID, registry.BranchFailed,
 			fmt.Sprintf("freeze failed (%v); parent restore failed: %v", cause, err))
 	}
-	cid, err := e.startOverlayBranch(ctx, parent.Name, origPlan, e.image(src.PGVersion), branchLabels(parent))
+	cid, err := e.startOverlayBranch(ctx, parent.Name, origPlan, e.image(src.PGVersion), e.branchLabels(parent))
 	if err != nil {
 		failed(err)
 		return

@@ -55,15 +55,16 @@ func TestReconcileGCEndToEnd(t *testing.T) {
 	}
 	time.Sleep(2 * time.Second)
 
-	// a stray managed volume owned by no branch.
+	// a stray managed volume owned by no branch (tagged with this registry's
+	// instance id so reconcile recognizes it as ITS orphan to reclaim).
 	strayVol := "pgbranch-br-gc-stray-rw"
-	if err := d.CreateVolume(ctx, strayVol, map[string]string{"pgbranch.managed": "true"}); err != nil {
+	if err := d.CreateVolume(ctx, strayVol, map[string]string{"pgbranch.managed": "true", runtime.LabelInstance: r.InstanceID()}); err != nil {
 		t.Fatal(err)
 	}
 
 	// a stuck `creating` registry row with its own rw volume.
 	stuckVol := "pgbranch-br-gc-stuck-rw"
-	if err := d.CreateVolume(ctx, stuckVol, map[string]string{"pgbranch.managed": "true"}); err != nil {
+	if err := d.CreateVolume(ctx, stuckVol, map[string]string{"pgbranch.managed": "true", runtime.LabelInstance: r.InstanceID()}); err != nil {
 		t.Fatal(err)
 	}
 	stuck := &registry.Branch{Name: "gc-stuck", SourceID: src.ID, RWVolume: stuckVol, SourceVolume: src.Volume}
@@ -87,12 +88,12 @@ func TestReconcileGCEndToEnd(t *testing.T) {
 	if b, err := r.GetBranchByName("gc-stuck"); err != nil || b.State != registry.BranchFailed {
 		t.Fatalf("gc-stuck should be failed: %+v err=%v", b, err)
 	}
-	if volumeExists(t, ctx, d, stuckVol) {
+	if volumeExists(t, ctx, d, r.InstanceID(), stuckVol) {
 		t.Fatalf("stuck rw volume %q survived reconcile", stuckVol)
 	}
 
 	// the stray volume is gone.
-	if volumeExists(t, ctx, d, strayVol) {
+	if volumeExists(t, ctx, d, r.InstanceID(), strayVol) {
 		t.Fatalf("stray volume %q survived reconcile", strayVol)
 	}
 
@@ -102,19 +103,19 @@ func TestReconcileGCEndToEnd(t *testing.T) {
 	}
 
 	// the keep branch's rw volume and the source volume are still present.
-	if !volumeExists(t, ctx, d, keep.RWVolume) {
+	if !volumeExists(t, ctx, d, r.InstanceID(), keep.RWVolume) {
 		t.Fatalf("kept branch rw volume %q was GC'd", keep.RWVolume)
 	}
-	if !volumeExists(t, ctx, d, src.Volume) {
+	if !volumeExists(t, ctx, d, r.InstanceID(), src.Volume) {
 		t.Fatalf("source volume %q was GC'd", src.Volume)
 	}
 }
 
 // volumeExists reports whether a managed volume with the given name is still
 // listed by the driver.
-func volumeExists(t *testing.T, ctx context.Context, d runtime.Driver, name string) bool {
+func volumeExists(t *testing.T, ctx context.Context, d runtime.Driver, instanceID, name string) bool {
 	t.Helper()
-	vols, err := d.ListManagedVolumes(ctx)
+	vols, err := d.ListManagedVolumes(ctx, instanceID)
 	if err != nil {
 		t.Fatal(err)
 	}
