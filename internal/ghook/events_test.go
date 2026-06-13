@@ -9,16 +9,19 @@ import (
 	"testing"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
+	"github.com/abd-ulbasit/pgbranch/internal/engine"
 )
 
 // fakePG is an httptest stand-in for branchd's REST API. It records every
 // call as "METHOD path" and serves a single configurable branch.
 type fakePG struct {
-	t      *testing.T
-	calls  []string
-	exists bool                    // GET /v1/branches/{name} → 200 vs 404
-	create api.CreateBranchRequest // last create body
-	srv    *httptest.Server
+	t        *testing.T
+	calls    []string
+	exists   bool                    // GET /v1/branches/{name} → 200 vs 404
+	create   api.CreateBranchRequest // last create body
+	diff     *engine.DiffResult      // served by GET .../diff when set
+	diffData string                  // last ?data query seen on the diff route
+	srv      *httptest.Server
 }
 
 func newFakePG(t *testing.T, exists bool) *fakePG {
@@ -61,6 +64,15 @@ func newFakePG(t *testing.T, exists bool) *fakePG {
 		}
 		f.exists = false
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /v1/branches/{name}/diff", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		f.diffData = r.URL.Query().Get("data")
+		res := f.diff
+		if res == nil {
+			res = &engine.DiffResult{}
+		}
+		json.NewEncoder(w).Encode(res)
 	})
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)

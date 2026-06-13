@@ -19,12 +19,16 @@ func TestLoadEnvDefaultsAndParsing(t *testing.T) {
 		"GHOOK_SOURCE":          "main",
 		"GHOOK_TTL":             "72h",
 		"GHOOK_RESET_ON_PUSH":   "true",
+		"GHOOK_DIFF_ON_PUSH":    "true",
 		"GHOOK_REPOS":           "acme/widgets, acme/gadgets",
 		"GHOOK_GITHUB_TOKEN":    "ghp_x",
 		"GHOOK_PROXY_HOST":      "pg.example.com:30432",
 	}))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !ec.DiffOnPush {
+		t.Error("DiffOnPush not parsed")
 	}
 	if ec.Listen != ":8080" {
 		t.Errorf("Listen = %q, want :8080 default", ec.Listen)
@@ -127,7 +131,7 @@ func TestLoadEnvBadValues(t *testing.T) {
 		"GHOOK_PGBRANCH_SERVER": "http://x:7070",
 		"GHOOK_SOURCE":          "main",
 	}
-	for k, v := range map[string]string{"GHOOK_TTL": "3 fortnights", "GHOOK_RESET_ON_PUSH": "yep"} {
+	for k, v := range map[string]string{"GHOOK_TTL": "3 fortnights", "GHOOK_RESET_ON_PUSH": "yep", "GHOOK_DIFF_ON_PUSH": "nope"} {
 		m := map[string]string{k: v}
 		for bk, bv := range base {
 			m[bk] = bv

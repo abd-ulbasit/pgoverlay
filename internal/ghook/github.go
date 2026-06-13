@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
+	"github.com/abd-ulbasit/pgbranch/internal/engine"
 )
 
 // TokenProvider supplies the bearer token for a GitHub API call. PAT mode is
@@ -48,8 +49,12 @@ func (g *GitHub) ForInstallation(id int64) *GitHub {
 
 // commentMarker identifies the live connect-info comment; the upsert finds
 // it on later events and rewrites it in place (one comment per PR, always
-// current).
-const commentMarker = "<!-- pgbranch -->"
+// current). diffMarker identifies the separate schema/data diff comment, so
+// the two are upserted independently and never clobber each other.
+const (
+	commentMarker = "<!-- pgbranch -->"
+	diffMarker    = "<!-- pgbranch-diff -->"
+)
 
 // statusContext is the commit-status context CI can gate on.
 const statusContext = "pgbranch/branch"
@@ -80,10 +85,11 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// UpsertComment makes the marker comment on repo#number carry body: PATCH
-// in place when it exists, POST otherwise.
-func (g *GitHub) UpsertComment(ctx context.Context, repo string, number int, body string) error {
-	id, err := g.findMarkerComment(ctx, repo, number)
+// UpsertComment makes the comment carrying marker on repo#number carry body:
+// PATCH in place when it exists, POST otherwise. Each marker is upserted
+// independently (e.g. the connect comment vs the diff comment).
+func (g *GitHub) UpsertComment(ctx context.Context, repo string, number int, marker, body string) error {
+	id, err := g.findMarkerComment(ctx, repo, number, marker)
 	if err != nil {
 		return err
 	}
@@ -100,18 +106,18 @@ func (g *GitHub) UpsertComment(ctx context.Context, repo string, number int, bod
 // UpdateComment rewrites the marker comment when present and does nothing
 // when it isn't — closing a PR that never got a comment shouldn't create
 // one just to say the branch is gone.
-func (g *GitHub) UpdateComment(ctx context.Context, repo string, number int, body string) error {
-	id, err := g.findMarkerComment(ctx, repo, number)
+func (g *GitHub) UpdateComment(ctx context.Context, repo string, number int, marker, body string) error {
+	id, err := g.findMarkerComment(ctx, repo, number, marker)
 	if err != nil || id == 0 {
 		return err
 	}
 	return g.patchComment(ctx, repo, id, body)
 }
 
-// findMarkerComment returns the id of the comment carrying the pgbranch
-// marker, or 0 when there is none. Only the first page (100 comments) is
-// checked — at worst a busy PR gets a duplicate comment.
-func (g *GitHub) findMarkerComment(ctx context.Context, repo string, number int) (int64, error) {
+// findMarkerComment returns the id of the comment carrying marker, or 0 when
+// there is none. Only the first page (100 comments) is checked — at worst a
+// busy PR gets a duplicate comment.
+func (g *GitHub) findMarkerComment(ctx context.Context, repo string, number int, marker string) (int64, error) {
 	path := fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100", repo, number)
 	var existing []struct {
 		ID   int64  `json:"id"`
@@ -121,7 +127,7 @@ func (g *GitHub) findMarkerComment(ctx context.Context, repo string, number int)
 		return 0, fmt.Errorf("list comments: %w", err)
 	}
 	for _, c := range existing {
-		if strings.Contains(c.Body, commentMarker) {
+		if strings.Contains(c.Body, marker) {
 			return c.ID, nil
 		}
 	}
@@ -212,6 +218,58 @@ func commentBody(proxyHost, branch, state string, b *api.Branch) string {
 		sb.WriteString("\nThe database name routes through the pgbranch proxy to the branch. " +
 			"The branch is destroyed when the pull request is closed.\n")
 	}
+	return sb.String()
+}
+
+// diffSchemaLimit caps the schema diff embedded in the PR comment; longer
+// diffs are truncated with a note so the comment stays readable and within
+// GitHub's body size limits.
+const diffSchemaLimit = 3000
+
+// diffCommentBody renders the schema/data diff comment for a branch: the
+// schema diff inside a ```diff fence (truncated to diffSchemaLimit chars with
+// a note), followed by the per-table row-estimate delta table. Carries the
+// diff marker so it is upserted independently of the connect comment.
+func diffCommentBody(branch string, res *engine.DiffResult) string {
+	var sb strings.Builder
+	sb.WriteString(diffMarker + "\n")
+	fmt.Fprintf(&sb, "**pgbranch diff** — what changed in `%s` vs its base.\n\n", branch)
+
+	if res.SchemaDiff == "" {
+		sb.WriteString("Schema: no differences.\n")
+	} else {
+		schema := res.SchemaDiff
+		truncated := false
+		if len([]rune(schema)) > diffSchemaLimit {
+			schema = string([]rune(schema)[:diffSchemaLimit])
+			truncated = true
+		}
+		sb.WriteString("Schema diff:\n\n```diff\n")
+		sb.WriteString(schema)
+		if !strings.HasSuffix(schema, "\n") {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("```\n")
+		if truncated {
+			fmt.Fprintf(&sb, "\n_(schema diff truncated to %d characters)_\n", diffSchemaLimit)
+		}
+	}
+
+	var changed []engine.TableDelta
+	for _, t := range res.Tables {
+		if t.Delta != 0 {
+			changed = append(changed, t)
+		}
+	}
+	if len(changed) == 0 {
+		sb.WriteString("\nTables: no row-count changes.\n")
+		return sb.String()
+	}
+	sb.WriteString("\n| TABLE | BASE | BRANCH | DELTA |\n|---|---|---|---|\n")
+	for _, t := range changed {
+		fmt.Fprintf(&sb, "| `%s` | %d | %d | %+d |\n", t.Table, t.BaseRows, t.BranchRows, t.Delta)
+	}
+	sb.WriteString("\n_(row counts are planner estimates)_\n")
 	return sb.String()
 }
 

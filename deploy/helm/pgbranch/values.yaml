@@ -168,6 +168,10 @@ ghook:
   ttl: 72h
   # Reset the branch to the source snapshot on every push (synchronize).
   resetOnPush: false
+  # Post a schema/data diff comment on the PR after the branch is ready
+  # (opt-in; requires GitHub credentials). The comment carries its own marker,
+  # separate from the live connect-info comment.
+  diffOnPush: false
   # Comma-separated "owner/name" allow-list; empty accepts any repository
   # that signs with the webhook secret (logged as a warning).
   repos: ""

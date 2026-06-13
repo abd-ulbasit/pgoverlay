@@ -55,6 +55,10 @@ spec:
             - name: GHOOK_RESET_ON_PUSH
               value: "true"
             {{- end }}
+            {{- if .Values.ghook.diffOnPush }}
+            - name: GHOOK_DIFF_ON_PUSH
+              value: "true"
+            {{- end }}
             {{- with .Values.ghook.repos }}
             - name: GHOOK_REPOS
               value: {{ . | quote }}

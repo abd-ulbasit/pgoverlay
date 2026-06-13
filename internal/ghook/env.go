@@ -65,6 +65,13 @@ func LoadEnv(getenv func(string) string) (*EnvConfig, error) {
 		}
 		ec.ResetOnPush = b
 	}
+	if v := getenv("GHOOK_DIFF_ON_PUSH"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("GHOOK_DIFF_ON_PUSH: invalid bool %q", v)
+		}
+		ec.DiffOnPush = b
+	}
 	for _, r := range strings.Split(getenv("GHOOK_REPOS"), ",") {
 		if r = strings.TrimSpace(r); r != "" {
 			ec.Repos = append(ec.Repos, r)

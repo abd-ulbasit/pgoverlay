@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
+	"github.com/abd-ulbasit/pgbranch/internal/engine"
 )
 
 // recordedStatus is one POST /statuses/{sha} call seen by the fake.
@@ -309,6 +310,130 @@ func TestEnsureFailurePostsFailureStatus(t *testing.T) {
 	fail := gh.statuses[1]
 	if fail.State != "failure" || fail.Description == "" || len([]rune(fail.Description)) > 140 {
 		t.Errorf("failure status = %+v", fail)
+	}
+}
+
+// sampleDiff is the DiffResult the fake PG serves for diff-comment tests.
+func sampleDiff() *engine.DiffResult {
+	return &engine.DiffResult{
+		SchemaDiff: "@@ -1,1 +1,2 @@\n CREATE TABLE users (\n+    extra text\n",
+		Tables: []engine.TableDelta{
+			{Table: "diffdemo", BaseRows: 0, BranchRows: 100, Delta: 100},
+			{Table: "untouched", BaseRows: 50, BranchRows: 50, Delta: 0},
+			{Table: "users", BaseRows: 1000, BranchRows: 990, Delta: -10},
+		},
+	}
+}
+
+// With DiffOnPush + a GitHub client, an opened PR gets a diff comment under
+// the diff marker (schema fence + delta table), separate from the connect
+// comment — both upserted, neither clobbering the other.
+func TestDiffOnPushPostsDiffCommentUnderOwnMarker(t *testing.T) {
+	pg := newFakePG(t, false)
+	pg.diff = sampleDiff()
+	gh := newFakeGitHub(t)
+	deliver(t, newService(Config{ProxyHost: "pg.example.com:30432", DiffOnPush: true}, pg.srv.URL, gh.client()),
+		fixture(t, "pr_opened.json"))
+
+	// the connect comment (POST creating + PATCH ready) AND a diff comment
+	// were posted; locate the diff comment by its marker.
+	var connect, diff string
+	for _, c := range gh.comments {
+		switch {
+		case strings.Contains(c.Body, diffMarker):
+			diff = c.Body
+		case strings.Contains(c.Body, commentMarker):
+			connect = c.Body
+		}
+	}
+	if connect == "" {
+		t.Fatal("connect comment missing")
+	}
+	if diff == "" {
+		t.Fatalf("no diff comment under %q; comments=%v", diffMarker, gh.comments)
+	}
+	// diff comment carries its own marker, the schema fence and the delta table
+	for _, want := range []string{diffMarker, "```diff", "extra text", "| `diffdemo` | 0 | 100 | +100 |"} {
+		if !strings.Contains(diff, want) {
+			t.Errorf("diff comment missing %q:\n%s", want, diff)
+		}
+	}
+	// the two markers live in different comments — neither clobbered the other
+	if strings.Contains(connect, diffMarker) || strings.Contains(diff, commentMarker) {
+		t.Errorf("markers bled across comments:\nconnect=%s\ndiff=%s", connect, diff)
+	}
+	// diff was requested without data sampling (schema + deltas only)
+	if pg.diffData != "" {
+		t.Errorf("diff ?data = %q, want empty (no sampling in the comment)", pg.diffData)
+	}
+}
+
+// Without DiffOnPush, no diff comment is posted and the connect comment is
+// unaffected; branchd's diff endpoint is never called.
+func TestNoDiffCommentWhenDiffOnPushOff(t *testing.T) {
+	pg := newFakePG(t, false)
+	pg.diff = sampleDiff()
+	gh := newFakeGitHub(t)
+	deliver(t, newService(Config{ProxyHost: "pg.example.com:30432"}, pg.srv.URL, gh.client()),
+		fixture(t, "pr_opened.json"))
+
+	for _, c := range gh.comments {
+		if strings.Contains(c.Body, diffMarker) {
+			t.Errorf("diff comment posted with DiffOnPush off: %s", c.Body)
+		}
+	}
+	for _, call := range pg.calls {
+		if strings.Contains(call, "/diff") {
+			t.Errorf("diff endpoint called with DiffOnPush off: %v", pg.calls)
+		}
+	}
+	// connect comment still works (creating -> ready)
+	if len(gh.patched) == 0 || !strings.Contains(gh.patched[len(gh.patched)-1], "ready") {
+		t.Errorf("connect comment broken: patched=%v", gh.patched)
+	}
+}
+
+// DiffOnPush with no GitHub client configured posts nothing and does not call
+// the diff endpoint (the comment is the only consumer).
+func TestDiffOnPushNoopWithoutGitHubClient(t *testing.T) {
+	pg := newFakePG(t, false)
+	pg.diff = sampleDiff()
+	deliver(t, newService(Config{DiffOnPush: true}, pg.srv.URL, nil), fixture(t, "pr_opened.json"))
+	for _, call := range pg.calls {
+		if strings.Contains(call, "/diff") {
+			t.Errorf("diff endpoint called without a GitHub client: %v", pg.calls)
+		}
+	}
+}
+
+// A failing diff endpoint is non-fatal: the branch op completes, the connect
+// comment is still posted, and no diff comment appears.
+func TestDiffCommentFailureIsNonFatal(t *testing.T) {
+	pg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/diff"):
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "diff boom"})
+		case r.Method == "GET":
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		default: // POST create
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(api.Branch{Name: "pr-7", State: "ready", ProxyDatabase: "appdb@pr-7"})
+		}
+	}))
+	defer pg.Close()
+	gh := newFakeGitHub(t)
+	deliver(t, newService(Config{DiffOnPush: true}, pg.URL, gh.client()), fixture(t, "pr_opened.json"))
+
+	for _, c := range gh.comments {
+		if strings.Contains(c.Body, diffMarker) {
+			t.Errorf("diff comment posted despite diff failure: %s", c.Body)
+		}
+	}
+	// connect comment still made it
+	if len(gh.posted) == 0 {
+		t.Error("connect comment not posted after diff failure")
 	}
 }
 

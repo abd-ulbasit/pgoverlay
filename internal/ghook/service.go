@@ -34,6 +34,10 @@ type Config struct {
 	ResetOnPush   bool     // synchronize resets the branch when true
 	Repos         []string // "owner/name" allow-list; empty allows all
 	ProxyHost     string   // host[:port] of the pgbranch proxy, for comments
+	// DiffOnPush, when true, posts a schema/data diff comment on opened/
+	// synchronize after the branch is ready (opt-in, GHOOK_DIFF_ON_PUSH).
+	// Only takes effect when a GitHub client is configured.
+	DiffOnPush bool
 	// BranchNaming picks the pgbranch branch name for a pull request:
 	//   "pr-number" (default): pr-<number>
 	//   "git-branch": the PR's head ref, sanitized (e.g. feat/login -> feat-login).
@@ -230,7 +234,7 @@ func (s *Service) handleEnsure(ctx context.Context, log *slog.Logger, p *payload
 		verb = "resetting"
 	}
 	s.setStatus(ctx, log, p, "pending", fmt.Sprintf("%s branch %s", verb, branch))
-	s.upsertComment(ctx, log, p, commentBody(s.cfg.ProxyHost, branch, verb, nil))
+	s.upsertComment(ctx, log, p, commentMarker, commentBody(s.cfg.ProxyHost, branch, verb, nil))
 
 	b, didReset, err := s.ensureBranch(ctx, log, p, branch)
 	if err != nil {
@@ -247,7 +251,32 @@ func (s *Service) handleEnsure(ctx context.Context, log *slog.Logger, p *payload
 		desc += " — connect via " + s.cfg.ProxyHost
 	}
 	s.setStatus(ctx, log, p, "success", desc)
-	s.upsertComment(ctx, log, p, commentBody(s.cfg.ProxyHost, branch, state, b))
+	s.upsertComment(ctx, log, p, commentMarker, commentBody(s.cfg.ProxyHost, branch, state, b))
+
+	s.diffComment(ctx, log, p, branch)
+}
+
+// diffComment posts the schema/data diff comment when DiffOnPush is enabled
+// and a GitHub client is configured. It runs after the branch is ready, asks
+// branchd for the diff (no data sampling — the comment stays schema + delta
+// table) and upserts it under the diff marker. Non-fatal on every error: the
+// diff comment is a convenience, the branch operation is the point.
+func (s *Service) diffComment(ctx context.Context, log *slog.Logger, p *payload, branch string) {
+	if !s.cfg.DiffOnPush {
+		return
+	}
+	gh := s.github(p)
+	if gh == nil {
+		return
+	}
+	res, err := s.pg.DiffBranch(ctx, branch, 0)
+	if err != nil {
+		log.Warn("diff for PR comment failed", "branch", branch, "err", err)
+		return
+	}
+	if err := gh.UpsertComment(ctx, p.Repository.FullName, p.Number, diffMarker, diffCommentBody(branch, res)); err != nil {
+		log.Warn("posting diff comment failed", "err", err)
+	}
 }
 
 // handleClosed destroys the branch and rewrites the live comment to record
@@ -263,7 +292,7 @@ func (s *Service) handleClosed(ctx context.Context, log *slog.Logger, p *payload
 		return
 	}
 	body := commentBody(s.cfg.ProxyHost, branch, "destroyed", nil)
-	if err := gh.UpdateComment(ctx, p.Repository.FullName, p.Number, body); err != nil {
+	if err := gh.UpdateComment(ctx, p.Repository.FullName, p.Number, commentMarker, body); err != nil {
 		log.Warn("updating PR comment failed", "err", err)
 	}
 }
@@ -341,15 +370,15 @@ func (s *Service) destroyBranch(ctx context.Context, log *slog.Logger, branch st
 	return nil
 }
 
-// upsertComment writes body to the PR's live marker comment when a GitHub
+// upsertComment writes body to the PR comment carrying marker when a GitHub
 // client is configured. Failures are logged, never fatal: the branch
 // operation is the point of this service, the comment is a convenience.
-func (s *Service) upsertComment(ctx context.Context, log *slog.Logger, p *payload, body string) {
+func (s *Service) upsertComment(ctx context.Context, log *slog.Logger, p *payload, marker, body string) {
 	gh := s.github(p)
 	if gh == nil {
 		return
 	}
-	if err := gh.UpsertComment(ctx, p.Repository.FullName, p.Number, body); err != nil {
+	if err := gh.UpsertComment(ctx, p.Repository.FullName, p.Number, marker, body); err != nil {
 		log.Warn("posting PR comment failed", "err", err)
 	}
 }
