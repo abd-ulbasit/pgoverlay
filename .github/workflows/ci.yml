@@ -43,7 +43,11 @@ jobs:
         run: |
           docker pull -q postgres:17
           docker pull -q alpine:3.21
-      - run: PGBRANCH_IT=1 go test ./... -count=1 -timeout 25m
+      # -p 1: serialize packages. The IT suites each spin Postgres containers
+      # with published ephemeral ports; running packages in parallel on one
+      # daemon races those ports ("address already in use"). Serializing trades
+      # a little speed for determinism.
+      - run: PGBRANCH_IT=1 go test ./... -count=1 -p 1 -timeout 25m
 
   helm:
     runs-on: ubuntu-latest
@@ -68,8 +72,9 @@ jobs:
           chmod +x kind kubectl && sudo mv kind kubectl /usr/local/bin/
       - name: Kubernetes + HA-failover ITs (kind, hostPath)
         # the suites bootstrap the cluster (hack/kind-up.sh) and build/kind-load
-        # pgbranch/branchd:dev themselves
-        run: PGBRANCH_K8S_IT=1 go test ./internal/runtime/ ./internal/deploy/ -count=1 -timeout 35m
+        # pgbranch/branchd:dev themselves. -p 1 serializes the packages so they
+        # don't both try to create the kind cluster at once.
+        run: PGBRANCH_K8S_IT=1 go test ./internal/runtime/ ./internal/deploy/ -count=1 -p 1 -timeout 35m
       - name: CSI ITs (best-effort — csi-driver-host-path install can be flaky)
         continue-on-error: true
         run: |
