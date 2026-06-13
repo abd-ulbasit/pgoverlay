@@ -122,6 +122,7 @@ type Server struct {
 	metrics      http.Handler
 	ready        Ready
 	stuckTimeout time.Duration
+	leader       *LeaderGate
 }
 
 // New builds the API server. metricsHandler serves /metrics (promhttp over the
@@ -133,8 +134,13 @@ func New(eng *engine.Engine, reg *registry.Registry, token string, metricsHandle
 	if stuckTimeout <= 0 {
 		stuckTimeout = DefaultStuckTimeout
 	}
-	return &Server{eng: eng, reg: reg, token: token, metrics: metricsHandler, ready: ready, stuckTimeout: stuckTimeout}
+	return &Server{eng: eng, reg: reg, token: token, metrics: metricsHandler, ready: ready, stuckTimeout: stuckTimeout, leader: newLeaderGate()}
 }
+
+// LeaderGate exposes the HA mutating-route gate so branchd's leader-election
+// orchestration can flip it on gaining/losing leadership. With leader election
+// off it stays leader=true (single-instance default) and is never touched.
+func (s *Server) LeaderGate() *LeaderGate { return s.leader }
 
 // DefaultStuckTimeout is the fallback cutoff for reconcile's stuck-row pass.
 const DefaultStuckTimeout = 10 * time.Minute
@@ -146,24 +152,27 @@ func (s *Server) Handler() http.Handler {
 	// token); /healthz, /readyz and /metrics sit outside this mux unauthenticated.
 	admin, operator, viewer := registry.RoleAdmin, registry.RoleOperator, registry.RoleViewer
 	v1 := http.NewServeMux()
-	v1.HandleFunc("POST /v1/sources", s.requireRole(admin, s.createSource))
+	// Reads use requireRole (bearer + min-role). Mutations use s.mutate, which
+	// composes the HA leader gate (503 "not leader" on non-leaders) in front of
+	// the same role check — so only the leader accepts writes.
+	v1.HandleFunc("POST /v1/sources", s.mutate(admin, s.createSource))
 	v1.HandleFunc("GET /v1/sources", s.requireRole(viewer, s.listSources))
-	v1.HandleFunc("DELETE /v1/sources/{name}", s.requireRole(admin, s.removeSource))
-	v1.HandleFunc("POST /v1/sources/{name}/refresh", s.requireRole(admin, s.refreshSource))
-	v1.HandleFunc("PUT /v1/sources/{name}/mask", s.requireRole(admin, s.setMaskScripts))
+	v1.HandleFunc("DELETE /v1/sources/{name}", s.mutate(admin, s.removeSource))
+	v1.HandleFunc("POST /v1/sources/{name}/refresh", s.mutate(admin, s.refreshSource))
+	v1.HandleFunc("PUT /v1/sources/{name}/mask", s.mutate(admin, s.setMaskScripts))
 	v1.HandleFunc("GET /v1/sources/{name}/mask", s.requireRole(viewer, s.getMaskScripts))
-	v1.HandleFunc("POST /v1/branches", s.requireRole(operator, s.createBranch))
+	v1.HandleFunc("POST /v1/branches", s.mutate(operator, s.createBranch))
 	v1.HandleFunc("GET /v1/branches", s.requireRole(viewer, s.listBranches))
 	v1.HandleFunc("GET /v1/branches/{name}", s.requireRole(viewer, s.getBranch))
 	v1.HandleFunc("GET /v1/branches/{name}/usage", s.requireRole(viewer, s.branchUsage))
 	v1.HandleFunc("GET /v1/branches/{name}/diff", s.requireRole(viewer, s.branchDiff))
-	v1.HandleFunc("DELETE /v1/branches/{name}", s.requireRole(operator, s.destroyBranch))
-	v1.HandleFunc("POST /v1/branches/{name}/reset", s.requireRole(operator, s.resetBranch))
+	v1.HandleFunc("DELETE /v1/branches/{name}", s.mutate(operator, s.destroyBranch))
+	v1.HandleFunc("POST /v1/branches/{name}/reset", s.mutate(operator, s.resetBranch))
 	v1.HandleFunc("GET /v1/reconcile/plan", s.requireRole(viewer, s.reconcilePlan))
-	v1.HandleFunc("POST /v1/reconcile", s.requireRole(operator, s.reconcileApply))
-	v1.HandleFunc("POST /v1/tokens", s.requireRole(admin, s.createToken))
+	v1.HandleFunc("POST /v1/reconcile", s.mutate(operator, s.reconcileApply))
+	v1.HandleFunc("POST /v1/tokens", s.mutate(admin, s.createToken))
 	v1.HandleFunc("GET /v1/tokens", s.requireRole(admin, s.listTokens))
-	v1.HandleFunc("DELETE /v1/tokens/{name}", s.requireRole(admin, s.revokeToken))
+	v1.HandleFunc("DELETE /v1/tokens/{name}", s.mutate(admin, s.revokeToken))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {

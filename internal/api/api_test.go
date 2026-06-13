@@ -132,6 +132,32 @@ func newTestServer(t *testing.T, opts ...engine.Option) (*httptest.Server, *fake
 	return ts, d
 }
 
+// newTestServerWithLeader builds the API like newTestServer but returns the
+// *Server too, so leader-gate tests can flip its gate.
+func newTestServerWithLeader(t *testing.T, opts ...engine.Option) (*httptest.Server, *Server) {
+	t.Helper()
+	d := newFake()
+	reg, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reg.Close() })
+	eng := engine.New(reg, d, "postgres:17", opts...)
+	m := metrics.New()
+	m.SetStateCounter(reg)
+	ready := func(ctx context.Context) error {
+		if err := reg.Ping(ctx); err != nil {
+			return err
+		}
+		_, err := d.ListManaged(ctx)
+		return err
+	}
+	srv := New(eng, reg, testToken, m.Handler(), ready, 0)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, srv
+}
+
 // do sends an authenticated JSON request; token "" sends no Authorization.
 func do(t *testing.T, ts *httptest.Server, token, method, path string, body any) (int, []byte) {
 	t.Helper()
