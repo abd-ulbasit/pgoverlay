@@ -8,6 +8,8 @@
 
 *branching a 1 GiB database, recorded for real — see [docs/benchmarks.md](docs/benchmarks.md)*
 
+**New here?** [**Ways to use pgbranch**](docs/usage.md) walks through the common workflows — local dev, a database per test, branch-per-PR, preview environments, and reviewing migrations with `pgb diff` — each with an example.
+
 **Measured:** pgbranch branches a 1 GiB database in ~1.9 s and a 5 GiB database in ~1.9 s (p50 of 5 runs, Colima VM on Apple Silicon) — creation time is independent of database size, and a fresh branch costs ~33 MiB of disk, not a copy of the dataset. Full results, methodology, and the diagnosis of the copy-up bug this fixed are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## The problem
