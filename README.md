@@ -304,6 +304,8 @@ PG 13 and older are unsupported because branch startup passes `-c recovery_init_
 - **Phase 3** ✅ — Kubernetes runtime driver (branch pods on a storage node), Helm chart, GitHub webhook service (a branch per PR, automatically).
 - **Phase 4** ✅ — data masking hooks, embedded web UI with per-branch disk usage, published benchmarks (with the copy-up fix they motivated), experimental ZFS backend, docs site.
 - **Phase 5** ✅ — TLS (router + REST API), Postgres 14–18 support matrix, branch-from-branch (frozen-layer DAG), multi-node CSI storage for Kubernetes (PVC-clone branches, no `SYS_ADMIN`, any node).
+- **Phase 6** ✅ — GitHub story (commit statuses, App auth, live PR comment, git-ref branch naming), test-suite SDKs (Go + JS) and a reusable Action, dump-based seeding for managed Postgres (Supabase/Neon/RDS), per-branch credential rotation, registry on a PVC, and `pgb diff`.
+- **Phase 7 — road to v1** ✅ — operational trust: Prometheus `/metrics` + real `/readyz`; a periodic reconcile loop with leak-proof, instance-scoped GC (`pgb doctor`/`pgb gc`); a role-based authz model (scoped API tokens, proxy TLS, namespaced deployer RBAC); and HA via leader election.
 - **Future** — merge-back of branch data and multi-writer branches remain non-goals; ideas welcome in issues.
 
 ## Documentation
@@ -311,8 +313,12 @@ PG 13 and older are unsupported because branch startup passes `-c recovery_init_
 `docs/` is a small MkDocs site — no hosting or CI, build it locally with `pip install mkdocs-material && mkdocs serve`:
 
 - [Quickstart](docs/quickstart.md) — Docker on a laptop: CLI, `branchd`, REST API, router, web UI.
+- [Ways to use it](docs/usage.md) — local dev, a DB per test, branch-per-PR, preview environments, reviewing migrations.
 - [Testing](docs/testing.md) — a real database for every test: Go/JS SDKs and the GitHub Action.
-- [Kubernetes](docs/kubernetes.md) — Helm chart, the storage-node model.
+- [Kubernetes](docs/kubernetes.md) — Helm chart, storage modes, proxy TLS, scoped RBAC.
+- [Running on EKS](docs/eks.md) — a full cloud walkthrough end to end.
+- [Observability](docs/observability.md) — Prometheus metrics and readiness.
+- [High availability](docs/ha.md) — leader election and failover.
 - [GitHub App](docs/github-app.md) — a database branch per pull request.
 - [Benchmarks](docs/benchmarks.md) — measured numbers, methodology, and the copy-up diagnosis.
 - [ZFS backend](docs/zfs.md) — experimental; requirements and manual verification walkthrough.
