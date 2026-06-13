@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -259,7 +260,10 @@ func (d *DockerDriver) StopRemove(ctx context.Context, id string) error {
 	timeout := 30
 	_ = d.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
 	err := d.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true, RemoveVolumes: true})
-	if client.IsErrNotFound(err) {
+	// Idempotent: gone already, or another caller (e.g. a concurrent reconcile
+	// pass racing an explicit destroy) is already removing it — both mean the
+	// container is going away, which is the intent.
+	if err == nil || client.IsErrNotFound(err) || strings.Contains(err.Error(), "already in progress") {
 		return nil
 	}
 	return err
