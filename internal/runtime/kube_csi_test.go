@@ -239,6 +239,14 @@ func TestStrategySelection(t *testing.T) {
 	if sc == nil || sc.Capabilities == nil || len(sc.Capabilities.Add) != 1 || sc.Capabilities.Add[0] != "SYS_ADMIN" {
 		t.Errorf("hostPath branch security = %+v, want SYS_ADMIN", sc)
 	}
+	// newer kernels (fd-based mount API) need the mount syscalls unblocked:
+	// unconfined seccomp + AppArmor, matching the docker driver's posture.
+	if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined {
+		t.Errorf("hostPath branch seccomp = %+v, want Unconfined", sc.SeccompProfile)
+	}
+	if sc.AppArmorProfile == nil || sc.AppArmorProfile.Type != corev1.AppArmorProfileTypeUnconfined {
+		t.Errorf("hostPath branch AppArmor = %+v, want Unconfined", sc.AppArmorProfile)
+	}
 	csi, _, _ := testCSIStorage("")
 	if csi.nodeName() != "" || csi.branchSecurityContext() != nil {
 		t.Errorf("csi strategy must not pin nodes or add capabilities")

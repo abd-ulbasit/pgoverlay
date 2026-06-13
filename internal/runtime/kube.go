@@ -203,10 +203,20 @@ type hostPathStorage struct {
 func (s *hostPathStorage) nodeName() string { return s.node }
 
 // branchSecurityContext: SYS_ADMIN is required for the in-container overlay
-// mount, same as the docker driver.
+// mount. Newer kernels (≥ ~6.7) with util-linux ≥ 2.39 drive mounts through
+// the fd-based mount API (fsopen/fsconfig/fsmount/move_mount); the default
+// container seccomp/AppArmor profiles block those syscalls, so the overlay
+// mount fails with "overlay: No changes allowed in reconfigure" under
+// SYS_ADMIN alone (observed on a k3s node, kernel 7.0 / util-linux 2.41).
+// Running the branch container with unconfined seccomp and AppArmor — the
+// same effective posture as the docker driver's apparmor=unconfined —
+// restores it. Branch pods are already a privileged dev/test scope.
 func (s *hostPathStorage) branchSecurityContext() *corev1.SecurityContext {
+	unconfined := corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined}
 	return &corev1.SecurityContext{
-		Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"SYS_ADMIN"}},
+		Capabilities:    &corev1.Capabilities{Add: []corev1.Capability{"SYS_ADMIN"}},
+		SeccompProfile:  &unconfined,
+		AppArmorProfile: &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeUnconfined},
 	}
 }
 
