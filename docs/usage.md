@@ -13,6 +13,10 @@ two or three together.
 | [Preview environments](#4-preview-environments) | per-PR app **and** DB, with a URL on the PR | webhook + a deploy step |
 | [Reviewing migrations](#5-reviewing-migrations-with-pgb-diff) | see exactly what a change does to prod-shaped data | `pgb diff` |
 
+![pgbranch feature tour](features.gif)
+
+*branch → apply a migration → `pgb diff` (schema + row deltas) → branch-off-a-branch, against a masked clone of prod.*
+
 A note that informs several patterns below — **credential modes**:
 
 - **inherit (default)** — every branch shares the source's credentials. A
