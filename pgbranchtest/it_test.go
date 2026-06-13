@@ -58,7 +58,7 @@ func TestSDKAcquire(t *testing.T) {
 	t.Cleanup(func() { reg.Close() })
 	eng := engine.New(reg, drv, "postgres:17")
 
-	ts := httptest.NewServer(api.New(eng, reg, sdkITToken).Handler())
+	ts := httptest.NewServer(api.New(eng, reg, sdkITToken, nil, nil).Handler())
 	t.Cleanup(ts.Close)
 
 	// sdk- prefix keeps the source name disjoint from other IT packages'

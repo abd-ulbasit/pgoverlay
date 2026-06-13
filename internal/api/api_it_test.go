@@ -104,7 +104,7 @@ func TestPhase2DataPlane(t *testing.T) {
 	t.Cleanup(func() { reg.Close() })
 	eng := engine.New(reg, drv, "postgres:17")
 
-	ts := httptest.NewServer(api.New(eng, reg, itToken).Handler())
+	ts := httptest.NewServer(api.New(eng, reg, itToken, nil, nil).Handler())
 	t.Cleanup(ts.Close)
 
 	// best-effort cleanup of managed resources if assertions below bail out

@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/abd-ulbasit/pgbranch/internal/engine"
@@ -88,14 +89,25 @@ type MaskScript struct {
 	SQL  string `json:"sql"`
 }
 
+// Ready reports whether branchd can serve traffic: the registry is reachable
+// and the container driver responds. Returns nil when ready, an error
+// otherwise. branchd supplies a closure; tests inject a fake.
+type Ready func(ctx context.Context) error
+
 type Server struct {
-	eng   *engine.Engine
-	reg   *registry.Registry
-	token string
+	eng     *engine.Engine
+	reg     *registry.Registry
+	token   string
+	metrics http.Handler
+	ready   Ready
 }
 
-func New(eng *engine.Engine, reg *registry.Registry, token string) *Server {
-	return &Server{eng: eng, reg: reg, token: token}
+// New builds the API server. metricsHandler serves /metrics (promhttp over the
+// metrics registry) and ready backs /readyz; both may be nil (then /metrics
+// 404s and /readyz reports ready iff the handler is wired). branchd always
+// passes both.
+func New(eng *engine.Engine, reg *registry.Registry, token string, metricsHandler http.Handler, ready Ready) *Server {
+	return &Server{eng: eng, reg: reg, token: token, metrics: metricsHandler, ready: ready}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -118,9 +130,29 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	// /readyz and /metrics sit outside the bearer auth: Prometheus scrapers
+	// and kubelet readiness probes do not present a token, and neither leaks
+	// secrets (metrics are aggregate; readiness is a boolean).
+	mux.HandleFunc("GET /readyz", s.readyz)
+	if s.metrics != nil {
+		mux.Handle("GET /metrics", s.metrics)
+	}
 	// static UI assets carry no secrets and are served without auth; every
 	// API call the page makes goes through /v1 and needs the bearer token.
 	mux.Handle("GET /ui/", uiHandler())
 	mux.Handle("/v1/", s.auth(v1))
 	return mux
+}
+
+// readyz reports readiness via the injected checker: 200 when the registry is
+// reachable and the driver responds, 503 otherwise. With no checker wired it
+// reports ready (process is up).
+func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	if s.ready != nil {
+		if err := s.ready(r.Context()); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }

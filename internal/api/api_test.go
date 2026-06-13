@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgbranch/internal/metrics"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 	"github.com/abd-ulbasit/pgbranch/internal/runtime"
 )
@@ -110,7 +111,16 @@ func newTestServer(t *testing.T, opts ...engine.Option) (*httptest.Server, *fake
 	}
 	t.Cleanup(func() { reg.Close() })
 	eng := engine.New(reg, d, "postgres:17", opts...)
-	ts := httptest.NewServer(New(eng, reg, testToken).Handler())
+	m := metrics.New()
+	m.SetStateCounter(reg)
+	ready := func(ctx context.Context) error {
+		if err := reg.Ping(ctx); err != nil {
+			return err
+		}
+		_, err := d.ListManaged(ctx)
+		return err
+	}
+	ts := httptest.NewServer(New(eng, reg, testToken, m.Handler(), ready).Handler())
 	t.Cleanup(ts.Close)
 	return ts, d
 }
@@ -171,6 +181,51 @@ func TestHealthzUnauthenticated(t *testing.T) {
 	code, _ := do(t, ts, "", "GET", "/healthz", nil)
 	if code != http.StatusOK {
 		t.Fatalf("healthz code=%d", code)
+	}
+}
+
+func TestMetricsUnauthenticated(t *testing.T) {
+	ts, _ := newTestServer(t)
+	// seed a source + branch so the collector reports the branches gauge
+	// (GROUP BY emits a series only for states that have rows)
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create branch: code=%d body=%s", code, body)
+	}
+	code, body := do(t, ts, "", "GET", "/metrics", nil)
+	if code != http.StatusOK {
+		t.Fatalf("metrics code=%d (want 200, no auth)", code)
+	}
+	if !strings.Contains(string(body), "pgbranch_branches_total") {
+		t.Fatalf("metrics body missing pgbranch_branches_total:\n%s", body)
+	}
+}
+
+func TestReadyzOpenAndClosed(t *testing.T) {
+	d := newFake()
+	reg, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := engine.New(reg, d, "postgres:17")
+	ready := func(ctx context.Context) error {
+		if err := reg.Ping(ctx); err != nil {
+			return err
+		}
+		_, err := d.ListManaged(ctx)
+		return err
+	}
+	ts := httptest.NewServer(New(eng, reg, testToken, metrics.New().Handler(), ready).Handler())
+	t.Cleanup(ts.Close)
+
+	// registry open + driver responds -> ready
+	if code, body := do(t, ts, "", "GET", "/readyz", nil); code != http.StatusOK {
+		t.Fatalf("readyz (open) code=%d body=%s want 200 no-auth", code, body)
+	}
+	// close the registry: the trivial Ping query now fails -> 503
+	reg.Close()
+	if code, _ := do(t, ts, "", "GET", "/readyz", nil); code != http.StatusServiceUnavailable {
+		t.Fatalf("readyz (closed registry) code=%d want 503", code)
 	}
 }
 
