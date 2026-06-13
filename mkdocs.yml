@@ -19,6 +19,7 @@ theme:
 nav:
   - Home: index.md
   - Quickstart: quickstart.md
+  - Ways to use it: usage.md
   - Testing: testing.md
   - Kubernetes: kubernetes.md
   - Running on EKS: eks.md
