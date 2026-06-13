@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -106,5 +107,26 @@ func TestVolumeAndHelperRoundtrip(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("helper error %q does not include captured output", err)
+	}
+}
+
+func TestIsPortRace(t *testing.T) {
+	retry := []string{
+		"start branch container: ... failed to listen on TCP socket: address already in use",
+		"driver failed programming external connectivity: port is already allocated",
+		"failed to set up container networking",
+	}
+	for _, m := range retry {
+		if !isPortRace(errors.New(m)) {
+			t.Errorf("isPortRace(%q) = false, want true", m)
+		}
+	}
+	for _, m := range []string{"no such image", "permission denied", ""} {
+		if isPortRace(errors.New(m)) {
+			t.Errorf("isPortRace(%q) = true, want false", m)
+		}
+	}
+	if isPortRace(nil) {
+		t.Error("isPortRace(nil) = true")
 	}
 }

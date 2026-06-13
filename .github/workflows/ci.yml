@@ -9,9 +9,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Only fast, runner-friendly suites run here. The kind/K8s suites (k8s-it,
-# csi-it) and the Postgres version matrix are run locally via the Makefile —
-# they need a kind cluster and many image pulls, which would make CI slow.
+# unit/integration/helm are fast. The `kube` job stands up a kind cluster and
+# runs the Kubernetes + HA-failover suites (CSI best-effort). The Postgres
+# version matrix still runs locally via the Makefile.
 jobs:
   unit:
     runs-on: ubuntu-latest
@@ -51,3 +51,27 @@ jobs:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
       - run: make helm-test
+
+  kube:
+    runs-on: ubuntu-latest # Docker preinstalled; the ITs create their own kind cluster
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+      - name: Install kind + kubectl
+        run: |
+          curl -fsSL -o kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          curl -fsSL -o kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          chmod +x kind kubectl && sudo mv kind kubectl /usr/local/bin/
+      - name: Kubernetes + HA-failover ITs (kind, hostPath)
+        # the suites bootstrap the cluster (hack/kind-up.sh) and build/kind-load
+        # pgbranch/branchd:dev themselves
+        run: PGBRANCH_K8S_IT=1 go test ./internal/runtime/ ./internal/deploy/ -count=1 -timeout 35m
+      - name: CSI ITs (best-effort — csi-driver-host-path install can be flaky)
+        continue-on-error: true
+        run: |
+          hack/kind-csi-up.sh
+          PGBRANCH_CSI_IT=1 go test ./internal/runtime/ -run CSI -count=1 -timeout 20m

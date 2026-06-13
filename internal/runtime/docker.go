@@ -202,15 +202,40 @@ func (d *DockerDriver) StartBranch(ctx context.Context, spec BranchSpec) (string
 		NetworkMode:   container.NetworkMode(spec.Network),
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyUnlessStopped},
 	}
-	cr, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, spec.Name)
-	if err != nil {
-		return "", fmt.Errorf("create branch container: %w", err)
+	// Publishing to an ephemeral host port (HostPort "") can rarely lose a
+	// race — Docker picks a free port, but another process binds it before
+	// the container's start completes ("address already in use" / "port is
+	// already allocated"). The next attempt picks a different port, so retry
+	// a few times on that specific failure; any other error is returned.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		cr, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, spec.Name)
+		if err != nil {
+			return "", fmt.Errorf("create branch container: %w", err)
+		}
+		if err := d.cli.ContainerStart(ctx, cr.ID, container.StartOptions{}); err != nil {
+			d.cli.ContainerRemove(context.WithoutCancel(ctx), cr.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+			lastErr = fmt.Errorf("start branch container: %w", err)
+			if isPortRace(err) {
+				continue
+			}
+			return "", lastErr
+		}
+		return cr.ID, nil
 	}
-	if err := d.cli.ContainerStart(ctx, cr.ID, container.StartOptions{}); err != nil {
-		d.cli.ContainerRemove(context.WithoutCancel(ctx), cr.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
-		return "", fmt.Errorf("start branch container: %w", err)
+	return "", lastErr
+}
+
+// isPortRace reports whether a container-start error is a transient host-port
+// allocation collision worth retrying with a fresh ephemeral port.
+func isPortRace(err error) bool {
+	if err == nil {
+		return false
 	}
-	return cr.ID, nil
+	msg := err.Error()
+	return strings.Contains(msg, "address already in use") ||
+		strings.Contains(msg, "port is already allocated") ||
+		strings.Contains(msg, "failed to set up container networking")
 }
 
 func (d *DockerDriver) Exec(ctx context.Context, id string, cmd []string) error {
