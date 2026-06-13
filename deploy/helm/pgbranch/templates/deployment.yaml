@@ -16,6 +16,12 @@ spec:
     metadata:
       labels:
         {{- include "pgbranch.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Prometheus pod-scrape discovery: branchd serves /metrics on the API
+        # port without auth (see docs/observability.md).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.api.port | quote }}
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: {{ include "pgbranch.fullname" . }}
       # Pin to the storage node: branchd's sqlite state shares the node (and
@@ -66,9 +72,15 @@ spec:
               containerPort: {{ .Values.api.port }}
             - name: proxy
               containerPort: {{ .Values.proxy.port }}
-          readinessProbe:
+          livenessProbe:
             httpGet:
               path: /healthz
+              port: api
+          # /readyz is real readiness: registry reachable + driver responds
+          # (liveness above is just process-up). Both are unauthenticated.
+          readinessProbe:
+            httpGet:
+              path: /readyz
               port: api
           securityContext:
             # root for write access to the hostPath state dir (see values.yaml)
