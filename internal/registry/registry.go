@@ -148,6 +148,40 @@ func migrate(db *sql.DB) error {
 
 func (r *Registry) Close() error { return r.db.Close() }
 
+// Ping verifies the registry's database handle is reachable (a trivial query).
+// Used by branchd's /readyz check.
+func (r *Registry) Ping(ctx context.Context) error { return r.db.PingContext(ctx) }
+
+// CountBranchesByState returns the number of branches in each state (including
+// 'destroyed' tombstones). Used by the metrics collector on scrape.
+func (r *Registry) CountBranchesByState() (map[string]int, error) {
+	return r.countByState(`SELECT state, count(*) FROM branches GROUP BY state`)
+}
+
+// CountSourcesByState returns the number of sources in each state. Used by the
+// metrics collector on scrape.
+func (r *Registry) CountSourcesByState() (map[string]int, error) {
+	return r.countByState(`SELECT state, count(*) FROM sources GROUP BY state`)
+}
+
+func (r *Registry) countByState(query string) (map[string]int, error) {
+	rows, err := r.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var state string
+		var n int
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, err
+		}
+		out[state] = n
+	}
+	return out, rows.Err()
+}
+
 func newID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
