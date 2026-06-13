@@ -99,6 +99,13 @@ func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, 
 	}
 	return out, nil
 }
+func (f *fakeDriver) ListManagedVolumes(ctx context.Context) ([]string, error) {
+	var out []string
+	for name := range f.volumes {
+		out = append(out, name)
+	}
+	return out, nil
+}
 
 const testToken = "sekrit"
 
@@ -120,7 +127,7 @@ func newTestServer(t *testing.T, opts ...engine.Option) (*httptest.Server, *fake
 		_, err := d.ListManaged(ctx)
 		return err
 	}
-	ts := httptest.NewServer(New(eng, reg, testToken, m.Handler(), ready).Handler())
+	ts := httptest.NewServer(New(eng, reg, testToken, m.Handler(), ready, 0).Handler())
 	t.Cleanup(ts.Close)
 	return ts, d
 }
@@ -215,7 +222,7 @@ func TestReadyzOpenAndClosed(t *testing.T) {
 		_, err := d.ListManaged(ctx)
 		return err
 	}
-	ts := httptest.NewServer(New(eng, reg, testToken, metrics.New().Handler(), ready).Handler())
+	ts := httptest.NewServer(New(eng, reg, testToken, metrics.New().Handler(), ready, 0).Handler())
 	t.Cleanup(ts.Close)
 
 	// registry open + driver responds -> ready
@@ -764,4 +771,63 @@ func TestBranchDiffEndpoint(t *testing.T) {
 	if code, body := do(t, ts, testToken, "GET", "/v1/branches/pr-2/diff", nil); code != http.StatusConflict {
 		t.Fatalf("non-ready branch diff: code=%d body=%s, want 409", code, body)
 	}
+}
+
+// The reconcile endpoints report a plan (GET) and apply it (POST), both behind
+// the bearer token. A stray managed volume with no registry row drifts; GET
+// lists it, POST removes it.
+func TestReconcileEndpoints(t *testing.T) {
+	ts, d := newTestServer(t)
+	addSource(t, ts)
+	// a stray managed volume owned by no branch -> gc_volume drift.
+	d.volumes["pgbranch-br-stray-rw"] = true
+
+	// auth required.
+	if code, _ := do(t, ts, "", "GET", "/v1/reconcile/plan", nil); code != http.StatusUnauthorized {
+		t.Fatalf("plan without token: code=%d want 401", code)
+	}
+	if code, _ := do(t, ts, "", "POST", "/v1/reconcile", nil); code != http.StatusUnauthorized {
+		t.Fatalf("apply without token: code=%d want 401", code)
+	}
+
+	// GET plan: reports the drift, mutates nothing.
+	code, body := do(t, ts, testToken, "GET", "/v1/reconcile/plan", nil)
+	if code != http.StatusOK {
+		t.Fatalf("plan: code=%d body=%s", code, body)
+	}
+	plan := mustUnmarshal[engine.ReconcilePlan](t, body)
+	if !plan.Drift() || !planHas(plan, engine.ActionGCVolume, "pgbranch-br-stray-rw") {
+		t.Fatalf("plan missing stray-volume drift: %+v", plan.Actions)
+	}
+	if !d.volumes["pgbranch-br-stray-rw"] {
+		t.Fatal("GET /v1/reconcile/plan mutated state")
+	}
+	// wire-contract field names.
+	for _, field := range []string{`"actions"`, `"kind"`, `"target"`, `"reason"`} {
+		if !strings.Contains(string(body), field) {
+			t.Errorf("plan JSON missing %s: %s", field, body)
+		}
+	}
+
+	// POST apply: removes the stray volume, returns the action taken.
+	code, body = do(t, ts, testToken, "POST", "/v1/reconcile", nil)
+	if code != http.StatusOK {
+		t.Fatalf("apply: code=%d body=%s", code, body)
+	}
+	taken := mustUnmarshal[engine.ReconcilePlan](t, body)
+	if !planHas(taken, engine.ActionGCVolume, "pgbranch-br-stray-rw") {
+		t.Fatalf("apply did not report removing the stray volume: %+v", taken.Actions)
+	}
+	if d.volumes["pgbranch-br-stray-rw"] {
+		t.Fatal("apply did not remove the stray volume")
+	}
+}
+
+func planHas(p engine.ReconcilePlan, kind engine.ActionKind, target string) bool {
+	for _, a := range p.Actions {
+		if a.Kind == kind && a.Target == target {
+			return true
+		}
+	}
+	return false
 }

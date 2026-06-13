@@ -194,3 +194,23 @@ func (c *Client) ResetBranch(ctx context.Context, name string) (*api.Branch, err
 	}
 	return &b, nil
 }
+
+// ReconcilePlan fetches the read-only convergence plan (drift report) from the
+// server. Backs `pgb doctor` in server mode.
+func (c *Client) ReconcilePlan(ctx context.Context) (*engine.ReconcilePlan, error) {
+	var p engine.ReconcilePlan
+	if err := c.do(ctx, "GET", "/v1/reconcile/plan", nil, &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// ReconcileApply runs a reconcile pass on the server and returns the actions
+// taken. Backs `pgb gc` in server mode.
+func (c *Client) ReconcileApply(ctx context.Context) (*engine.ReconcilePlan, error) {
+	var p engine.ReconcilePlan
+	if err := c.do(ctx, "POST", "/v1/reconcile", nil, &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}

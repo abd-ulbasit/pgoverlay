@@ -317,3 +317,26 @@ func (s *Server) resetBranch(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, s.branchJSON(b))
 }
+
+// reconcilePlan computes the read-only convergence plan (drift report) and
+// returns it as JSON. Backs `pgb doctor`. Mutates nothing.
+func (s *Server) reconcilePlan(w http.ResponseWriter, r *http.Request) {
+	plan, err := s.eng.PlanReconcile(r.Context(), time.Now(), s.stuckTimeout)
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, plan)
+}
+
+// reconcileApply runs a reconcile pass and returns the actions actually taken.
+// Backs `pgb gc`. Best-effort: a partial failure still returns the actions that
+// succeeded with a 200 (the error surfaces in branchd logs/metrics).
+func (s *Server) reconcileApply(w http.ResponseWriter, r *http.Request) {
+	taken, err := s.eng.ApplyReconcile(r.Context(), time.Now(), s.stuckTimeout)
+	if err != nil {
+		writeEngineError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, taken)
+}

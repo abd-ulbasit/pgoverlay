@@ -104,7 +104,7 @@ func TestPhase2DataPlane(t *testing.T) {
 	t.Cleanup(func() { reg.Close() })
 	eng := engine.New(reg, drv, "postgres:17")
 
-	ts := httptest.NewServer(api.New(eng, reg, itToken, nil, nil).Handler())
+	ts := httptest.NewServer(api.New(eng, reg, itToken, nil, nil, 0).Handler())
 	t.Cleanup(ts.Close)
 
 	// best-effort cleanup of managed resources if assertions below bail out
@@ -159,7 +159,7 @@ func TestPhase2DataPlane(t *testing.T) {
 	// 4. reaper destroys the expired branch. Started after the connectivity
 	// check: provisioning takes longer than the 2s TTL, so a reaper running
 	// from t=0 could legitimately destroy the branch before step 3.
-	go eng.RunReaper(bgCtx, time.Second, nil)
+	go eng.RunReconcile(bgCtx, time.Second, 10*time.Minute, nil)
 	deadline := time.Now().Add(45 * time.Second)
 	for {
 		code, body = itDo(t, ts, "GET", "/v1/branches", nil)

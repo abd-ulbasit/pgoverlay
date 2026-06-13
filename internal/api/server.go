@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/engine"
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
@@ -95,20 +96,28 @@ type MaskScript struct {
 type Ready func(ctx context.Context) error
 
 type Server struct {
-	eng     *engine.Engine
-	reg     *registry.Registry
-	token   string
-	metrics http.Handler
-	ready   Ready
+	eng          *engine.Engine
+	reg          *registry.Registry
+	token        string
+	metrics      http.Handler
+	ready        Ready
+	stuckTimeout time.Duration
 }
 
 // New builds the API server. metricsHandler serves /metrics (promhttp over the
 // metrics registry) and ready backs /readyz; both may be nil (then /metrics
 // 404s and /readyz reports ready iff the handler is wired). branchd always
-// passes both.
-func New(eng *engine.Engine, reg *registry.Registry, token string, metricsHandler http.Handler, ready Ready) *Server {
-	return &Server{eng: eng, reg: reg, token: token, metrics: metricsHandler, ready: ready}
+// passes both. stuckTimeout is the reconcile cutoff for stuck creating/
+// resetting rows (0 → DefaultStuckTimeout).
+func New(eng *engine.Engine, reg *registry.Registry, token string, metricsHandler http.Handler, ready Ready, stuckTimeout time.Duration) *Server {
+	if stuckTimeout <= 0 {
+		stuckTimeout = DefaultStuckTimeout
+	}
+	return &Server{eng: eng, reg: reg, token: token, metrics: metricsHandler, ready: ready, stuckTimeout: stuckTimeout}
 }
+
+// DefaultStuckTimeout is the fallback cutoff for reconcile's stuck-row pass.
+const DefaultStuckTimeout = 10 * time.Minute
 
 func (s *Server) Handler() http.Handler {
 	v1 := http.NewServeMux()
@@ -125,6 +134,8 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("GET /v1/branches/{name}/diff", s.branchDiff)
 	v1.HandleFunc("DELETE /v1/branches/{name}", s.destroyBranch)
 	v1.HandleFunc("POST /v1/branches/{name}/reset", s.resetBranch)
+	v1.HandleFunc("GET /v1/reconcile/plan", s.reconcilePlan)
+	v1.HandleFunc("POST /v1/reconcile", s.reconcileApply)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {

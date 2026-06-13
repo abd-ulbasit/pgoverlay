@@ -21,7 +21,7 @@ func TestCommandTree(t *testing.T) {
 		{"source", "add"}, {"source", "ls"}, {"source", "rm"}, {"source", "refresh"},
 		{"source", "set-mask"}, {"source", "get-mask"},
 		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"},
-		{"connect"}, {"diff"},
+		{"connect"}, {"diff"}, {"doctor"}, {"gc"},
 	} {
 		cmd, _, err := root.Find(path)
 		if err != nil || cmd.Name() != path[len(path)-1] {
@@ -469,6 +469,83 @@ users     1000  990     -10
 	out = run(t, "diff", "pr-7", "--all", "--server", ts.URL)
 	if !strings.Contains(out, "untouched  50    50      0") {
 		t.Errorf("pgb diff --all missing unchanged table:\n%s", out)
+	}
+}
+
+// runErr executes the CLI and returns stdout plus the command error (for
+// commands like `pgb doctor` that exit non-zero on drift).
+func runErr(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	root := NewRootCmd()
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs(args)
+	err := root.Execute()
+	return buf.String(), err
+}
+
+// pgb doctor against a drifted fake server: prints the plan and exits non-zero.
+func TestServerModeDoctorDriftExitsNonZero(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/reconcile/plan" {
+			t.Errorf("%s %s", r.Method, r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(engine.ReconcilePlan{Actions: []engine.Action{
+			{Kind: engine.ActionFailStuck, Target: "stuck-1", Reason: "stuck in creating longer than 10m0s"},
+			{Kind: engine.ActionGCVolume, Target: "pgbranch-br-orphan-rw", Reason: "managed volume owned by no live branch or source"},
+		}})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out, err := runErr(t, "doctor", "--server", ts.URL)
+	if err == nil {
+		t.Fatal("doctor exited 0 on drift; want non-zero")
+	}
+	if !strings.Contains(out, "stuck-1") || !strings.Contains(out, "pgbranch-br-orphan-rw") {
+		t.Fatalf("doctor output missing drift rows: %q", out)
+	}
+	if !strings.Contains(out, "fail_stuck") || !strings.Contains(out, "gc_volume") {
+		t.Fatalf("doctor output missing action kinds: %q", out)
+	}
+}
+
+// pgb doctor against a clean fake server: prints "no drift", exits zero.
+func TestServerModeDoctorCleanExitsZero(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(engine.ReconcilePlan{})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out, err := runErr(t, "doctor", "--server", ts.URL)
+	if err != nil {
+		t.Fatalf("doctor exited non-zero on a clean system: %v (out %q)", err, out)
+	}
+	if !strings.Contains(out, "no drift") {
+		t.Fatalf("doctor output %q", out)
+	}
+}
+
+// pgb gc applies and reports the actions taken.
+func TestServerModeGCApplies(t *testing.T) {
+	var gotMethod, gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		json.NewEncoder(w).Encode(engine.ReconcilePlan{Actions: []engine.Action{
+			{Kind: engine.ActionReap, Target: "expired-1", Reason: "ttl expired"},
+		}})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "gc", "--server", ts.URL)
+	if gotMethod != "POST" || gotPath != "/v1/reconcile" {
+		t.Fatalf("%s %s", gotMethod, gotPath)
+	}
+	if !strings.Contains(out, "expired-1") || !strings.Contains(out, "applied") {
+		t.Fatalf("gc output %q", out)
 	}
 }
 
