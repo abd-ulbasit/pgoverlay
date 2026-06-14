@@ -144,6 +144,34 @@ func TestResolveStorage(t *testing.T) {
 	}
 }
 
+// pgProxyExposedPlaintext decides whether to warn that the Postgres router
+// carries cleartext over the network: only when TLS is off AND the listener is
+// not loopback. TLS on, or a loopback bind, is safe; a non-loopback/all-ifaces
+// bind without TLS is exposed; a malformed address errs on the side of warning.
+func TestPGProxyExposedPlaintext(t *testing.T) {
+	cases := []struct {
+		name       string
+		addr       string
+		tlsEnabled bool
+		want       bool
+	}{
+		{"tls on, all interfaces", ":6432", true, false},
+		{"tls on, public host", "10.0.0.5:6432", true, false},
+		{"plaintext, all interfaces", ":6432", false, true},
+		{"plaintext, 0.0.0.0", "0.0.0.0:6432", false, true},
+		{"plaintext, public IP", "10.0.0.5:6432", false, true},
+		{"plaintext, loopback IP", "127.0.0.1:6432", false, false},
+		{"plaintext, ipv6 loopback", "[::1]:6432", false, false},
+		{"plaintext, localhost", "localhost:6432", false, false},
+		{"plaintext, malformed addr", "not-an-addr", false, true},
+	}
+	for _, tc := range cases {
+		if got := pgProxyExposedPlaintext(tc.addr, tc.tlsEnabled); got != tc.want {
+			t.Errorf("%s: pgProxyExposedPlaintext(%q, %v) = %v, want %v", tc.name, tc.addr, tc.tlsEnabled, got, tc.want)
+		}
+	}
+}
+
 func TestUIURLScheme(t *testing.T) {
 	if got := uiURL(":7070", false); got != "http://localhost:7070/ui/" {
 		t.Errorf("uiURL(:7070, false) = %q", got)

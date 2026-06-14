@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -157,4 +157,23 @@ CREATE TABLE api_tokens (
   role TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+`
+
+// v10 (Phase 9): index api_tokens by hash so LookupAPIToken is a point lookup
+// instead of a full table scan. token_hash is itself a SHA-256 of the secret,
+// so a unique index leaks nothing about the plaintext and the lookup stays
+// timing-safe (match/no-match reveals nothing about the secret).
+const migrateV10 = `
+CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_hash ON api_tokens(token_hash);
+`
+
+// v11 (Phase 9): audit the actor behind every branch mutation. transitions
+// records the state change but not WHO caused it — after an incident (a reset
+// that lost data, a source deleted) there was no record of which API token did
+// it. actor stores "name (role)" for token-initiated transitions, the sentinel
+// for the built-in PGBRANCH_TOKEN (admin, no stored name), or 'system:reconcile'
+// for daemon-initiated ones (reconcile, GC, TTL expiry). Pre-existing rows
+// backfill to the empty string (unknown actor, predating the audit log).
+const migrateV11 = `
+ALTER TABLE transitions ADD COLUMN actor TEXT NOT NULL DEFAULT '';
 `

@@ -1,0 +1,55 @@
+pgbranch ({{ include "pgbranch.fullname" . }}) is installed.
+
+branchd API:   {{ include "pgbranch.fullname" . }}-api:{{ .Values.api.port }}   (ClusterIP{{ if ne .Values.api.service.type "ClusterIP" }} / {{ .Values.api.service.type }}{{ end }})
+Postgres proxy: {{ include "pgbranch.fullname" . }}-proxy:{{ .Values.proxy.port }} ({{ .Values.proxy.service.type }})
+Storage mode:  {{ .Values.storage.mode }}{{ if eq .Values.storage.mode "hostpath" }} (single-node / trusted-workload posture){{ end }}
+
+Get the API token:
+{{- if .Values.existingSecret }}
+  kubectl -n {{ .Release.Namespace }} get secret {{ .Values.existingSecret }} -o jsonpath='{.data.token}' | base64 -d
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "pgbranch.fullname" . }}-token -o jsonpath='{.data.token}' | base64 -d
+{{- end }}
+
+SECURITY — read before exposing pgbranch beyond a single trusted node:
+
+{{- if not .Values.existingSecret }}
+
+  [!] SECRET HYGIENE: this release rendered a chart-managed Secret for the API
+      token. If you set it with `--set token=` or a committed values file, that
+      value is now stored IN CLEARTEXT in the Helm release history and is
+      readable via `helm get values {{ .Release.Name }}`. For production, create
+      the Secret out-of-band and reference it with `existingSecret` instead.
+{{- end }}
+{{- if and .Values.ghook.enabled (not .Values.ghook.existingSecret) }}
+
+  [!] The ghook webhook/GitHub secrets were rendered by the chart — same
+      release-history caveat. Use `ghook.existingSecret` in production.
+{{- end }}
+
+  [!] PROXY TLS / TRUSTED BOUNDARY: the Postgres proxy speaks the Postgres wire
+      protocol. {{ if .Values.proxy.tls.certSecret }}TLS is configured (proxy.tls.certSecret), good.{{ else }}TLS is NOT configured (proxy.tls.certSecret is empty), so the
+      proxy answers SSLRequest with 'N' and serves PLAINTEXT.{{ end }}
+      Only expose the proxy (NodePort/LoadBalancer/Ingress) behind TLS or a
+      trusted network boundary — never put a plaintext proxy on an untrusted
+      network.
+{{- if and (or (eq .Values.proxy.service.type "NodePort") (eq .Values.proxy.service.type "LoadBalancer")) (not .Values.rotateBranchCredentials) }}
+
+  [!] The proxy is network-exposed (service type {{ .Values.proxy.service.type }}) but
+      rotateBranchCredentials is OFF, so every branch inherits the source
+      password. Set `rotateBranchCredentials: true` so each branch gets its own
+      generated credential when the proxy is reachable off-cluster.
+{{- end }}
+{{- if not .Values.networkPolicy.enabled }}
+
+  [i] NetworkPolicies are disabled. On a shared/multi-tenant cluster set
+      `networkPolicy.enabled: true` (requires a policy-enforcing CNI) to limit
+      who can reach branchd and the branch pods.
+{{- end }}
+{{- if eq .Values.storage.mode "hostpath" }}
+
+  [i] hostpath/overlay mode: the branch pods branchd creates at runtime need
+      CAP_SYS_ADMIN + unconfined seccomp for the in-container overlay mount.
+      This is a single-node / trusted-workload posture. For shared/production
+      clusters use `storage.mode=csi` (no added caps on branch pods).
+{{- end }}

@@ -3,7 +3,6 @@ package registry
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 )
@@ -59,36 +58,37 @@ func (r *Registry) CreateAPIToken(name, role string) (string, error) {
 	return plaintext, nil
 }
 
-// LookupAPIToken resolves a presented plaintext token to its role. The lookup
-// is by hash; the digest comparison is constant-time so a timing side channel
-// can't distinguish a wrong-but-existing hash from a missing one.
+// LookupAPIToken resolves a presented plaintext token to its role via an
+// indexed point lookup on token_hash (api_tokens_hash, v10). This is
+// timing-safe without a constant-time compare: the discriminator is itself a
+// SHA-256 of the secret, so a hit/miss reveals nothing about the plaintext and
+// an attacker cannot steer the query toward a partial match. Returns ("",
+// false) for the empty token, an unknown token, or any query error.
 func (r *Registry) LookupAPIToken(plaintext string) (string, bool) {
 	if plaintext == "" {
 		return "", false
 	}
-	want := hashToken(plaintext)
-	rows, err := r.db.Query(`SELECT token_hash, role FROM api_tokens`)
-	if err != nil {
-		return "", false
-	}
-	defer rows.Close()
 	var role string
-	var found bool
-	for rows.Next() {
-		var hash, rl string
-		if err := rows.Scan(&hash, &rl); err != nil {
-			return "", false
-		}
-		// constant-time compare every row; don't early-return on the match so
-		// the work is independent of where (or whether) the token is found.
-		if subtle.ConstantTimeCompare([]byte(hash), []byte(want)) == 1 {
-			role, found = rl, true
-		}
+	err := r.db.QueryRow(`SELECT role FROM api_tokens WHERE token_hash=?`, hashToken(plaintext)).Scan(&role)
+	if err != nil {
+		return "", false // sql.ErrNoRows (unknown token) or any other error
 	}
-	if rows.Err() != nil {
-		return "", false
+	return role, true
+}
+
+// LookupAPITokenActor resolves a presented plaintext token to its stored
+// name and role via the same indexed point lookup as LookupAPIToken. The audit
+// log uses the name to record WHO performed a branch mutation. Returns ("", "",
+// false) for the empty token, an unknown token, or any query error.
+func (r *Registry) LookupAPITokenActor(plaintext string) (name, role string, ok bool) {
+	if plaintext == "" {
+		return "", "", false
 	}
-	return role, found
+	err := r.db.QueryRow(`SELECT name, role FROM api_tokens WHERE token_hash=?`, hashToken(plaintext)).Scan(&name, &role)
+	if err != nil {
+		return "", "", false
+	}
+	return name, role, true
 }
 
 // ListAPITokens returns token metadata (name/role/created_at) ordered by

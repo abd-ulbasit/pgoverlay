@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"time"
@@ -19,6 +20,12 @@ import (
 
 	"github.com/abd-ulbasit/pgbranch/internal/registry"
 )
+
+// genericRouteRefusal is the single client-facing message for every routing
+// failure (unknown branch, not-ready branch, any resolver error). It is
+// deliberately uniform so an UNAUTHENTICATED client cannot enumerate branch
+// names or distinguish branch state; the real reason is logged server-side.
+const genericRouteRefusal = "pgbranch: database not available"
 
 // BranchResolver maps a branch name to the "host:port" address of its
 // Postgres instance. Implementations must only resolve branches that can
@@ -43,10 +50,32 @@ func (r *RegistryResolver) ResolveBranch(name string) (string, error) {
 	return net.JoinHostPort(b.Host, strconv.Itoa(b.Port)), nil
 }
 
+// DoS-hardening defaults. Each is overridable via the corresponding Proxy
+// field (the constructor seeds these; a zero field falls back to the default
+// at use-site so a struct literal without New() is still safe).
+const (
+	defaultStartupTimeout = 10 * time.Second // client must finish the startup phase within this
+	defaultMaxConns       = 256              // cap on concurrently-handled connections
+	defaultIdleTimeout    = 15 * time.Minute // relay closes after this long with no bytes either way
+)
+
 type Proxy struct {
 	Resolver BranchResolver
 	// DialTimeout bounds the backend dial. Defaults to 5s.
 	DialTimeout time.Duration
+	// StartupTimeout bounds the entire startup phase (SSL/GSS negotiation +
+	// StartupMessage). A client that connects and dribbles bytes — or sends
+	// nothing — is dropped after this, freeing the goroutine+fd it pins.
+	// Defaults to 10s; the deadline is cleared once relaying begins.
+	StartupTimeout time.Duration
+	// MaxConns caps the number of connections handled concurrently. When the
+	// cap is reached, further accepts are refused fast (connection closed)
+	// rather than queued unbounded. Defaults to 256.
+	MaxConns int
+	// IdleTimeout closes a relayed session that has seen no bytes in either
+	// direction for this long, reclaiming abandoned-but-open connections.
+	// Defaults to 15m.
+	IdleTimeout time.Duration
 	// TLSConfig, when set, makes the proxy answer SSLRequest with 'S' and
 	// upgrade the client connection via a server-side TLS handshake before
 	// the startup message. When nil (default) SSLRequest is answered 'N' and
@@ -56,7 +85,29 @@ type Proxy struct {
 }
 
 func New(r BranchResolver) *Proxy {
-	return &Proxy{Resolver: r, DialTimeout: 5 * time.Second}
+	return &Proxy{
+		Resolver:       r,
+		DialTimeout:    5 * time.Second,
+		StartupTimeout: defaultStartupTimeout,
+		MaxConns:       defaultMaxConns,
+		IdleTimeout:    defaultIdleTimeout,
+	}
+}
+
+// startupTimeout / idleTimeout return the effective values, tolerating a Proxy
+// built as a bare struct literal (zero field -> default).
+func (p *Proxy) startupTimeout() time.Duration {
+	if p.StartupTimeout > 0 {
+		return p.StartupTimeout
+	}
+	return defaultStartupTimeout
+}
+
+func (p *Proxy) idleTimeout() time.Duration {
+	if p.IdleTimeout > 0 {
+		return p.IdleTimeout
+	}
+	return defaultIdleTimeout
 }
 
 // Serve accepts connections until ctx is cancelled (which closes the
@@ -64,6 +115,13 @@ func New(r BranchResolver) *Proxy {
 func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 	stop := context.AfterFunc(ctx, func() { lis.Close() })
 	defer stop()
+	// Size the connection-cap semaphore from MaxConns once, here, so callers
+	// that set MaxConns after New() (the field is exported for exactly that)
+	// still get the cap they asked for. A non-positive MaxConns disables it.
+	var sem chan struct{}
+	if p.MaxConns > 0 {
+		sem = make(chan struct{}, p.MaxConns)
+	}
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
@@ -72,7 +130,24 @@ func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 			}
 			return err
 		}
-		go p.handleConn(conn)
+		// Connection cap: acquire a slot before spawning the handler. If the
+		// cap is full, refuse fast (close the conn) rather than queueing — an
+		// unbounded backlog is itself the DoS we're guarding against.
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			default:
+				slog.Warn("pgproxy: connection cap reached, refusing", "max", cap(sem))
+				conn.Close()
+				continue
+			}
+		}
+		go func() {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+			p.handleConn(conn)
+		}()
 	}
 }
 
@@ -81,6 +156,11 @@ func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 // the StartupMessage.
 func (p *Proxy) handleConn(client net.Conn) {
 	defer func() { client.Close() }() // closure: client may be re-bound to the TLS conn
+	// Bound the whole startup phase: a client that connects and then sends
+	// nothing (or dribbles) is dropped at this deadline, freeing the
+	// goroutine+fd it would otherwise pin forever. Cleared in route() once we
+	// hand off to the relay.
+	client.SetReadDeadline(time.Now().Add(p.startupTimeout()))
 	inTLS := false
 	for {
 		code, payload, err := readStartupFrame(client)
@@ -146,8 +226,10 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 	}
 	addr, err := p.Resolver.ResolveBranch(branch)
 	if err != nil {
-		writeRefusal(client, "3D000",
-			fmt.Sprintf("pgbranch: cannot route to branch %q: %v", branch, err))
+		// Uniform refusal: unknown vs not-ready vs any other resolve error are
+		// indistinguishable to the (unauthenticated) client. Real reason logged.
+		slog.Warn("pgproxy: route refused", "branch", branch, "reason", "resolve", "error", err)
+		writeRefusal(client, "3D000", genericRouteRefusal) // invalid_catalog_name
 		return
 	}
 	startup.Parameters["database"] = dbname
@@ -158,33 +240,79 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 	}
 	backend, err := net.DialTimeout("tcp", addr, p.DialTimeout)
 	if err != nil {
-		writeRefusal(client, "08006", // connection_failure
-			fmt.Sprintf("pgbranch: branch %q backend unreachable: %v", branch, err))
+		// A resolved-but-unreachable backend would otherwise confirm the branch
+		// name and its (down) state — collapse it into the same generic refusal.
+		slog.Warn("pgproxy: route refused", "branch", branch, "reason", "dial", "addr", addr, "error", err)
+		writeRefusal(client, "3D000", genericRouteRefusal)
 		return
 	}
 	defer backend.Close()
 	if _, err := backend.Write(raw); err != nil {
 		return
 	}
-	relay(client, backend)
+	// Startup is done: drop the startup read deadline. The relay installs its
+	// own idle deadlines from here on.
+	client.SetReadDeadline(time.Time{})
+	relay(client, backend, p.idleTimeout())
 }
 
 // relay copies bytes in both directions until both sides are done. Each
 // direction propagates EOF with a half-close (CloseWrite) so in-flight data
 // in the other direction can still drain.
-func relay(client, backend net.Conn) error {
+//
+// idle, when > 0, is an inactivity timeout: every read from either side bumps
+// BOTH connections' read deadlines forward by idle, so a session with no bytes
+// flowing in either direction for that long has its reads time out and the
+// relay tears down. (Bumping both sides — not just the active one — means a
+// busy direction keeps the quiet direction alive, so we only close truly idle
+// sessions, never merely-one-directional ones.)
+func relay(client, backend net.Conn, idle time.Duration) error {
+	if idle > 0 {
+		bump := func() {
+			d := time.Now().Add(idle)
+			client.SetReadDeadline(d)
+			backend.SetReadDeadline(d)
+		}
+		bump()
+	}
 	g := new(errgroup.Group)
-	g.Go(func() error { return halfCopy(backend, client) })
-	g.Go(func() error { return halfCopy(client, backend) })
+	g.Go(func() error { return halfCopy(backend, client, idle) })
+	g.Go(func() error { return halfCopy(client, backend, idle) })
 	return g.Wait()
 }
 
-func halfCopy(dst, src net.Conn) error {
-	_, err := io.Copy(dst, src)
+// halfCopy copies src->dst. When idle > 0 each successful read bumps both
+// connections' read deadlines (via an idleReader wrapping src), so the copy
+// returns with a timeout error once the whole session goes quiet.
+func halfCopy(dst, src net.Conn, idle time.Duration) error {
+	var r io.Reader = src
+	if idle > 0 {
+		r = &idleReader{src: src, peer: dst, idle: idle}
+	}
+	_, err := io.Copy(dst, r)
 	if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 		cw.CloseWrite()
 	} else {
 		dst.Close()
 	}
 	return err
+}
+
+// idleReader bumps both connections' read deadlines on every successful read,
+// so any activity in either direction keeps the whole session alive and a
+// fully-quiet session times out after idle.
+type idleReader struct {
+	src  net.Conn
+	peer net.Conn
+	idle time.Duration
+}
+
+func (r *idleReader) Read(b []byte) (int, error) {
+	n, err := r.src.Read(b)
+	if n > 0 {
+		d := time.Now().Add(r.idle)
+		r.src.SetReadDeadline(d)
+		r.peer.SetReadDeadline(d)
+	}
+	return n, err
 }

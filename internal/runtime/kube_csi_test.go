@@ -177,6 +177,9 @@ func TestBuildBranchPodCSI(t *testing.T) {
 	if pod.Spec.NodeName != "" {
 		t.Errorf("NodeName = %q, want unpinned", pod.Spec.NodeName)
 	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Errorf("AutomountServiceAccountToken = %v, want false", pod.Spec.AutomountServiceAccountToken)
+	}
 	c := pod.Spec.Containers[0]
 	if c.SecurityContext != nil {
 		t.Errorf("SecurityContext = %+v, want none (no SYS_ADMIN in csi mode)", c.SecurityContext)
@@ -210,6 +213,9 @@ func TestBuildHelperPodCSI(t *testing.T) {
 	})
 	if pod.Spec.NodeName != "" {
 		t.Errorf("NodeName = %q, want unpinned", pod.Spec.NodeName)
+	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Errorf("AutomountServiceAccountToken = %v, want false", pod.Spec.AutomountServiceAccountToken)
 	}
 	if len(pod.Spec.Volumes) != 2 {
 		t.Fatalf("volumes = %d", len(pod.Spec.Volumes))

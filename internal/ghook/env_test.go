@@ -11,9 +11,13 @@ func env(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
+// validSecret is a >= minWebhookSecretLen webhook secret for env tests that
+// aren't exercising the length guard.
+const validSecret = "0123456789abcdef" // 16 chars
+
 func TestLoadEnvDefaultsAndParsing(t *testing.T) {
 	ec, err := LoadEnv(env(map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  "wh",
+		"GHOOK_WEBHOOK_SECRET":  validSecret,
 		"GHOOK_PGBRANCH_SERVER": "http://pgbranch-api:7070",
 		"GHOOK_PGBRANCH_TOKEN":  "tok",
 		"GHOOK_SOURCE":          "main",
@@ -50,7 +54,7 @@ func TestLoadEnvDefaultsAndParsing(t *testing.T) {
 
 func TestLoadEnvRequiredVars(t *testing.T) {
 	base := map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  "wh",
+		"GHOOK_WEBHOOK_SECRET":  validSecret,
 		"GHOOK_PGBRANCH_SERVER": "http://x:7070",
 		"GHOOK_SOURCE":          "main",
 	}
@@ -72,7 +76,7 @@ func TestLoadEnvRequiredVars(t *testing.T) {
 
 func TestLoadEnvAppAuth(t *testing.T) {
 	base := map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  "wh",
+		"GHOOK_WEBHOOK_SECRET":  validSecret,
 		"GHOOK_PGBRANCH_SERVER": "http://x:7070",
 		"GHOOK_SOURCE":          "main",
 	}
@@ -125,9 +129,35 @@ func TestLoadEnvAppAuth(t *testing.T) {
 	}
 }
 
+// TestLoadEnvWebhookSecretLength: an empty secret is rejected as missing, a
+// too-short one is rejected as weak, and a >= minWebhookSecretLen one loads.
+func TestLoadEnvWebhookSecretLength(t *testing.T) {
+	base := func(secret string) func(string) string {
+		return env(map[string]string{
+			"GHOOK_WEBHOOK_SECRET":  secret,
+			"GHOOK_PGBRANCH_SERVER": "http://x:7070",
+			"GHOOK_SOURCE":          "main",
+		})
+	}
+	// empty -> "required"
+	if _, err := LoadEnv(base("")); err == nil || !strings.Contains(err.Error(), "GHOOK_WEBHOOK_SECRET") {
+		t.Errorf("empty secret: err = %v, want it named required", err)
+	}
+	// short (15 chars) -> length error naming the var
+	short := strings.Repeat("a", minWebhookSecretLen-1)
+	_, err := LoadEnv(base(short))
+	if err == nil || !strings.Contains(err.Error(), "GHOOK_WEBHOOK_SECRET") {
+		t.Errorf("short secret: err = %v, want a length rejection naming the var", err)
+	}
+	// exactly minWebhookSecretLen -> ok
+	if _, err := LoadEnv(base(strings.Repeat("a", minWebhookSecretLen))); err != nil {
+		t.Errorf("min-length secret must load: %v", err)
+	}
+}
+
 func TestLoadEnvBadValues(t *testing.T) {
 	base := map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  "wh",
+		"GHOOK_WEBHOOK_SECRET":  validSecret,
 		"GHOOK_PGBRANCH_SERVER": "http://x:7070",
 		"GHOOK_SOURCE":          "main",
 	}

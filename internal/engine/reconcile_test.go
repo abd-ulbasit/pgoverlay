@@ -332,3 +332,99 @@ func hasAction(p ReconcilePlan, kind ActionKind, target string) bool {
 	}
 	return false
 }
+
+// TestReconcileStuckResettingParentKeepsReferencedRWVolume is the freeze
+// data-loss regression guard. A branch-from-branch freeze parks the PARENT in
+// resetting and keeps the parent's live data in parent.RWVolume until
+// CommitFreeze. If that freeze is slow (cold pull / large WAL replay) and
+// exceeds the stuck timeout, reconcile used to call removeBranchLayer(parent)
+// and permanently delete the parent's live data volume. The fail-stuck action
+// must SKIP layer removal whenever another live branch references the volume
+// (the in-flight child does), while still moving the row out of the stuck
+// state so it is not flagged forever.
+func TestReconcileStuckResettingParentKeepsReferencedRWVolume(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	src := readySource(t, r)
+
+	// parent: a ready branch with real data in its rw volume.
+	parent := &registry.Branch{Name: "parent", SourceID: src.ID,
+		RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+	if err := r.CreateBranch(parent); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes["pgbranch-br-parent-rw"] = true
+	markReady(t, r, parent, "cid-parent")
+
+	// child: created (creating) by freezeAndProvision before CommitFreeze. The
+	// overlay freeze records source_volume = the SOURCE and links to the parent
+	// by name; csi/zfs would record source_volume = parent.RWVolume. Cover the
+	// stricter overlay shape (parent_branch_name only).
+	child := &registry.Branch{Name: "child", SourceID: src.ID,
+		RWVolume: "pgbranch-br-child-rw", SourceVolume: "pgbranch-src-main",
+		ParentBranchName: parent.Name}
+	if err := r.CreateBranch(child); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes["pgbranch-br-child-rw"] = true
+
+	// freeze parks the parent in resetting (legal ready->resetting); reconciling
+	// an hour in the future makes the row look stuck past the 10m timeout.
+	if err := r.TransitionBranch(parent.ID, registry.BranchResetting, "freeze for child"); err != nil {
+		t.Fatal(err)
+	}
+
+	taken, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// it still fails the stuck row (so it is not stuck forever)...
+	if !hasAction(taken, ActionFailStuck, "parent") {
+		t.Fatalf("expected fail_stuck on the stuck parent: %+v", taken.Actions)
+	}
+	got, _ := r.GetBranchByName("parent")
+	if got.State != registry.BranchFailed {
+		t.Fatalf("parent state=%q want failed", got.State)
+	}
+	// ...but it MUST NOT delete the parent's live data volume (the child still
+	// references it).
+	if !d.volumes["pgbranch-br-parent-rw"] {
+		t.Fatal("DATA LOSS: reconcile deleted the freeze parent's live rw volume")
+	}
+}
+
+// CSI/ZFS shape: the child records the parent's rw volume directly as its
+// source_volume. The same volume-reference guard must protect it.
+func TestReconcileStuckResettingParentKeepsRWReferencedBySourceVolume(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	src := readySource(t, r)
+
+	parent := &registry.Branch{Name: "parent", SourceID: src.ID,
+		RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+	if err := r.CreateBranch(parent); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes["pgbranch-br-parent-rw"] = true
+	markReady(t, r, parent, "cid-parent")
+
+	// csi/zfs child: source_volume = parent.RWVolume.
+	child := &registry.Branch{Name: "child", SourceID: src.ID,
+		RWVolume: "pgbranch-br-child-rw", SourceVolume: parent.RWVolume,
+		ParentBranchName: parent.Name}
+	if err := r.CreateBranch(child); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes["pgbranch-br-child-rw"] = true
+
+	if err := r.TransitionBranch(parent.ID, registry.BranchResetting, "freeze for child"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if !d.volumes["pgbranch-br-parent-rw"] {
+		t.Fatal("DATA LOSS: reconcile deleted the csi/zfs freeze parent's rw volume")
+	}
+}

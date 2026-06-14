@@ -125,6 +125,46 @@ func TestWebhookMethodAndPathHandling(t *testing.T) {
 	}
 }
 
+// TestWebhookBodySizeLimited: an over-limit body (here just over 1 MiB) is
+// rejected with a 4xx before signature verification, and crucially without
+// buffering the whole thing — MaxBytesReader makes io.ReadAll error out. A
+// normal signed payload of ordinary size still verifies and is accepted.
+func TestWebhookBodySizeLimited(t *testing.T) {
+	// pgbranch stub: a 404 from GetBranch makes the detached "opened" handler
+	// take the create path; a 201 from create finishes it cleanly. We only
+	// need it to not error out on the normal-payload leg.
+	pg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "GET" {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"name":"pr-7"}`)
+	}))
+	defer pg.Close()
+	svc := newService(Config{}, pg.URL, nil)
+	h := svc.Handler()
+
+	// Over the 1 MiB cap. Sign it correctly so we prove the limit fires
+	// independently of signature verification — a real attacker won't sign.
+	big := make([]byte, maxWebhookBody+4096)
+	for i := range big {
+		big[i] = 'a'
+	}
+	rr := post(t, h, "pull_request", sign(testSecret, big), big)
+	if rr.Code < 400 || rr.Code >= 500 {
+		t.Fatalf("over-limit body: code=%d, want a 4xx rejection", rr.Code)
+	}
+
+	// A normal-sized, correctly signed payload still verifies and is accepted.
+	body := []byte(`{"action":"opened","number":7,"repository":{"full_name":"acme/widgets"}}`)
+	if rr := post(t, h, "pull_request", sign(testSecret, body), body); rr.Code != http.StatusAccepted {
+		t.Fatalf("normal signed payload: code=%d, want 202", rr.Code)
+	}
+	svc.Wait() // let the detached branch op finish against the stub
+}
+
 func TestWebhookRejectsInvalidJSON(t *testing.T) {
 	h := newService(Config{}, "http://127.0.0.1:1", nil).Handler()
 	body := []byte(`{not json`)

@@ -121,7 +121,7 @@ func TestOpenedPostsThenPatchesLiveComment(t *testing.T) {
 	if len(gh.posted) != 1 {
 		t.Fatalf("posted comments = %v, want exactly one", gh.posted)
 	}
-	for _, want := range []string{commentMarker, "`pr-7`", "creating"} {
+	for _, want := range []string{commentMarker, "`gh-pr-7`", "creating"} {
 		if !strings.Contains(gh.posted[0], want) {
 			t.Errorf("creating comment missing %q:\n%s", want, gh.posted[0])
 		}
@@ -130,7 +130,7 @@ func TestOpenedPostsThenPatchesLiveComment(t *testing.T) {
 		t.Fatalf("patched comments = %v, want exactly one (the ready update)", gh.patched)
 	}
 	final := gh.patched[0]
-	for _, want := range []string{commentMarker, "`pr-7`", "ready", "-h pg.example.com", "-p 30432", "appdb@pr-7"} {
+	for _, want := range []string{commentMarker, "`gh-pr-7`", "ready", "-h pg.example.com", "-p 30432", "appdb@pr-7"} {
 		if !strings.Contains(final, want) {
 			t.Errorf("ready comment missing %q:\n%s", want, final)
 		}
@@ -182,10 +182,10 @@ func TestResetCommentShowsShortSHA(t *testing.T) {
 // (the branch it pointed at no longer exists) — and posts no status.
 func TestClosedUpdatesCommentToDestroyed(t *testing.T) {
 	pg := newFakePG(t, true)
-	gh := newFakeGitHub(t, commentMarker+" branch pr-7 ready, psql -h pg.example.com")
+	gh := newFakeGitHub(t, commentMarker+" branch gh-pr-7 ready, psql -h pg.example.com")
 	deliver(t, newService(Config{ProxyHost: "pg.example.com"}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
 
-	pg.assertCalls("DELETE /v1/branches/pr-7")
+	pg.assertCalls("DELETE /v1/branches/gh-pr-7")
 	if len(gh.patched) != 1 {
 		t.Fatalf("patched = %v, want exactly one destroyed update", gh.patched)
 	}
@@ -228,7 +228,7 @@ func TestGitHubFailureDoesNotFailWebhook(t *testing.T) {
 	gh := &GitHub{BaseURL: down.URL, Token: StaticToken("gh-token"), HTTP: down.Client()}
 	// comment failure is non-fatal: the branch operation still completes
 	deliver(t, newService(Config{}, pg.srv.URL, gh), fixture(t, "pr_opened.json"))
-	pg.assertCalls("GET /v1/branches/pr-7", "POST /v1/branches")
+	pg.assertCalls("GET /v1/branches/gh-pr-7", "POST /v1/branches")
 }
 
 func TestSetStatusRequestShape(t *testing.T) {
@@ -271,11 +271,11 @@ func TestEnsureSetsPendingThenSuccessStatus(t *testing.T) {
 	}
 	pending, success := gh.statuses[0], gh.statuses[1]
 	if pending.State != "pending" || pending.SHA != "0d1e2f3a4b5c6d7e" ||
-		pending.Context != "pgbranch/branch" || !strings.Contains(pending.Description, "creating branch pr-7") {
+		pending.Context != "pgbranch/branch" || !strings.Contains(pending.Description, "creating branch gh-pr-7") {
 		t.Errorf("pending status = %+v", pending)
 	}
 	if success.State != "success" || success.SHA != "0d1e2f3a4b5c6d7e" ||
-		!strings.Contains(success.Description, "branch pr-7 ready") ||
+		!strings.Contains(success.Description, "branch gh-pr-7 ready") ||
 		!strings.Contains(success.Description, "pg.example.com:30432") {
 		t.Errorf("success status = %+v", success)
 	}
@@ -285,8 +285,8 @@ func TestSynchronizeWithResetPostsResettingPending(t *testing.T) {
 	pg := newFakePG(t, true)
 	gh := newFakeGitHub(t)
 	deliver(t, newService(Config{ResetOnPush: true}, pg.srv.URL, gh.client()), fixture(t, "pr_synchronize.json"))
-	if len(gh.statuses) < 1 || !strings.Contains(gh.statuses[0].Description, "resetting branch pr-7") {
-		t.Fatalf("statuses = %+v, want pending 'resetting branch pr-7' first", gh.statuses)
+	if len(gh.statuses) < 1 || !strings.Contains(gh.statuses[0].Description, "resetting branch gh-pr-7") {
+		t.Fatalf("statuses = %+v, want pending 'resetting branch gh-pr-7' first", gh.statuses)
 	}
 }
 
@@ -444,7 +444,7 @@ func TestClosedWithoutMarkerCommentCreatesNothing(t *testing.T) {
 	pg := newFakePG(t, true)
 	gh := newFakeGitHub(t, "unrelated comment")
 	deliver(t, newService(Config{}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
-	pg.assertCalls("DELETE /v1/branches/pr-7")
+	pg.assertCalls("DELETE /v1/branches/gh-pr-7")
 	if len(gh.posted) != 0 || len(gh.patched) != 0 || len(gh.statuses) != 0 {
 		t.Fatalf("posted=%v patched=%v statuses=%+v, want no GitHub writes on closed without a marker comment",
 			gh.posted, gh.patched, gh.statuses)

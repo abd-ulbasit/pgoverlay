@@ -104,11 +104,24 @@ spec:
               path: /readyz
               port: api
           securityContext:
-            # root for write access to the hostPath state dir (see values.yaml)
+            # root for write access to the hostPath state dir (see values.yaml);
+            # the rest of the controls are valid regardless of UID. The state
+            # dir is a real volume (hostPath/PVC) and /tmp is an emptyDir below,
+            # so the container rootfs can be read-only.
             runAsUser: {{ .Values.runAsUser }}
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
             - name: state
               mountPath: {{ .Values.dataRoot }}/state
+            # writable scratch with readOnlyRootFilesystem (sqlite temp files,
+            # exec'd tooling). Not the registry — that is the state volume.
+            - name: tmp
+              mountPath: /tmp
             {{- with .Values.proxy.tls.certSecret }}
             - name: proxy-tls
               mountPath: /etc/pgbranch/proxy-tls
@@ -119,6 +132,8 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: state
           {{- if eq (include "pgbranch.persistenceEnabled" .) "true" }}
           persistentVolumeClaim:

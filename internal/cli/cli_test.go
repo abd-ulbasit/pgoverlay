@@ -21,7 +21,7 @@ func TestCommandTree(t *testing.T) {
 		{"source", "add"}, {"source", "ls"}, {"source", "rm"}, {"source", "refresh"},
 		{"source", "set-mask"}, {"source", "get-mask"},
 		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"},
-		{"connect"}, {"diff"}, {"doctor"}, {"gc"},
+		{"connect"}, {"diff"}, {"history"}, {"doctor"}, {"gc"},
 		{"token", "create"}, {"token", "ls"}, {"token", "revoke"},
 	} {
 		cmd, _, err := root.Find(path)
@@ -664,6 +664,35 @@ func TestServerModeDiffWithDataSample(t *testing.T) {
 	run(t, "diff", "pr-7", "--server", ts.URL)
 	if gotQuery != "" {
 		t.Fatalf("query without --data = %q, want empty (no sampling)", gotQuery)
+	}
+}
+
+// pgb history prints the audit trail returned by /v1/branches/{name}/history,
+// including the actor column.
+func TestServerModeHistory(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/branches/pr-7/history" {
+			t.Errorf("%s %s", r.Method, r.URL.Path)
+		}
+		json.NewEncoder(w).Encode([]api.Transition{
+			{FromState: "", ToState: "creating", Reason: "created", Actor: "deploy-bot (operator)", At: "2026-06-14T10:00:00.000Z"},
+			{FromState: "creating", ToState: "ready", Reason: "instance running", Actor: "deploy-bot (operator)", At: "2026-06-14T10:00:05.000Z"},
+			{FromState: "ready", ToState: "destroying", Reason: "destroy requested", Actor: "root (admin)", At: "2026-06-14T11:00:00.000Z"},
+		})
+	}))
+	defer ts.Close()
+	t.Setenv("PGBRANCH_TOKEN", "tok")
+
+	out := run(t, "history", "pr-7", "--server", ts.URL)
+	for _, want := range []string{
+		"ACTOR", "AT", "FROM", "TO", "REASON",
+		"deploy-bot (operator)", "root (admin)",
+		"creating", "ready", "destroying",
+		"2026-06-14T10:00:00.000Z",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("pgb history output missing %q:\n%s", want, out)
+		}
 	}
 }
 

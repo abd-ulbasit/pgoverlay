@@ -100,8 +100,27 @@ spec:
             httpGet:
               path: /healthz
               port: http
+          # Internet-facing webhook receiver: needs zero privileges. Strict,
+          # non-toggleable hardening — run as a non-root UID with a read-only
+          # rootfs, no privilege escalation, all caps dropped, RuntimeDefault
+          # seccomp. /tmp is an emptyDir so the rootfs can stay read-only.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           {{- with .Values.ghook.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
 {{- end }}

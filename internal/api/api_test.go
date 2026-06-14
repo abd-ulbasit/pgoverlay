@@ -429,6 +429,23 @@ func TestCreateBranchTTLPropagation(t *testing.T) {
 	}
 }
 
+// TestCreateBranchQuotaReturns403 wires --max-branches via WithMaxBranches and
+// asserts the over-cap create maps to HTTP 403 (writeEngineError's
+// ErrQuotaExceeded branch).
+func TestCreateBranchQuotaReturns403(t *testing.T) {
+	ts, _ := newTestServer(t, engine.WithMaxBranches(1))
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches",
+		CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("first create: code=%d body=%s", code, body)
+	}
+	code, body := do(t, ts, testToken, "POST", "/v1/branches",
+		CreateBranchRequest{Name: "pr-2", Source: "main"})
+	if code != http.StatusForbidden {
+		t.Fatalf("over-cap create: code=%d body=%s, want 403", code, body)
+	}
+}
+
 func TestResetBranchEndpoint(t *testing.T) {
 	ts, d := newTestServer(t)
 	addSource(t, ts)

@@ -1,0 +1,108 @@
+{{- if .Values.networkPolicy.enabled }}
+# NetworkPolicies for pgbranch. OFF by default (networkPolicy.enabled=false) so
+# existing installs don't suddenly lose connectivity, but RECOMMENDED for any
+# shared/multi-tenant cluster. Requires a CNI that enforces NetworkPolicy
+# (Calico, Cilium, etc.); on a CNI without enforcement these are inert.
+#
+# Three policies:
+#  1. ingress to branchd (API + proxy) — from ghook, configured client
+#     selectors, and the metrics scrape source.
+#  2. ingress to branch pods — only from branchd.
+#  3. egress from branch pods — only the Postgres source(s) + cluster DNS.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pgbranch.fullname" . }}-branchd
+  labels:
+    {{- include "pgbranch.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pgbranch.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # ghook -> branchd REST API (in-cluster webhook receiver).
+    {{- if .Values.ghook.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "pgbranch.ghook.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.api.port }}
+    {{- end }}
+    # Configured clients (pgb CLI users, preview deployers, app pods) -> API +
+    # proxy. Each entry is a raw NetworkPolicyPeer (namespaceSelector and/or
+    # podSelector); see values.yaml networkPolicy.allowedClients.
+    {{- with .Values.networkPolicy.allowedClients }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.api.port }}
+        - protocol: TCP
+          port: {{ $.Values.proxy.port }}
+    {{- end }}
+    # Metrics scrape source (Prometheus) -> API port (/metrics is served there).
+    {{- with .Values.networkPolicy.metricsFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.api.port }}
+    {{- end }}
+---
+# Branch pods are created by branchd at RUNTIME (not by this chart). The Go
+# runtime stamps them with pgbranch.managed=true and pgbranch.role=branch
+# (see internal/engine branchLabels / internal/runtime). These policies select
+# on those labels; if the runtime label scheme changes, update them here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pgbranch.fullname" . }}-branch-pods
+  labels:
+    {{- include "pgbranch.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      pgbranch.managed: "true"
+      pgbranch.role: branch
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only branchd (API + proxy live in the same pod) reaches branch Postgres.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "pgbranch.selectorLabels" . | nindent 14 }}
+  egress:
+    # Cluster DNS (kube-dns / CoreDNS) so the branch pod can resolve names.
+    - to:
+        {{- with .Values.networkPolicy.dnsFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- else }}
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        {{- end }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The Postgres source(s) a branch hydrates from. Configure with the source's
+    # selector(s) and/or CIDRs; empty = no source egress is opened (branch pods
+    # that hold their own data, e.g. CSI clones, need none).
+    {{- with .Values.networkPolicy.sourceEgress }}
+    - to:
+        {{- toYaml . | nindent 8 }}
+      {{- with $.Values.networkPolicy.sourcePorts }}
+      ports:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}

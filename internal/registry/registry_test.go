@@ -1,11 +1,13 @@
 package registry
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -164,8 +166,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 9 {
-		t.Fatalf("user_version=%d want 9", v)
+	if v != 11 {
+		t.Fatalf("user_version=%d want 11", v)
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -227,6 +229,20 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	// v9: api_tokens table exists and is usable on the upgraded DB
 	if _, err := r.CreateAPIToken("ci", RoleOperator); err != nil {
 		t.Fatalf("v9 api_tokens unusable after upgrade: %v", err)
+	}
+	// v11: transitions.actor column exists; the pre-existing branch's "created"
+	// journal row (written by schemaV1 fixture? no — fixture inserts no
+	// transitions) is absent, but a fresh transition records the actor column.
+	if err := r.TransitionBranchCtx(WithActor(context.Background(), Actor{Name: "ci", Role: RoleOperator}),
+		"br1", BranchDestroying, "audit upgrade check"); err != nil {
+		t.Fatalf("v11 transition after upgrade: %v", err)
+	}
+	var actor string
+	if err := r.db.QueryRow(`SELECT actor FROM transitions WHERE entity_id='br1' ORDER BY id DESC LIMIT 1`).Scan(&actor); err != nil {
+		t.Fatalf("v11 actor column read: %v", err)
+	}
+	if actor != "ci (operator)" {
+		t.Fatalf("v11 actor=%q want %q", actor, "ci (operator)")
 	}
 	// re-opening an already-migrated DB is a no-op
 	r2, err := Open(path)
@@ -764,6 +780,157 @@ func TestBranchPasswordRoundTrip(t *testing.T) {
 	}
 }
 
+// rawBranchPassword reads the password column straight from SQLite, bypassing
+// scanBranch's decrypt, so a test can assert the on-disk value is ciphertext.
+func rawBranchPassword(t *testing.T, r *Registry, id string) string {
+	t.Helper()
+	var pw string
+	if err := r.db.QueryRow(`SELECT password FROM branches WHERE id=?`, id).Scan(&pw); err != nil {
+		t.Fatal(err)
+	}
+	return pw
+}
+
+func makeBranch(t *testing.T, r *Registry, name string) *Branch {
+	t.Helper()
+	src, err := r.GetSourceByName("main")
+	if err != nil {
+		src = &Source{Name: "main", PGVersion: "17", Volume: "v"}
+		if err := r.CreateSource(src); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := &Branch{Name: name, SourceID: src.ID, RWVolume: "rw-" + name, SourceVolume: "v"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// With a key set, SetBranchPassword encrypts on write (raw column is enc:-prefixed
+// ciphertext, not the plaintext) and every read path decrypts back to the
+// original plaintext.
+func TestBranchPasswordEncryptedAtRest(t *testing.T) {
+	r := openTest(t)
+	if err := r.SetSecretKey(DeriveSecretKey("super-secret-token")); err != nil {
+		t.Fatal(err)
+	}
+	b := makeBranch(t, r, "pr-1")
+	const plain = "deadbeefcafef00d"
+	if err := r.SetBranchPassword(b.ID, plain); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := rawBranchPassword(t, r, b.ID)
+	if raw == plain {
+		t.Fatalf("raw column stored plaintext %q; want ciphertext", raw)
+	}
+	if !strings.HasPrefix(raw, encPrefix) {
+		t.Fatalf("raw column %q missing %q prefix", raw, encPrefix)
+	}
+
+	got, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != plain {
+		t.Fatalf("GetBranchByName Password=%q want %q", got.Password, plain)
+	}
+	live, err := r.ListLiveBranches()
+	if err != nil || len(live) != 1 || live[0].Password != plain {
+		t.Fatalf("ListLiveBranches password=%v err=%v want %q", live, err, plain)
+	}
+}
+
+// With no key, behavior is unchanged: the password is stored and read as
+// plaintext (back-compat for inherit-mode setups and existing tests).
+func TestBranchPasswordPlaintextWithoutKey(t *testing.T) {
+	r := openTest(t)
+	b := makeBranch(t, r, "pr-1")
+	const plain = "a1b2c3d4"
+	if err := r.SetBranchPassword(b.ID, plain); err != nil {
+		t.Fatal(err)
+	}
+	if raw := rawBranchPassword(t, r, b.ID); raw != plain {
+		t.Fatalf("no-key raw column=%q want plaintext %q", raw, plain)
+	}
+	if got, _ := r.GetBranchByName("pr-1"); got.Password != plain {
+		t.Fatalf("no-key read Password=%q want %q", got.Password, plain)
+	}
+}
+
+// A legacy plaintext row (written before encryption, or while no key was set)
+// reads back correctly even after a key is configured: the missing enc: prefix
+// marks it plaintext, so it never double-encrypts or fails to decrypt.
+func TestBranchPasswordLegacyPlaintextReadWithKey(t *testing.T) {
+	r := openTest(t)
+	b := makeBranch(t, r, "pr-1")
+	const legacy = "legacyplaintext0"
+	if err := r.SetBranchPassword(b.ID, legacy); err != nil { // no key yet -> plaintext
+		t.Fatal(err)
+	}
+	// Operator now sets a key (e.g. PGBRANCH_TOKEN configured after an upgrade).
+	if err := r.SetSecretKey(DeriveSecretKey("token-set-later")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != legacy {
+		t.Fatalf("legacy row read with key Password=%q want %q", got.Password, legacy)
+	}
+}
+
+// Empty passwords (inherit mode) stay empty whether or not a key is set, and
+// never grow an enc: prefix.
+func TestBranchPasswordEmptyStaysEmpty(t *testing.T) {
+	r := openTest(t)
+	if err := r.SetSecretKey(DeriveSecretKey("tok")); err != nil {
+		t.Fatal(err)
+	}
+	b := makeBranch(t, r, "pr-1")
+	if got, _ := r.GetBranchByName("pr-1"); got.Password != "" {
+		t.Fatalf("fresh branch Password=%q want empty", got.Password)
+	}
+	if raw := rawBranchPassword(t, r, b.ID); raw != "" {
+		t.Fatalf("empty password raw column=%q want empty", raw)
+	}
+}
+
+// A wrong-length key is rejected at SetSecretKey.
+func TestSetSecretKeyRejectsBadLength(t *testing.T) {
+	r := openTest(t)
+	if err := r.SetSecretKey([]byte("short")); err == nil {
+		t.Fatal("want error for 5-byte key")
+	}
+	// nil key is the no-op (plaintext) path, not an error
+	if err := r.SetSecretKey(nil); err != nil {
+		t.Fatalf("nil key should be a no-op, got %v", err)
+	}
+}
+
+// A value encrypted under one token cannot be decrypted after the token (and
+// thus the derived key) is rotated — surfaces as a decrypt error, not silent
+// corruption. Documents the rotation trade-off at the unit level.
+func TestBranchPasswordUnrecoverableAfterTokenRotation(t *testing.T) {
+	r := openTest(t)
+	if err := r.SetSecretKey(DeriveSecretKey("old-token")); err != nil {
+		t.Fatal(err)
+	}
+	b := makeBranch(t, r, "pr-1")
+	if err := r.SetBranchPassword(b.ID, "secretpw12345678"); err != nil {
+		t.Fatal(err)
+	}
+	// token rotated: key no longer matches the stored ciphertext
+	if err := r.SetSecretKey(DeriveSecretKey("new-token")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.GetBranchByName("pr-1"); err == nil {
+		t.Fatal("want decrypt error reading a password encrypted under the old token")
+	}
+}
+
 func TestCreateBranchPersistsParentBranchName(t *testing.T) {
 	r := openTest(t)
 	src := &Source{Name: "main", PGVersion: "17", Volume: "v"}
@@ -901,5 +1068,183 @@ func TestInstanceIDDistinctAcrossFiles(t *testing.T) {
 	t.Cleanup(func() { rb.Close() })
 	if ra.InstanceID() == rb.InstanceID() {
 		t.Fatalf("distinct registry files share an instance id: %q", ra.InstanceID())
+	}
+}
+
+// SetBranchContainer must bump updated_at so a freeze/clone saga that records
+// its in-flight container keeps resetting the stuck-timer. Without the bump a
+// slow-but-alive op looks abandoned to ListStuckBranches and reconcile reaps
+// it (the freeze data-loss bug).
+func TestSetBranchContainerBumpsUpdatedAt(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	b := &Branch{Name: "parent", SourceID: s.ID, RWVolume: "pgbranch-br-parent-rw"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate updated_at well into the past so the row looks stuck.
+	old := "2000-01-01T00:00:00.000Z"
+	if _, err := r.db.Exec(`UPDATE branches SET state='resetting', updated_at=? WHERE id=?`, old, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: with the old timestamp it IS flagged stuck.
+	stuck, err := r.ListStuckBranches("2020-01-01T00:00:00.000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stuck) != 1 {
+		t.Fatalf("precondition: backdated row should be stuck, got %d", len(stuck))
+	}
+
+	// Saga progress records the in-flight container — this must bump updated_at.
+	if err := r.SetBranchContainer(b.ID, "cid-inflight"); err != nil {
+		t.Fatal(err)
+	}
+
+	var updatedAt string
+	if err := r.db.QueryRow(`SELECT updated_at FROM branches WHERE id=?`, b.ID).Scan(&updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if updatedAt == old {
+		t.Fatal("SetBranchContainer did not bump updated_at")
+	}
+	// And it is no longer flagged stuck against a recent-past deadline.
+	stuck, err = r.ListStuckBranches("2020-01-01T00:00:00.000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stuck) != 0 {
+		t.Fatalf("progressing branch still flagged stuck after SetBranchContainer: %d", len(stuck))
+	}
+}
+
+// CountLiveBranchesReferencingRW guards the stuck-fail path: a freeze/clone
+// parent's rw volume is referenced by its in-flight child (as source_volume in
+// csi/zfs, or via parent_branch_name in the overlay freeze) and must never be
+// counted as removable while that child is live.
+func TestCountLiveBranchesReferencingRW(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	parent := &Branch{Name: "parent", SourceID: s.ID, RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+	if err := r.CreateBranch(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkBranchReady(parent.ID, "cid-parent", "127.0.0.1", 5432); err != nil {
+		t.Fatal(err)
+	}
+	// No child yet: nothing references the parent's rw volume.
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 0 {
+		t.Fatalf("n=%d err=%v want 0", n, err)
+	}
+
+	// csi/zfs child: records parent.RWVolume as its source_volume.
+	csiChild := &Branch{Name: "csichild", SourceID: s.ID, RWVolume: "pgbranch-br-csichild-rw",
+		SourceVolume: parent.RWVolume, ParentBranchName: parent.Name}
+	if err := r.CreateBranch(csiChild); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v want 1 (csi child references rw via source_volume)", n, err)
+	}
+
+	// overlay child: source_volume is the SOURCE, not the parent rw; the link
+	// is parent_branch_name. Still must count.
+	overlayChild := &Branch{Name: "ovchild", SourceID: s.ID, RWVolume: "pgbranch-br-ovchild-rw",
+		SourceVolume: "pgbranch-src-main", ParentBranchName: parent.Name}
+	if err := r.CreateBranch(overlayChild); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 2 {
+		t.Fatalf("n=%d err=%v want 2 (overlay child references parent by name)", n, err)
+	}
+
+	// the parent must not count itself.
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 2 {
+		t.Fatalf("parent counted itself: n=%d", n)
+	}
+
+	// destroyed children no longer count.
+	for _, c := range []*Branch{csiChild, overlayChild} {
+		if err := r.TransitionBranch(c.ID, BranchFailed, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.TransitionBranch(c.ID, BranchDestroying, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.TransitionBranch(c.ID, BranchDestroyed, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := r.CountLiveBranchesReferencingRW(parent.Name, parent.RWVolume); err != nil || n != 0 {
+		t.Fatalf("n=%d err=%v want 0 after children destroyed", n, err)
+	}
+}
+
+// TestTransitionBranchIsAtomicCAS races two concurrent TransitionBranch calls
+// from the SAME legal start state (ready) to two DIFFERENT target states
+// (destroying vs resetting). The transition must be a compare-and-swap: exactly
+// one goroutine wins, the other gets the illegal-transition error (its legal
+// from-state no longer holds), and the row ends in the winner's state. A
+// non-atomic read-check-write would let both read 'ready' and both succeed,
+// leaving the journal and row inconsistent.
+func TestTransitionBranchIsAtomicCAS(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "v"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "rw", SourceVolume: "v"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkBranchReady(b.ID, "c", "127.0.0.1", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		to  BranchState
+		err error
+	}
+	results := make(chan result, 2)
+	var start sync.WaitGroup
+	start.Add(1)
+	for _, to := range []BranchState{BranchDestroying, BranchResetting} {
+		to := to
+		go func() {
+			start.Wait() // release both goroutines together to maximise the race
+			results <- result{to: to, err: r.TransitionBranch(b.ID, to, "race")}
+		}()
+	}
+	start.Done()
+
+	var winners, losers int
+	var winState BranchState
+	for i := 0; i < 2; i++ {
+		res := <-results
+		if res.err == nil {
+			winners++
+			winState = res.to
+		} else {
+			losers++
+			if !strings.Contains(res.err.Error(), "illegal branch transition") {
+				t.Fatalf("loser err = %v, want illegal-transition error", res.err)
+			}
+		}
+	}
+	if winners != 1 || losers != 1 {
+		t.Fatalf("winners=%d losers=%d, want exactly one of each (CAS not atomic)", winners, losers)
+	}
+	got, err := r.getBranch(`id=?`, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != winState {
+		t.Fatalf("final state=%q, want winner's state %q", got.State, winState)
 	}
 }

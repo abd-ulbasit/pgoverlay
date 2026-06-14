@@ -25,6 +25,11 @@ A note that informs several patterns below — **credential modes**:
 - **rotation** (`--rotate-branch-credentials`) — every branch gets its own
   password. Safer for shared/long-lived branches, but a consumer must fetch
   the per-branch password (from the REST API) rather than hold a static one.
+  Rotated passwords are encrypted at rest in the registry DB with a key
+  derived from `PGBRANCH_TOKEN` (AES-256-GCM). **Rotating `PGBRANCH_TOKEN`
+  makes existing encrypted branch passwords unrecoverable** — re-run rotation
+  (reset the affected branches) after a token change. Acceptable for
+  pgbranch's ephemeral branches.
 
 **Rotation *and* static config — the connect helper.** With rotation on, an
 app can't hold a fixed `PGPASSWORD`. The `pgbranchconnect` helper resolves

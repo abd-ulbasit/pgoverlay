@@ -28,10 +28,41 @@ metadata:
   namespace: pgbranch-preview
 rules:
   # Core workload + config objects a Helm release of pgbranch (and the preview
-  # app) creates in this namespace.
+  # app) creates in this namespace. NOTE: secrets are deliberately NOT in this
+  # broad rule — see the scoped secrets rule below.
   - apiGroups: [""]
-    resources: ["pods", "services", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims"]
+    resources: ["pods", "services", "configmaps", "serviceaccounts", "persistentvolumeclaims"]
     verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
+  # Secrets are scoped tighter than the rest: a broad secrets/get+list+watch
+  # would let a leaked CI token read EVERY secret in the namespace (other
+  # tenants' DB creds, TLS keys, ...). Helm's release-state secrets are named
+  # sh.helm.release.v1.<release>.v<n>; the chart's own token Secret is
+  # <release>-pgbranch-token (and -ghook). We allow create (Helm needs it for
+  # release state + the chart Secret) but restrict get/delete/patch/update to
+  # those known names via resourceNames, and grant NO list/watch (no
+  # namespace-wide enumeration). Best practice: pass token/webhookSecret via a
+  # pre-created Secret (existingSecret) so this deployer never creates secrets
+  # at all and you can drop `create` here too.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "delete", "patch", "update"]
+    resourceNames:
+      # Helm release state (covers v1..v9; extend if a release exceeds 9 revs).
+      - sh.helm.release.v1.pgbranch.v1
+      - sh.helm.release.v1.pgbranch.v2
+      - sh.helm.release.v1.pgbranch.v3
+      - sh.helm.release.v1.pgbranch.v4
+      - sh.helm.release.v1.pgbranch.v5
+      - sh.helm.release.v1.pgbranch.v6
+      - sh.helm.release.v1.pgbranch.v7
+      - sh.helm.release.v1.pgbranch.v8
+      - sh.helm.release.v1.pgbranch.v9
+      # Chart-managed Secrets (when not using existingSecret).
+      - pgbranch-token
+      - pgbranch-ghook
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
     verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]

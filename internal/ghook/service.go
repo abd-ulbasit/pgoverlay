@@ -94,10 +94,32 @@ type payload struct {
 	} `json:"installation"`
 }
 
+// maxWebhookBody caps the request body read BEFORE signature verification so
+// an unauthenticated multi-GB POST can't exhaust memory. GitHub payloads are
+// well under 1 MiB.
+const maxWebhookBody = 1 << 20
+
+// branchPrefix namespaces every App-created branch so a webhook-derived name
+// can never collide with a differently-sourced branch (another PR, or a
+// human-created branch). Without it, in git-branch mode an untrusted external
+// PR head ref, after sanitization, could land on an existing branch and — with
+// ResetOnPush — wipe someone else's data. Both naming modes live under this
+// reserved prefix: pr-number -> "gh-pr-<n>", git-branch -> "gh-<sanitizedref>".
+const branchPrefix = "gh-"
+
+// maxBranchNameLen is the engine's branch-name limit (^[a-z0-9][a-z0-9-]{0,40}$
+// => 41 chars). The sanitized git ref is truncated so prefix+ref stays within
+// it, keeping the reserved namespace inside the engine's budget.
+const maxBranchNameLen = 41
+
 func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	// Limit before reading and before HMAC verification: the read itself is
+	// the attack surface. ReadAll on an over-limit body returns an error (and
+	// MaxBytesReader writes a 413 to w), so we reject without buffering it all.
+	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "read body: "+err.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
 	if !verifySignature(s.cfg.WebhookSecret, body, r.Header.Get("X-Hub-Signature-256")) {
@@ -187,22 +209,28 @@ func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 	json.NewEncoder(w).Encode(map[string]string{"branch": branch, "status": "accepted"})
 }
 
-// branchName derives the pgbranch branch name for a pull request according
-// to Config.BranchNaming. git-branch mode falls back to pr-<number> when the
-// sanitized ref comes up empty.
+// branchName derives the pgbranch branch name for a pull request according to
+// Config.BranchNaming. Every name lives under the reserved branchPrefix so a
+// webhook-created branch can never collide with a differently-sourced one
+// (cross-PR or human): pr-number -> "gh-pr-<n>", git-branch -> "gh-<ref>".
+// git-branch mode falls back to gh-pr-<number> when the sanitized ref comes up
+// empty.
 func (s *Service) branchName(p *payload) string {
 	if s.cfg.BranchNaming == "git-branch" {
-		if n := sanitizeBranchName(p.PullRequest.Head.Ref); n != "" {
-			return n
+		// Budget the sanitized ref so branchPrefix+ref stays within the engine's
+		// limit; the prefix is part of the reserved namespace, not free length.
+		if n := sanitizeBranchName(p.PullRequest.Head.Ref, maxBranchNameLen-len(branchPrefix)); n != "" {
+			return branchPrefix + n
 		}
 	}
-	return fmt.Sprintf("pr-%d", p.Number)
+	return fmt.Sprintf("%spr-%d", branchPrefix, p.Number)
 }
 
-// sanitizeBranchName maps a git ref to a valid pgbranch branch name
-// (^[a-z0-9][a-z0-9-]{0,40}$): lowercase, runs of other characters collapse
-// to single dashes, edges trimmed, truncated to 41 chars.
-func sanitizeBranchName(ref string) string {
+// sanitizeBranchName maps a git ref to a valid pgbranch branch-name fragment:
+// lowercase, runs of other characters collapse to single dashes, edges
+// trimmed, truncated to maxLen chars. maxLen is the budget left after the
+// caller's prefix so the final prefix+fragment fits ^[a-z0-9][a-z0-9-]{0,40}$.
+func sanitizeBranchName(ref string, maxLen int) string {
 	var b strings.Builder
 	dash := false
 	for _, r := range strings.ToLower(ref) {
@@ -216,11 +244,11 @@ func sanitizeBranchName(ref string) string {
 		default:
 			dash = true
 		}
-		if b.Len() >= 41 {
+		if b.Len() >= maxLen {
 			break
 		}
 	}
-	return strings.TrimRight(b.String()[:min(b.Len(), 41)], "-")
+	return strings.TrimRight(b.String()[:min(b.Len(), maxLen)], "-")
 }
 
 // handleEnsure brackets the branch operation with commit statuses on the PR

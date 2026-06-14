@@ -47,6 +47,42 @@ func TestLookupAPIToken(t *testing.T) {
 	}
 }
 
+// TestLookupAPITokenIndexedPath exercises the v10 indexed point-lookup path:
+// a known token resolves to its role, an unknown token is rejected, all via
+// the WHERE token_hash=? query (no scan-all).
+func TestLookupAPITokenIndexedPath(t *testing.T) {
+	r := openTest(t)
+	plaintext, err := r.CreateAPIToken("op-1", RoleOperator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if role, ok := r.LookupAPIToken(plaintext); !ok || role != RoleOperator {
+		t.Fatalf("LookupAPIToken(known) = %q,%v want operator,true", role, ok)
+	}
+	if role, ok := r.LookupAPIToken("ffffffffffffffffffffffffffffffff"); ok {
+		t.Fatalf("LookupAPIToken(unknown) = %q,%v want \"\",false", role, ok)
+	}
+}
+
+// TestMigrationV10IndexExists asserts a fresh Open lands at user_version 10 and
+// the unique index on api_tokens(token_hash) exists.
+func TestMigrationV10IndexExists(t *testing.T) {
+	r := openTest(t)
+	var version int
+	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 10 {
+		t.Fatalf("user_version = %d, want >= 10 (the api_tokens_hash index migration)", version)
+	}
+	var name string
+	err := r.db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='index' AND name='api_tokens_hash'`).Scan(&name)
+	if err != nil {
+		t.Fatalf("api_tokens_hash index not found: %v", err)
+	}
+}
+
 func TestListAndRevokeAPIToken(t *testing.T) {
 	r := openTest(t)
 	if _, err := r.CreateAPIToken("a", RoleAdmin); err != nil {

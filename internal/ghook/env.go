@@ -2,11 +2,17 @@ package ghook
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// minWebhookSecretLen rejects a webhook secret too short to give the HMAC any
+// real strength. GitHub's own guidance is a long random secret; a sub-16-char
+// value is almost certainly a placeholder and is refused at startup.
+const minWebhookSecretLen = 16
 
 // EnvConfig is the full GHOOK_* environment configuration for the
 // pgbranch-github binary: the service Config plus wiring (listen address,
@@ -51,6 +57,12 @@ func LoadEnv(getenv func(string) string) (*EnvConfig, error) {
 			return nil, fmt.Errorf("%s is required", name)
 		}
 	}
+	// The webhook secret is the ONLY thing standing between the public internet
+	// and branch create/reset/destroy: anyone who can sign a body with it drives
+	// branch ops. A short secret is brute-forceable, so refuse it at startup.
+	if len(ec.WebhookSecret) < minWebhookSecretLen {
+		return nil, fmt.Errorf("GHOOK_WEBHOOK_SECRET must be at least %d characters (it is the only authentication for branch operations)", minWebhookSecretLen)
+	}
 	if v := getenv("GHOOK_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d < 0 {
@@ -76,6 +88,13 @@ func LoadEnv(getenv func(string) string) (*EnvConfig, error) {
 		if r = strings.TrimSpace(r); r != "" {
 			ec.Repos = append(ec.Repos, r)
 		}
+	}
+	// Empty allow-list = every repository whose webhook can sign with the secret
+	// triggers branch ops. That is a legitimate single-tenant config, but it is
+	// also a foot-gun if the secret leaks, so warn loudly rather than silently
+	// allowing all.
+	if len(ec.Repos) == 0 {
+		slog.Warn("GHOOK_REPOS is empty: branch operations will run for ANY repository that can sign with GHOOK_WEBHOOK_SECRET; set GHOOK_REPOS to an owner/name allow-list to scope this")
 	}
 	switch v := getenv("GHOOK_BRANCH_NAMING"); v {
 	case "", "pr-number", "git-branch":

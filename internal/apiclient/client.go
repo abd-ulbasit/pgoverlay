@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,17 +28,84 @@ type Client struct {
 	HTTP    *http.Client
 }
 
-// New builds a client for the given base URL (http or https). For branchd
-// instances serving a self-signed certificate, PGBRANCH_TLS_SKIP_VERIFY=1
-// disables certificate verification (read once, here).
+// New builds a client for the given base URL (http or https). Transport
+// safety, in order of preference:
+//   - PGBRANCH_CA_CERT=<pem-file> trusts a self-signed branchd properly by
+//     adding the PEM to the root pool (the right way to use a private CA).
+//   - PGBRANCH_TLS_SKIP_VERIFY=1 disables certificate verification entirely;
+//     supported as an escape hatch but warned about loudly (MITM-exposed).
+//
+// It also warns once, to stderr, when the token would be sent over plaintext
+// http to a non-loopback host (cleartext bearer token on the wire). It does
+// not hard-fail: some deployments front branchd with a trusted TLS proxy.
 func New(baseURL, token string) *Client {
+	baseURL = strings.TrimRight(baseURL, "/")
 	httpClient := http.DefaultClient
+
+	if caPath := os.Getenv("PGBRANCH_CA_CERT"); caPath != "" {
+		if tlsCfg, err := tlsConfigWithCA(caPath); err != nil {
+			warnf("pgbranch: PGBRANCH_CA_CERT %q could not be loaded (%v); falling back to system roots", caPath, err)
+		} else {
+			httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+		}
+	}
 	if os.Getenv("PGBRANCH_TLS_SKIP_VERIFY") == "1" {
+		warnf("pgbranch: PGBRANCH_TLS_SKIP_VERIFY=1 disables TLS certificate verification — the connection is exposed to man-in-the-middle attacks")
 		httpClient = &http.Client{Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}}
 	}
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: httpClient}
+	if token != "" && plaintextTokenLeak(baseURL) {
+		warnf("pgbranch: sending bearer token in cleartext over http to a non-loopback host (%s) — use https or PGBRANCH_CA_CERT", baseURL)
+	}
+
+	return &Client{BaseURL: baseURL, Token: token, HTTP: httpClient}
+}
+
+// warnf prints a one-line warning to stderr. Kept tiny and dependency-free so
+// the CLI surfaces transport-safety issues without pulling in a logger.
+func warnf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+// plaintextTokenLeak reports whether sending a bearer token to rawURL would
+// expose it in cleartext: the scheme is http (not https) AND the host is not
+// loopback. Loopback http is fine (the token never leaves the machine);
+// remote http leaks it on the wire. Unparseable/relative/other-scheme URLs
+// return false — we only warn on a clear, actionable cleartext-to-remote case.
+func plaintextTokenLeak(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	return !isLoopbackHost(u.Hostname())
+}
+
+// isLoopbackHost reports whether host is the loopback interface by name or IP
+// (localhost, 127.0.0.0/8, ::1).
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// tlsConfigWithCA loads a PEM bundle from path into a fresh root pool and
+// returns a tls.Config that trusts exactly those roots (so a self-signed
+// branchd verifies properly, without disabling verification).
+func tlsConfigWithCA(path string) (*tls.Config, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("no PEM certificates found in %s", path)
+	}
+	return &tls.Config{RootCAs: pool}, nil
 }
 
 // StatusError is returned for non-2xx responses; it carries the HTTP status
@@ -187,6 +256,14 @@ func (c *Client) DiffBranch(ctx context.Context, name string, dataSample int) (*
 		return nil, err
 	}
 	return &out, nil
+}
+
+// BranchHistory fetches a branch's audit trail: every recorded state
+// transition with its reason, the actor that caused it, and the timestamp,
+// oldest first. Backs `pgb history` in server mode.
+func (c *Client) BranchHistory(ctx context.Context, name string) ([]api.Transition, error) {
+	var out []api.Transition
+	return out, c.do(ctx, "GET", "/v1/branches/"+url.PathEscape(name)+"/history", nil, &out)
 }
 
 func (c *Client) DestroyBranch(ctx context.Context, name string) error {

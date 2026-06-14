@@ -66,6 +66,10 @@ func TestBuildHelperPod(t *testing.T) {
 	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		t.Errorf("RestartPolicy = %q", pod.Spec.RestartPolicy)
 	}
+	// Helper pods do volume ops, not Kubernetes API calls: no SA token mounted.
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Errorf("AutomountServiceAccountToken = %v, want false", pod.Spec.AutomountServiceAccountToken)
+	}
 	if len(pod.Spec.Containers) != 1 {
 		t.Fatalf("containers = %d", len(pod.Spec.Containers))
 	}
@@ -192,6 +196,10 @@ func TestBuildBranchPod(t *testing.T) {
 	}
 	if pod.Spec.RestartPolicy != corev1.RestartPolicyAlways {
 		t.Errorf("RestartPolicy = %q", pod.Spec.RestartPolicy)
+	}
+	// Branch pods run Postgres only: no Kubernetes API access, no SA token.
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Errorf("AutomountServiceAccountToken = %v, want false", pod.Spec.AutomountServiceAccountToken)
 	}
 	c := pod.Spec.Containers[0]
 	if c.Name != "postgres" || c.Image != "postgres:17" {

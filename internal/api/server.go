@@ -110,6 +110,17 @@ type MaskScript struct {
 	SQL  string `json:"sql"`
 }
 
+// Transition is one entry of a branch's audit history: a recorded state change,
+// its reason, the actor that caused it ("name (role)", the env-token sentinel,
+// or "system:reconcile" for daemon-initiated changes), and when it happened.
+type Transition struct {
+	FromState string `json:"from_state"`
+	ToState   string `json:"to_state"`
+	Reason    string `json:"reason"`
+	Actor     string `json:"actor"`
+	At        string `json:"at"`
+}
+
 // Ready reports whether branchd can serve traffic: the registry is reachable
 // and the container driver responds. Returns nil when ready, an error
 // otherwise. branchd supplies a closure; tests inject a fake.
@@ -166,6 +177,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("GET /v1/branches/{name}", s.requireRole(viewer, s.getBranch))
 	v1.HandleFunc("GET /v1/branches/{name}/usage", s.requireRole(viewer, s.branchUsage))
 	v1.HandleFunc("GET /v1/branches/{name}/diff", s.requireRole(viewer, s.branchDiff))
+	v1.HandleFunc("GET /v1/branches/{name}/history", s.requireRole(viewer, s.branchHistory))
 	v1.HandleFunc("DELETE /v1/branches/{name}", s.mutate(operator, s.destroyBranch))
 	v1.HandleFunc("POST /v1/branches/{name}/reset", s.mutate(operator, s.resetBranch))
 	v1.HandleFunc("GET /v1/reconcile/plan", s.requireRole(viewer, s.reconcilePlan))

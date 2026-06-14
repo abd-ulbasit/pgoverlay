@@ -1,12 +1,19 @@
 # pgbranch-github container image (the Helm chart's optional ghook
 # sub-deployment). Same pure-Go static build recipe as the branchd image.
-FROM golang:1.26-alpine AS build
+# Base images pinned by digest (resolved from Docker Hub; supply-chain hygiene).
+# Refresh with: docker buildx imagetools inspect golang:1.26-alpine (and alpine:3.21).
+FROM golang:1.26-alpine@sha256:7a3e50096189ad57c9f9f865e7e4aa8585ed1585248513dc5cda498e2f41812c AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /pgbranch-github ./cmd/pgbranch-github
 
-FROM alpine:3.21
+FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
 COPY --from=build /pgbranch-github /usr/local/bin/pgbranch-github
+# ghook is the internet-facing webhook receiver and needs no privileges: run as
+# a non-root, non-existent UID so the image is non-root even outside the chart
+# (the Helm chart additionally pins runAsNonRoot/runAsUser=65532 and drops all
+# caps). 65532 = the conventional "nonroot" distroless UID.
+USER 65532:65532
 ENTRYPOINT ["pgbranch-github"]

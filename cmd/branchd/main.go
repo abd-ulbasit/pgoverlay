@@ -13,10 +13,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -57,6 +59,34 @@ func uiURL(apiAddr string, tlsEnabled bool) string {
 	return fmt.Sprintf("%s://%s/ui/", scheme, net.JoinHostPort(host, port))
 }
 
+// envInt reads an int env var as a flag default; an unset/empty var keeps def,
+// a malformed value is fatal so a typo'd cap can't silently disable the quota.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: %v", key, v, err)
+	}
+	return n
+}
+
+// envDuration reads a Go-duration env var (e.g. "24h") as a flag default; an
+// unset/empty var keeps def, a malformed value is fatal.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: %v", key, v, err)
+	}
+	return d
+}
+
 // tlsConfigFromFlags loads an optional PEM cert/key flag pair (--<name>-tls-cert
 // / --<name>-tls-key). Both empty = TLS off (nil config); one without the
 // other is a startup error.
@@ -72,6 +102,29 @@ func tlsConfigFromFlags(certFile, keyFile, name string) (*tls.Config, error) {
 		return nil, fmt.Errorf("load --%s-tls-cert/--%s-tls-key: %w", name, name, err)
 	}
 	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
+}
+
+// pgProxyExposedPlaintext reports whether the Postgres router would carry
+// traffic (including credentials) in cleartext across the network: TLS is off
+// (no cert) AND the listen address is not loopback. A loopback-only listener,
+// or any TLS-terminated one, is fine. A malformed address is treated as exposed
+// (conservative: warn rather than stay silent). Pulled out as a pure function
+// so the loopback decision is unit-testable without standing up a listener.
+func pgProxyExposedPlaintext(pgAddr string, tlsEnabled bool) bool {
+	if tlsEnabled {
+		return false
+	}
+	host, _, err := net.SplitHostPort(pgAddr)
+	if err != nil {
+		return true // can't prove it's loopback -> assume exposed
+	}
+	if host == "" {
+		return true // ":6432" binds all interfaces
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsLoopback()
+	}
+	return host != "localhost"
 }
 
 // storageOptions captures the --runtime/--kube-storage/--cow flag triangle
@@ -126,6 +179,21 @@ func resolveStorage(o storageOptions) (cow.Backend, error) {
 	}
 }
 
+// storageRoot returns the on-disk path whose filesystem holds all branch CoW
+// data and the SQLite registry, for the disk-free gauge. docker/overlay use
+// cfg.Home (~/.pgbranch); kube hostpath uses --kube-data-root on the storage
+// node. CSI has no single shared local root (one PVC per branch), so it returns
+// "" and the gauge is left unregistered.
+func storageRoot(runtimeName, kubeStorage, kubeDataRoot, home string) string {
+	if runtimeName == "kube" {
+		if kubeStorage == "hostpath" {
+			return kubeDataRoot
+		}
+		return "" // csi: no single shared root
+	}
+	return home // docker / overlay
+}
+
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
@@ -144,6 +212,9 @@ func run() error {
 	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default), zfs (experimental, see docs/zfs.md) or csi (forced by --kube-storage csi)")
 	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgbranch datasets, e.g. tank/pgbranch (required with --cow zfs)")
 	rotateCreds := flag.Bool("rotate-branch-credentials", false, "give every branch its own generated password instead of inheriting the source's (returned as `password` in branch API responses; see docs/architecture.md)")
+	maxBranches := flag.Int("max-branches", envInt("PGBRANCH_MAX_BRANCHES", 0), "cap on live (non-destroyed) branches; creates past the cap return 403 (0 = unlimited; env PGBRANCH_MAX_BRANCHES)")
+	defaultTTL := flag.Duration("default-ttl", envDuration("PGBRANCH_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGBRANCH_DEFAULT_TTL)")
+	maxTTL := flag.Duration("max-ttl", envDuration("PGBRANCH_MAX_TTL", 0), "upper bound on any requested branch TTL; longer TTLs are capped to this, e.g. 168h (0 = no cap; env PGBRANCH_MAX_TTL)")
 	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
@@ -184,6 +255,15 @@ func run() error {
 		return err
 	}
 	defer reg.Close()
+	// Encrypt branch passwords at rest with a key derived from PGBRANCH_TOKEN
+	// (key = sha256(token)). The registry DB sits on a hostPath/PVC; without
+	// this a reader of the file gets every live branch's working credential.
+	// Trade-off: rotating PGBRANCH_TOKEN makes existing encrypted passwords
+	// unrecoverable — re-run credential rotation after a token change. (token
+	// is non-empty here: branchd refused to start above otherwise.)
+	if err := reg.SetSecretKey(registry.DeriveSecretKey(token)); err != nil {
+		return err
+	}
 	cowSet := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "cow" {
@@ -231,9 +311,29 @@ func run() error {
 	}
 	m := metrics.New()
 	m.SetStateCounter(reg)
+	// Disk-free visibility on the storage-root filesystem that holds all CoW
+	// branch volumes plus the SQLite registry. For docker/overlay that root is
+	// cfg.Home (~/.pgbranch); for kube hostpath it is --kube-data-root on the
+	// storage node. CSI gives each branch its own PVC with no single shared
+	// local root to statfs, so the gauge is wired only for the local-FS modes.
+	if diskRoot := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home); diskRoot != "" {
+		m.SetDiskRoot(diskRoot)
+	}
 	engOpts := []engine.Option{engine.WithMetrics(m)}
 	if *rotateCreds {
 		engOpts = append(engOpts, engine.WithCredentialRotation())
+	}
+	if *maxBranches < 0 {
+		return errors.New("--max-branches must be >= 0 (0 = unlimited)")
+	}
+	if *maxBranches > 0 {
+		engOpts = append(engOpts, engine.WithMaxBranches(*maxBranches))
+	}
+	if *defaultTTL < 0 || *maxTTL < 0 {
+		return errors.New("--default-ttl and --max-ttl must be >= 0 (0 = unset)")
+	}
+	if *defaultTTL > 0 || *maxTTL > 0 {
+		engOpts = append(engOpts, engine.WithTTLPolicy(*defaultTTL, *maxTTL))
 	}
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
 		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")}, engOpts...)
@@ -284,6 +384,10 @@ func run() error {
 	lis, err := net.Listen("tcp", *pgAddr)
 	if err != nil {
 		return fmt.Errorf("pg router listen: %w", err)
+	}
+	if pgProxyExposedPlaintext(*pgAddr, pgTLS != nil) {
+		slog.Warn("Postgres router is exposed without TLS: client traffic — including credentials — crosses the network in cleartext; set --pg-tls-cert/--pg-tls-key or bind --pg-addr to loopback and front it with a trusted TLS boundary",
+			"pg_addr", *pgAddr)
 	}
 	g.Go(func() error {
 		log.Printf("pg router listening on %s (connect with dbname@branch; TLS %v)", *pgAddr, pgTLS != nil)

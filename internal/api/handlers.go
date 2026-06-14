@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,25 +25,38 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 // writeEngineError maps engine/registry failures to HTTP statuses: invalid
-// input -> 400, missing rows -> 404, name/lifecycle conflicts -> 409,
-// everything else -> 500.
-func writeEngineError(w http.ResponseWriter, err error) {
-	code := http.StatusInternalServerError
+// input -> 400, missing rows -> 404, quota exceeded -> 403, name/lifecycle
+// conflicts -> 409, everything else -> 500.
+//
+// The mapped 4xx cases return their (intentional, already-clean) messages.
+// The default 500 case does NOT: err.Error() can carry SQLite/driver/volume/
+// path internals, so the real error is logged server-side and the client sees
+// a generic body. r may be nil (logs without method/path then).
+func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	msg := err.Error()
 	switch {
 	case errors.Is(err, engine.ErrInvalidName),
 		errors.Is(err, registry.ErrUnsupportedPGVersion):
-		code = http.StatusBadRequest
+		writeError(w, http.StatusBadRequest, msg)
 	case errors.Is(err, registry.ErrNotFound):
-		code = http.StatusNotFound
+		writeError(w, http.StatusNotFound, msg)
+	case errors.Is(err, engine.ErrQuotaExceeded):
+		writeError(w, http.StatusForbidden, msg)
 	case strings.Contains(msg, "UNIQUE constraint"),
 		strings.Contains(msg, "live branch"),
 		strings.Contains(msg, "child branch"),
 		strings.Contains(msg, "illegal branch transition"),
 		strings.Contains(msg, "not ready"):
-		code = http.StatusConflict
+		writeError(w, http.StatusConflict, msg)
+	default:
+		// Unmapped: treat as internal. Log the full detail; tell the client nothing.
+		attrs := []any{"error", err}
+		if r != nil {
+			attrs = append(attrs, "method", r.Method, "path", r.URL.Path)
+		}
+		slog.Error("api: internal server error", attrs...)
+		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
-	writeError(w, code, msg)
 }
 
 func decode[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
@@ -120,12 +134,12 @@ func (s *Server) createSource(w http.ResponseWriter, r *http.Request) {
 		SeedVia: req.Via, DumpSchemas: req.DumpSchemas,
 	}
 	if err := s.eng.AddSource(r.Context(), src, req.Password); err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	fresh, err := s.reg.GetSourceByName(req.Name)
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, sourceJSON(fresh))
@@ -134,7 +148,7 @@ func (s *Server) createSource(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
 	sources, err := s.reg.ListSources()
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	out := make([]Source, 0, len(sources))
@@ -146,7 +160,7 @@ func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) removeSource(w http.ResponseWriter, r *http.Request) {
 	if err := s.eng.RemoveSource(r.Context(), r.PathValue("name")); err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -159,12 +173,12 @@ func (s *Server) refreshSource(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("name")
 	if err := s.eng.RefreshSource(r.Context(), name, req.Password); err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	fresh, err := s.reg.GetSourceByName(name)
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, sourceJSON(fresh))
@@ -175,7 +189,7 @@ func (s *Server) refreshSource(w http.ResponseWriter, r *http.Request) {
 func (s *Server) setMaskScripts(w http.ResponseWriter, r *http.Request) {
 	src, err := s.reg.GetSourceByName(r.PathValue("name"))
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	scripts, ok := decode[[]MaskScript](w, r)
@@ -193,7 +207,7 @@ func (s *Server) setMaskScripts(w http.ResponseWriter, r *http.Request) {
 		rs[i] = registry.MaskScript{Name: sc.Name, SQL: sc.SQL}
 	}
 	if err := s.reg.SetMaskScripts(src.ID, rs); err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	if scripts == nil {
@@ -205,12 +219,12 @@ func (s *Server) setMaskScripts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getMaskScripts(w http.ResponseWriter, r *http.Request) {
 	src, err := s.reg.GetSourceByName(r.PathValue("name"))
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	rs, err := s.reg.GetMaskScripts(src.ID)
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	out := make([]MaskScript, 0, len(rs))
@@ -248,7 +262,7 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) {
 		b, err = s.eng.CreateBranch(r.Context(), req.Name, req.Source, ttl)
 	}
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, s.branchJSON(b))
@@ -257,7 +271,7 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listBranches(w http.ResponseWriter, r *http.Request) {
 	branches, err := s.reg.ListLiveBranches()
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	out := make([]Branch, 0, len(branches))
@@ -270,7 +284,7 @@ func (s *Server) listBranches(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getBranch(w http.ResponseWriter, r *http.Request) {
 	b, err := s.reg.GetBranchByName(r.PathValue("name"))
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, s.branchJSON(b))
@@ -282,7 +296,7 @@ func (s *Server) getBranch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) branchUsage(w http.ResponseWriter, r *http.Request) {
 	n, err := s.eng.BranchUsage(r.Context(), r.PathValue("name"))
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int64{"bytes": n})
@@ -309,15 +323,34 @@ func (s *Server) branchDiff(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.eng.DiffBranch(r.Context(), r.PathValue("name"), opts...)
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
 }
 
+// branchHistory returns a branch's audit trail: every recorded state
+// transition with its reason, the actor that caused it, and the timestamp,
+// oldest first. Role-gated at viewer. 404 if the name was never used.
+func (s *Server) branchHistory(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.reg.BranchHistory(r.PathValue("name"))
+	if err != nil {
+		writeEngineError(w, r, err)
+		return
+	}
+	out := make([]Transition, 0, len(rows))
+	for _, t := range rows {
+		out = append(out, Transition{
+			FromState: t.FromState, ToState: t.ToState,
+			Reason: t.Reason, Actor: t.Actor, At: t.At,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) destroyBranch(w http.ResponseWriter, r *http.Request) {
 	if err := s.eng.DestroyBranch(r.Context(), r.PathValue("name")); err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -326,7 +359,7 @@ func (s *Server) destroyBranch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) resetBranch(w http.ResponseWriter, r *http.Request) {
 	b, err := s.eng.ResetBranch(r.Context(), r.PathValue("name"))
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, s.branchJSON(b))
@@ -337,7 +370,7 @@ func (s *Server) resetBranch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) reconcilePlan(w http.ResponseWriter, r *http.Request) {
 	plan, err := s.eng.PlanReconcile(r.Context(), time.Now(), s.stuckTimeout)
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, plan)
@@ -349,7 +382,7 @@ func (s *Server) reconcilePlan(w http.ResponseWriter, r *http.Request) {
 func (s *Server) reconcileApply(w http.ResponseWriter, r *http.Request) {
 	taken, err := s.eng.ApplyReconcile(r.Context(), time.Now(), s.stuckTimeout)
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, taken)
@@ -372,7 +405,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 	}
 	plaintext, err := s.reg.CreateAPIToken(req.Name, req.Role)
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, CreateTokenResponse{Token: plaintext})
@@ -382,7 +415,7 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) {
 	tokens, err := s.reg.ListAPITokens()
 	if err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	out := make([]Token, 0, len(tokens))
@@ -395,7 +428,7 @@ func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) {
 // revokeToken deletes a token by name (admin-only).
 func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
 	if err := s.reg.RevokeAPIToken(r.PathValue("name")); err != nil {
-		writeEngineError(w, err)
+		writeEngineError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

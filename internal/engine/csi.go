@@ -42,19 +42,23 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 	bg := context.WithoutCancel(ctx)
 
 	if parent != nil {
-		if err := e.reg.TransitionBranch(parent.ID, registry.BranchResetting, "stop for clone to "+b.Name); err != nil {
+		if err := e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchResetting, "stop for clone to "+b.Name); err != nil {
 			return err
 		}
 		// CHECKPOINT so the clone is a clean snapshot needing minimal WAL
 		// replay. The parent container is untouched up to here, so a failure
 		// leaves it ready and running.
 		if err := e.drv.Exec(ctx, parent.ContainerID, psqlCmd(src, "CHECKPOINT")); err != nil {
-			e.reg.TransitionBranch(parent.ID, registry.BranchReady, "clone to "+b.Name+" aborted: checkpoint failed")
+			e.logCompensationErr("transition", "csi: restore parent to ready after checkpoint failed",
+				e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchReady, "clone to "+b.Name+" aborted: checkpoint failed"),
+				"branch", parent.Name, "branch_id", parent.ID)
 			return fmt.Errorf("checkpoint parent %q: %w", parent.Name, err)
 		}
 		if err := e.drv.StopRemove(ctx, parent.ContainerID); err != nil {
 			// container state unknown — don't guess; reconcile/destroy can clean
-			e.reg.TransitionBranch(parent.ID, registry.BranchFailed, "stop for clone to "+b.Name+" failed: "+err.Error())
+			e.logCompensationErr("transition", "csi: mark parent failed after stop parent failed",
+				e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed, "stop for clone to "+b.Name+" failed: "+err.Error()),
+				"branch", parent.Name, "branch_id", parent.ID)
 			return fmt.Errorf("stop parent %q: %w", parent.Name, err)
 		}
 	}
@@ -75,7 +79,10 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 		e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID})); err != nil {
 		return fail(fmt.Errorf("clone volume: %w", err))
 	}
-	undo = append(undo, func() { e.drv.RemoveVolume(bg, b.RWVolume) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provisionCSI: remove cloned volume", e.drv.RemoveVolume(bg, b.RWVolume),
+			"branch", b.Name, "volume", b.RWVolume)
+	})
 
 	// 2. direct entrypoint into the clone (also its first consumer)
 	if err := e.installDirectEntrypoint(ctx, b.RWVolume); err != nil {
@@ -96,7 +103,10 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
-	undo = append(undo, func() { e.drv.StopRemove(bg, cid) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provisionCSI: stop/remove branch container", e.drv.StopRemove(bg, cid),
+			"branch", b.Name, "container", cid)
+	})
 
 	if err := e.awaitAndMark(ctx, b, src, cid); err != nil {
 		return fail(err)
@@ -138,23 +148,26 @@ func (e *Engine) restartCSIBranch(ctx context.Context, b *registry.Branch, src *
 		if cause != nil {
 			msg = fmt.Sprintf("clone failed (%v); restart failed: %v", cause, err)
 		}
-		e.reg.TransitionBranch(b.ID, registry.BranchFailed, msg)
+		e.logCompensationErr("transition", "restartCSIBranch: mark branch failed after restart failed",
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, msg), "branch", b.Name, "branch_id", b.ID)
 		return err
 	}
 	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), e.branchLabels(b))
 	if err != nil {
 		return failed(err)
 	}
-	e.reg.SetBranchContainer(b.ID, cid) // own the in-flight container before the readiness wait (reconcile-safe)
+	e.logCompensationErr("transition", "restartCSIBranch: own restarted container before readiness wait",
+		e.reg.SetBranchContainer(b.ID, cid), "branch", b.Name, "container", cid) // own the in-flight container before the readiness wait (reconcile-safe)
 	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
-		e.drv.StopRemove(ctx, cid)
+		e.logCompensationErr("undo", "restartCSIBranch: stop/remove container after readiness wait failed",
+			e.drv.StopRemove(ctx, cid), "branch", b.Name, "container", cid)
 		return failed(err)
 	}
 	info, err := e.inspectAddr(ctx, cid)
 	if err != nil {
 		return failed(err)
 	}
-	return e.reg.MarkBranchReady(b.ID, cid, info.Host, info.Port)
+	return e.reg.MarkBranchReadyCtx(ctx, b.ID, cid, info.Host, info.Port)
 }
 
 // installDirectEntrypoint writes the direct (no-overlay) entrypoint into a

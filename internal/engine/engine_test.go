@@ -384,6 +384,76 @@ func TestDestroyBranch(t *testing.T) {
 	}
 }
 
+// TestDestroyBranchForcesStuckCreating destroys a branch wedged in the
+// transient 'creating' state (branchd died mid-saga, before the stuck-timeout
+// reconcile would fail it). DestroyBranch must force it to failed first, then
+// run the normal failed->destroying->destroyed path, leaving the row destroyed.
+func TestDestroyBranchForcesStuckCreating(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	// a row stuck in 'creating' (no container, no resources committed yet)
+	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-stuck-rw"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes["pgbranch-br-stuck-rw"] = true
+
+	if err := e.DestroyBranch(context.Background(), "stuck"); err != nil {
+		t.Fatalf("DestroyBranch(stuck creating) = %v, want nil", err)
+	}
+	if _, err := r.GetBranchByName("stuck"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("want branch gone (destroyed), got %v", err)
+	}
+	// the stuck branch's own rw volume is cleaned (nothing references it)
+	if d.volumes["pgbranch-br-stuck-rw"] {
+		t.Fatal("stuck branch rw volume not removed")
+	}
+}
+
+// TestDestroyBranchForcingStuckRespectsVolumeGuard forces-destroys a freeze
+// PARENT wedged in 'resetting' while an in-flight child still references the
+// parent's rw volume (its live data, pre-CommitFreeze). The destroy must
+// succeed and end the parent row 'destroyed', but it must NOT remove the rw
+// volume — that would be the A1 data-loss bug. Mirrors reconcile's
+// ActionFailStuck CountLiveBranchesReferencingRW guard.
+func TestDestroyBranchForcingStuckRespectsVolumeGuard(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	srcID := mustSource(t, r).ID
+
+	parent := &registry.Branch{Name: "parent", SourceID: srcID, RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+	if err := r.CreateBranch(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkBranchReady(parent.ID, "cid-parent", "127.0.0.1", 1); err != nil {
+		t.Fatal(err)
+	}
+	// park the parent mid-freeze (resetting), holding its live data in its rw vol
+	if err := r.TransitionBranch(parent.ID, registry.BranchResetting, "freeze"); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes["pgbranch-br-parent-rw"] = true
+	// an in-flight child references the parent (by parent_branch_name)
+	child := &registry.Branch{Name: "child", SourceID: srcID, RWVolume: "pgbranch-br-child-rw",
+		SourceVolume: "pgbranch-src-main", ParentBranchName: "parent"}
+	if err := r.CreateBranch(child); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.DestroyBranch(context.Background(), "parent"); err != nil {
+		t.Fatalf("DestroyBranch(parent resetting) = %v, want nil", err)
+	}
+	if _, err := r.GetBranchByName("parent"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("want parent gone (destroyed), got %v", err)
+	}
+	// CRITICAL: the parent's rw volume is still the child's live data — keep it.
+	if !d.volumes["pgbranch-br-parent-rw"] {
+		t.Fatal("A1 data-loss: parent rw volume removed while child still references it")
+	}
+}
+
 func TestCreateBranchRecordsTTLAndSourceVolume(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
@@ -761,6 +831,52 @@ func TestAddSourceBasebackupUnaffected(t *testing.T) {
 	}
 	if !basebackup {
 		t.Fatalf("pg_basebackup helper not recorded: %v", d.helpers)
+	}
+}
+
+// TestAddSourceRejectsUnsafeNames gates the ZFS path-injection sink: a source
+// name flows into volume/dataset names, so AddSource must reject anything that
+// is not [a-z0-9][a-z0-9-]{0,40}. The "../../rpool/ROOT" case is the actual
+// dataset-namespace-traversal payload.
+func TestAddSourceRejectsUnsafeNames(t *testing.T) {
+	bad := []struct{ name, value string }{
+		{"slash", "a/b"},
+		{"dotdot-traversal", "../../rpool/ROOT"},
+		{"uppercase", "Main"},
+		{"leading-hyphen", "-main"},
+		{"spaces", "my source"},
+		{"empty", ""},
+		{"overlength", strings.Repeat("a", 42)},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newFake()
+			e, r := testEngine(t, d)
+			s := &registry.Source{Name: tc.value, PGVersion: "17", ConnHost: "h", ConnPort: 5432, ConnUser: "postgres"}
+			err := e.AddSource(context.Background(), s, "secret")
+			if err == nil {
+				t.Fatalf("AddSource(%q) = nil, want rejection", tc.value)
+			}
+			if !errors.Is(err, ErrInvalidName) {
+				t.Fatalf("AddSource(%q) err = %v, want ErrInvalidName", tc.value, err)
+			}
+			// rejected at the boundary: nothing was created in the registry
+			if _, gerr := r.GetSourceByName(tc.value); gerr == nil {
+				t.Fatalf("AddSource(%q) created a source row despite invalid name", tc.value)
+			}
+		})
+	}
+}
+
+func TestAddSourceAcceptsValidName(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	s := &registry.Source{Name: "main-1", PGVersion: "17", ConnHost: "h", ConnPort: 5432, ConnUser: "postgres"}
+	if err := e.AddSource(context.Background(), s, "secret"); err != nil {
+		t.Fatalf("AddSource(valid) = %v, want nil", err)
+	}
+	if got, err := r.GetSourceByName("main-1"); err != nil || got.State != registry.SourceReady {
+		t.Fatalf("source after add: %+v err=%v", got, err)
 	}
 }
 

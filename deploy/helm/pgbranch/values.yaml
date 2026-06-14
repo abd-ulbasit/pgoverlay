@@ -79,8 +79,13 @@ image:
   pullPolicy: IfNotPresent
 
 # Bearer token for the REST API. Exactly one of these is required:
-#  - token: the chart renders a Secret holding it
-#  - existingSecret: name of a pre-created Secret with key "token"
+#  - token: the chart renders a Secret holding it. WARNING: a value passed via
+#    --set token= (or a values file committed to git) is persisted IN CLEARTEXT
+#    in the Helm release history (the release Secret) and visible to anyone with
+#    `helm get values`. For anything beyond local/dev use existingSecret.
+#  - existingSecret: name of a pre-created Secret with key "token" (PREFERRED).
+#    Create it out-of-band (kubectl create secret / sealed-secrets / ESO) so the
+#    token never touches Helm values or release history.
 token: ""
 existingSecret: ""
 
@@ -123,11 +128,63 @@ rotateBranchCredentials: false
 # branchd writes its sqlite registry to a hostPath on the storage node, so it
 # must run as root for write access to that directory (simplest correct
 # choice for the single-node scope; the branchd image has no other users).
-# Branch pods (created by branchd at runtime, not by this chart) additionally
-# get CAP_SYS_ADMIN for their in-container overlay mounts.
+# Only the UID is values-driven: the branchd container still gets the rest of
+# the hardening hardcoded (allowPrivilegeEscalation:false, all caps dropped,
+# readOnlyRootFilesystem with a /tmp emptyDir, RuntimeDefault seccomp).
+#
+# SECURITY POSTURE — branch pods vs storage mode:
+#  - hostpath/overlay mode (default): the branch pods branchd creates at
+#    runtime (NOT this chart) need CAP_SYS_ADMIN + an UNCONFINED seccomp
+#    profile to perform the in-container overlay mount (a privileged kernel
+#    op). That is a single-node / trusted-workload posture only.
+#  - csi mode (storage.mode=csi) is the RECOMMENDED PRODUCTION DEFAULT:
+#    branches are PVC clones, branch pods need NO added capabilities and run
+#    under the cluster's default (RuntimeDefault) seccomp, schedulable on any
+#    node. Prefer csi whenever the cluster is shared/untrusted.
 runAsUser: 0
 
 resources: {}
+
+# NetworkPolicies (templates/networkpolicy.yaml). OFF by default so existing
+# installs don't lose connectivity, but RECOMMENDED on any shared cluster.
+# Needs a CNI that enforces NetworkPolicy (Calico, Cilium, ...). When enabled
+# the chart locks down: (a) ingress to branchd API/proxy to ghook + the
+# selectors below + the metrics source; (b) ingress to branch pods to branchd
+# only; (c) egress from branch pods to cluster DNS + the configured Postgres
+# source(s) only.
+networkPolicy:
+  enabled: false
+  # Who may reach branchd's API (7070) and proxy (6432). A list of raw
+  # NetworkPolicyPeer objects (namespaceSelector and/or podSelector), e.g.:
+  #   allowedClients:
+  #     - namespaceSelector:
+  #         matchLabels: { kubernetes.io/metadata.name: ci }
+  #     - podSelector:
+  #         matchLabels: { app: my-preview-app }
+  # Empty = no extra clients (only ghook + metrics, when set).
+  allowedClients: []
+  # Where Prometheus scrapes from (branchd serves /metrics on the API port). A
+  # list of NetworkPolicyPeer; empty = no scrape ingress opened. Example:
+  #   metricsFrom:
+  #     - namespaceSelector:
+  #         matchLabels: { kubernetes.io/metadata.name: monitoring }
+  metricsFrom: []
+  # Cluster DNS peer(s) for branch-pod egress. Defaults to the kube-dns pods in
+  # any namespace (k8s-app=kube-dns, the CoreDNS convention). Override if your
+  # DNS uses different labels/namespace.
+  dnsFrom: []
+  # The Postgres source(s) branch pods hydrate from — a list of
+  # NetworkPolicyPeer (podSelector/namespaceSelector and/or ipBlock). Empty =
+  # no source egress opened (CSI-clone branches that carry their own data need
+  # none; overlay branches reading a remote source do). Example:
+  #   sourceEgress:
+  #     - ipBlock: { cidr: 10.0.5.10/32 }
+  sourceEgress: []
+  # Ports allowed for sourceEgress (default Postgres 5432). Only used when
+  # sourceEgress is set.
+  sourcePorts:
+    - protocol: TCP
+      port: 5432
 
 # Optional GitHub webhook service (pgbranch-github): branch-per-PR. Disabled
 # by default; see docs/github-app.md for the full setup walkthrough.
@@ -139,9 +196,13 @@ ghook:
     pullPolicy: IfNotPresent
   # Webhook HMAC secret (X-Hub-Signature-256). Exactly one is required when
   # enabled:
-  #  - webhookSecret: the chart renders a Secret holding it
+  #  - webhookSecret: the chart renders a Secret holding it. Same caveat as
+  #    `token` above — values passed via --set / a values file land in CLEARTEXT
+  #    in the Helm release history. The same applies to githubToken and
+  #    appPrivateKey below.
   #  - existingSecret: name of a pre-created Secret with key "webhook-secret"
-  #    (and optionally "github-token")
+  #    (and optionally "github-token" / "app-private-key"). PREFERRED for
+  #    production — keeps all ghook secrets out of Helm values/history.
   webhookSecret: ""
   existingSecret: ""
   # GitHub credentials enable the live connect-info PR comment and the

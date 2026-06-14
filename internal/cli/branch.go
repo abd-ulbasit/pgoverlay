@@ -199,6 +199,57 @@ func newBranchResetCmd() *cobra.Command {
 	}
 }
 
+// newHistoryCmd prints a branch's audit trail: every recorded state transition
+// with its reason, the actor that caused it (token name + role, the env-token
+// sentinel, or system:reconcile for daemon-initiated changes), and the time.
+func newHistoryCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "history NAME",
+		Short: "Show a branch's audit trail (who transitioned it, when, and why)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var rows []api.Transition
+			if c := serverClient(cmd); c != nil {
+				r, err := c.BranchHistory(cmd.Context(), args[0])
+				if err != nil {
+					return err
+				}
+				rows = r
+			} else {
+				reg, err := openRegistry()
+				if err != nil {
+					return err
+				}
+				defer reg.Close()
+				ts, err := reg.BranchHistory(args[0])
+				if err != nil {
+					return err
+				}
+				for _, t := range ts {
+					rows = append(rows, api.Transition{
+						FromState: t.FromState, ToState: t.ToState,
+						Reason: t.Reason, Actor: t.Actor, At: t.At,
+					})
+				}
+			}
+			w := tabwriter.NewWriter(cmd.OutOrStdout(), 2, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "AT\tFROM\tTO\tACTOR\tREASON")
+			for _, t := range rows {
+				from := t.FromState
+				if from == "" {
+					from = "-"
+				}
+				reason := t.Reason
+				if reason == "" {
+					reason = "-"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t.At, from, t.ToState, t.Actor, reason)
+			}
+			return w.Flush()
+		},
+	}
+}
+
 func newConnectCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "connect NAME",

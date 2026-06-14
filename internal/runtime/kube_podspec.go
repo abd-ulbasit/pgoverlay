@@ -28,6 +28,14 @@ const (
 // subdirectories of the data root.
 var volumeNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,200}$`)
 
+// boolPtr returns a *bool for the K8s tri-state fields (nil/true/false).
+func boolPtr(b bool) *bool { return &b }
+
+// noAutomount disables the default ServiceAccount-token mount. Branch pods run
+// Postgres and helper pods do volume ops; neither touches the Kubernetes API,
+// so an SA token in the pod would only be a credential to steal.
+var noAutomount = boolPtr(false)
+
 func validVolumeName(name string) error {
 	if !volumeNameRe.MatchString(name) {
 		return fmt.Errorf("invalid volume name %q", name)
@@ -112,9 +120,10 @@ func buildHelperPod(namespace string, st kubeStorage, spec HelperSpec) *corev1.P
 			Labels:       map[string]string{"pgbranch.managed": "true", "pgbranch.role": "helper"},
 		},
 		Spec: corev1.PodSpec{
-			NodeName:      st.nodeName(),
-			RestartPolicy: corev1.RestartPolicyNever,
-			Volumes:       vols,
+			NodeName:                     st.nodeName(),
+			RestartPolicy:                corev1.RestartPolicyNever,
+			AutomountServiceAccountToken: noAutomount,
+			Volumes:                      vols,
 			Containers: []corev1.Container{{
 				Name:            helperContainerName,
 				Image:           spec.Image,
@@ -141,9 +150,10 @@ func buildBranchPod(namespace string, st kubeStorage, spec BranchSpec) *corev1.P
 			Labels:    spec.Labels,
 		},
 		Spec: corev1.PodSpec{
-			NodeName:      st.nodeName(),
-			RestartPolicy: corev1.RestartPolicyAlways,
-			Volumes:       vols,
+			NodeName:                     st.nodeName(),
+			RestartPolicy:                corev1.RestartPolicyAlways,
+			AutomountServiceAccountToken: noAutomount,
+			Volumes:                      vols,
 			Containers: []corev1.Container{{
 				Name:            branchContainerName,
 				Image:           spec.Image,

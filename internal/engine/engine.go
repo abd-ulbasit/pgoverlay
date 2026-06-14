@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +30,19 @@ type Engine struct {
 	// metrics observes saga durations, errors and reaper/reconcile counters.
 	// nil = no instrumentation (every call is nil-safe); branchd wires it.
 	metrics *metrics.Metrics
+	// maxBranches caps the number of live (non-destroyed) branches. 0 = no cap.
+	// Enforced in the create paths (branchd --max-branches).
+	maxBranches int
+	// defaultTTL is applied to a create that requests no TTL (0 = no default,
+	// the branch never expires). maxTTL caps any requested TTL (0 = no cap).
+	// Both come from branchd --default-ttl / --max-ttl.
+	defaultTTL time.Duration
+	maxTTL     time.Duration
 }
+
+// ErrQuotaExceeded is returned by the create paths when --max-branches is set
+// and the live-branch count is already at the cap. The API maps it to 403.
+var ErrQuotaExceeded = errors.New("branch quota exceeded")
 
 // Option configures optional engine behavior at construction time.
 type Option func(*Engine)
@@ -39,6 +52,22 @@ type Option func(*Engine)
 // branch and stores it on the branch row (returned by the API as `password`).
 func WithCredentialRotation() Option {
 	return func(e *Engine) { e.rotateCredentials = true }
+}
+
+// WithMaxBranches caps the number of live (non-destroyed) branches. The create
+// paths return ErrQuotaExceeded once the cap is reached. 0 (the default) is
+// unlimited. branchd --max-branches / PGBRANCH_MAX_BRANCHES.
+func WithMaxBranches(n int) Option {
+	return func(e *Engine) { e.maxBranches = n }
+}
+
+// WithTTLPolicy sets the create-time TTL policy: defaultTTL is used when a
+// create requests no TTL (0 = no default, never expires); maxTTL caps any
+// requested TTL (0 = no cap). branchd --default-ttl / --max-ttl. The policy is
+// applied in the engine create path so both API- and ghook-created branches
+// inherit it.
+func WithTTLPolicy(defaultTTL, maxTTL time.Duration) Option {
+	return func(e *Engine) { e.defaultTTL = defaultTTL; e.maxTTL = maxTTL }
 }
 
 // WithMetrics attaches a metrics sink the engine uses to observe saga
@@ -60,6 +89,59 @@ func NewWithPlanner(reg *registry.Registry, drv runtime.Driver, defaultImage str
 		o(e)
 	}
 	return e
+}
+
+// logCompensationErr surfaces a swallowed best-effort error: a saga
+// compensation (undo: RemoveVolume/StopRemove), a post-failure state
+// transition (transition: TransitionBranch(..., Failed)/TouchBranch), or a
+// deferred cleanup (cleanup: throwaway DestroyBranch). It does NOT change
+// control flow — the caller still proceeds best-effort; this only makes the
+// failure observable via a slog.Warn and the compensation-failures counter.
+// kind is the metric label (transition|undo|cleanup). Extra attrs (e.g.
+// "branch", name, "rw_volume", vol) are appended to the log line. nil err is a
+// no-op so call sites can pass results unconditionally.
+func (e *Engine) logCompensationErr(kind, msg string, err error, attrs ...any) {
+	if err == nil {
+		return
+	}
+	e.metrics.IncCompensationFailure(kind)
+	slog.Warn(msg, append(attrs, "kind", kind, "err", err)...)
+}
+
+// checkQuota enforces --max-branches before a create provisions anything:
+// when the cap is set and the live (non-destroyed) branch count is already at
+// or over it, the create is refused with ErrQuotaExceeded. 0 = unlimited.
+func (e *Engine) checkQuota() error {
+	if e.maxBranches <= 0 {
+		return nil
+	}
+	n, err := e.reg.CountLiveBranches()
+	if err != nil {
+		return err
+	}
+	if n >= e.maxBranches {
+		return fmt.Errorf("%w: %d live branch(es) at the --max-branches=%d cap", ErrQuotaExceeded, n, e.maxBranches)
+	}
+	return nil
+}
+
+// expiresAtFor applies the TTL policy (--default-ttl / --max-ttl) to a
+// requested ttl and renders the resulting expires_at. A zero requested ttl
+// falls back to defaultTTL; a requested ttl above maxTTL is capped to maxTTL.
+// The effective ttl of 0 means the branch never expires (empty expires_at).
+// Centralised here so every create path (API and ghook, which both go through
+// the engine) gets identical behaviour.
+func (e *Engine) expiresAtFor(ttl time.Duration) string {
+	if ttl <= 0 && e.defaultTTL > 0 {
+		ttl = e.defaultTTL
+	}
+	if e.maxTTL > 0 && ttl > e.maxTTL {
+		ttl = e.maxTTL
+	}
+	if ttl <= 0 {
+		return ""
+	}
+	return time.Now().Add(ttl).UTC().Format(time.RFC3339)
 }
 
 func (e *Engine) image(pgVersion string) string {
@@ -88,17 +170,23 @@ func (e *Engine) seedSource(ctx context.Context, s *registry.Source, layer, pass
 
 // AddSource registers a source and seeds it from the given live Postgres.
 func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password string) error {
+	if err := validateSourceName(s.Name); err != nil {
+		return err
+	}
 	s.Volume = e.planner.SourceLayerName(s.Name, 1)
 	if err := e.reg.CreateSource(s); err != nil {
 		return err
 	}
 	if err := e.createSourceLayer(ctx, s.Volume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": s.Name})); err != nil {
-		e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed")
+		e.logCompensationErr("transition", "add source: mark source failed after layer create failed",
+			e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed"), "source", s.Name)
 		return err
 	}
 	if err := e.seedSource(ctx, s, s.Volume, password); err != nil {
-		e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume)
-		e.reg.SetSourceState(s.ID, registry.SourceFailed, err.Error())
+		e.logCompensationErr("undo", "add source: remove source layer after seed failed",
+			e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume), "source", s.Name, "volume", s.Volume)
+		e.logCompensationErr("transition", "add source: mark source failed after seed failed",
+			e.reg.SetSourceState(s.ID, registry.SourceFailed, err.Error()), "source", s.Name)
 		return fmt.Errorf("seed source %q: %w", s.Name, err)
 	}
 	return e.reg.SetSourceState(s.ID, registry.SourceReady, "seed complete")

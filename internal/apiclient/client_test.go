@@ -2,11 +2,21 @@ package apiclient
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/abd-ulbasit/pgbranch/internal/api"
 	"github.com/abd-ulbasit/pgbranch/internal/engine"
@@ -221,6 +231,108 @@ func TestHTTPSBaseURL(t *testing.T) {
 	if len(got) != 1 || got[0].Name != "pr-1" {
 		t.Fatalf("branches = %+v", got)
 	}
+}
+
+// TestPlaintextTokenLeakDetection: the warn-decision helper warns only for
+// plaintext http to a non-loopback host. https, loopback http (by name or IP),
+// and non-http schemes never warn.
+func TestPlaintextTokenLeakDetection(t *testing.T) {
+	cases := []struct {
+		url  string
+		warn bool
+	}{
+		{"http://branchd.example:7070", true},
+		{"http://10.0.0.5:7070", true},
+		{"http://[2001:db8::1]:7070", true},
+		{"https://branchd.example:7070", false}, // TLS: not cleartext
+		{"http://localhost:7070", false},        // loopback by name
+		{"http://127.0.0.1:7070", false},        // loopback IPv4
+		{"http://127.0.0.5:7070", false},        // 127.0.0.0/8 is all loopback
+		{"http://[::1]:7070", false},            // loopback IPv6
+		{"https://localhost:7070", false},
+		{"not a url", false},
+	}
+	for _, tc := range cases {
+		if got := plaintextTokenLeak(tc.url); got != tc.warn {
+			t.Errorf("plaintextTokenLeak(%q) = %v, want %v", tc.url, got, tc.warn)
+		}
+	}
+}
+
+// TestCACertBuildsRootPool: PGBRANCH_CA_CERT loaded via tlsConfigWithCA yields
+// a tls.Config whose RootCAs is non-nil (the self-signed cert is trusted via
+// the pool, not via skip-verify). A bad path / non-PEM file errors instead.
+func TestCACertBuildsRootPool(t *testing.T) {
+	pemPath := writeTestCACert(t)
+
+	cfg, err := tlsConfigWithCA(pemPath)
+	if err != nil {
+		t.Fatalf("tlsConfigWithCA: %v", err)
+	}
+	if cfg.RootCAs == nil {
+		t.Fatal("RootCAs is nil; CA cert was not loaded into the pool")
+	}
+	if cfg.InsecureSkipVerify {
+		t.Fatal("InsecureSkipVerify must stay false when a CA is provided")
+	}
+
+	if _, err := tlsConfigWithCA(filepath.Join(t.TempDir(), "nope.pem")); err == nil {
+		t.Error("expected an error for a missing CA file")
+	}
+	notPEM := filepath.Join(t.TempDir(), "garbage.pem")
+	if err := os.WriteFile(notPEM, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tlsConfigWithCA(notPEM); err == nil {
+		t.Error("expected an error for a non-PEM file")
+	}
+}
+
+// TestNewWithCACertUsesPool: New() wired with PGBRANCH_CA_CERT installs an
+// http transport whose TLS config carries the loaded root pool (no network).
+func TestNewWithCACertUsesPool(t *testing.T) {
+	t.Setenv("PGBRANCH_CA_CERT", writeTestCACert(t))
+	c := New("https://branchd.example:7070", "tok")
+	tr, ok := c.HTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", c.HTTP.Transport)
+	}
+	if tr.TLSClientConfig == nil || tr.TLSClientConfig.RootCAs == nil {
+		t.Fatal("CA cert env did not install a root pool on the client transport")
+	}
+}
+
+// writeTestCACert writes a fresh self-signed CA PEM to a temp file and returns
+// its path.
+func writeTestCACert(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "pgbranch-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestDiffBranch(t *testing.T) {

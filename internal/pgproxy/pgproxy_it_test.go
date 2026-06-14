@@ -136,13 +136,20 @@ func TestProxyIntegration(t *testing.T) {
 		t.Errorf("missing-suffix error %q lacks guidance", err)
 	}
 
-	// negative: unknown branch -> 3D000 naming the branch
+	// negative: unknown branch -> generic 3D000 that does NOT leak the branch
+	// name or state (anti-enumeration; the real reason is logged server-side).
 	_, err = pgx.Connect(ctx, fmt.Sprintf("postgres://postgres:secret@%s/postgres@nope", proxyAddr))
 	if err == nil {
 		t.Fatal("connect to unknown branch should fail")
 	}
-	if !strings.Contains(err.Error(), `"nope"`) {
-		t.Errorf("unknown-branch error %q does not name the branch", err)
+	// The server message must be the generic refusal and must NOT distinguish
+	// not-found from not-ready (the enumeration signal C2 removed). (The DSN
+	// "postgres@nope" is echoed by pgx itself, not by our server message.)
+	if !strings.Contains(err.Error(), "database not available") {
+		t.Errorf("unknown-branch error %q lacks the generic refusal", err)
+	}
+	if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not ready") {
+		t.Errorf("unknown-branch error %q leaks branch existence/state (enumeration)", err)
 	}
 
 	// TLS: a second proxy with a self-signed cert; pgx sslmode=require sends

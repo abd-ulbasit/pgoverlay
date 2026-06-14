@@ -232,10 +232,26 @@ func (e *Engine) applyAction(ctx context.Context, a Action) (applied bool, err e
 		if b.ContainerID != "" {
 			e.drv.StopRemove(ctx, b.ContainerID)
 		}
-		if err := e.removeBranchLayer(ctx, b); err != nil {
+		// Never delete a volume that holds another live branch's data. A
+		// branch-from-branch freeze (overlay) or PVC clone (csi/zfs) parks the
+		// PARENT in resetting and keeps the parent's live data in its rw volume
+		// until CommitFreeze; an in-flight child references that volume (as its
+		// source_volume, or by naming the parent). A slow freeze can overrun the
+		// stuck timeout — failing the parent is fine, but removing its rw volume
+		// would be permanent data loss, so skip the layer removal when the volume
+		// is still referenced. (Re-checked here against the live registry, like
+		// the GC paths, so a child provisioned since planning is respected.)
+		referenced, err := e.reg.CountLiveBranchesReferencingRW(b.Name, b.RWVolume)
+		if err != nil {
+			return false, err
+		}
+		if referenced > 0 {
+			slog.Warn("reconcile: stuck branch rw volume is live data for another branch; failing the row but keeping the volume",
+				"branch", b.Name, "rw_volume", b.RWVolume, "referencing_branches", referenced)
+		} else if err := e.removeBranchLayer(ctx, b); err != nil {
 			slog.Warn("reconcile: remove stuck branch layer failed", "branch", b.Name, "rw_volume", b.RWVolume, "err", err)
 		}
-		if err := e.reg.TransitionBranch(b.ID, registry.BranchFailed, "reconcile: stuck "+string(b.State)); err != nil {
+		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, "reconcile: stuck "+string(b.State)); err != nil {
 			return false, err
 		}
 		return true, nil

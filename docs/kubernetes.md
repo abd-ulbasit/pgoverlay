@@ -163,6 +163,53 @@ The chart wires the OverlayFS (hostpath) and csi backends; the experimental
 [zfs backend](zfs.md) needs a zpool on the storage node and privileged
 helper pods, and is not wired into chart values yet.
 
+## Pod security & network hardening
+
+**Container securityContext.** Both deployments ship a hardened container
+`securityContext` out of the box: `allowPrivilegeEscalation: false`, all
+capabilities dropped, `readOnlyRootFilesystem: true` (with a `/tmp` emptyDir
+for scratch), and `seccompProfile: RuntimeDefault`. The **ghook** webhook
+receiver additionally runs `runAsNonRoot: true` as UID `65532` — it needs no
+privileges at all. **branchd** keeps `runAsUser` (default `0`) values-driven
+because it must write its `hostPath` state dir, but gets every other control.
+
+**Branch pods vs storage mode.** The branch pods branchd creates *at runtime*
+(not by this chart) are where the privilege story differs:
+
+- **hostpath/overlay mode (default):** branch pods need `CAP_SYS_ADMIN` **and
+  an unconfined seccomp profile** to perform the in-container OverlayFS mount
+  (a privileged kernel operation). This is a **single-node / trusted-workload
+  posture** — fine for kind/dev/a dedicated box, not for a shared cluster.
+- **csi mode (`storage.mode=csi`) — recommended production default:** branches
+  are PVC clones, so branch pods get **no added capabilities** and run under
+  the cluster's default (RuntimeDefault) seccomp on any node. Prefer csi
+  whenever the cluster is shared or untrusted.
+
+**NetworkPolicies.** Set `networkPolicy.enabled: true` (needs a
+policy-enforcing CNI such as Calico or Cilium) to lock traffic down:
+
+- ingress to branchd API/proxy is limited to the ghook pod, the peers in
+  `networkPolicy.allowedClients`, and `networkPolicy.metricsFrom` (Prometheus);
+- ingress to branch pods (selected by `pgbranch.managed=true,pgbranch.role=branch`)
+  is limited to branchd;
+- egress from branch pods is limited to cluster DNS (`networkPolicy.dnsFrom`,
+  default kube-dns) and the Postgres source(s) in `networkPolicy.sourceEgress`.
+
+It is **off by default** so existing installs don't lose connectivity, but is
+recommended on any multi-tenant cluster. See `values.yaml` for the peer-shape
+examples.
+
+**Secret hygiene.** `--set token=` / `--set ghook.webhookSecret=` (and a
+values file in git) persist those secrets **in cleartext in the Helm release
+history**. For production, pre-create the Secret and reference it with
+`existingSecret` / `ghook.existingSecret` so secrets never touch Helm values.
+A scoped CI deployer RBAC example lives in `deploy/preview-deployer-rbac.yaml`.
+
+**Proxy exposure.** The Postgres proxy speaks the wire protocol in plaintext
+unless `proxy.tls.certSecret` is set. Only expose it (NodePort/LB/Ingress)
+behind TLS or a trusted boundary, and enable `rotateBranchCredentials` so each
+branch gets its own password when the proxy is reachable off-cluster.
+
 ## Using it
 
 Same REST API as on Docker; branch hosts are pod IPs, so connect via the

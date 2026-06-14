@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -22,14 +23,32 @@ var ErrInvalidName = errors.New("invalid branch name")
 
 var branchNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 
+// validateName enforces the cross-runtime naming rule shared by branch and
+// source names: lowercase letters/digits/hyphens, starting with a letter or
+// digit, at most 41 chars. The anchored regex rejects path-traversal payloads
+// (no '/', '.', '..'), uppercase, leading '-', spaces and over-length names —
+// names flow into container/dataset/volume names, so this is the one gate.
+func validateName(kind, name string) error {
+	if !branchNameRe.MatchString(name) {
+		return fmt.Errorf("%w %q: %s name must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", ErrInvalidName, name, kind)
+	}
+	return nil
+}
+
 // validateBranchName enforces the cross-runtime naming rule on new branches.
 // Stored names (reset/destroy paths) are assumed valid: they passed this
 // check when created.
 func validateBranchName(name string) error {
-	if !branchNameRe.MatchString(name) {
-		return fmt.Errorf("%w %q: must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", ErrInvalidName, name)
-	}
-	return nil
+	return validateName("branch", name)
+}
+
+// validateSourceName enforces the same anchored naming rule on source names.
+// A source name flows into volume/dataset names (e.g. the ZFS backend builds
+// `tank/pgbranch/src-<name>-gN`), so without this gate a name like
+// `../../rpool/ROOT` would traverse the dataset namespace. Gated at the engine
+// boundary (AddSource) so every backend and caller is covered.
+func validateSourceName(name string) error {
+	return validateName("source", name)
 }
 
 // observeOp brackets a saga entry point: it increments the in-flight gauge,
@@ -56,6 +75,9 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	if err := validateBranchName(name); err != nil {
 		return nil, err
 	}
+	if err := e.checkQuota(); err != nil {
+		return nil, err
+	}
 	src, err := e.reg.GetSourceByName(sourceName)
 	if err != nil {
 		return nil, fmt.Errorf("source %q: %w", sourceName, err)
@@ -63,19 +85,17 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	if src.State != registry.SourceReady {
 		return nil, fmt.Errorf("source %q is %s, not ready", sourceName, src.State)
 	}
-	expiresAt := ""
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl).UTC().Format(time.RFC3339)
-	}
+	expiresAt := e.expiresAtFor(ttl)
 	b := &registry.Branch{
 		Name: name, SourceID: src.ID, RWVolume: e.planner.BranchLayerName(name),
 		SourceVolume: src.Volume, ExpiresAt: expiresAt,
 	}
-	if err := e.reg.CreateBranch(b); err != nil {
+	if err := e.reg.CreateBranchCtx(ctx, b); err != nil {
 		return nil, err
 	}
 	if err := e.provision(ctx, b, src); err != nil {
-		e.reg.TransitionBranch(b.ID, registry.BranchFailed, err.Error())
+		e.logCompensationErr("transition", "create: mark branch failed after provision failed",
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, err.Error()), "branch", b.Name, "branch_id", b.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)
@@ -116,7 +136,10 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	if err := e.drv.CreateVolume(ctx, plan.RWVolume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID})); err != nil {
 		return fail(fmt.Errorf("create rw volume: %w", err))
 	}
-	undo = append(undo, func() { e.drv.RemoveVolume(bg, plan.RWVolume) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provision: remove rw volume", e.drv.RemoveVolume(bg, plan.RWVolume),
+			"branch", b.Name, "volume", plan.RWVolume)
+	})
 
 	// 2. write entrypoint into the rw volume
 	if err := e.installOverlayEntrypoint(ctx, plan.RWVolume); err != nil {
@@ -128,7 +151,10 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
-	undo = append(undo, func() { e.drv.StopRemove(bg, cid) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provision: stop/remove branch container", e.drv.StopRemove(bg, cid),
+			"branch", b.Name, "container", cid)
+	})
 
 	// 4-6. readiness, masking, mark ready
 	if err := e.awaitAndMark(ctx, b, src, cid); err != nil {
@@ -203,13 +229,21 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	if err := e.runZFS(ctx, zfsHelperSpec(e.planner.ZFSSnapshot(b.SourceVolume, b.Name))); err != nil {
 		return fail(fmt.Errorf("zfs snapshot: %w", err))
 	}
-	undo = append(undo, func() { e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroySnapshot(b.SourceVolume, b.Name))) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provisionZFS: destroy snapshot",
+			e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroySnapshot(b.SourceVolume, b.Name))),
+			"branch", b.Name, "source_volume", b.SourceVolume)
+	})
 
 	// 2. clone it into the branch's writable dataset
 	if err := e.runZFS(ctx, zfsHelperSpec(e.planner.ZFSClone(b.SourceVolume, b.Name))); err != nil {
 		return fail(fmt.Errorf("zfs clone: %w", err))
 	}
-	undo = append(undo, func() { e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroyClone(b.Name))) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provisionZFS: destroy clone",
+			e.runZFS(bg, zfsDestroySpec(e.planner.ZFSDestroyClone(b.Name))),
+			"branch", b.Name, "rw_volume", b.RWVolume)
+	})
 
 	// 3. install the zfs entrypoint into the clone, next to its data/ dir
 	// (plain unprivileged helper: it only writes a file)
@@ -235,7 +269,10 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
-	undo = append(undo, func() { e.drv.StopRemove(bg, cid) })
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "provisionZFS: stop/remove branch container", e.drv.StopRemove(bg, cid),
+			"branch", b.Name, "container", cid)
+	})
 
 	if err := e.awaitAndMark(ctx, b, src, cid); err != nil {
 		return fail(err)
@@ -287,7 +324,7 @@ func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *regi
 	if err != nil {
 		return err
 	}
-	return e.reg.MarkBranchReady(b.ID, cid, info.Host, info.Port)
+	return e.reg.MarkBranchReadyCtx(ctx, b.ID, cid, info.Host, info.Port)
 }
 
 // rotateBranchCredentials gives a fresh/reset branch its own password: a
@@ -313,6 +350,14 @@ func (e *Engine) rotateBranchCredentials(ctx context.Context, cid string, b *reg
 	// the role name is identifier-quoted; the password is pure hex, so the
 	// literal needs no escaping
 	stmt := fmt.Sprintf(`ALTER ROLE "%s" WITH PASSWORD '%s'`, strings.ReplaceAll(user, `"`, `""`), pw)
+	// S-2 (audit-log exposure): the rotated password is passed as a `psql -c`
+	// argv element, so it appears in container/k8s exec audit logs. Feeding the
+	// SQL on stdin instead would keep it out of argv, but runtime.Driver only
+	// exposes Exec/ExecOutput (no stdin) — adding a stdin variant means changing
+	// the interface and both the Docker and Kube drivers, an invasive change for
+	// a bounded leak. The exposure is bounded: this same password is also stored
+	// (now encrypted at rest), is re-rotated on every reset, and belongs to an
+	// ephemeral branch. Left as-is deliberately; revisit if a stdin exec lands.
 	if err := e.drv.Exec(ctx, cid, psqlCmd(src, stmt)); err != nil {
 		return fmt.Errorf("rotate credentials for branch %q: %w", b.Name, err)
 	}
@@ -361,11 +406,12 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 	if err != nil {
 		return nil, err
 	}
-	if err := e.reg.TransitionBranch(b.ID, registry.BranchResetting, "reset requested"); err != nil {
+	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchResetting, "reset requested"); err != nil {
 		return nil, err
 	}
 	fail := func(stepErr error) (*registry.Branch, error) {
-		e.reg.TransitionBranch(b.ID, registry.BranchFailed, stepErr.Error())
+		e.logCompensationErr("transition", "reset: mark branch failed after reset step failed",
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, stepErr.Error()), "branch", b.Name, "branch_id", b.ID)
 		return nil, stepErr
 	}
 	if b.ContainerID != "" {
@@ -455,7 +501,18 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	if err != nil {
 		return err
 	}
-	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
+	// Force a branch wedged in a transient state (creating/resetting) to failed
+	// first, so it can be destroyed now instead of waiting out the 10m
+	// stuck-timeout reconcile. creating->failed and resetting->failed are both
+	// legal (the same edges reconcile's fail-stuck path uses), so this just
+	// fast-paths what reconcile would eventually do.
+	forcedFromTransient := b.State == registry.BranchCreating || b.State == registry.BranchResetting
+	if forcedFromTransient {
+		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, "destroy requested: forcing stuck "+string(b.State)); err != nil {
+			return err
+		}
+	}
+	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
 		return err
 	}
 	if b.ContainerID != "" {
@@ -463,10 +520,31 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 			return fmt.Errorf("remove container: %w", err)
 		}
 	}
-	if err := e.removeBranchLayer(ctx, b); err != nil {
+	// When we forced a branch out of a transient state, its rw volume may still
+	// be another live branch's data. A freeze parent forced out of 'resetting'
+	// keeps its live data in its rw volume until CommitFreeze; an in-flight child
+	// references that volume (as its source_volume, or by naming the parent).
+	// Removing it would be the A1 data-loss bug, so guard exactly like
+	// reconcile's ActionFailStuck. A normally-destroyed ready/failed branch is
+	// NOT guarded: a post-CommitFreeze parent has already swapped to a fresh rw
+	// volume (its old one is now a layer GC'd separately), and the
+	// parent_branch_name link would otherwise false-positive against that fresh
+	// volume.
+	if forcedFromTransient {
+		referenced, err := e.reg.CountLiveBranchesReferencingRW(b.Name, b.RWVolume)
+		if err != nil {
+			return err
+		}
+		if referenced > 0 {
+			slog.Warn("destroy: forced-stuck branch rw volume is live data for another branch; keeping the volume",
+				"branch", b.Name, "rw_volume", b.RWVolume, "referencing_branches", referenced)
+		} else if err := e.removeBranchLayer(ctx, b); err != nil {
+			return fmt.Errorf("remove branch layer: %w", err)
+		}
+	} else if err := e.removeBranchLayer(ctx, b); err != nil {
 		return fmt.Errorf("remove branch layer: %w", err)
 	}
-	if err := e.reg.TransitionBranch(b.ID, registry.BranchDestroyed, ""); err != nil {
+	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroyed, ""); err != nil {
 		return err
 	}
 	// the destroyed branch may have been the last reference to its frozen
