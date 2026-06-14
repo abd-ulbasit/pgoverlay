@@ -28,6 +28,7 @@ nav:
   - High availability: ha.md
   - Benchmarks: benchmarks.md
   - ZFS backend (experimental): zfs.md
+  - API stability: api.md
   - Architecture: architecture.md
 
 markdown_extensions:
