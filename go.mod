@@ -1,6 +1,6 @@
 module github.com/abd-ulbasit/pgbranch
 
-go 1.26.2
+go 1.26.4
 
 require (
 	github.com/docker/docker v28.5.2+incompatible

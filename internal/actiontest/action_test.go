@@ -98,6 +98,29 @@ func newStub(t *testing.T) *stub {
 	return s
 }
 
+// The setters below mutate fields the server's handler reads under s.mu. The
+// httptest server serves requests on its own goroutines while the test goroutine
+// is still running (the action shells out to curl), so every write must take the
+// same lock the handler uses for its reads.
+
+func (s *stub) setStates(states ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getStates = states
+}
+
+func (s *stub) setCreate(fn func(w http.ResponseWriter, body map[string]any)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.create = fn
+}
+
+func (s *stub) setDelete(fn func(w http.ResponseWriter)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delete = fn
+}
+
 // run executes a script with the action's env contract and returns combined
 // output, the parsed GITHUB_OUTPUT key/values, and the error (nil on exit 0).
 func run(t *testing.T, script string, env map[string]string) (string, map[string]string, error) {
@@ -127,7 +150,7 @@ func run(t *testing.T, script string, env map[string]string) (string, map[string
 func TestCreateHappyPath(t *testing.T) {
 	requireTools(t)
 	s := newStub(t)
-	s.getStates = []string{"creating", "creating", "ready"} // create returns creating; polls reach ready
+	s.setStates("creating", "creating", "ready") // create returns creating; polls reach ready
 	script := scriptPath(t, "action/entrypoint.sh")
 
 	out, outputs, err := run(t, script, map[string]string{
@@ -209,10 +232,10 @@ func TestCreateExplicitName(t *testing.T) {
 func TestCreateServerError(t *testing.T) {
 	requireTools(t)
 	s := newStub(t)
-	s.create = func(w http.ResponseWriter, _ map[string]any) {
+	s.setCreate(func(w http.ResponseWriter, _ map[string]any) {
 		w.WriteHeader(http.StatusConflict)
 		w.Write([]byte(`{"error":"branch exists"}`))
-	}
+	})
 	script := scriptPath(t, "action/entrypoint.sh")
 	out, _, err := run(t, script, map[string]string{
 		"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t",
@@ -228,7 +251,7 @@ func TestCreateServerError(t *testing.T) {
 func TestCreateNeverReady(t *testing.T) {
 	requireTools(t)
 	s := newStub(t)
-	s.getStates = []string{"creating"}
+	s.setStates("creating")
 	script := scriptPath(t, "action/entrypoint.sh")
 	out, _, err := run(t, script, map[string]string{
 		"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t",
@@ -274,7 +297,7 @@ func TestDestroy(t *testing.T) {
 
 	t.Run("404 is success (already gone)", func(t *testing.T) {
 		s := newStub(t)
-		s.delete = func(w http.ResponseWriter) { w.WriteHeader(http.StatusNotFound) }
+		s.setDelete(func(w http.ResponseWriter) { w.WriteHeader(http.StatusNotFound) })
 		if out, _, err := run(t, script, map[string]string{
 			"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t", "PGBRANCH_BRANCH": "gone",
 		}); err != nil {
@@ -284,7 +307,7 @@ func TestDestroy(t *testing.T) {
 
 	t.Run("500 fails", func(t *testing.T) {
 		s := newStub(t)
-		s.delete = func(w http.ResponseWriter) { w.WriteHeader(http.StatusInternalServerError) }
+		s.setDelete(func(w http.ResponseWriter) { w.WriteHeader(http.StatusInternalServerError) })
 		if out, _, err := run(t, script, map[string]string{
 			"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t", "PGBRANCH_BRANCH": "b",
 		}); err == nil {

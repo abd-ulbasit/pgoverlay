@@ -29,7 +29,39 @@ jobs:
             echo "$out" >&2
             exit 1
           fi
-      - run: go test ./... -count=1
+      # -race: the registry CAS, pgproxy connection cap, and reconcile loop are
+      # concurrent; the race detector guards them (IT suites stay env-gated, so
+      # this is the unit set).
+      - run: go test ./... -race -count=1
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: govulncheck (binary mode + documented allowlist)
+        # Binary mode scans the actually-compiled deps and avoids source-version
+        # skew. The two allowlisted IDs are Moby (github.com/docker/docker) CVEs
+        # with no fixed release; pgbranch installs no docker plugins, so they are
+        # not reachable in our usage (rationale in SECURITY.md). Fail on anything
+        # else — including any future stdlib CVE the toolchain hasn't patched.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          GOVC="$(go env GOPATH)/bin/govulncheck"
+          go build -o /tmp/branchd ./cmd/branchd
+          go build -o /tmp/pgbranch-github ./cmd/pgbranch-github
+          allow='GO-2026-4887|GO-2026-4883'
+          rc=0
+          for bin in /tmp/branchd /tmp/pgbranch-github; do
+            out=$("$GOVC" -mode=binary "$bin" 2>&1 || true)
+            echo "== $bin =="; echo "$out"
+            unexpected=$(echo "$out" | grep -oE 'GO-[0-9]{4}-[0-9]+' | sort -u | grep -vE "$allow" || true)
+            if [ -n "$unexpected" ]; then echo "::error::unallowlisted vulnerabilities in $bin: $unexpected"; rc=1; fi
+          done
+          [ "$rc" -eq 0 ] && echo "only allowlisted upstream CVEs present — OK"
+          exit $rc
 
   integration:
     runs-on: ubuntu-latest # Docker preinstalled; overlay tests use --cap-add SYS_ADMIN
