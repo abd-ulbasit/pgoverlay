@@ -2,3 +2,6 @@
 *.db
 .DS_Store
 /pgb
+
+# local working notes, not part of the docs site
+/.notes/

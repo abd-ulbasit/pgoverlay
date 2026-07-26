@@ -1,7 +1,7 @@
 # pgbranch
 
 `git branch` for Postgres: seed once from any running database, then spin up
-isolated, writable copies without ever touching the source.
+isolated, writable copies that never write back to it.
 
 ```
 $ pgb branch create pr-1 --from main
@@ -35,9 +35,15 @@ to `PGDATA`. No special filesystem, no cloud, no fork of Postgres. (If you
 - [Quickstart](quickstart.md) — Docker on a laptop, CLI and `branchd` server.
 - [Kubernetes](kubernetes.md) — branch pods on a storage node, Helm chart.
 - [GitHub App](github-app.md) — a database branch per pull request.
-- [Benchmarks](benchmarks.md) — real measured numbers and the copy-up
-  diagnosis behind them.
+- [Benchmarks](benchmarks.md) — real measured numbers, and the OverlayFS
+  copy-up diagnosis behind them.
+- [Core concepts](concepts.md) — copy-on-write and OverlayFS from first
+  principles.
 - [Architecture](architecture.md) — how it actually works, as built.
+- [Code tour](code-tour.md) — the codebase package by package.
+- [Design decisions](DESIGN-DECISIONS.md) — ten ADRs and their trade-offs.
+- [Deep dives](deep-dives.md) — the places where the obvious implementation
+  was wrong.
 
 ## Scope
 

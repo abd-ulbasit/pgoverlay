@@ -1,8 +1,10 @@
 # Architecture (as built)
 
-How pgbranch actually works after Phase 4 — written from the code rather than
-from the original design spec, so where the two disagree this document follows
-the code.
+How pgbranch actually works — written from the code rather than from the
+original design spec, so where the two disagree this document follows the
+code. For the file-by-file map of which package does what, see the
+[code tour](code-tour.md); for *why* each major structural choice was made,
+see the [design decisions](DESIGN-DECISIONS.md).
 
 ## Components
 

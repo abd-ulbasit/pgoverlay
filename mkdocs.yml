@@ -20,16 +20,21 @@ nav:
   - Home: index.md
   - Quickstart: quickstart.md
   - Ways to use it: usage.md
+  - How it works:
+      - Core concepts: concepts.md
+      - Architecture: architecture.md
+      - Code tour: code-tour.md
+      - Design decisions (ADRs): DESIGN-DECISIONS.md
+      - Deep dives: deep-dives.md
+      - Benchmarks: benchmarks.md
   - Testing: testing.md
   - Kubernetes: kubernetes.md
   - Running on EKS: eks.md
   - GitHub App: github-app.md
   - Observability: observability.md
   - High availability: ha.md
-  - Benchmarks: benchmarks.md
   - ZFS backend (experimental): zfs.md
   - API stability: api.md
-  - Architecture: architecture.md
 
 markdown_extensions:
   - admonition
