@@ -2,17 +2,30 @@
 
 [![ci](https://github.com/abd-ulbasit/pgbranch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/abd-ulbasit/pgbranch/actions/workflows/ci.yml)
 
-`git branch` for Postgres: seed once from any running database, then spin up isolated, writable copies without ever touching the source.
+`git branch` for Postgres: seed once from any running database, then spin up isolated, writable copies that never write back to it.
 
 ![pgbranch demo](docs/demo.gif)
 
 *branching a 1 GiB database, recorded for real — see [docs/benchmarks.md](docs/benchmarks.md)*
 
-**New here?** [**Ways to use pgbranch**](docs/usage.md) walks through the common workflows — local dev, a database per test, branch-per-PR, preview environments, and reviewing migrations with `pgb diff` — each with an example.
+## The copy-on-write system that copied the whole database
 
-**Measured:** pgbranch branches a 1 GiB database in ~1.9 s and a 5 GiB database in ~1.9 s (p50 of 5 runs, Colima VM on Apple Silicon) — creation time is independent of database size, and a fresh branch costs ~33 MiB of disk, not a copy of the dataset. Full results, methodology, and the diagnosis of the copy-up bug this fixed are in [docs/benchmarks.md](docs/benchmarks.md).
+The first real benchmark said branching a 5 GiB database took **61.9 s** and left a **5.05 GiB** writable layer behind. For a design whose entire premise is that branches share one base and store only what they change, that is not a slow path — it is the feature not working. Create time tracked the VM's effective disk throughput (~87 MB/s), which is what copying 5 GiB looks like.
 
-## The problem
+**The diagnosis.** A branch is a stock `postgres` container whose `PGDATA` is an OverlayFS mount: the seeded source volume read-only below, an empty writable volume on top. The seed comes from `pg_basebackup`, so a branch's first boot is crash recovery — and *before* replaying any WAL, Postgres runs `SyncDataDirectory`. Under the default `recovery_init_sync_method=fsync`, that pass opens **every** file in the data directory read-write in order to fsync it. On OverlayFS, a read-write open of a lower-layer file forces a full copy-up of that file. So the sync pass that runs before recovery copied the entire dataset into a supposedly empty writable layer, before the branch could serve a single query. The WAL replay it was preparing for was trivial: `redo done ... elapsed: 0.00 s` in the branch logs.
+
+Two measurements turned that from a theory into the cause. The writable layer immediately after create was ≈ the full database size (5.05 GiB for a 5.00 GiB database; 1.05 GiB for a 1.00 GiB one). And a control run identical except for `-c recovery_init_sync_method=syncfs` finished recovery with the writable layer at **16 KiB** — no copy-up at all.
+
+**The fix is that flag**, now in the branch entrypoint ([`internal/cow/entrypoint.sh`](internal/cow/entrypoint.sh)): one `syncfs()` call per filesystem instead of a per-file fsync pass. It opens nothing read-write, so it copies nothing up, and it syncs a *superset* of what the per-file pass covered — the durability guarantee that pass exists for is preserved, and crash-recovery semantics are unchanged. `syncfs` is Linux-only and Postgres 14+, which is why PG 13 and older are unsupported here.
+
+| 5.00 GiB database | branch create (p50 of 5) | writable layer after create |
+|---|---|---|
+| before | 61.9 s | 5.05 GiB |
+| after | **1.89 s** | **33.1 MiB** |
+
+Creation is now independent of database size — 1.90 s at 1 GiB, 1.89 s at 5 GiB, on a Colima VM on an M1 Pro. The cost did not disappear, it moved: OverlayFS copies up whole files and Postgres heap/index segments run to 1 GiB each, so a branch that rewrites everything still converges on ~1× the database — paid per file at first write instead of all at once at create. [docs/benchmarks.md](docs/benchmarks.md) has both tables in full, the methodology, the hardware, and the pre-fix numbers kept intact, including the write-amplification column that looked better before the fix than after it.
+
+## The alternatives, and where pgbranch sits
 
 Every team wants production-like databases for development, CI, and PR review apps. The options today:
 
@@ -24,7 +37,9 @@ pgbranch takes the middle path: plain Docker, plain Postgres images, and Overlay
 
 ## Quickstart
 
-Requirements: Docker (Colima works on macOS), Go 1.26+ to build. The source database needs `wal_level=replica` and a user with `REPLICATION` privilege (pg_basebackup does the seeding) — or use `--via dump` for managed Postgres, see below.
+**New here?** [**Ways to use pgbranch**](docs/usage.md) walks through the common workflows — local dev, a database per test, branch-per-PR, preview environments, and reviewing migrations with `pgb diff` — each with a worked example.
+
+Requirements: Docker (Colima works on macOS), Go 1.26.4+ to build. The source database needs `wal_level=replica` and a user with `REPLICATION` privilege (pg_basebackup does the seeding) — or use `--via dump` for managed Postgres, see below.
 
 ```bash
 make build   # produces ./bin/pgb (CLI) and ./bin/branchd (daemon)
@@ -308,21 +323,29 @@ PG 13 and older are unsupported because branch startup passes `-c recovery_init_
 - **Phase 7 — road to v1** ✅ — operational trust: Prometheus `/metrics` + real `/readyz`; a periodic reconcile loop with leak-proof, instance-scoped GC (`pgb doctor`/`pgb gc`); a role-based authz model (scoped API tokens, proxy TLS, namespaced deployer RBAC); and HA via leader election.
 - **Future** — merge-back of branch data and multi-writer branches remain non-goals; ideas welcome in issues.
 
+## How this was built
+
+96 of the 116 commits here carry a `Co-authored-by: Claude` trailer — `git log --grep='^Co-authored-by: Claude' -i --oneline | wc -l` if you want to check. I build with coding agents running in parallel git worktrees — one per phase of the roadmap above — and I review, benchmark, and integrate what comes back; the phase structure in the roadmap is what that parallelism is organised around. The parts that decided the shape of this project were not generated: the OverlayFS copy-up diagnosis at the top of this README came from reading `SyncDataDirectory`, instrumenting the writable layer, and running a single-variable control to prove the mechanism, and [docs/benchmarks.md](docs/benchmarks.md) still carries the pre-fix numbers that contradicted the project's own thesis rather than quietly replacing them. If you want to judge the engineering rather than the tooling, read that file and [docs/deep-dives.md](docs/deep-dives.md).
+
 ## Documentation
 
 `docs/` is a small MkDocs site — no hosting or CI, build it locally with `pip install mkdocs-material && mkdocs serve`:
 
 - [Quickstart](docs/quickstart.md) — Docker on a laptop: CLI, `branchd`, REST API, router, web UI.
 - [Ways to use it](docs/usage.md) — local dev, a DB per test, branch-per-PR, preview environments, reviewing migrations.
+- [Benchmarks](docs/benchmarks.md) — measured numbers, methodology, and the copy-up diagnosis.
+- [Core concepts](docs/concepts.md) — copy-on-write, OverlayFS layers, seeding, the frozen-layer DAG, from first principles.
+- [Architecture](docs/architecture.md) — components, CoW mechanics, sagas, generations, routing — as built.
+- [Code tour](docs/code-tour.md) — the codebase package by package, plus the branch-create and proxy request paths.
+- [Design decisions](docs/DESIGN-DECISIONS.md) — ten ADRs: no operator, SQLite registry, sagas, the proxy, dual runtime, HA, and what each cost.
+- [Deep dives](docs/deep-dives.md) — the reconcile loop that deleted live data, the state-machine CAS, three more places the obvious implementation was wrong, and what an adversarial pre-v1 review turned up.
 - [Testing](docs/testing.md) — a real database for every test: Go/JS SDKs and the GitHub Action.
 - [Kubernetes](docs/kubernetes.md) — Helm chart, storage modes, proxy TLS, scoped RBAC.
 - [Running on EKS](docs/eks.md) — a full cloud walkthrough end to end.
 - [Observability](docs/observability.md) — Prometheus metrics and readiness.
 - [High availability](docs/ha.md) — leader election and failover.
 - [GitHub App](docs/github-app.md) — a database branch per pull request.
-- [Benchmarks](docs/benchmarks.md) — measured numbers, methodology, and the copy-up diagnosis.
 - [ZFS backend](docs/zfs.md) — experimental; requirements and manual verification walkthrough.
-- [Architecture](docs/architecture.md) — components, CoW mechanics, sagas, generations, routing — as built.
 
 ## Development
 
