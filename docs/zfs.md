@@ -178,4 +178,10 @@ manual Deployment edit if you want to try it in-cluster.
   alpine package vs host kernel-module compatibility is on you).
 - `--cow` is a branchd flag; local-mode `pgb` (no `--server`) is overlay-only.
 - One backend per `PGBRANCH_HOME` — don't mix.
-- Branch-from-branch (clone of a clone) is future work, same as overlay.
+Branch-from-branch is **not** a limitation here — it is the backend's best
+feature. `CreateBranchFrom` snapshots the parent's clone and clones that
+(`zfs snapshot <parent>@br-<child>` + `zfs clone`), so unlike the overlay
+backend there is no freeze: the parent is never checkpointed, stopped or
+restarted, and no layer rows are written. Covered by
+`TestZFSCreateBranchFromSnapshotsParentClone` against the fake driver; like
+everything else on this page, unverified on real ZFS.

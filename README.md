@@ -356,6 +356,8 @@ make test    # unit tests
 make it      # integration tests (needs Docker): PGBRANCH_IT=1, ~min on first pull
 make matrix  # Postgres version matrix (PGBRANCH_MATRIX_VERSIONS="14 18" by default)
 make lint    # go vet
+make vuln    # the CI supply-chain gate (govulncheck, same script CI runs)
+make check-toolchain  # Dockerfile base image vs go.mod's `go` directive
 ```
 
 ## License
