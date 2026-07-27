@@ -219,13 +219,13 @@ func TestOrderTotals(t *testing.T) {
 In CI, the composite action provisions the branch and waits for readiness:
 
 ```yaml
-- uses: abd-ulbasit/pgoverlay/action@v1.0.0-rc.3
+- uses: abd-ulbasit/pgoverlay/action@v1
   id: branch
   with:
     server: ${{ vars.PGOVERLAY_SERVER }}
     token: ${{ secrets.PGOVERLAY_TOKEN }}
 - run: go test ./...   # steps.branch.outputs.{host,port,database}
-- uses: abd-ulbasit/pgoverlay/action/destroy@v1.0.0-rc.3
+- uses: abd-ulbasit/pgoverlay/action/destroy@v1
   if: always()
   with: { server: "${{ vars.PGOVERLAY_SERVER }}", token: "${{ secrets.PGOVERLAY_TOKEN }}", branch: "${{ steps.branch.outputs.branch }}" }
 ```

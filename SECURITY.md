@@ -18,6 +18,24 @@ CI-enforced (`internal/api/compat_test.go`), but it is a promise **from v1.0**;
 until that tag exists, treat the CLI flags, the Helm values, and the API alike
 as pre-1.0.
 
+The `v1` tag is the **GitHub Action's** floating major tag (`action@v1`,
+`action/destroy@v1`), following the Actions convention that a major tag moves
+to the newest compatible release. It is not a stable `v1.0.0` of the project
+and carries no API-stability promise; pin a full tag such as `v1.0.0-rc.4` if
+you want an immutable reference.
+
+### The pgbranch → pgoverlay rename
+
+This project was called `pgbranch` up to and including `v1.0.0-rc.3`. From
+`v1.0.0-rc.4` the name, the Go module path
+(`github.com/abd-ulbasit/pgoverlay`), every `PGOVERLAY_*` environment variable,
+the container/pod labels, the Prometheus metric names, the on-disk state paths,
+and the Helm chart all use `pgoverlay`. The `pgb` CLI and the `branchd` daemon
+keep their names. Nothing is backported to the `pgbranch` tags, and there is no
+automatic migration — a deployment created by an older tag will not be seen by
+`v1.0.0-rc.4` (different state directory, registry filename, labels, and
+resource names). Destroy branches with the old version before upgrading.
+
 ## Supply-chain scanning
 
 CI runs [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) in

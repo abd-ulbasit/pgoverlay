@@ -1,6 +1,6 @@
 apiVersion: v2
 name: pgoverlay
-description: Copy-on-write Postgres branches on Kubernetes (branchd control plane)
+description: OverlayFS copy-on-write Postgres branches on Kubernetes (branchd control plane)
 type: application
-version: 0.1.0
-appVersion: "0.3.0"
+version: 0.2.0
+appVersion: "1.0.0-rc.4"

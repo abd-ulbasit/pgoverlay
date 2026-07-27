@@ -1,7 +1,7 @@
 # Delete a pgoverlay branch by name. Run it with `if: always()` so the branch
 # goes away even when the tests fail:
 #
-#   - uses: abd-ulbasit/pgoverlay/action/destroy@v1.0.0-rc.3
+#   - uses: abd-ulbasit/pgoverlay/action/destroy@v1
 #     if: always()
 #     with:
 #       server: ${{ vars.PGOVERLAY_SERVER }}
