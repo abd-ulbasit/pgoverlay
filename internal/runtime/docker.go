@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -281,6 +282,19 @@ func (d *DockerDriver) Inspect(ctx context.Context, id string) (ContainerInfo, e
 	return info, nil
 }
 
+// StopRemove stops and removes the container and waits until it is actually
+// gone, matching KubeDriver.StopRemove. Idempotent: NotFound is success.
+//
+// The wait is load-bearing, not politeness. ContainerRemove returns once the
+// daemon has ACCEPTED the removal, while teardown continues in the background
+// and the container keeps its reference on the rw volume until it finishes.
+// Every caller in internal/engine follows StopRemove with RemoveVolume on that
+// volume (saga.go, csi.go, freeze.go, reconcile.go), so returning early makes
+// the next call fail with "volume is in use - [<container id>]". That is a
+// timing-dependent failure: it needs the volume removal to land inside the
+// teardown window, so it passes most runs and fails perhaps one in three.
+// KubeDriver already waits and documents why; this is the same contract, which
+// the interface has always implied because of how its callers are written.
 func (d *DockerDriver) StopRemove(ctx context.Context, id string) error {
 	timeout := 30
 	_ = d.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout})
@@ -288,10 +302,23 @@ func (d *DockerDriver) StopRemove(ctx context.Context, id string) error {
 	// Idempotent: gone already, or another caller (e.g. a concurrent reconcile
 	// pass racing an explicit destroy) is already removing it — both mean the
 	// container is going away, which is the intent.
-	if err == nil || client.IsErrNotFound(err) || strings.Contains(err.Error(), "already in progress") {
-		return nil
+	if err != nil && !client.IsErrNotFound(err) && !strings.Contains(err.Error(), "already in progress") {
+		return err
 	}
-	return err
+	// Poll rather than ContainerWait(WaitConditionRemoved): the container may
+	// already be gone by the time we get here (the NotFound and
+	// already-in-progress paths above), and ContainerWait on a missing
+	// container is an error rather than an immediate success.
+	for {
+		if _, err := d.cli.ContainerInspect(ctx, id); client.IsErrNotFound(err) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for container %s to be removed: %w", id, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (d *DockerDriver) ListManaged(ctx context.Context) ([]ContainerInfo, error) {
