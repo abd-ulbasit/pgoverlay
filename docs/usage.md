@@ -108,10 +108,10 @@ await branch.destroy();
 **CI** (reusable Action):
 
 ```yaml
-- uses: abd-ulbasit/pgoverlay/action@main
+- uses: abd-ulbasit/pgoverlay/action@v1
   with: { server: ${{ vars.PGOVERLAY_API }}, token: ${{ secrets.PGOVERLAY_TOKEN }}, source: prod }
 # … your tests use the branch it created …
-- uses: abd-ulbasit/pgoverlay/action/destroy@main
+- uses: abd-ulbasit/pgoverlay/action/destroy@v1
 ```
 
 The SDK is integration-only (it talks to a running `branchd`); point it with

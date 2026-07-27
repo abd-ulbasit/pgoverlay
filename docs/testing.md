@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: abd-ulbasit/pgoverlay/action@main
+      - uses: abd-ulbasit/pgoverlay/action@v1
         id: branch
         with:
           server: ${{ vars.PGOVERLAY_SERVER }}
@@ -94,7 +94,7 @@ jobs:
       - run: go test ./...
         env:
           DATABASE_URL: postgres://app:${{ secrets.DB_PASSWORD }}@${{ steps.branch.outputs.host }}:${{ steps.branch.outputs.port }}/${{ steps.branch.outputs.database }}
-      - uses: abd-ulbasit/pgoverlay/action/destroy@main
+      - uses: abd-ulbasit/pgoverlay/action/destroy@v1
         if: always()
         with:
           server: ${{ vars.PGOVERLAY_SERVER }}

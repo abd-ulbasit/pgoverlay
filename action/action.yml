@@ -1,7 +1,7 @@
 # Create a copy-on-write Postgres branch on a pgoverlay server and wait until
 # it is ready. Usage:
 #
-#   - uses: abd-ulbasit/pgoverlay/action@main
+#   - uses: abd-ulbasit/pgoverlay/action@v1
 #     id: branch
 #     with:
 #       server: ${{ vars.PGOVERLAY_SERVER }}
@@ -9,7 +9,7 @@
 #       source: main
 #   - run: psql "host=${{ steps.branch.outputs.host }} port=${{ steps.branch.outputs.port }} ..."
 #
-# Pair with abd-ulbasit/pgoverlay/action/destroy@main in an `if: always()`
+# Pair with abd-ulbasit/pgoverlay/action/destroy@v1 in an `if: always()`
 # step; the TTL reaps leaked branches as a fallback.
 name: pgoverlay branch
 description: Create a copy-on-write Postgres branch on a pgoverlay server and wait until it is ready
