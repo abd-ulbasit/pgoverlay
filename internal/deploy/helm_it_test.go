@@ -33,6 +33,9 @@ const (
 	release     = "pgoverlay" // fullname collapses to "pgoverlay" -> svc pgoverlay-api
 	apiToken    = "helm-it-token"
 	sourcePod   = "pgoverlay-it-helm-source"
+	// chartPath is spelled once: both suites install from it and chartImage
+	// renders it to learn which image to build.
+	chartPath = "deploy/helm/pgoverlay"
 )
 
 // run executes a command from the repo root and fails the test on error.
@@ -97,17 +100,42 @@ func writeKubeconfig(t *testing.T) string {
 	return p
 }
 
-// loadBranchdImage builds ghcr.io/abd-ulbasit/pgoverlay-branchd:dev and side-loads it into kind.
+// chartImage renders the chart and returns the branchd image reference it
+// actually asks for.
+//
+// The name is NOT spelled here on purpose. Both suites install with
+// image.pullPolicy=Never, so a pod can only ever start from an image already
+// side-loaded into the kind node. If the name this test builds and the name
+// the chart deploys ever drift apart — a rename that touches values.yaml but
+// not the test, or the Makefile but not the chart — every pod strands in
+// ErrImageNeverPull and the only symptom is "Available: 0/1" three minutes
+// later. Deriving the string from the chart makes that class of drift
+// impossible rather than merely unlikely.
+func chartImage(t *testing.T) string {
+	t.Helper()
+	out := run(t, "helm", "template", release, chartPath,
+		"--set", "node="+storageNode, "--set", "token=x")
+	m := regexp.MustCompile(`(?m)^\s*image:\s*"?([^"\s]+)"?\s*$`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no container image in the rendered chart %s:\n%s", chartPath, out)
+	}
+	return m[1]
+}
+
+// loadBranchdImage builds the image the chart asks for (see chartImage) and
+// side-loads it into kind.
 // `kind load docker-image` fails with Colima's containerd image store on
 // multi-arch manifests, so export a single-platform archive (same trick as
 // hack/kind-up.sh) and fall back to a plain save for older docker.
 func loadBranchdImage(t *testing.T) {
 	t.Helper()
-	run(t, "docker", "build", "-t", "ghcr.io/abd-ulbasit/pgoverlay-branchd:dev", ".")
+	img := chartImage(t)
+	t.Logf("chart asks for image %s; building and side-loading that", img)
+	run(t, "docker", "build", "-t", img, ".")
 	arch := strings.TrimSpace(run(t, "docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"))
 	tar := filepath.Join(t.TempDir(), "branchd.tar")
-	if cmd := exec.Command("docker", "save", "--platform", arch, "ghcr.io/abd-ulbasit/pgoverlay-branchd:dev", "-o", tar); cmd.Run() != nil {
-		run(t, "docker", "save", "ghcr.io/abd-ulbasit/pgoverlay-branchd:dev", "-o", tar)
+	if cmd := exec.Command("docker", "save", "--platform", arch, img, "-o", tar); cmd.Run() != nil {
+		run(t, "docker", "save", img, "-o", tar)
 	}
 	run(t, "kind", "load", "image-archive", tar, "--name", kindCluster)
 }
@@ -243,7 +271,7 @@ func TestHelmDeployEndToEnd(t *testing.T) {
 	dumpOnFailure(t, kc, helmNS)
 
 	start := time.Now()
-	run(t, "helm", "--kubeconfig", kc, "install", release, "deploy/helm/pgoverlay",
+	run(t, "helm", "--kubeconfig", kc, "install", release, chartPath,
 		"-n", helmNS, "--create-namespace",
 		"--set", "node="+storageNode,
 		"--set", "token="+apiToken,

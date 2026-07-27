@@ -84,7 +84,7 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 
 	// 2 replicas → the chart renders --leader-elect, POD_NAME and the leases
 	// RBAC. Both pods co-schedule to the storage node (RWO state dir).
-	run(t, "helm", "--kubeconfig", kc, "install", haRelease, "deploy/helm/pgoverlay",
+	run(t, "helm", "--kubeconfig", kc, "install", haRelease, chartPath,
 		"-n", haNS, "--create-namespace",
 		"--set", "node="+storageNode,
 		"--set", "token="+haToken,

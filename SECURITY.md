@@ -18,11 +18,17 @@ CI-enforced (`internal/api/compat_test.go`), but it is a promise **from v1.0**;
 until that tag exists, treat the CLI flags, the Helm values, and the API alike
 as pre-1.0.
 
-The `v1` tag is the **GitHub Action's** floating major tag (`action@v1`,
-`action/destroy@v1`), following the Actions convention that a major tag moves
-to the newest compatible release. It is not a stable `v1.0.0` of the project
-and carries no API-stability promise; pin a full tag such as `v1.0.0-rc.4` if
-you want an immutable reference.
+**No version tag of the GitHub Action has been published yet.** The docs used
+to show `action@v1`, but no `v1` (and no `v1.0.0`) tag exists: the only tags in
+this repository are `v0.2.0`, `v0.3.0` and `v1.0.0-rc.1` … `v1.0.0-rc.3`, and
+those predate the rename, so they carry the old `pgbranch` action. The examples
+therefore reference `action@main` and `action/destroy@main`, which resolve
+today. `main` is a moving target: pin the commit SHA
+(`abd-ulbasit/pgoverlay/action@<sha>`) if you need an immutable reference, as
+you would for any third-party action. A floating `v1` tag, following the
+Actions convention that a major tag moves to the newest compatible release,
+will be published when `v1.0.0-rc.4` is cut; it will carry no API-stability
+promise even then.
 
 ### The pgbranch → pgoverlay rename
 
