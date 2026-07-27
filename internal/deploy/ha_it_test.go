@@ -103,11 +103,14 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 		t.Fatalf("Lease holder %q is not one of the branchd pods %v", holder, pods)
 	}
 
-	// The leader serves mutations; seed a source + create a branch through the
-	// Service (which load-balances to whichever replica — non-leaders 503 on
-	// mutations, but the Service has only the leader ready for writes... so we
-	// drive the API and tolerate a transient 503 by retrying through the LB).
-	base := portForward(t, kc, haNS)
+	// Forward to the leader POD, not to the Service. /readyz is deliberately
+	// NOT leader-gated (a follower stays ready to serve reads and probes), so
+	// both replicas are Service endpoints and `port-forward svc/...` would pin
+	// one at random — half the time a follower, which 503s every mutation for
+	// as long as the forward lives. Naming the pod makes the test deterministic
+	// and is what lets the post-failover step below prove the *new* leader
+	// accepts writes.
+	base := portForward(t, kc, haNS, "pod/"+holder)
 	client := apiclient.New(base, haToken)
 	srcIP := startHASourcePod(t, kc)
 
@@ -134,6 +137,12 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 		t.Fatalf("Lease was not re-acquired by a surviving replica within %s", renewBound)
 	}
 	t.Logf("failed over: new Lease holder %s", newHolder)
+
+	// The old forward went down with the pod we just deleted ("lost connection
+	// to pod"), so every later request would get connection-refused on a dead
+	// local port and look like a failover failure. Re-establish against the
+	// survivor before asserting it accepts writes.
+	client = apiclient.New(portForward(t, kc, haNS, "pod/"+newHolder), haToken)
 
 	// A create now succeeds against the new leader within the budget.
 	if _, err := createBranchWithRetry(ctx, client, "ha-pr-2", renewBound); err != nil {

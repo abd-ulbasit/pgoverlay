@@ -83,14 +83,19 @@ func loadBranchdImage(t *testing.T) {
 	run(t, "kind", "load", "image-archive", tar, "--name", kindCluster)
 }
 
-// portForward starts kubectl port-forward to the api Service on a random
-// local port and returns the base URL once the forward is listening. ns is
-// explicit: the HA suite installs the chart into its own namespace, and a
-// helper that assumed helmNS silently forwarded to a Service that wasn't there.
-func portForward(t *testing.T, kc, ns string) string {
+// portForward starts kubectl port-forward to target ("svc/pgbranch-api", or
+// "pod/<name>") on a random local port and returns the base URL once the
+// forward is listening.
+//
+// ns and target are both explicit. ns because the HA suite installs its own
+// release into its own namespace, and a helper that assumed helmNS forwarded
+// to a Service that wasn't there. target because a port-forward is not a load
+// balancer: it binds ONE pod for the life of the connection and dies with it,
+// so a test that kills a pod has to say which pod it wants next.
+func portForward(t *testing.T, kc, ns, target string) string {
 	t.Helper()
 	cmd := exec.Command("kubectl", "--kubeconfig", kc, "-n", ns,
-		"port-forward", "svc/pgbranch-api", ":7070")
+		"port-forward", target, ":7070")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -117,13 +122,13 @@ func portForward(t *testing.T, kc, ns string) string {
 	case line := <-lines:
 		m := regexp.MustCompile(`127\.0\.0\.1:(\d+)`).FindStringSubmatch(line)
 		if m == nil {
-			t.Fatalf("kubectl port-forward -n %s svc/pgbranch-api gave no local address (stdout %q); stderr: %s",
-				ns, line, strings.TrimSpace(errOut.String()))
+			t.Fatalf("kubectl port-forward -n %s %s gave no local address (stdout %q); stderr: %s",
+				ns, target, line, strings.TrimSpace(errOut.String()))
 		}
 		return "http://127.0.0.1:" + m[1]
 	case <-time.After(30 * time.Second):
-		t.Fatalf("kubectl port-forward -n %s svc/pgbranch-api never became ready; stderr: %s",
-			ns, strings.TrimSpace(errOut.String()))
+		t.Fatalf("kubectl port-forward -n %s %s never became ready; stderr: %s",
+			ns, target, strings.TrimSpace(errOut.String()))
 		return ""
 	}
 }
@@ -216,7 +221,7 @@ func TestHelmDeployEndToEnd(t *testing.T) {
 		"--wait", "--timeout", "3m")
 	t.Logf("helm release ready in %s", time.Since(start))
 
-	base := portForward(t, kc, helmNS)
+	base := portForward(t, kc, helmNS, "svc/pgbranch-api")
 	resp, err := http.Get(base + "/healthz")
 	if err != nil {
 		t.Fatal(err)
