@@ -3,7 +3,7 @@
 > Adapted from the [README](https://github.com/abd-ulbasit/pgbranch); the
 > README stays the canonical copy of this walkthrough.
 
-Requirements: Docker (Colima works on macOS), Go 1.26.4+ to build. The source
+Requirements: Docker (Colima works on macOS), Go 1.26.5+ to build. The source
 database needs `wal_level=replica` and a user with `REPLICATION` privilege
 (`pg_basebackup` does the seeding) — or use `--via dump` for managed
 Postgres, see below.

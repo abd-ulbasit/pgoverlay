@@ -39,7 +39,7 @@ pgbranch takes the middle path: plain Docker, plain Postgres images, and Overlay
 
 **New here?** [**Ways to use pgbranch**](docs/usage.md) walks through the common workflows — local dev, a database per test, branch-per-PR, preview environments, and reviewing migrations with `pgb diff` — each with a worked example.
 
-Requirements: Docker (Colima works on macOS), Go 1.26.4+ to build. The source database needs `wal_level=replica` and a user with `REPLICATION` privilege (pg_basebackup does the seeding) — or use `--via dump` for managed Postgres, see below.
+Requirements: Docker (Colima works on macOS), Go 1.26.5+ to build. The source database needs `wal_level=replica` and a user with `REPLICATION` privilege (pg_basebackup does the seeding) — or use `--via dump` for managed Postgres, see below.
 
 ```bash
 make build   # produces ./bin/pgb (CLI) and ./bin/branchd (daemon)
