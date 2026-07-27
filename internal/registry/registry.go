@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlitelib "modernc.org/sqlite/lib"
 )
 
 type SourceState string
@@ -111,12 +113,24 @@ func (r *Registry) SetSecretKey(key []byte) error {
 	return nil
 }
 
+// walRetryBudget bounds how long Open waits out the WAL-conversion race in
+// connect; it mirrors the DSN's busy_timeout so a caller sees one timeout
+// budget, not two.
+const (
+	walRetryBudget = 5 * time.Second
+	walRetryDelay  = 20 * time.Millisecond
+)
+
 func Open(path string) (*Registry, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // SQLite single-writer; keep it simple
+	if err := connect(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open registry: %w", err)
+	}
 	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
@@ -153,10 +167,66 @@ func ensureInstanceID(db *sql.DB) (string, error) {
 // reclaims only resources owned by this registry.
 func (r *Registry) InstanceID() string { return r.instanceID }
 
-// migrate applies pending versioned migrations (PRAGMA user_version). Each
-// migration runs in its own transaction; foreign keys are disabled for the
-// duration because v2 recreates the sources table (drop + rename) while
-// branches rows still reference it.
+// connect establishes the pool's first connection, retrying SQLITE_BUSY.
+//
+// Every connection applies journal_mode=WAL from the DSN, and converting a
+// brand-new rollback-journal file to WAL needs a momentary EXCLUSIVE lock.
+// SQLite deliberately does NOT invoke the busy handler for a SHARED->EXCLUSIVE
+// upgrade — two upgraders each waiting on the other would deadlock, so it
+// returns SQLITE_BUSY immediately — which means busy_timeout does not cover
+// this one step. Two branchd replicas starting together on a fresh state dir
+// could therefore both fail to open a database that is perfectly healthy.
+//
+// Retrying is the whole fix: WAL is a persistent property of the file, so the
+// moment any opener wins the race, every other opener's journal_mode pragma
+// becomes a no-op and succeeds. Only SQLITE_BUSY is retried; a genuinely
+// unusable file still fails fast.
+func connect(ctx context.Context, db *sql.DB) error {
+	deadline := time.Now().Add(walRetryBudget)
+	for {
+		err := db.PingContext(ctx)
+		if err == nil || !isBusy(err) || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(walRetryDelay):
+		}
+	}
+}
+
+// isBusy reports whether err is SQLITE_BUSY — the lock is held elsewhere and
+// the operation is worth retrying — as opposed to a real fault in the file.
+func isBusy(err error) bool {
+	var serr *sqlite.Error
+	return errors.As(err, &serr) && serr.Code() == sqlitelib.SQLITE_BUSY
+}
+
+// ErrSchemaTooNew reports a registry written by a newer pgoverlay than this
+// one. Migrations only go forward, so there is nothing safe to do: proceeding
+// would run this build's queries against a schema it does not know.
+var ErrSchemaTooNew = errors.New("registry schema is newer than this build")
+
+// migrate applies pending versioned migrations (PRAGMA user_version).
+//
+// Every step re-reads user_version inside the same write transaction that
+// applies the DDL and bumps it, so the version driving a migration is never a
+// snapshot taken earlier and can never be written backwards. That matters
+// because migrations are deliberately not replay-safe — SQLite has no ALTER
+// TABLE ADD COLUMN IF NOT EXISTS, so a replayed v2 dies on "duplicate column
+// name: expires_at" — and because schemaV1 *is* replay-safe, which is what made
+// the old TOCTOU silent: an opener holding a stale version=0 sailed through
+// migrations[0] and then committed user_version=1 over an already-current
+// database, wedging every later open permanently. Reading the version under
+// the transaction's write lock is what makes each migration apply exactly once,
+// even when several branchd replicas open one registry file at the same time
+// (branchd migrates at startup, before leader election, so they all do).
+//
+// Foreign keys are disabled for the duration because v2 recreates the sources
+// table (drop + rename) while branches rows still reference it. The pragma is
+// per-connection and a silent no-op inside a transaction, hence the pinned
+// connection and the placement outside the loop.
 func migrate(db *sql.DB) error {
 	ctx := context.Background()
 	conn, err := db.Conn(ctx) // pin one conn: FK pragma is per-connection
@@ -164,35 +234,85 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	defer conn.Close()
+	// Fast path: an already-migrated registry takes no write lock at all, so
+	// the common case (a replica restarting onto current state) never
+	// contends. Safe now that the version cannot move backwards.
 	var version int
 	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version >= len(migrations) {
+	if err := checkVersion(version); err != nil {
+		return err
+	}
+	if version == len(migrations) {
 		return nil
 	}
 	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
 		return err
 	}
 	defer conn.ExecContext(ctx, `PRAGMA foreign_keys=ON`)
-	for ; version < len(migrations); version++ {
-		tx, err := conn.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, migrations[version]); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("migrate to v%d: %w", version+1, err)
-		}
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, version+1)); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+	for {
+		done, err := migrateStep(ctx, conn)
+		if err != nil || done {
 			return err
 		}
 	}
+}
+
+// checkVersion rejects a user_version this build cannot reason about: negative
+// (corrupt header) or ahead of the migrations it ships.
+func checkVersion(version int) error {
+	if version < 0 || version > len(migrations) {
+		return fmt.Errorf("%w: file is at v%d, this build knows up to v%d",
+			ErrSchemaTooNew, version, len(migrations))
+	}
 	return nil
+}
+
+// migrateStep applies at most one migration and reports whether the schema is
+// now fully migrated.
+//
+// BEGIN IMMEDIATE (rather than database/sql's plain BEGIN) is load-bearing: it
+// takes the write lock up front, so the user_version read below is serialized
+// against every other migrator. A deferred transaction starts read-only, which
+// would let two processes read the same version before either wrote — exactly
+// the race this function exists to close. Concurrent openers either block here
+// until busy_timeout and then observe the committed version, or win the lock
+// and are themselves observed.
+func migrateStep(ctx context.Context, conn *sql.Conn) (done bool, err error) {
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			conn.ExecContext(ctx, `ROLLBACK`)
+		}
+	}()
+
+	var version int
+	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return false, err
+	}
+	if err := checkVersion(version); err != nil {
+		return false, err
+	}
+	if version == len(migrations) {
+		return true, nil
+	}
+	if _, err := conn.ExecContext(ctx, migrations[version]); err != nil {
+		return false, fmt.Errorf("migrate to v%d: %w", version+1, err)
+	}
+	// Derived from the version read inside this transaction, so it is a
+	// compare-and-set in effect: it can only ever move the file forward by one.
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version=%d`, version+1)); err != nil {
+		return false, err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return false, err
+	}
+	committed = true
+	return false, nil
 }
 
 func (r *Registry) Close() error { return r.db.Close() }
