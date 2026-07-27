@@ -288,19 +288,33 @@ func (s *hostPathStorage) cloneVolume(ctx context.Context, src, dst string, labe
 // listVolumes enumerates the volume dirs under the data root and returns only
 // those whose .pgoverlay-labels.json records pgoverlay.instance=<instanceID>.
 // Each managed volume dir is emitted on its own line followed by its label
-// file's contents on the next (NUL-padded marker lines bracket each entry); a
-// dir whose marker is missing or names a different instance is foreign and
+// file's contents on the next, with listVolumesSentinel bracketing each entry;
+// a dir whose marker is missing or names a different instance is foreign and
 // skipped. A missing data root (nothing created yet) lists nothing.
 func (s *hostPathStorage) listVolumes(ctx context.Context, instanceID string) ([]string, error) {
-	// For every entry under the data root, print "<name>\n", then its label
-	// JSON on one line, then a sentinel. Tolerate an empty/missing root.
-	script := fmt.Sprintf(
-		`for d in %s/*/; do [ -d "$d" ] || continue; n=$(basename "$d"); printf '%%s\n' "$n"; cat "$d/%s" 2>/dev/null; printf '\n%s\n'; done 2>/dev/null || true`,
-		dataRootMountPath, volumeLabelsFile, listVolumesSentinel)
-	out, err := s.runRootHelper(ctx, script, nil)
+	out, err := s.runRootHelper(ctx, listVolumesScript(dataRootMountPath), nil)
 	if err != nil {
 		return nil, err
 	}
+	return parseVolumeList(out, instanceID), nil
+}
+
+// listVolumesScript prints, for every directory under root, the dir name on
+// one line, then its label file's contents (possibly empty), then
+// listVolumesSentinel. An empty or missing root prints nothing rather than
+// failing. Split out from listVolumes so the script can be exercised against a
+// real shell in the unit suite instead of only inside a live cluster.
+func listVolumesScript(root string) string {
+	return fmt.Sprintf(
+		`for d in %s/*/; do [ -d "$d" ] || continue; n=$(basename "$d"); printf '%%s\n' "$n"; cat "$d/%s" 2>/dev/null; printf '\n%s\n'; done 2>/dev/null || true`,
+		root, volumeLabelsFile, listVolumesSentinel)
+}
+
+// parseVolumeList picks out the volume dirs whose label file records
+// pgoverlay.instance=<instanceID>. A dir whose marker is missing, unparseable,
+// or names a different instance is foreign and is skipped, so reconcile never
+// reclaims another instance's data.
+func parseVolumeList(out, instanceID string) []string {
 	var names []string
 	for _, entry := range strings.Split(out, listVolumesSentinel) {
 		entry = strings.TrimSpace(entry)
@@ -320,13 +334,30 @@ func (s *hostPathStorage) listVolumes(ctx context.Context, instanceID string) ([
 			names = append(names, name)
 		}
 	}
-	return names, nil
+	return names
 }
 
 // listVolumesSentinel brackets each volume entry in the hostPath listVolumes
 // helper output so a name can be split cleanly from its (possibly empty) label
-// JSON; chosen to never collide with a volume name or JSON content.
-const listVolumesSentinel = "\x00--pgoverlay-vol--\x00"
+// JSON.
+//
+// It is spliced into a shell script that is handed to the helper pod as an
+// argv element ("sh", "-c", script), which constrains it in two ways:
+//
+//   - No NUL. execve(2) argv entries are NUL-terminated C strings, so a single
+//     NUL anywhere in the script makes the exec fail with EINVAL before the
+//     syscall is even attempted. runc reports that as "exec /bin/sh: invalid
+//     argument" — which reads like a missing or incompatible shell and sends
+//     you hunting the image, not the argument. This constant used to be
+//     NUL-padded, and it broke every hostPath reconcile pass that way.
+//   - No '%' and no single quote, because the sentinel lands inside a
+//     single-quoted printf format string in that script.
+//
+// ASCII RS (0x1E) satisfies both and still cannot collide with either half of
+// an entry: JSON requires control characters below 0x20 to be escaped, so a
+// label file can never emit a literal one, and validVolumeName restricts names
+// to an alphanumeric/dash set that excludes it.
+const listVolumesSentinel = "\x1e--pgoverlay-vol--\x1e"
 
 // runRootHelper runs sh -c cmd in a helper pod with the whole data root
 // mounted at dataRootMountPath (needed to create/remove volume dirs).

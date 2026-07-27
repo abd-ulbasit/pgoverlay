@@ -2,7 +2,15 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -358,5 +366,148 @@ func TestKubeInspectAndListManaged(t *testing.T) {
 	}
 	if len(list) != 1 || list[0].ID != "pgoverlay-br-x" || !list[0].Running {
 		t.Errorf("ListManaged = %+v", list)
+	}
+}
+
+// TestHostPathHelperArgvIsExecSafe is the regression test for
+// "exec /bin/sh: invalid argument", which took out every hostPath reconcile
+// pass while looking like a broken helper image.
+//
+// The listVolumes helper script embedded a sentinel containing literal NUL
+// bytes. execve(2) argv entries are NUL-terminated C strings, so the exec was
+// rejected with EINVAL before it ever reached the shell; runc surfaced that as
+// a message about /bin/sh, and reconcile aborted on step (d) every pass — no
+// TTL reaping, no orphan GC, no layer GC — while the run counter kept
+// incrementing as though it were converging.
+//
+// Nothing in the unit suite reached this path before: the helper-pod tests
+// build specs against a fake clientset that never execs. So this asserts the
+// property the kernel asserts, over every helper the hostPath storage builds.
+func TestHostPathHelperArgvIsExecSafe(t *testing.T) {
+	d, cs := fakeKubeDriver(t)
+	var mu sync.Mutex
+	var built []*corev1.Pod
+	cs.PrependReactor("create", "pods", func(action ktesting.Action) (bool, kruntime.Object, error) {
+		mu.Lock()
+		built = append(built, action.(ktesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy())
+		mu.Unlock()
+		return false, nil, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	s := d.storage.(*hostPathStorage)
+	labels := map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst-1"}
+
+	// Every helper the hostPath driver can issue, including the one that broke.
+	ops := []struct {
+		name string
+		run  func() error
+	}{
+		{"createVolume", func() error { return s.createVolume(ctx, "pgoverlay-src-main", labels) }},
+		{"cloneVolume", func() error {
+			return s.cloneVolume(ctx, "pgoverlay-src-main", "pgoverlay-br-pr-1-rw", labels)
+		}},
+		{"removeVolume", func() error { return s.removeVolume(ctx, "pgoverlay-br-pr-1-rw") }},
+		{"listVolumes", func() error { _, err := s.listVolumes(ctx, "inst-1"); return err }},
+	}
+	for _, op := range ops {
+		settlePods(cs, corev1.PodSucceeded)
+		if err := op.run(); err != nil {
+			t.Fatalf("%s: %v", op.name, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(built) != len(ops) {
+		t.Fatalf("built %d helper pods, want %d", len(built), len(ops))
+	}
+	for _, pod := range built {
+		for _, c := range pod.Spec.Containers {
+			args := append(append([]string{}, c.Command...), c.Args...)
+			for _, e := range c.Env {
+				args = append(args, e.Value)
+			}
+			for i, a := range args {
+				// The exact conversion the exec path performs: it returns
+				// EINVAL for any string containing a NUL byte.
+				if _, err := syscall.BytePtrFromString(a); err != nil {
+					t.Errorf("helper argv[%d] is not exec-safe: %v\nargv = %q", i, err, a)
+				}
+			}
+		}
+	}
+}
+
+// TestListVolumesSentinelIsShellSafe pins the other two constraints on the
+// sentinel: it is spliced into a single-quoted printf format string in the
+// helper script, so a '%' would be read as a conversion specifier and a single
+// quote would end the quoting and reshape the command.
+func TestListVolumesSentinelIsShellSafe(t *testing.T) {
+	if strings.ContainsAny(listVolumesSentinel, "%'") {
+		t.Errorf("listVolumesSentinel %q contains %% or ', which the shell printf format would reinterpret", listVolumesSentinel)
+	}
+	if strings.Contains(listVolumesSentinel, "\x00") {
+		t.Errorf("listVolumesSentinel %q contains NUL: execve would reject the helper argv with EINVAL", listVolumesSentinel)
+	}
+	if listVolumesSentinel == "" {
+		t.Error("listVolumesSentinel is empty: listVolumes output could not be split into entries")
+	}
+}
+
+// TestListVolumesRoundTripsThroughRealShell exercises the hostPath volume
+// listing end to end without a cluster: the real script, a real /bin/sh, and
+// the real parser. exec.Command performs the same argv conversion the kubelet's
+// runtime does, so a sentinel that cannot be exec'd fails here exactly as it
+// failed in kind — which is the coverage gap that let the NUL sentinel ship
+// (kube_test.go only ever built pod specs, and only the live kind IT ran them).
+func TestListVolumesRoundTripsThroughRealShell(t *testing.T) {
+	root := t.TempDir()
+	write := func(dir string, labels map[string]string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if labels == nil {
+			return // a dir with no marker at all
+		}
+		j, err := json.Marshal(labels)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, dir, volumeLabelsFile), j, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("pgoverlay-src-main", map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst-1"})
+	write("pgoverlay-br-pr-1-rw", map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst-1"})
+	write("pgoverlay-src-other", map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst-2"})
+	write("someone-elses-data", nil)
+
+	out, err := exec.Command("/bin/sh", "-c", listVolumesScript(root)).Output()
+	if err != nil {
+		t.Fatalf("running the helper script through /bin/sh: %v", err)
+	}
+	got := parseVolumeList(string(out), "inst-1")
+	sort.Strings(got)
+	want := []string{"pgoverlay-br-pr-1-rw", "pgoverlay-src-main"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("listVolumes = %v, want %v (foreign and unlabelled dirs must be skipped)", got, want)
+	}
+}
+
+// TestListVolumesEmptyRoot: a data root with nothing in it (or no data root at
+// all) lists nothing and is not an error — reconcile runs before any volume
+// exists.
+func TestListVolumesEmptyRoot(t *testing.T) {
+	for _, root := range []string{t.TempDir(), filepath.Join(t.TempDir(), "does-not-exist")} {
+		out, err := exec.Command("/bin/sh", "-c", listVolumesScript(root)).Output()
+		if err != nil {
+			t.Fatalf("root %q: %v", root, err)
+		}
+		if got := parseVolumeList(string(out), "inst-1"); len(got) != 0 {
+			t.Errorf("root %q: listVolumes = %v, want none", root, got)
+		}
 	}
 }
