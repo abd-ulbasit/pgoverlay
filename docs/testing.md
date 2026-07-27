@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: abd-ulbasit/pgbranch/action@main
+      - uses: abd-ulbasit/pgbranch/action@v1.0.0-rc.3
         id: branch
         with:
           server: ${{ vars.PGBRANCH_SERVER }}
@@ -94,13 +94,23 @@ jobs:
       - run: go test ./...
         env:
           DATABASE_URL: postgres://app:${{ secrets.DB_PASSWORD }}@${{ steps.branch.outputs.host }}:${{ steps.branch.outputs.port }}/${{ steps.branch.outputs.database }}
-      - uses: abd-ulbasit/pgbranch/action/destroy@main
+      - uses: abd-ulbasit/pgbranch/action/destroy@v1.0.0-rc.3
         if: always()
         with:
           server: ${{ vars.PGBRANCH_SERVER }}
           token: ${{ secrets.PGBRANCH_TOKEN }}
           branch: ${{ steps.branch.outputs.branch }}
 ```
+
+**Pin it.** The examples use the newest published tag rather than `@main`,
+because `@main` is a moving target that runs whatever was pushed last — the
+thing [SECURITY.md](https://github.com/abd-ulbasit/pgbranch/blob/main/SECURITY.md)
+argues against everywhere else. There is no floating `v1` tag yet (pgbranch has
+not cut a stable v1.0.0); pin the commit SHA instead of the tag if you want the
+strict version, since tags can be moved.
+
+The action is a composite action that only talks to the `/v1` REST API — it
+ships no binary and is not tied to the `branchd` version you run.
 
 The create action waits for the branch to report `ready` (polling up to
 60×5s) before the next step runs. Outputs are `branch`, `host`, `port`,

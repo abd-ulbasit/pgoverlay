@@ -8,7 +8,15 @@ undisclosed vulnerabilities.
 
 ## Supported versions
 
-The latest `v1.x` release line receives security fixes.
+Fixes land on `main` and ship in the next release; nothing is backported to
+older tags. Run the newest published
+[release](https://github.com/abd-ulbasit/pgbranch/releases).
+
+There is no stable `v1.0.0` yet — the current line is `v1.0.0-rc`, and the last
+stable tag is `v0.3.0`. The `/v1` REST contract in `docs/api.md` is written and
+CI-enforced (`internal/api/compat_test.go`), but it is a promise **from v1.0**;
+until that tag exists, treat the CLI flags, the Helm values, and the API alike
+as pre-1.0.
 
 ## Supply-chain scanning
 
@@ -19,7 +27,10 @@ Go race detector (`go test -race`). The build toolchain is pinned via the `go`
 directive in `go.mod`; bumping it is how stdlib CVEs are cleared.
 
 The `vuln` job fails on any reachable vulnerability **except** the documented
-allowlist below.
+allowlist below. It is a thin wrapper around
+[`hack/vulncheck.sh`](hack/vulncheck.sh), which is also `make vuln` — the gate
+is one script, so it can be run locally before pushing rather than discovered
+in CI.
 
 ## Accepted upstream advisories
 
@@ -33,9 +44,10 @@ allowlist below.
 ### Why the allowlist is scoped to a module, not a list of IDs
 
 Moby publishes plugin-privilege and `docker cp` advisories faster than it
-publishes fixed releases: four of them affect v28.5.2, and none has a fixed
-version. An ID list meant CI went red every time a new one landed, which trains
-you to ignore the one job whose whole purpose is to be believed.
+publishes fixed releases on the `github.com/docker/docker` module path: four of
+them affect v28.5.2, and none has a fixed version there. An ID list meant CI
+went red every time a new one landed, which trains you to ignore the one job
+whose whole purpose is to be believed.
 
 The `vuln` job therefore allows advisories **whose module is
 `github.com/docker/docker`** and fails on everything else. It uses govulncheck's
@@ -50,8 +62,33 @@ build: `GO-2026-5856` (Encrypted Client Hello privacy leak in `crypto/tls`) did
 exactly that, and was fixed by moving to Go 1.26.5 rather than by allowlisting
 it.
 
-The Docker allowlist will be removed and the dependency bumped once Moby ships
-a fixed release. v28.5.2 is currently the latest published version.
+### When the allowlist expires — and what watches for it
+
+"No fixed release" above means *no fixed release on the module path pgbranch
+depends on*. Upstream has fixed all four, but only in the **renamed** module
+`github.com/moby/moby/v2` (v2.0.0-beta.8 and v2.0.0-beta.14), which is still a
+beta. `github.com/docker/docker` itself has published nothing since
+v28.5.2+incompatible (2025-11-05), so taking the fixes today would mean moving
+to a pre-release under a new module path — a bigger change than the advisories
+justify, given none of the affected code is reachable from pgbranch.
+
+That promise is not left to anyone's memory. `hack/vulncheck.sh` reads each
+allowlisted advisory's OSV affected-ranges for `github.com/docker/docker` and
+**fails the build** the day one of them gains a `fixed` version, with the
+message to bump the dependency and delete the row from the table above. The
+same script is `make vuln`, so it behaves identically on a laptop.
+
+Everything else here is manual and worth saying plainly: the four rows above
+are hand-written, and nothing checks that the *reasons* in the last column are
+still true. If pgbranch ever starts installing Docker plugins or calling
+`docker cp`, this table becomes wrong and no job will notice.
+
+Dependency updates themselves are automated — Dependabot alerts and security
+updates are on, with a weekly `gomod` / `github-actions` / `docker` schedule in
+[`.github/dependabot.yml`](.github/dependabot.yml). The Go toolchain is the
+exception: Dependabot cannot bump the `go` directive, so stdlib CVEs are still
+cleared by hand (that is how `GO-2026-5856` was), and `make check-toolchain`
+keeps the Dockerfiles' base image from drifting away from it.
 
 ## Hardening posture
 

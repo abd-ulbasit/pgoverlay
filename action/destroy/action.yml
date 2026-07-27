@@ -1,7 +1,7 @@
 # Delete a pgbranch branch by name. Run it with `if: always()` so the branch
 # goes away even when the tests fail:
 #
-#   - uses: abd-ulbasit/pgbranch/action/destroy@main
+#   - uses: abd-ulbasit/pgbranch/action/destroy@v1.0.0-rc.3
 #     if: always()
 #     with:
 #       server: ${{ vars.PGBRANCH_SERVER }}

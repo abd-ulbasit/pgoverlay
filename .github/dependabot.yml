@@ -1,0 +1,48 @@
+version: 2
+
+# Ecosystems deliberately absent: npm. sdk/js and sdk/js-connect are
+# zero-dependency ESM packages (no dependencies, no devDependencies, tests run
+# on node --test), so an npm entry would only ever open no-op PRs.
+updates:
+  # Go modules. The `vuln` job is the gate that must not go red; this is what
+  # keeps it from having to. Grouped so a quiet week is one PR, not six.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-deps:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  # Workflow actions. Left ungrouped-by-default but batched the same way; this
+  # is also what will surface action majors going out of support (the Node 20
+  # deprecation warnings currently on every run).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # Base images in Dockerfile and Dockerfile.ghook, both digest-pinned.
+  #
+  # golang is excluded on purpose: its version is not a free choice, it must
+  # equal go.mod's `go` directive or the build dies at `go mod download`
+  # (the image sets GOTOOLCHAIN=local — see hack/check-toolchain.sh). Dependabot
+  # cannot bump the `go` directive, so a golang PR here would always fail
+  # check-toolchain until a human bumped go.mod first. The toolchain moves the
+  # other way round: bump go.mod, then the Dockerfiles follow.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: golang
+    commit-message:
+      prefix: "build"

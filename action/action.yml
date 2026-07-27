@@ -1,7 +1,7 @@
 # Create a copy-on-write Postgres branch on a pgbranch server and wait until
 # it is ready. Usage:
 #
-#   - uses: abd-ulbasit/pgbranch/action@main
+#   - uses: abd-ulbasit/pgbranch/action@v1.0.0-rc.3
 #     id: branch
 #     with:
 #       server: ${{ vars.PGBRANCH_SERVER }}
@@ -9,7 +9,7 @@
 #       source: main
 #   - run: psql "host=${{ steps.branch.outputs.host }} port=${{ steps.branch.outputs.port }} ..."
 #
-# Pair with abd-ulbasit/pgbranch/action/destroy@main in an `if: always()`
+# Pair with abd-ulbasit/pgbranch/action/destroy@v1.0.0-rc.3 in an `if: always()`
 # step; the TTL reaps leaked branches as a fallback.
 name: pgbranch branch
 description: Create a copy-on-write Postgres branch on a pgbranch server and wait until it is ready

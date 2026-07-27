@@ -108,10 +108,10 @@ await branch.destroy();
 **CI** (reusable Action):
 
 ```yaml
-- uses: abd-ulbasit/pgbranch/action@main
+- uses: abd-ulbasit/pgbranch/action@v1.0.0-rc.3
   with: { server: ${{ vars.PGBRANCH_API }}, token: ${{ secrets.PGBRANCH_TOKEN }}, source: prod }
 # … your tests use the branch it created …
-- uses: abd-ulbasit/pgbranch/action/destroy@main
+- uses: abd-ulbasit/pgbranch/action/destroy@v1.0.0-rc.3
 ```
 
 The SDK is integration-only (it talks to a running `branchd`); point it with
