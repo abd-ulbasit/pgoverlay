@@ -1,4 +1,4 @@
-.PHONY: build test it k8s-it csi-it matrix lint check-toolchain docker-build docker-build-ghook helm-test js-sdk-test
+.PHONY: build test it k8s-it csi-it matrix lint vuln check-toolchain docker-build docker-build-ghook helm-test js-sdk-test
 
 build:
 	go build -o bin/pgb ./cmd/pgb
@@ -29,6 +29,13 @@ matrix:
 
 lint:
 	go vet ./...
+
+# The CI supply-chain gate, verbatim: govulncheck in binary mode against both
+# shipped binaries, with the module-scoped allowlist documented in SECURITY.md.
+# CI runs this same script, so a local pass means a CI pass. Needs jq;
+# installs govulncheck if it is not already on PATH.
+vuln:
+	hack/vulncheck.sh
 
 # Asserts the Dockerfiles' golang base image matches go.mod's `go` directive.
 # The golang image pins GOTOOLCHAIN=local, so drift here breaks every image
