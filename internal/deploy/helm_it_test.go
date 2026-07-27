@@ -209,6 +209,58 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
+// readyProbe gates on the FINAL postgres server, not merely on "something is
+// answering". See waitPostgresReady for why the TCP half is load-bearing; the
+// socket half then proves the exact path every caller below uses is live.
+const readyProbe = `pg_isready -U postgres -h 127.0.0.1 -p 5432 && ` +
+	`psql -U postgres -h /var/run/postgresql -tAc 'SELECT 1'`
+
+// waitPostgresReady blocks until pod is running the postgres server the test
+// will actually talk to, and shares one implementation with the HA suite
+// because the two copies of this wait had already drifted apart.
+//
+// The gate must not be a bare socket pg_isready. Initialising an empty PGDATA,
+// the official image's entrypoint starts a TEMPORARY server to create the
+// database and run /docker-entrypoint-initdb.d, then stops it (`pg_ctl -m fast
+// -w stop`) before exec'ing the real one. That temporary server owns
+// /var/run/postgresql/.s.PGSQL.5432 while it lives, so a socket pg_isready
+// succeeds against it and returns — and the socket then vanishes for the
+// restart. The next psql lands in that window and dies with
+//
+//	connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed:
+//	No such file or directory
+//
+// which is exactly how TestHelmDeployEndToEnd failed in CI 30312070784, in
+// 20.75s: the wait returned early rather than exhausting its deadline. The
+// race is not new, it was hidden — the helm install used to burn its full 3m
+// timeout ahead of this call, which gave postgres all the time in the world.
+//
+// TCP discriminates because the entrypoint starts that temporary server under
+// -c listen_addresses= (set to the empty string) on the command line, which
+// overrides the image's own postgresql.conf (its Dockerfile rewrites the
+// shipped sample to listen_addresses = '*'). The init server is therefore
+// reachable ONLY over the socket and can never answer a TCP ping, so this
+// loop cannot pass until the final server is up — no sleeping, no blind
+// retry, no widened deadline.
+// internal/runtime/kube_it_test.go gates the same image on the entrypoint's
+// "PostgreSQL init process complete" log line; this asserts the same fact
+// structurally instead of by matching a log string.
+func waitPostgresReady(t *testing.T, kc, ns, pod string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		out, err := exec.Command("kubectl", "--kubeconfig", kc, "-n", ns,
+			"exec", pod, "--", "sh", "-c", readyProbe).CombinedOutput()
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("postgres in %s/%s never accepted a query: %v\n%s", ns, pod, err, out)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
 // startSourcePod runs a vanilla "production" postgres pod for the engine to
 // seed from (small local copy of the runtime IT helper, via kubectl):
 // wal_level=replica plus a replication pg_hba entry appended after startup.
@@ -223,20 +275,7 @@ func startSourcePod(t *testing.T, kc string) (podIP string) {
 		exec.Command("kubectl", "--kubeconfig", kc, "-n", helmNS,
 			"delete", "pod", sourcePod, "--ignore-not-found", "--wait=false").Run()
 	})
-	// readiness: pg_isready over the unix socket (TCP comes up before the
-	// init scripts finish, the socket only after)
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		err := exec.Command("kubectl", "--kubeconfig", kc, "-n", helmNS, "exec", sourcePod,
-			"--", "pg_isready", "-U", "postgres", "-h", "/var/run/postgresql").Run()
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("source pod never became ready: %v", err)
-		}
-		time.Sleep(time.Second)
-	}
+	waitPostgresReady(t, kc, helmNS, sourcePod)
 	// stock pg_hba has no remote replication entry; branchd's pg_basebackup
 	// helper would be rejected without this
 	kubectl("exec", sourcePod, "--", "sh", "-c",

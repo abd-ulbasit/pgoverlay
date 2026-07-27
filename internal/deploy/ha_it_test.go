@@ -168,18 +168,7 @@ func startHASourcePod(t *testing.T, kc string) string {
 		exec.Command("kubectl", "--kubeconfig", kc, "-n", haNS,
 			"delete", "pod", haSrcPod, "--ignore-not-found", "--wait=false").Run()
 	})
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		err := exec.Command("kubectl", "--kubeconfig", kc, "-n", haNS, "exec", haSrcPod,
-			"--", "pg_isready", "-U", "postgres", "-h", "/var/run/postgresql").Run()
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("HA source pod never became ready: %v", err)
-		}
-		time.Sleep(time.Second)
-	}
+	waitPostgresReady(t, kc, haNS, haSrcPod)
 	kubectl("exec", haSrcPod, "--", "sh", "-c",
 		`echo 'host replication all all scram-sha-256' >> "$PGDATA/pg_hba.conf"`)
 	kubectl("exec", haSrcPod, "--", "psql", "-U", "postgres", "-c", "SELECT pg_reload_conf()")
