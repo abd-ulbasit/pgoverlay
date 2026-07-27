@@ -8,14 +8,17 @@ package deploy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,16 +84,22 @@ func loadBranchdImage(t *testing.T) {
 }
 
 // portForward starts kubectl port-forward to the api Service on a random
-// local port and returns the base URL once the forward is listening.
-func portForward(t *testing.T, kc string) string {
+// local port and returns the base URL once the forward is listening. ns is
+// explicit: the HA suite installs the chart into its own namespace, and a
+// helper that assumed helmNS silently forwarded to a Service that wasn't there.
+func portForward(t *testing.T, kc, ns string) string {
 	t.Helper()
-	cmd := exec.Command("kubectl", "--kubeconfig", kc, "-n", helmNS,
+	cmd := exec.Command("kubectl", "--kubeconfig", kc, "-n", ns,
 		"port-forward", "svc/pgbranch-api", ":7070")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd.Stderr = os.Stderr
+	// Keep a copy of stderr: when kubectl exits immediately (no such Service,
+	// no such namespace) stdout closes empty, and without this the only
+	// symptom is an empty line and no reason.
+	var errOut syncBuffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &errOut)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -108,13 +117,34 @@ func portForward(t *testing.T, kc string) string {
 	case line := <-lines:
 		m := regexp.MustCompile(`127\.0\.0\.1:(\d+)`).FindStringSubmatch(line)
 		if m == nil {
-			t.Fatalf("unexpected port-forward output: %q", line)
+			t.Fatalf("kubectl port-forward -n %s svc/pgbranch-api gave no local address (stdout %q); stderr: %s",
+				ns, line, strings.TrimSpace(errOut.String()))
 		}
 		return "http://127.0.0.1:" + m[1]
 	case <-time.After(30 * time.Second):
-		t.Fatal("kubectl port-forward never became ready")
+		t.Fatalf("kubectl port-forward -n %s svc/pgbranch-api never became ready; stderr: %s",
+			ns, strings.TrimSpace(errOut.String()))
 		return ""
 	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the exec copy goroutine to write to
+// while the test goroutine reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // startSourcePod runs a vanilla "production" postgres pod for the engine to
@@ -186,7 +216,7 @@ func TestHelmDeployEndToEnd(t *testing.T) {
 		"--wait", "--timeout", "3m")
 	t.Logf("helm release ready in %s", time.Since(start))
 
-	base := portForward(t, kc)
+	base := portForward(t, kc, helmNS)
 	resp, err := http.Get(base + "/healthz")
 	if err != nil {
 		t.Fatal(err)

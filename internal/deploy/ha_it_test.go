@@ -107,7 +107,7 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 	// Service (which load-balances to whichever replica — non-leaders 503 on
 	// mutations, but the Service has only the leader ready for writes... so we
 	// drive the API and tolerate a transient 503 by retrying through the LB).
-	base := portForward(t, kc)
+	base := portForward(t, kc, haNS)
 	client := apiclient.New(base, haToken)
 	srcIP := startHASourcePod(t, kc)
 
