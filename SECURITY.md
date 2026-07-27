@@ -36,10 +36,10 @@ in CI.
 
 | ID | Module | Status | Why accepted |
 |----|--------|--------|--------------|
-| [GO-2026-4887](https://pkg.go.dev/vuln/GO-2026-4887) | `github.com/docker/docker` v28.5.2 | No fixed release | Moby plugin-privilege validation. pgbranch uses the Docker **client** only to manage branch containers and **installs no Docker plugins**, so the affected code path is not exercised. |
-| [GO-2026-4883](https://pkg.go.dev/vuln/GO-2026-4883) | `github.com/docker/docker` v28.5.2 | No fixed release | Same as above — plugin-privilege off-by-one; unreachable in pgbranch's usage. |
-| [GO-2026-5617](https://pkg.go.dev/vuln/GO-2026-5617) | `github.com/docker/docker` v28.5.2 | No fixed release | Race in `docker cp` allowing bind-mount redirection to a host path. pgbranch never calls `docker cp`: branch data reaches a container through the OverlayFS mount assembled in its own mount namespace (`internal/cow/entrypoint.sh`), and seeding uses `pg_basebackup` against a running source. |
-| [GO-2026-5668](https://pkg.go.dev/vuln/GO-2026-5668) | `github.com/docker/docker` v28.5.2 | No fixed release | Another plugin-privilege off-by-one; unreachable for the same reason as GO-2026-4887. |
+| [GO-2026-4887](https://pkg.go.dev/vuln/GO-2026-4887) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Moby plugin-privilege validation. pgbranch uses the Docker **client** only to manage branch containers and **installs no Docker plugins**, so the affected code path is not exercised. |
+| [GO-2026-4883](https://pkg.go.dev/vuln/GO-2026-4883) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Same as above — plugin-privilege off-by-one; unreachable in pgbranch's usage. |
+| [GO-2026-5617](https://pkg.go.dev/vuln/GO-2026-5617) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Race in `docker cp` allowing bind-mount redirection to a host path. pgbranch never calls `docker cp`: branch data reaches a container through the OverlayFS mount assembled in its own mount namespace (`internal/cow/entrypoint.sh`), and seeding uses `pg_basebackup` against a running source. |
+| [GO-2026-5668](https://pkg.go.dev/vuln/GO-2026-5668) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Another plugin-privilege off-by-one; unreachable for the same reason as GO-2026-4887. |
 
 ### Why the allowlist is scoped to a module, not a list of IDs
 
