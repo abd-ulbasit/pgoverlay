@@ -36,6 +36,13 @@ automatic migration — a deployment created by an older tag will not be seen by
 `v1.0.0-rc.4` (different state directory, registry filename, labels, and
 resource names). Destroy branches with the old version before upgrading.
 
+One rename fails quietly rather than loudly and is worth calling out: the
+GitHub App posts its commit status under the context `pgoverlay/branch`, which
+was `pgbranch/branch`. A branch protection rule that lists `pgbranch/branch` as
+a **required** status check will never be satisfied again — the new context is
+a different check, so pull requests wait forever instead of erroring. Update
+the rule at the same time you upgrade ghook.
+
 ## Supply-chain scanning
 
 CI runs [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) in
