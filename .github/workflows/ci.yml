@@ -43,16 +43,17 @@ jobs:
           go-version-file: go.mod
       - name: govulncheck (binary mode + documented allowlist)
         # Binary mode scans the actually-compiled deps and avoids source-version
-        # skew. The two allowlisted IDs are Moby (github.com/docker/docker) CVEs
-        # with no fixed release; pgbranch installs no docker plugins, so they are
-        # not reachable in our usage (rationale in SECURITY.md). Fail on anything
+        # skew. The allowlisted IDs are Moby (github.com/docker/docker) CVEs with
+        # no fixed release, none reachable in pgbranch's usage: we install no
+        # docker plugins and never call docker cp (rationale in SECURITY.md).
+        # Fail on anything
         # else — including any future stdlib CVE the toolchain hasn't patched.
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           GOVC="$(go env GOPATH)/bin/govulncheck"
           go build -o /tmp/branchd ./cmd/branchd
           go build -o /tmp/pgbranch-github ./cmd/pgbranch-github
-          allow='GO-2026-4887|GO-2026-4883'
+          allow='GO-2026-4887|GO-2026-4883|GO-2026-5617'
           rc=0
           for bin in /tmp/branchd /tmp/pgbranch-github; do
             out=$("$GOVC" -mode=binary "$bin" 2>&1 || true)
