@@ -1,9 +1,9 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "pgbranch.fullname" . }}
+  name: {{ include "pgoverlay.fullname" . }}
   labels:
-    {{- include "pgbranch.labels" . | nindent 4 }}
+    {{- include "pgoverlay.labels" . | nindent 4 }}
 spec:
   # sqlite registry = single writer. replicaCount defaults to 1; >1 is an HA
   # standby set guarded by leader election (only the leader writes), NOT
@@ -14,11 +14,11 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      {{- include "pgbranch.selectorLabels" . | nindent 6 }}
+      {{- include "pgoverlay.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "pgbranch.selectorLabels" . | nindent 8 }}
+        {{- include "pgoverlay.selectorLabels" . | nindent 8 }}
       annotations:
         # Prometheus pod-scrape discovery: branchd serves /metrics on the API
         # port without auth (see docs/observability.md).
@@ -26,7 +26,7 @@ spec:
         prometheus.io/port: {{ .Values.api.port | quote }}
         prometheus.io/path: /metrics
     spec:
-      serviceAccountName: {{ include "pgbranch.fullname" . }}
+      serviceAccountName: {{ include "pgoverlay.fullname" . }}
       # Pin to the storage node: branchd's sqlite state shares the node (and
       # data root) with the CoW volumes it manages.
       nodeName: {{ required "set node to the storage node name (kubectl get nodes)" .Values.node }}
@@ -58,30 +58,30 @@ spec:
             - --pg-addr=:{{ .Values.proxy.port }}
             {{- with .Values.proxy.tls.certSecret }}
             # wire-protocol TLS for the Postgres router (secret mounted below)
-            - --pg-tls-cert=/etc/pgbranch/proxy-tls/tls.crt
-            - --pg-tls-key=/etc/pgbranch/proxy-tls/tls.key
+            - --pg-tls-cert=/etc/pgoverlay/proxy-tls/tls.crt
+            - --pg-tls-key=/etc/pgoverlay/proxy-tls/tls.key
             {{- end }}
             - --reconcile-interval={{ .Values.reconcileInterval }}
             - --stuck-timeout={{ .Values.stuckTimeout }}
-            {{- if eq (include "pgbranch.leaderElectionEnabled" .) "true" }}
-            # HA: contend for the pgbranch-branchd Lease; only the leader
+            {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
+            # HA: contend for the pgoverlay-branchd Lease; only the leader
             # reconciles + accepts mutating /v1 requests (see docs/ha.md).
             - --leader-elect
             {{- end }}
           env:
-            - name: PGBRANCH_TOKEN
+            - name: PGOVERLAY_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgbranch.tokenSecretName" . }}
+                  name: {{ include "pgoverlay.tokenSecretName" . }}
                   key: token
             # sqlite registry on the storage node (mounted below)
-            - name: PGBRANCH_HOME
+            - name: PGOVERLAY_HOME
               value: {{ .Values.dataRoot }}/state
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            {{- if eq (include "pgbranch.leaderElectionEnabled" .) "true" }}
+            {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
             # leader-election identity (the Lease holder)
             - name: POD_NAME
               valueFrom:
@@ -124,7 +124,7 @@ spec:
               mountPath: /tmp
             {{- with .Values.proxy.tls.certSecret }}
             - name: proxy-tls
-              mountPath: /etc/pgbranch/proxy-tls
+              mountPath: /etc/pgoverlay/proxy-tls
               readOnly: true
             {{- end }}
           {{- with .Values.resources }}
@@ -135,9 +135,9 @@ spec:
         - name: tmp
           emptyDir: {}
         - name: state
-          {{- if eq (include "pgbranch.persistenceEnabled" .) "true" }}
+          {{- if eq (include "pgoverlay.persistenceEnabled" .) "true" }}
           persistentVolumeClaim:
-            claimName: {{ include "pgbranch.fullname" . }}-state
+            claimName: {{ include "pgoverlay.fullname" . }}-state
           {{- else }}
           hostPath:
             path: {{ .Values.dataRoot }}/state

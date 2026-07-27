@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 func newBranchCmd() *cobra.Command {

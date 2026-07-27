@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // Unit tests for the csi backend: the branch's writable layer is a PVC clone
@@ -39,14 +39,14 @@ func TestCSICreateBranchClonesAndStartsDirectPod(t *testing.T) {
 	if b.State != registry.BranchReady {
 		t.Fatalf("state = %q", b.State)
 	}
-	if b.RWVolume != "pgbranch-br-pr-1-rw" || b.SourceVolume != "pgbranch-src-main" {
+	if b.RWVolume != "pgoverlay-br-pr-1-rw" || b.SourceVolume != "pgoverlay-src-main" {
 		t.Fatalf("volumes: rw=%q source=%q", b.RWVolume, b.SourceVolume)
 	}
 	// the rw volume is a CloneVolume of the source PVC, not a fresh CreateVolume
-	if len(d.clones) != 1 || d.clones[0] != [2]string{"pgbranch-src-main", "pgbranch-br-pr-1-rw"} {
+	if len(d.clones) != 1 || d.clones[0] != [2]string{"pgoverlay-src-main", "pgoverlay-br-pr-1-rw"} {
 		t.Fatalf("clones = %v, want source->rw", d.clones)
 	}
-	if i := d.logIndex("volume:pgbranch-br-pr-1-rw"); i >= 0 {
+	if i := d.logIndex("volume:pgoverlay-br-pr-1-rw"); i >= 0 {
 		t.Fatal("csi branch must not CreateVolume its rw layer (it is cloned)")
 	}
 	// the direct entrypoint is installed into the clone via an unprivileged
@@ -63,11 +63,11 @@ func TestCSICreateBranchClonesAndStartsDirectPod(t *testing.T) {
 	if ep.Privileged {
 		t.Fatal("entrypoint install must not be privileged")
 	}
-	if len(ep.Env) != 1 || ep.Env[0] != "PGBRANCH_ENTRYPOINT="+cow.EntrypointScriptDirect {
+	if len(ep.Env) != 1 || ep.Env[0] != "PGOVERLAY_ENTRYPOINT="+cow.EntrypointScriptDirect {
 		t.Fatalf("entrypoint helper env = %v, want the direct entrypoint script", ep.Env)
 	}
 	if len(ep.Mounts) != 1 || ep.Mounts[0].Kind != runtime.MountVolume ||
-		ep.Mounts[0].Volume != "pgbranch-br-pr-1-rw" || ep.Mounts[0].Target != cow.RWPath {
+		ep.Mounts[0].Volume != "pgoverlay-br-pr-1-rw" || ep.Mounts[0].Target != cow.RWPath {
 		t.Fatalf("entrypoint helper mounts = %+v, want the clone PVC at %s", ep.Mounts, cow.RWPath)
 	}
 	// branch pod: only the clone mounted rw, PGDATA in its data/ subdir,
@@ -77,11 +77,11 @@ func TestCSICreateBranchClonesAndStartsDirectPod(t *testing.T) {
 	}
 	bs := d.branches[0]
 	if len(bs.Mounts) != 1 || bs.Mounts[0].Kind != runtime.MountVolume ||
-		bs.Mounts[0].Volume != "pgbranch-br-pr-1-rw" || bs.Mounts[0].Target != cow.RWPath || bs.Mounts[0].ReadOnly {
+		bs.Mounts[0].Volume != "pgoverlay-br-pr-1-rw" || bs.Mounts[0].Target != cow.RWPath || bs.Mounts[0].ReadOnly {
 		t.Fatalf("branch mounts = %+v, want rw clone PVC at %s", bs.Mounts, cow.RWPath)
 	}
 	if len(bs.Env) != 1 || bs.Env[0] != "PGDATA="+cow.DirectDataPath {
-		t.Fatalf("branch env = %v, want only PGDATA=%s (no PGBRANCH_LOWERS)", bs.Env, cow.DirectDataPath)
+		t.Fatalf("branch env = %v, want only PGDATA=%s (no PGOVERLAY_LOWERS)", bs.Env, cow.DirectDataPath)
 	}
 	if len(bs.Entrypoint) != 2 || bs.Entrypoint[1] != cow.RWPath+"/entrypoint.sh" {
 		t.Fatalf("branch entrypoint = %v", bs.Entrypoint)
@@ -97,7 +97,7 @@ func TestCSICreateBranchUnwindsCloneOnStartFailure(t *testing.T) {
 	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err == nil {
 		t.Fatal("want error")
 	}
-	if d.volumes["pgbranch-br-pr-1-rw"] {
+	if d.volumes["pgoverlay-br-pr-1-rw"] {
 		t.Fatal("clone PVC not removed by compensation")
 	}
 	b, err := r.GetBranchByName("pr-1")
@@ -127,25 +127,25 @@ func TestCSICreateBranchFromStopsClonesRestartsParent(t *testing.T) {
 		t.Fatalf("child %+v", b)
 	}
 	// the child's volume is a full clone of the PARENT'S PVC
-	if b.RWVolume != "pgbranch-br-pr-2-rw" || b.SourceVolume != "pgbranch-br-pr-1-rw" {
+	if b.RWVolume != "pgoverlay-br-pr-2-rw" || b.SourceVolume != "pgoverlay-br-pr-1-rw" {
 		t.Fatalf("child volumes: rw=%q source=%q", b.RWVolume, b.SourceVolume)
 	}
-	if len(d.clones) != 2 || d.clones[1] != [2]string{"pgbranch-br-pr-1-rw", "pgbranch-br-pr-2-rw"} {
+	if len(d.clones) != 2 || d.clones[1] != [2]string{"pgoverlay-br-pr-1-rw", "pgoverlay-br-pr-2-rw"} {
 		t.Fatalf("clones = %v, want parent rw -> child rw", d.clones)
 	}
 	// ordering: checkpoint -> stop parent -> clone -> restart parent -> child
-	ckpt := d.logIndex("exec:psql:cid-pgbranch-br-pr-1")
-	stop := d.logIndex("stop:cid-pgbranch-br-pr-1")
-	clone := d.logIndex("clone:pgbranch-br-pr-1-rw>pgbranch-br-pr-2-rw")
+	ckpt := d.logIndex("exec:psql:cid-pgoverlay-br-pr-1")
+	stop := d.logIndex("stop:cid-pgoverlay-br-pr-1")
+	clone := d.logIndex("clone:pgoverlay-br-pr-1-rw>pgoverlay-br-pr-2-rw")
 	if !(ckpt >= 0 && stop >= 0 && clone >= 0 && ckpt < stop && stop < clone) {
 		t.Fatalf("order ckpt=%d stop=%d clone=%d; log=%v", ckpt, stop, clone, d.log)
 	}
 	var parentRestart, childStart int = -1, -1
 	for i, ent := range d.log {
-		if ent == "start:pgbranch-br-pr-1" && i > stop {
+		if ent == "start:pgoverlay-br-pr-1" && i > stop {
 			parentRestart = i
 		}
-		if ent == "start:pgbranch-br-pr-2" {
+		if ent == "start:pgoverlay-br-pr-2" {
 			childStart = i
 		}
 	}
@@ -185,7 +185,7 @@ func TestCSICreateBranchFromCheckpointFailureLeavesParentRunning(t *testing.T) {
 	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err == nil {
 		t.Fatal("want error")
 	}
-	if !d.containers["cid-pgbranch-br-pr-1"] {
+	if !d.containers["cid-pgoverlay-br-pr-1"] {
 		t.Fatal("parent container was stopped after a checkpoint failure")
 	}
 	if p, _ := r.GetBranchByName("pr-1"); p.State != registry.BranchReady {
@@ -210,7 +210,7 @@ func TestCSICreateBranchFromUnwindRestoresParent(t *testing.T) {
 	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err == nil {
 		t.Fatal("want error")
 	}
-	if d.volumes["pgbranch-br-pr-2-rw"] {
+	if d.volumes["pgoverlay-br-pr-2-rw"] {
 		t.Fatal("child clone PVC not removed by compensation")
 	}
 	p, err := r.GetBranchByName("pr-1")
@@ -247,10 +247,10 @@ func TestCSICreateBranchFromParentRestartFailure(t *testing.T) {
 		t.Fatalf("parent state = %q, want failed", p.State)
 	}
 	// the parent's PVC must never be removed — it holds the data
-	if !d.volumes["pgbranch-br-pr-1-rw"] {
+	if !d.volumes["pgoverlay-br-pr-1-rw"] {
 		t.Fatal("parent PVC removed")
 	}
-	if d.volumes["pgbranch-br-pr-2-rw"] {
+	if d.volumes["pgoverlay-br-pr-2-rw"] {
 		t.Fatal("child clone PVC not removed by compensation")
 	}
 }
@@ -272,7 +272,7 @@ func TestCSIResetChildReclonesFromParent(t *testing.T) {
 	}
 	var fromParent int
 	for _, c := range d.clones {
-		if c == [2]string{"pgbranch-br-pr-1-rw", "pgbranch-br-pr-2-rw"} {
+		if c == [2]string{"pgoverlay-br-pr-1-rw", "pgoverlay-br-pr-2-rw"} {
 			fromParent++
 		}
 	}
@@ -300,7 +300,7 @@ func TestCSIDestroyIndependence(t *testing.T) {
 	if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
 		t.Fatalf("destroy parent with live csi child = %v, want ok", err)
 	}
-	if d.volumes["pgbranch-br-pr-1-rw"] {
+	if d.volumes["pgoverlay-br-pr-1-rw"] {
 		t.Fatal("parent PVC not removed")
 	}
 	// the child keeps running on its own clone
@@ -310,7 +310,7 @@ func TestCSIDestroyIndependence(t *testing.T) {
 	if err := e.DestroyBranch(context.Background(), "pr-2"); err != nil {
 		t.Fatal(err)
 	}
-	if d.volumes["pgbranch-br-pr-2-rw"] {
+	if d.volumes["pgoverlay-br-pr-2-rw"] {
 		t.Fatal("child PVC not removed")
 	}
 	if len(d.containers) != 0 {

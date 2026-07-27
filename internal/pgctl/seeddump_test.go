@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // recordingDriver records RunHelper calls; only the methods SeedDump touches
@@ -50,7 +50,7 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 	d := &recordingDriver{}
 	err := SeedDump(context.Background(), d, SeedDumpSpec{
 		SeedSpec: SeedSpec{
-			Image: "postgres:17", Volume: "pgbranch-src-main", Network: "net1",
+			Image: "postgres:17", Volume: "pgoverlay-src-main", Network: "net1",
 			Host: "db.proj.supabase.co", Port: 6543, User: "appuser", Password: "s3cret",
 		},
 		Database: "appdb",
@@ -67,7 +67,7 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 	if prep.Image != "alpine:3.21" || !strings.Contains(strings.Join(prep.Cmd, " "), "chown 999:999 /seed") {
 		t.Fatalf("prep helper: %+v", prep)
 	}
-	if len(prep.Mounts) != 1 || prep.Mounts[0].Volume != "pgbranch-src-main" || prep.Mounts[0].Target != "/seed" {
+	if len(prep.Mounts) != 1 || prep.Mounts[0].Volume != "pgoverlay-src-main" || prep.Mounts[0].Target != "/seed" {
 		t.Fatalf("prep mounts: %+v", prep.Mounts)
 	}
 
@@ -81,7 +81,7 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 	if dump.Network != "net1" {
 		t.Fatalf("network=%q want net1", dump.Network)
 	}
-	if len(dump.Mounts) != 1 || dump.Mounts[0].Volume != "pgbranch-src-main" || dump.Mounts[0].Target != "/seed" {
+	if len(dump.Mounts) != 1 || dump.Mounts[0].Volume != "pgoverlay-src-main" || dump.Mounts[0].Target != "/seed" {
 		t.Fatalf("dump mounts: %+v", dump.Mounts)
 	}
 	// remote credentials travel via env, never argv

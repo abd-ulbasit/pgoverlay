@@ -6,23 +6,23 @@ import (
 )
 
 type Config struct {
-	Home          string // state directory, default ~/.pgbranch
+	Home          string // state directory, default ~/.pgoverlay
 	RegistryPath  string // SQLite file
 	PostgresImage string // default image for helpers/branches when source has no version
 }
 
 func Load() (*Config, error) {
-	home := os.Getenv("PGBRANCH_HOME")
+	home := os.Getenv("PGOVERLAY_HOME")
 	if home == "" {
 		uh, err := os.UserHomeDir()
 		if err != nil {
 			return nil, err
 		}
-		home = filepath.Join(uh, ".pgbranch")
+		home = filepath.Join(uh, ".pgoverlay")
 	}
 	return &Config{
 		Home:          home,
-		RegistryPath:  filepath.Join(home, "pgbranch.db"),
+		RegistryPath:  filepath.Join(home, "pgoverlay.db"),
 		PostgresImage: "postgres:17",
 	}, nil
 }

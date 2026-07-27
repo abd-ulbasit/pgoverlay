@@ -7,23 +7,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // Unit tests for branch-from-branch (overlay backend): the freeze saga
 // ordering (checkpoint -> stop -> swap -> restart parent -> start child),
-// the exact chain -> PGBRANCH_LOWERS/mounts construction, failure unwinding
+// the exact chain -> PGOVERLAY_LOWERS/mounts construction, failure unwinding
 // that restores the parent, layer GC refcounts, and reset-to-own-base.
 
 func lowersEnv(t *testing.T, s runtime.BranchSpec) string {
 	t.Helper()
 	for _, e := range s.Env {
-		if v, ok := strings.CutPrefix(e, "PGBRANCH_LOWERS="); ok {
+		if v, ok := strings.CutPrefix(e, "PGOVERLAY_LOWERS="); ok {
 			return v
 		}
 	}
-	t.Fatalf("spec %q has no PGBRANCH_LOWERS env: %v", s.Name, s.Env)
+	t.Fatalf("spec %q has no PGOVERLAY_LOWERS env: %v", s.Name, s.Env)
 	return ""
 }
 
@@ -39,28 +39,28 @@ func mountAt(t *testing.T, s runtime.BranchSpec, target string) runtime.Mount {
 }
 
 // assertOverlaySpec checks a branch container spec against the expected
-// overlay stack: rw volume at /pgbranch/rw, source ro at lower0, frozen layer
-// volumes (newest first) ro at lower1..N, and PGBRANCH_LOWERS listing the
+// overlay stack: rw volume at /pgoverlay/rw, source ro at lower0, frozen layer
+// volumes (newest first) ro at lower1..N, and PGOVERLAY_LOWERS listing the
 // layers' upper/ subdirs newest-first with the source's data/ last.
 func assertOverlaySpec(t *testing.T, s runtime.BranchSpec, rwVol, srcVol string, layerVols []string) {
 	t.Helper()
-	if got := mountAt(t, s, "/pgbranch/rw"); got.Volume != rwVol || got.ReadOnly {
+	if got := mountAt(t, s, "/pgoverlay/rw"); got.Volume != rwVol || got.ReadOnly {
 		t.Errorf("spec %q rw mount = %+v, want rw volume %q", s.Name, got, rwVol)
 	}
-	if got := mountAt(t, s, "/pgbranch/lower0"); got.Volume != srcVol || !got.ReadOnly {
+	if got := mountAt(t, s, "/pgoverlay/lower0"); got.Volume != srcVol || !got.ReadOnly {
 		t.Errorf("spec %q lower0 mount = %+v, want ro source %q", s.Name, got, srcVol)
 	}
 	wantLowers := make([]string, 0, len(layerVols)+1)
 	for i, lv := range layerVols {
-		target := []string{"", "/pgbranch/lower1", "/pgbranch/lower2", "/pgbranch/lower3"}[i+1]
+		target := []string{"", "/pgoverlay/lower1", "/pgoverlay/lower2", "/pgoverlay/lower3"}[i+1]
 		if got := mountAt(t, s, target); got.Volume != lv || !got.ReadOnly {
 			t.Errorf("spec %q %s mount = %+v, want ro layer %q", s.Name, target, got, lv)
 		}
 		wantLowers = append(wantLowers, target+"/upper")
 	}
-	wantLowers = append(wantLowers, "/pgbranch/lower0/data")
+	wantLowers = append(wantLowers, "/pgoverlay/lower0/data")
 	if got, want := lowersEnv(t, s), strings.Join(wantLowers, ":"); got != want {
-		t.Errorf("spec %q PGBRANCH_LOWERS = %q, want %q", s.Name, got, want)
+		t.Errorf("spec %q PGOVERLAY_LOWERS = %q, want %q", s.Name, got, want)
 	}
 	if got := len(s.Mounts); got != len(layerVols)+2 {
 		t.Errorf("spec %q has %d mounts, want %d: %+v", s.Name, got, len(layerVols)+2, s.Mounts)
@@ -81,7 +81,7 @@ func TestCreateBranchFromFreezeHappyPath(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true
+	d.volumes["pgoverlay-src-main"] = true
 	if _, err := e.CreateBranch(context.Background(), "p", "main", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestCreateBranchFromFreezeHappyPath(t *testing.T) {
 	if c.State != registry.BranchReady || c.ParentBranchName != "p" || c.BaseLayerID == "" {
 		t.Fatalf("child %+v", c)
 	}
-	if c.SourceVolume != "pgbranch-src-main" || c.RWVolume != "pgbranch-br-c-rw" {
+	if c.SourceVolume != "pgoverlay-src-main" || c.RWVolume != "pgoverlay-br-c-rw" {
 		t.Fatalf("child volumes: %+v", c)
 	}
 	if c.ExpiresAt == "" {
@@ -104,12 +104,12 @@ func TestCreateBranchFromFreezeHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.State != registry.BranchReady || p.RWVolume != "pgbranch-br-p-rw-g2" || p.BaseLayerID != c.BaseLayerID {
+	if p.State != registry.BranchReady || p.RWVolume != "pgoverlay-br-p-rw-g2" || p.BaseLayerID != c.BaseLayerID {
 		t.Fatalf("parent after freeze: %+v", p)
 	}
 	chain, err := r.LayerChain(c.ID)
-	if err != nil || len(chain) != 1 || chain[0].Volume != "pgbranch-br-p-rw" {
-		t.Fatalf("child chain=%v err=%v want [pgbranch-br-p-rw]", chain, err)
+	if err != nil || len(chain) != 1 || chain[0].Volume != "pgoverlay-br-p-rw" {
+		t.Fatalf("child chain=%v err=%v want [pgoverlay-br-p-rw]", chain, err)
 	}
 	// the freeze is journaled with the freeze reason on the parent
 	if _, err := r.GetBranchByName("p"); err != nil {
@@ -118,11 +118,11 @@ func TestCreateBranchFromFreezeHappyPath(t *testing.T) {
 
 	// exact saga ordering: CHECKPOINT on the parent -> stop parent ->
 	// fresh parent rw volume -> restart parent -> start child
-	ci := d.logIndex("exec:psql:cid-pgbranch-br-p")
-	si := indexAfter(d.log, "stop:cid-pgbranch-br-p", ci)
-	vi := indexAfter(d.log, "volume:pgbranch-br-p-rw-g2", si)
-	pi := indexAfter(d.log, "start:pgbranch-br-p", vi)
-	chi := indexAfter(d.log, "start:pgbranch-br-c", pi)
+	ci := d.logIndex("exec:psql:cid-pgoverlay-br-p")
+	si := indexAfter(d.log, "stop:cid-pgoverlay-br-p", ci)
+	vi := indexAfter(d.log, "volume:pgoverlay-br-p-rw-g2", si)
+	pi := indexAfter(d.log, "start:pgoverlay-br-p", vi)
+	chi := indexAfter(d.log, "start:pgoverlay-br-c", pi)
 	if ci < 0 || si < 0 || vi < 0 || pi < 0 || chi < 0 {
 		t.Fatalf("saga order checkpoint(%d) -> stop(%d) -> swap(%d) -> restart parent(%d) -> start child(%d) violated:\n%s",
 			ci, si, vi, pi, chi, strings.Join(d.log, "\n"))
@@ -143,12 +143,12 @@ func TestCreateBranchFromFreezeHappyPath(t *testing.T) {
 	if len(d.branches) != 3 {
 		t.Fatalf("StartBranch calls = %d want 3 (create p, restart p, start c)", len(d.branches))
 	}
-	assertOverlaySpec(t, d.branches[0], "pgbranch-br-p-rw", "pgbranch-src-main", nil)
-	assertOverlaySpec(t, d.branches[1], "pgbranch-br-p-rw-g2", "pgbranch-src-main", []string{"pgbranch-br-p-rw"})
-	assertOverlaySpec(t, d.branches[2], "pgbranch-br-c-rw", "pgbranch-src-main", []string{"pgbranch-br-p-rw"})
+	assertOverlaySpec(t, d.branches[0], "pgoverlay-br-p-rw", "pgoverlay-src-main", nil)
+	assertOverlaySpec(t, d.branches[1], "pgoverlay-br-p-rw-g2", "pgoverlay-src-main", []string{"pgoverlay-br-p-rw"})
+	assertOverlaySpec(t, d.branches[2], "pgoverlay-br-c-rw", "pgoverlay-src-main", []string{"pgoverlay-br-p-rw"})
 
 	// volumes: source + frozen layer + parent's fresh rw + child rw
-	for _, v := range []string{"pgbranch-src-main", "pgbranch-br-p-rw", "pgbranch-br-p-rw-g2", "pgbranch-br-c-rw"} {
+	for _, v := range []string{"pgoverlay-src-main", "pgoverlay-br-p-rw", "pgoverlay-br-p-rw-g2", "pgoverlay-br-c-rw"} {
 		if !d.volumes[v] {
 			t.Errorf("volume %q missing after freeze: %v", v, d.volumes)
 		}
@@ -177,11 +177,11 @@ func TestCreateBranchFromGrandchildChains(t *testing.T) {
 	if err != nil || len(chain) != 2 {
 		t.Fatalf("c2 chain=%v err=%v", chain, err)
 	}
-	if chain[0].Volume != "pgbranch-br-c1-rw" || chain[1].Volume != "pgbranch-br-p-rw" {
+	if chain[0].Volume != "pgoverlay-br-c1-rw" || chain[1].Volume != "pgoverlay-br-p-rw" {
 		t.Fatalf("c2 chain order (newest first): %v", chain)
 	}
 	last := d.branches[len(d.branches)-1]
-	assertOverlaySpec(t, last, "pgbranch-br-c2-rw", "pgbranch-src-main", []string{"pgbranch-br-c1-rw", "pgbranch-br-p-rw"})
+	assertOverlaySpec(t, last, "pgoverlay-br-c2-rw", "pgoverlay-src-main", []string{"pgoverlay-br-c1-rw", "pgoverlay-br-p-rw"})
 
 	// second freeze of p: the new layer (p's g2 rw) chains onto the first
 	c3, err := e.CreateBranchFrom(context.Background(), "c3", "p", 0)
@@ -189,15 +189,15 @@ func TestCreateBranchFromGrandchildChains(t *testing.T) {
 		t.Fatal(err)
 	}
 	chain, err = r.LayerChain(c3.ID)
-	if err != nil || len(chain) != 2 || chain[0].Volume != "pgbranch-br-p-rw-g2" || chain[1].Volume != "pgbranch-br-p-rw" {
+	if err != nil || len(chain) != 2 || chain[0].Volume != "pgoverlay-br-p-rw-g2" || chain[1].Volume != "pgoverlay-br-p-rw" {
 		t.Fatalf("c3 chain=%v err=%v", chain, err)
 	}
 	p, _ := r.GetBranchByName("p")
-	if p.RWVolume != "pgbranch-br-p-rw-g3" {
+	if p.RWVolume != "pgoverlay-br-p-rw-g3" {
 		t.Fatalf("parent rw after second freeze: %q", p.RWVolume)
 	}
 	last = d.branches[len(d.branches)-1]
-	assertOverlaySpec(t, last, "pgbranch-br-c3-rw", "pgbranch-src-main", []string{"pgbranch-br-p-rw-g2", "pgbranch-br-p-rw"})
+	assertOverlaySpec(t, last, "pgoverlay-br-c3-rw", "pgoverlay-src-main", []string{"pgoverlay-br-p-rw-g2", "pgoverlay-br-p-rw"})
 }
 
 func TestCreateBranchFromValidation(t *testing.T) {
@@ -240,13 +240,13 @@ func TestCreateBranchFromCheckpointFailureAbortsCleanly(t *testing.T) {
 	}
 	// parent untouched: still ready on its original rw volume and container
 	p, _ := r.GetBranchByName("p")
-	if p.State != registry.BranchReady || p.RWVolume != "pgbranch-br-p-rw" || p.BaseLayerID != "" {
+	if p.State != registry.BranchReady || p.RWVolume != "pgoverlay-br-p-rw" || p.BaseLayerID != "" {
 		t.Fatalf("parent after aborted freeze: %+v", p)
 	}
-	if !d.containers["cid-pgbranch-br-p"] {
+	if !d.containers["cid-pgoverlay-br-p"] {
 		t.Fatal("parent container was stopped despite checkpoint failure")
 	}
-	if d.volumes["pgbranch-br-p-rw-g2"] || d.volumes["pgbranch-br-c-rw"] {
+	if d.volumes["pgoverlay-br-p-rw-g2"] || d.volumes["pgoverlay-br-c-rw"] {
 		t.Fatalf("aborted freeze leaked volumes: %v", d.volumes)
 	}
 	c, _ := r.GetBranchByName("c")
@@ -266,22 +266,22 @@ func assertParentRestored(t *testing.T, d *fakeDriver, r *registry.Registry) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.State != registry.BranchReady || p.RWVolume != "pgbranch-br-p-rw" || p.BaseLayerID != "" {
+	if p.State != registry.BranchReady || p.RWVolume != "pgoverlay-br-p-rw" || p.BaseLayerID != "" {
 		t.Fatalf("parent not restored: %+v", p)
 	}
-	if !d.containers["cid-pgbranch-br-p"] {
+	if !d.containers["cid-pgoverlay-br-p"] {
 		t.Fatal("parent container not restarted")
 	}
 	// the restore restart runs the original stack: own rw, no layers
 	last := d.branches[len(d.branches)-1]
-	if last.Name != "pgbranch-br-p" {
+	if last.Name != "pgoverlay-br-p" {
 		t.Fatalf("last started container = %q, want the restored parent", last.Name)
 	}
-	assertOverlaySpec(t, last, "pgbranch-br-p-rw", "pgbranch-src-main", nil)
-	if d.volumes["pgbranch-br-p-rw-g2"] || d.volumes["pgbranch-br-c-rw"] {
+	assertOverlaySpec(t, last, "pgoverlay-br-p-rw", "pgoverlay-src-main", nil)
+	if d.volumes["pgoverlay-br-p-rw-g2"] || d.volumes["pgoverlay-br-c-rw"] {
 		t.Fatalf("failed freeze leaked volumes: %v", d.volumes)
 	}
-	if !d.volumes["pgbranch-br-p-rw"] {
+	if !d.volumes["pgoverlay-br-p-rw"] {
 		t.Fatal("parent rw volume lost in failed freeze")
 	}
 	c, err := r.GetBranchByName("c")
@@ -303,7 +303,7 @@ func TestCreateBranchFromParentRestartFailureRestoresParent(t *testing.T) {
 	d.failStartAt = map[int]bool{2: true}
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true
+	d.volumes["pgoverlay-src-main"] = true
 	if _, err := e.CreateBranch(context.Background(), "p", "main", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestCreateBranchFromChildStartFailureRestoresParent(t *testing.T) {
 	d.failStartAt = map[int]bool{3: true}
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true
+	d.volumes["pgoverlay-src-main"] = true
 	if _, err := e.CreateBranch(context.Background(), "p", "main", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -347,10 +347,10 @@ func TestCreateBranchFromRestoreFailureMarksParentFailed(t *testing.T) {
 		t.Fatalf("parent state=%q want failed (never half-frozen)", p.State)
 	}
 	// the parent's data (its original rw volume) must never be deleted
-	if !d.volumes["pgbranch-br-p-rw"] {
+	if !d.volumes["pgoverlay-br-p-rw"] {
 		t.Fatal("parent rw volume deleted during failed freeze")
 	}
-	if d.volumes["pgbranch-br-p-rw-g2"] {
+	if d.volumes["pgoverlay-br-p-rw-g2"] {
 		t.Fatalf("fresh rw volume leaked: %v", d.volumes)
 	}
 }
@@ -368,16 +368,16 @@ func TestDestroyBranchGCsLayersUpChain(t *testing.T) {
 	if _, err := e.CreateBranchFrom(context.Background(), "c2", "c1", 0); err != nil {
 		t.Fatal(err)
 	}
-	// layers: L1 = pgbranch-br-p-rw (base of p, c1, c2), L2 = pgbranch-br-c1-rw (base of c1, c2)
+	// layers: L1 = pgoverlay-br-p-rw (base of p, c1, c2), L2 = pgoverlay-br-c1-rw (base of c1, c2)
 
 	// destroy the parent FIRST: children keep every layer alive
 	if err := e.DestroyBranch(context.Background(), "p"); err != nil {
 		t.Fatal(err)
 	}
-	if d.volumes["pgbranch-br-p-rw-g2"] {
+	if d.volumes["pgoverlay-br-p-rw-g2"] {
 		t.Fatal("destroyed parent's own rw volume must go")
 	}
-	if !d.volumes["pgbranch-br-p-rw"] || !d.volumes["pgbranch-br-c1-rw"] {
+	if !d.volumes["pgoverlay-br-p-rw"] || !d.volumes["pgoverlay-br-c1-rw"] {
 		t.Fatalf("layers GC'd while still referenced: %v", d.volumes)
 	}
 
@@ -385,7 +385,7 @@ func TestDestroyBranchGCsLayersUpChain(t *testing.T) {
 	if err := e.DestroyBranch(context.Background(), "c2"); err != nil {
 		t.Fatal(err)
 	}
-	if !d.volumes["pgbranch-br-p-rw"] || !d.volumes["pgbranch-br-c1-rw"] {
+	if !d.volumes["pgoverlay-br-p-rw"] || !d.volumes["pgoverlay-br-c1-rw"] {
 		t.Fatalf("layers GC'd while c1 references them: %v", d.volumes)
 	}
 
@@ -393,7 +393,7 @@ func TestDestroyBranchGCsLayersUpChain(t *testing.T) {
 	if err := e.DestroyBranch(context.Background(), "c1"); err != nil {
 		t.Fatal(err)
 	}
-	if d.volumes["pgbranch-br-p-rw"] || d.volumes["pgbranch-br-c1-rw"] {
+	if d.volumes["pgoverlay-br-p-rw"] || d.volumes["pgoverlay-br-c1-rw"] {
 		t.Fatalf("zero-ref layers not GC'd: %v", d.volumes)
 	}
 	if layers, err := r.ListLayersBySource(src.ID); err != nil || len(layers) != 0 {
@@ -422,10 +422,10 @@ func TestResetBranchUsesOwnBaseChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	last := d.branches[len(d.branches)-1]
-	if last.Name != "pgbranch-br-c" {
+	if last.Name != "pgoverlay-br-c" {
 		t.Fatalf("last start = %q", last.Name)
 	}
-	assertOverlaySpec(t, last, "pgbranch-br-c-rw", "pgbranch-src-main", []string{"pgbranch-br-p-rw"})
+	assertOverlaySpec(t, last, "pgoverlay-br-c-rw", "pgoverlay-src-main", []string{"pgoverlay-br-p-rw"})
 
 	// resetting the frozen parent re-clones onto its own base chain too,
 	// keeping its post-freeze rw volume name
@@ -433,10 +433,10 @@ func TestResetBranchUsesOwnBaseChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	last = d.branches[len(d.branches)-1]
-	if last.Name != "pgbranch-br-p" {
+	if last.Name != "pgoverlay-br-p" {
 		t.Fatalf("last start = %q", last.Name)
 	}
-	assertOverlaySpec(t, last, "pgbranch-br-p-rw-g2", "pgbranch-src-main", []string{"pgbranch-br-p-rw"})
+	assertOverlaySpec(t, last, "pgoverlay-br-p-rw-g2", "pgoverlay-src-main", []string{"pgoverlay-br-p-rw"})
 	if b, _ := r.GetBranchByName("p"); b.State != registry.BranchReady {
 		t.Fatalf("parent after reset: %+v", b)
 	}
@@ -446,18 +446,18 @@ func TestRemoveSourceGCsOrphanLayers(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	src := readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true
+	d.volumes["pgoverlay-src-main"] = true
 	// an orphaned zero-ref layer (e.g. an earlier best-effort GC failed)
-	l := &registry.Layer{SourceID: src.ID, Volume: "pgbranch-br-old-rw"}
+	l := &registry.Layer{SourceID: src.ID, Volume: "pgoverlay-br-old-rw"}
 	if err := r.CreateLayer(l); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-old-rw"] = true
+	d.volumes["pgoverlay-br-old-rw"] = true
 
 	if err := e.RemoveSource(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
-	if d.volumes["pgbranch-br-old-rw"] || d.volumes["pgbranch-src-main"] {
+	if d.volumes["pgoverlay-br-old-rw"] || d.volumes["pgoverlay-src-main"] {
 		t.Fatalf("RemoveSource left volumes: %v", d.volumes)
 	}
 	if _, err := r.GetSourceByName("main"); !errors.Is(err, registry.ErrNotFound) {

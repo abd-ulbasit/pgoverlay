@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/metrics"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/metrics"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // fakeDriver is a local copy of the engine tests' fake (test fakes are not
@@ -50,7 +50,7 @@ func (f *fakeDriver) CloneVolume(ctx context.Context, src, dst string, l map[str
 
 // RunHelper returns canned du output so the usage endpoint has something to parse.
 func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
-	return "4096\t/pgbranch/rw", nil
+	return "4096\t/pgoverlay/rw", nil
 }
 func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
 	if f.failStart {
@@ -73,7 +73,7 @@ func (f *fakeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (s
 	if f.execOutErr != nil {
 		return "", f.execOutErr
 	}
-	isBase := strings.Contains(id, "pgbranch-br-diff-")
+	isBase := strings.Contains(id, "pgoverlay-br-diff-")
 	joined := strings.Join(cmd, " ")
 	if len(cmd) > 0 && cmd[0] == "pg_dump" {
 		if isBase {
@@ -244,8 +244,8 @@ func TestMetricsUnauthenticated(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("metrics code=%d (want 200, no auth)", code)
 	}
-	if !strings.Contains(string(body), "pgbranch_branches_total") {
-		t.Fatalf("metrics body missing pgbranch_branches_total:\n%s", body)
+	if !strings.Contains(string(body), "pgoverlay_branches_total") {
+		t.Fatalf("metrics body missing pgoverlay_branches_total:\n%s", body)
 	}
 }
 
@@ -867,7 +867,7 @@ func TestReconcileEndpoints(t *testing.T) {
 	ts, d := newTestServer(t)
 	addSource(t, ts)
 	// a stray managed volume owned by no branch -> gc_volume drift.
-	d.volumes["pgbranch-br-stray-rw"] = true
+	d.volumes["pgoverlay-br-stray-rw"] = true
 
 	// auth required.
 	if code, _ := do(t, ts, "", "GET", "/v1/reconcile/plan", nil); code != http.StatusUnauthorized {
@@ -883,10 +883,10 @@ func TestReconcileEndpoints(t *testing.T) {
 		t.Fatalf("plan: code=%d body=%s", code, body)
 	}
 	plan := mustUnmarshal[engine.ReconcilePlan](t, body)
-	if !plan.Drift() || !planHas(plan, engine.ActionGCVolume, "pgbranch-br-stray-rw") {
+	if !plan.Drift() || !planHas(plan, engine.ActionGCVolume, "pgoverlay-br-stray-rw") {
 		t.Fatalf("plan missing stray-volume drift: %+v", plan.Actions)
 	}
-	if !d.volumes["pgbranch-br-stray-rw"] {
+	if !d.volumes["pgoverlay-br-stray-rw"] {
 		t.Fatal("GET /v1/reconcile/plan mutated state")
 	}
 	// wire-contract field names.
@@ -902,10 +902,10 @@ func TestReconcileEndpoints(t *testing.T) {
 		t.Fatalf("apply: code=%d body=%s", code, body)
 	}
 	taken := mustUnmarshal[engine.ReconcilePlan](t, body)
-	if !planHas(taken, engine.ActionGCVolume, "pgbranch-br-stray-rw") {
+	if !planHas(taken, engine.ActionGCVolume, "pgoverlay-br-stray-rw") {
 		t.Fatalf("apply did not report removing the stray volume: %+v", taken.Actions)
 	}
-	if d.volumes["pgbranch-br-stray-rw"] {
+	if d.volumes["pgoverlay-br-stray-rw"] {
 		t.Fatal("apply did not remove the stray volume")
 	}
 }

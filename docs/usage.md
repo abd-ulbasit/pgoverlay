@@ -1,6 +1,6 @@
-# Ways to use pgbranch
+# Ways to use pgoverlay
 
-pgbranch gives you **instant, disposable, copy-on-write branches of a real
+pgoverlay gives you **instant, disposable, copy-on-write branches of a real
 Postgres database**. Below are the common ways teams use it, smallest to
 largest, each with a concrete example. They compose — most teams end up using
 two or three together.
@@ -8,12 +8,12 @@ two or three together.
 | Use case | What you get | Start here |
 |---|---|---|
 | [Local dev](#1-local-development) | throwaway prod-shaped DBs on your laptop | `pgb` CLI |
-| [A database per test](#2-a-database-per-test) | isolated DB for every test, auto-destroyed | `pgbranchtest` SDK |
-| [Branch per pull request](#3-branch-per-pull-request) | each PR gets its own masked DB | `pgbranch-github` webhook |
+| [A database per test](#2-a-database-per-test) | isolated DB for every test, auto-destroyed | `pgoverlaytest` SDK |
+| [Branch per pull request](#3-branch-per-pull-request) | each PR gets its own masked DB | `pgoverlay-github` webhook |
 | [Preview environments](#4-preview-environments) | per-PR app **and** DB, with a URL on the PR | webhook + a deploy step |
 | [Reviewing migrations](#5-reviewing-migrations-with-pgb-diff) | see exactly what a change does to prod-shaped data | `pgb diff` |
 
-![pgbranch feature tour](features.gif)
+![pgoverlay feature tour](features.gif)
 
 *branch → apply a migration → `pgb diff` (schema + row deltas) → branch-off-a-branch, against a masked clone of prod.*
 
@@ -26,30 +26,30 @@ A note that informs several patterns below — **credential modes**:
   password. Safer for shared/long-lived branches, but a consumer must fetch
   the per-branch password (from the REST API) rather than hold a static one.
   Rotated passwords are encrypted at rest in the registry DB with a key
-  derived from `PGBRANCH_TOKEN` (AES-256-GCM). **Rotating `PGBRANCH_TOKEN`
+  derived from `PGOVERLAY_TOKEN` (AES-256-GCM). **Rotating `PGOVERLAY_TOKEN`
   makes existing encrypted branch passwords unrecoverable** — re-run rotation
   (reset the affected branches) after a token change. Acceptable for
-  pgbranch's ephemeral branches.
+  pgoverlay's ephemeral branches.
 
 **Rotation *and* static config — the connect helper.** With rotation on, an
-app can't hold a fixed `PGPASSWORD`. The `pgbranchconnect` helper resolves
+app can't hold a fixed `PGPASSWORD`. The `pgoverlayconnect` helper resolves
 this: the static config the app holds is the branchd API endpoint plus a
 read-only (`viewer`) token; it fetches the branch's current credentials at
 startup. App and webhook agree on the branch name with no coordination (both
 derive it from the git ref).
 
 ```go
-res, _ := pgbranchconnect.Resolve(ctx, pgbranchconnect.Options{
-    Server: os.Getenv("PGBRANCH_API"), Token: os.Getenv("PGBRANCH_TOKEN"), // viewer token
+res, _ := pgoverlayconnect.Resolve(ctx, pgoverlayconnect.Options{
+    Server: os.Getenv("PGOVERLAY_API"), Token: os.Getenv("PGOVERLAY_TOKEN"), // viewer token
     Ref: os.Getenv("GIT_REF"), ProxyHost: "proxy.example.com:6432",
 })
 db, _ := sql.Open("pgx", res.ProxyDSN)
 ```
 
 ```js
-import { resolve } from "pgbranch-connect";
+import { resolve } from "pgoverlay-connect";
 const { proxyDsn } = await resolve({
-  server: process.env.PGBRANCH_API, token: process.env.PGBRANCH_TOKEN,
+  server: process.env.PGOVERLAY_API, token: process.env.PGOVERLAY_TOKEN,
   ref: process.env.GIT_REF, proxyHost: "proxy.example.com:6432",
 });
 ```
@@ -86,20 +86,20 @@ pgb source set-mask prod mask-pii.sql      # SQL run before a branch is ready
 Give every test (or test binary) its own isolated, prod-shaped database that
 is destroyed when the test finishes — no shared fixtures, no cleanup.
 
-**Go** (`github.com/abd-ulbasit/pgbranch/pgbranchtest`):
+**Go** (`github.com/abd-ulbasit/pgoverlay/pgoverlaytest`):
 
 ```go
 func TestOrders(t *testing.T) {
-    b := pgbranchtest.Acquire(t)          // a branch, auto-destroyed via t.Cleanup
+    b := pgoverlaytest.Acquire(t)          // a branch, auto-destroyed via t.Cleanup
     db, _ := sql.Open("pgx", b.DSN)
     // …run the test against real prod-shaped data…
 }
 ```
 
-**JavaScript** (`pgbranch-test`, zero deps, Node 18+):
+**JavaScript** (`pgoverlay-test`, zero deps, Node 18+):
 
 ```js
-import { acquire } from 'pgbranch-test';
+import { acquire } from 'pgoverlay-test';
 const branch = await acquire({ source: 'prod' });
 // use branch.proxyDsn …
 await branch.destroy();
@@ -108,19 +108,19 @@ await branch.destroy();
 **CI** (reusable Action):
 
 ```yaml
-- uses: abd-ulbasit/pgbranch/action@v1.0.0-rc.3
-  with: { server: ${{ vars.PGBRANCH_API }}, token: ${{ secrets.PGBRANCH_TOKEN }}, source: prod }
+- uses: abd-ulbasit/pgoverlay/action@v1.0.0-rc.3
+  with: { server: ${{ vars.PGOVERLAY_API }}, token: ${{ secrets.PGOVERLAY_TOKEN }}, source: prod }
 # … your tests use the branch it created …
-- uses: abd-ulbasit/pgbranch/action/destroy@v1.0.0-rc.3
+- uses: abd-ulbasit/pgoverlay/action/destroy@v1.0.0-rc.3
 ```
 
 The SDK is integration-only (it talks to a running `branchd`); point it with
-`PGBRANCH_SERVER`/`PGBRANCH_TOKEN`. See [Testing](testing.md).
+`PGOVERLAY_SERVER`/`PGOVERLAY_TOKEN`. See [Testing](testing.md).
 
 ## 3. Branch per pull request
 
-Run `pgbranch-github` (the webhook service, in the Helm chart as
-`ghook.enabled=true`). Each PR gets a branch, a `pgbranch/branch` commit
+Run `pgoverlay-github` (the webhook service, in the Helm chart as
+`ghook.enabled=true`). Each PR gets a branch, a `pgoverlay/branch` commit
 status, and a comment with the connection string.
 
 ```yaml
@@ -143,9 +143,9 @@ before the PR-number association exists. Full setup: [GitHub App](github-app.md)
 The complete "Vercel-style" experience — each PR gets a deployed **app** and
 its own **database** — is two cooperating pieces:
 
-- **pgbranch** supplies the per-PR database branch (use case 3).
+- **pgoverlay** supplies the per-PR database branch (use case 3).
 - **your platform/CI** deploys the app for the PR and points it at that
-  branch. pgbranch deliberately doesn't deploy apps; that's the platform's job.
+  branch. pgoverlay deliberately doesn't deploy apps; that's the platform's job.
 
 The app derives its branch from the git ref (matching `branchNaming:
 git-branch`), so configuration is static — no per-PR secrets:
@@ -153,15 +153,15 @@ git-branch`), so configuration is static — no per-PR secrets:
 ```js
 // the app picks its branch from the deploy's git ref
 const branch = sanitize(process.env.GIT_REF);           // e.g. feat-login
-const pool = new Pool({ host: PGBRANCH_HOST, port: 6432,
-  user: 'app', password: PGBRANCH_PASSWORD,             // inherit mode → static
+const pool = new Pool({ host: PGOVERLAY_HOST, port: 6432,
+  user: 'app', password: PGOVERLAY_PASSWORD,             // inherit mode → static
   database: `appdb@${branch}` });                        // proxy routes by name
 ```
 
 Two ways to wire the deploy, both demonstrated in
 [pgbranch-demo](https://github.com/abd-ulbasit/pgbranch-demo):
 
-- **Managed platform (Vercel/Netlify/Render)** — set `PGBRANCH_HOST` etc. as
+- **Managed platform (Vercel/Netlify/Render)** — set `PGOVERLAY_HOST` etc. as
   project env vars pointing at the proxy; the platform builds a preview per
   PR and the app connects through the proxy with `dbname@branch`. Use
   **inherit** credentials (static env). Requires the proxy to be reachable
@@ -174,16 +174,16 @@ Two ways to wire the deploy, both demonstrated in
 > deploys into one namespace, so scope it there. Apply the namespaced
 > ServiceAccount + Role in [`deploy/preview-deployer-rbac.yaml`](../deploy/preview-deployer-rbac.yaml)
 > once (it grants only the verbs a `helm upgrade --install` of the chart and an
-> app deploy need in `pgbranch-preview` — no ClusterRole), then mint a
+> app deploy need in `pgoverlay-preview` — no ClusterRole), then mint a
 > short-lived token for the workflow instead of a long-lived admin credential:
 >
 > ```bash
 > kubectl apply -f deploy/preview-deployer-rbac.yaml
-> kubectl -n pgbranch-preview create token preview-deployer --duration=24h
+> kubectl -n pgoverlay-preview create token preview-deployer --duration=24h
 > ```
 >
 > For branchd's own REST API, mint a *scoped* bearer rather than reusing the
-> built-in `PGBRANCH_TOKEN` admin: `pgb token create ci --role operator` gives
+> built-in `PGOVERLAY_TOKEN` admin: `pgb token create ci --role operator` gives
 > CI exactly branch create/reset/destroy (`pgb token` is admin-only).
 
 > Reachability note: managed platforms live on the public internet, so the

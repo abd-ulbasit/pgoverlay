@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // Unit tests for per-branch credential rotation (WithCredentialRotation):

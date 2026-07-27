@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // TestDiffBranchEndToEnd exercises DiffBranch against real docker: branch a
@@ -18,8 +18,8 @@ import (
 // source untouched and no stray throwaway branches left behind. Names use a
 // dft- prefix so they cannot collide with the engine's internal diff- ones.
 func TestDiffBranchEndToEnd(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -113,7 +113,7 @@ func TestDiffBranchEndToEnd(t *testing.T) {
 		t.Errorf("live branches after diff = %v, want [dft-pr-1]", names)
 	}
 	for _, c := range mustListManaged(t, ctx, d) {
-		if strings.Contains(c.Labels["pgbranch.branch.name"], "diff-") {
+		if strings.Contains(c.Labels["pgoverlay.branch.name"], "diff-") {
 			t.Errorf("throwaway container leaked: %+v", c)
 		}
 	}
@@ -135,8 +135,8 @@ func TestDiffBranchEndToEnd(t *testing.T) {
 // Names use a diffd- prefix so they cannot collide with the engine's internal
 // diff- throwaways.
 func TestDiffBranchDataSampleEndToEnd(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()

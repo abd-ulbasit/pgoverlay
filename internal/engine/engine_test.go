@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/metrics"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/metrics"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -167,7 +167,7 @@ func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, 
 }
 
 // ListManagedVolumes returns only volumes whose recorded labels carry
-// pgbranch.instance=instanceID — mirroring the real drivers' instance-scoped
+// pgoverlay.instance=instanceID — mirroring the real drivers' instance-scoped
 // filter. A volume created without labels (set directly in a test) is treated
 // as belonging to no instance and is never returned.
 func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
@@ -192,7 +192,7 @@ func testEngine(t *testing.T, d runtime.Driver, opts ...Option) (*Engine, *regis
 
 func readySource(t *testing.T, r *registry.Registry) *registry.Source {
 	t.Helper()
-	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}
@@ -216,11 +216,11 @@ func TestReconcileCleansOrphans(t *testing.T) {
 	e, r := testEngine(t, d)
 	readySource(t, r)
 	// registry says creating, stuck past the timeout -> failed + cleaned
-	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-stuck-rw"}
+	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-stuck-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-stuck-rw"] = true
+	d.volumes["pgoverlay-br-stuck-rw"] = true
 	// container exists but registry has no row -> removed
 	d.addOrphanContainer("cid-ghost", r.InstanceID())
 
@@ -236,7 +236,7 @@ func TestReconcileCleansOrphans(t *testing.T) {
 	if d.containers["cid-ghost"] {
 		t.Fatal("ghost container not removed")
 	}
-	if d.volumes["pgbranch-br-stuck-rw"] {
+	if d.volumes["pgoverlay-br-stuck-rw"] {
 		t.Fatal("stuck branch rw volume not removed")
 	}
 }
@@ -278,12 +278,12 @@ func TestCreateBranchObservesOpMetric(t *testing.T) {
 	}
 	// the create histogram recorded exactly one observation
 	want := `
-# HELP pgbranch_branch_op_duration_seconds Duration of branch operations by op (create|reset|destroy|from_branch|diff).
-# TYPE pgbranch_branch_op_duration_seconds histogram
-pgbranch_branch_op_duration_seconds_count{op="create"} 1
+# HELP pgoverlay_branch_op_duration_seconds Duration of branch operations by op (create|reset|destroy|from_branch|diff).
+# TYPE pgoverlay_branch_op_duration_seconds histogram
+pgoverlay_branch_op_duration_seconds_count{op="create"} 1
 `
 	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
-		"pgbranch_branch_op_duration_seconds_count"); err != nil {
+		"pgoverlay_branch_op_duration_seconds_count"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -303,10 +303,10 @@ func TestCreateBranchHappyPath(t *testing.T) {
 	if b.Host != "127.0.0.1" {
 		t.Fatalf("Host=%q want 127.0.0.1 (from driver Inspect)", b.Host)
 	}
-	if !d.volumes["pgbranch-br-pr-1-rw"] {
+	if !d.volumes["pgoverlay-br-pr-1-rw"] {
 		t.Fatal("rw volume not created")
 	}
-	if !d.containers["cid-pgbranch-br-pr-1"] {
+	if !d.containers["cid-pgoverlay-br-pr-1"] {
 		t.Fatal("container not started")
 	}
 }
@@ -393,11 +393,11 @@ func TestDestroyBranchForcesStuckCreating(t *testing.T) {
 	e, r := testEngine(t, d)
 	readySource(t, r)
 	// a row stuck in 'creating' (no container, no resources committed yet)
-	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-stuck-rw"}
+	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-stuck-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-stuck-rw"] = true
+	d.volumes["pgoverlay-br-stuck-rw"] = true
 
 	if err := e.DestroyBranch(context.Background(), "stuck"); err != nil {
 		t.Fatalf("DestroyBranch(stuck creating) = %v, want nil", err)
@@ -406,7 +406,7 @@ func TestDestroyBranchForcesStuckCreating(t *testing.T) {
 		t.Fatalf("want branch gone (destroyed), got %v", err)
 	}
 	// the stuck branch's own rw volume is cleaned (nothing references it)
-	if d.volumes["pgbranch-br-stuck-rw"] {
+	if d.volumes["pgoverlay-br-stuck-rw"] {
 		t.Fatal("stuck branch rw volume not removed")
 	}
 }
@@ -423,7 +423,7 @@ func TestDestroyBranchForcingStuckRespectsVolumeGuard(t *testing.T) {
 	readySource(t, r)
 	srcID := mustSource(t, r).ID
 
-	parent := &registry.Branch{Name: "parent", SourceID: srcID, RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+	parent := &registry.Branch{Name: "parent", SourceID: srcID, RWVolume: "pgoverlay-br-parent-rw", SourceVolume: "pgoverlay-src-main"}
 	if err := r.CreateBranch(parent); err != nil {
 		t.Fatal(err)
 	}
@@ -434,10 +434,10 @@ func TestDestroyBranchForcingStuckRespectsVolumeGuard(t *testing.T) {
 	if err := r.TransitionBranch(parent.ID, registry.BranchResetting, "freeze"); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-parent-rw"] = true
+	d.volumes["pgoverlay-br-parent-rw"] = true
 	// an in-flight child references the parent (by parent_branch_name)
-	child := &registry.Branch{Name: "child", SourceID: srcID, RWVolume: "pgbranch-br-child-rw",
-		SourceVolume: "pgbranch-src-main", ParentBranchName: "parent"}
+	child := &registry.Branch{Name: "child", SourceID: srcID, RWVolume: "pgoverlay-br-child-rw",
+		SourceVolume: "pgoverlay-src-main", ParentBranchName: "parent"}
 	if err := r.CreateBranch(child); err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +449,7 @@ func TestDestroyBranchForcingStuckRespectsVolumeGuard(t *testing.T) {
 		t.Fatalf("want parent gone (destroyed), got %v", err)
 	}
 	// CRITICAL: the parent's rw volume is still the child's live data — keep it.
-	if !d.volumes["pgbranch-br-parent-rw"] {
+	if !d.volumes["pgoverlay-br-parent-rw"] {
 		t.Fatal("A1 data-loss: parent rw volume removed while child still references it")
 	}
 }
@@ -463,7 +463,7 @@ func TestCreateBranchRecordsTTLAndSourceVolume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.SourceVolume != "pgbranch-src-main" {
+	if b.SourceVolume != "pgoverlay-src-main" {
 		t.Fatalf("SourceVolume=%q", b.SourceVolume)
 	}
 	want := time.Now().Add(24 * time.Hour).UTC()
@@ -502,10 +502,10 @@ func TestResetBranchHappyPath(t *testing.T) {
 	if d.starts != 2 {
 		t.Fatalf("starts=%d want 2 (container recreated)", d.starts)
 	}
-	if !d.volumes["pgbranch-br-pr-1-rw"] {
+	if !d.volumes["pgoverlay-br-pr-1-rw"] {
 		t.Fatal("rw volume missing after reset")
 	}
-	if !d.containers["cid-pgbranch-br-pr-1"] {
+	if !d.containers["cid-pgoverlay-br-pr-1"] {
 		t.Fatal("container missing after reset")
 	}
 	// journal: ready -> resetting -> ready, same row
@@ -606,7 +606,7 @@ func TestCreateBranchAppliesMaskScriptsInOrder(t *testing.T) {
 func TestCreateBranchMaskUsesSourceUserAndDB(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
-	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main", ConnUser: "app", ConnDB: "appdb"}
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main", ConnUser: "app", ConnDB: "appdb"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}
@@ -678,20 +678,20 @@ func TestRefreshSourceBumpsGenerationAndGCsOldVolume(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true // gen-1 volume exists
+	d.volumes["pgoverlay-src-main"] = true // gen-1 volume exists
 
 	// no live branches -> old volume GC'd immediately
 	if err := e.RefreshSource(context.Background(), "main", "secret"); err != nil {
 		t.Fatal(err)
 	}
 	s := mustSource(t, r)
-	if s.Generation != 2 || s.Volume != "pgbranch-src-main-g2" {
+	if s.Generation != 2 || s.Volume != "pgoverlay-src-main-g2" {
 		t.Fatalf("source after refresh: %+v", s)
 	}
-	if !d.volumes["pgbranch-src-main-g2"] {
+	if !d.volumes["pgoverlay-src-main-g2"] {
 		t.Fatal("new generation volume not created")
 	}
-	if d.volumes["pgbranch-src-main"] {
+	if d.volumes["pgoverlay-src-main"] {
 		t.Fatal("unreferenced old volume not GC'd")
 	}
 }
@@ -700,7 +700,7 @@ func TestRefreshSourceKeepsOldVolumeWhileReferenced(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true
+	d.volumes["pgoverlay-src-main"] = true
 	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -708,7 +708,7 @@ func TestRefreshSourceKeepsOldVolumeWhileReferenced(t *testing.T) {
 	if err := e.RefreshSource(context.Background(), "main", "secret"); err != nil {
 		t.Fatal(err)
 	}
-	if !d.volumes["pgbranch-src-main"] {
+	if !d.volumes["pgoverlay-src-main"] {
 		t.Fatal("old volume removed while pr-1 still references it")
 	}
 	// new branches use the new generation volume
@@ -716,17 +716,17 @@ func TestRefreshSourceKeepsOldVolumeWhileReferenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b2.SourceVolume != "pgbranch-src-main-g2" {
+	if b2.SourceVolume != "pgoverlay-src-main-g2" {
 		t.Fatalf("pr-2 SourceVolume=%q", b2.SourceVolume)
 	}
 	// destroying the last referencing branch GCs the orphaned old volume
 	if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
 		t.Fatal(err)
 	}
-	if d.volumes["pgbranch-src-main"] {
+	if d.volumes["pgoverlay-src-main"] {
 		t.Fatal("orphaned old-generation volume not GC'd on branch destroy")
 	}
-	if !d.volumes["pgbranch-src-main-g2"] {
+	if !d.volumes["pgoverlay-src-main-g2"] {
 		t.Fatal("current generation volume must survive")
 	}
 }
@@ -735,20 +735,20 @@ func TestRefreshSourceSeedFailureKeepsCurrentGeneration(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true
+	d.volumes["pgoverlay-src-main"] = true
 	d.helperErr = errors.New("pg_basebackup: boom")
 
 	if err := e.RefreshSource(context.Background(), "main", "secret"); err == nil {
 		t.Fatal("want error")
 	}
 	s := mustSource(t, r)
-	if s.Generation != 1 || s.Volume != "pgbranch-src-main" || s.State != registry.SourceReady {
+	if s.Generation != 1 || s.Volume != "pgoverlay-src-main" || s.State != registry.SourceReady {
 		t.Fatalf("source mutated by failed refresh: %+v", s)
 	}
-	if d.volumes["pgbranch-src-main-g2"] {
+	if d.volumes["pgoverlay-src-main-g2"] {
 		t.Fatal("failed refresh leaked the new volume")
 	}
-	if !d.volumes["pgbranch-src-main"] {
+	if !d.volumes["pgoverlay-src-main"] {
 		t.Fatal("current volume must survive a failed refresh")
 	}
 }
@@ -789,7 +789,7 @@ func TestAddSourceViaDumpUsesSeedDump(t *testing.T) {
 	if !strings.Contains(h.Cmd[2], "-n 'public'") {
 		t.Fatalf("dump helper script missing schema scope:\n%s", h.Cmd[2])
 	}
-	if len(h.Mounts) != 1 || h.Mounts[0].Volume != "pgbranch-src-main" {
+	if len(h.Mounts) != 1 || h.Mounts[0].Volume != "pgoverlay-src-main" {
 		t.Fatalf("dump helper mounts: %+v", h.Mounts)
 	}
 }
@@ -884,7 +884,7 @@ func TestRemoveSource(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true
+	d.volumes["pgoverlay-src-main"] = true
 	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -899,7 +899,7 @@ func TestRemoveSource(t *testing.T) {
 	if err := e.RemoveSource(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
-	if d.volumes["pgbranch-src-main"] {
+	if d.volumes["pgoverlay-src-main"] {
 		t.Fatal("source volume not removed")
 	}
 	if _, err := r.GetSourceByName("main"); !errors.Is(err, registry.ErrNotFound) {
@@ -930,7 +930,7 @@ func TestRunReaperDestroysExpired(t *testing.T) {
 
 func TestBranchUsage(t *testing.T) {
 	d := newFake()
-	d.helperOut = "123456\t/pgbranch/rw\n"
+	d.helperOut = "123456\t/pgoverlay/rw\n"
 	e, r := testEngine(t, d)
 	readySource(t, r)
 	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
@@ -947,12 +947,12 @@ func TestBranchUsage(t *testing.T) {
 	// the measuring helper runs du -sb against the branch's rw volume,
 	// mounted read-only
 	last := d.helpers[len(d.helpers)-1]
-	wantCmd := []string{"du", "-sb", "/pgbranch/rw"}
+	wantCmd := []string{"du", "-sb", "/pgoverlay/rw"}
 	if len(last.Cmd) != 3 || last.Cmd[0] != wantCmd[0] || last.Cmd[1] != wantCmd[1] || last.Cmd[2] != wantCmd[2] {
 		t.Fatalf("helper cmd = %v want %v", last.Cmd, wantCmd)
 	}
-	if len(last.Mounts) != 1 || last.Mounts[0].Volume != "pgbranch-br-pr-1-rw" || !last.Mounts[0].ReadOnly {
-		t.Fatalf("helper mounts = %+v want ro pgbranch-br-pr-1-rw", last.Mounts)
+	if len(last.Mounts) != 1 || last.Mounts[0].Volume != "pgoverlay-br-pr-1-rw" || !last.Mounts[0].ReadOnly {
+		t.Fatalf("helper mounts = %+v want ro pgoverlay-br-pr-1-rw", last.Mounts)
 	}
 }
 
@@ -966,7 +966,7 @@ func TestBranchUsageUnknownBranch(t *testing.T) {
 
 func TestBranchUsageBadHelperOutput(t *testing.T) {
 	d := newFake()
-	d.helperOut = "du: cannot access '/pgbranch/rw'"
+	d.helperOut = "du: cannot access '/pgoverlay/rw'"
 	e, r := testEngine(t, d)
 	readySource(t, r)
 	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {

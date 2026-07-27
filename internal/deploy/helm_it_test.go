@@ -1,5 +1,5 @@
-// Helm deployment integration test against the pgbranch-test kind cluster
-// (hack/kind-up.sh), gated by PGBRANCH_K8S_IT=1. Shell-driven on purpose: it
+// Helm deployment integration test against the pgoverlay-test kind cluster
+// (hack/kind-up.sh), gated by PGOVERLAY_K8S_IT=1. Shell-driven on purpose: it
 // exercises exactly what an operator runs (docker build, kind load, helm
 // install, kubectl port-forward) and then drives branchd's REST API with the
 // typed client. The chart is installed into a throwaway namespace and fully
@@ -22,17 +22,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/apiclient"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
 )
 
 const (
-	kindCluster = "pgbranch-test"
-	storageNode = "pgbranch-test-control-plane"
-	helmNS      = "pgbranch-system"
-	release     = "pgbranch" // fullname collapses to "pgbranch" -> svc pgbranch-api
+	kindCluster = "pgoverlay-test"
+	storageNode = "pgoverlay-test-control-plane"
+	helmNS      = "pgoverlay-system"
+	release     = "pgoverlay" // fullname collapses to "pgoverlay" -> svc pgoverlay-api
 	apiToken    = "helm-it-token"
-	sourcePod   = "pgbranch-it-helm-source"
+	sourcePod   = "pgoverlay-it-helm-source"
 )
 
 // run executes a command from the repo root and fails the test on error.
@@ -68,22 +68,22 @@ func writeKubeconfig(t *testing.T) string {
 	return p
 }
 
-// loadBranchdImage builds ghcr.io/abd-ulbasit/pgbranch-branchd:dev and side-loads it into kind.
+// loadBranchdImage builds ghcr.io/abd-ulbasit/pgoverlay-branchd:dev and side-loads it into kind.
 // `kind load docker-image` fails with Colima's containerd image store on
 // multi-arch manifests, so export a single-platform archive (same trick as
 // hack/kind-up.sh) and fall back to a plain save for older docker.
 func loadBranchdImage(t *testing.T) {
 	t.Helper()
-	run(t, "docker", "build", "-t", "ghcr.io/abd-ulbasit/pgbranch-branchd:dev", ".")
+	run(t, "docker", "build", "-t", "ghcr.io/abd-ulbasit/pgoverlay-branchd:dev", ".")
 	arch := strings.TrimSpace(run(t, "docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"))
 	tar := filepath.Join(t.TempDir(), "branchd.tar")
-	if cmd := exec.Command("docker", "save", "--platform", arch, "ghcr.io/abd-ulbasit/pgbranch-branchd:dev", "-o", tar); cmd.Run() != nil {
-		run(t, "docker", "save", "ghcr.io/abd-ulbasit/pgbranch-branchd:dev", "-o", tar)
+	if cmd := exec.Command("docker", "save", "--platform", arch, "ghcr.io/abd-ulbasit/pgoverlay-branchd:dev", "-o", tar); cmd.Run() != nil {
+		run(t, "docker", "save", "ghcr.io/abd-ulbasit/pgoverlay-branchd:dev", "-o", tar)
 	}
 	run(t, "kind", "load", "image-archive", tar, "--name", kindCluster)
 }
 
-// portForward starts kubectl port-forward to target ("svc/pgbranch-api", or
+// portForward starts kubectl port-forward to target ("svc/pgoverlay-api", or
 // "pod/<name>") on a random local port and returns the base URL once the
 // forward is listening.
 //
@@ -195,8 +195,8 @@ func startSourcePod(t *testing.T, kc string) (podIP string) {
 }
 
 func TestHelmDeployEndToEnd(t *testing.T) {
-	if os.Getenv("PGBRANCH_K8S_IT") != "1" {
-		t.Skip("set PGBRANCH_K8S_IT=1 to run kubernetes integration tests")
+	if os.Getenv("PGOVERLAY_K8S_IT") != "1" {
+		t.Skip("set PGOVERLAY_K8S_IT=1 to run kubernetes integration tests")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
@@ -213,7 +213,7 @@ func TestHelmDeployEndToEnd(t *testing.T) {
 	})
 
 	start := time.Now()
-	run(t, "helm", "--kubeconfig", kc, "install", release, "deploy/helm/pgbranch",
+	run(t, "helm", "--kubeconfig", kc, "install", release, "deploy/helm/pgoverlay",
 		"-n", helmNS, "--create-namespace",
 		"--set", "node="+storageNode,
 		"--set", "token="+apiToken,
@@ -221,7 +221,7 @@ func TestHelmDeployEndToEnd(t *testing.T) {
 		"--wait", "--timeout", "3m")
 	t.Logf("helm release ready in %s", time.Since(start))
 
-	base := portForward(t, kc, helmNS, "svc/pgbranch-api")
+	base := portForward(t, kc, helmNS, "svc/pgoverlay-api")
 	resp, err := http.Get(base + "/healthz")
 	if err != nil {
 		t.Fatal(err)
@@ -270,8 +270,8 @@ func TestHelmDeployEndToEnd(t *testing.T) {
 		t.Fatalf("remove source: %v", err)
 	}
 	if out := strings.TrimSpace(run(t, "kubectl", "--kubeconfig", kc, "-n", helmNS,
-		"get", "pods", "-l", "pgbranch.managed=true", "-o", "name")); out != "" {
-		t.Errorf("leftover pgbranch-managed pods after destroy: %s", out)
+		"get", "pods", "-l", "pgoverlay.managed=true", "-o", "name")); out != "" {
+		t.Errorf("leftover pgoverlay-managed pods after destroy: %s", out)
 	}
 
 	run(t, "kubectl", "--kubeconfig", kc, "-n", helmNS, "delete", "pod", sourcePod, "--wait")

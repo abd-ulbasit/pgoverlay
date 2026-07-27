@@ -9,9 +9,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // mustConnFail asserts that a connection string is rejected (wrong password
@@ -31,8 +31,8 @@ func mustConnFail(t *testing.T, ctx context.Context, conn, why string) {
 // and a reset rotates again (the first rotated password stops working).
 // Branch/source names are rot- prefixed for parallel-run safety.
 func TestRotateCredentialsEndToEnd(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()

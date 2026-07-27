@@ -16,23 +16,23 @@ probes don't authenticate, and neither endpoint leaks secrets.
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `pgbranch_branches_total` | gauge | `state` | Branches by state (reported from the registry on scrape). |
-| `pgbranch_sources_total` | gauge | `state` | Sources by state. |
-| `pgbranch_branch_op_duration_seconds` | histogram | `op` | Branch operation latency (`op` = create\|reset\|destroy\|from_branch\|diff). |
-| `pgbranch_branch_op_errors_total` | counter | `op` | Failed branch operations. |
-| `pgbranch_masking_duration_seconds` | histogram | — | Time applying a source's masking scripts inside a branch. |
-| `pgbranch_reaper_runs_total` | counter | — | TTL reaper passes. |
-| `pgbranch_reaper_reaped_total` | counter | — | Expired branches destroyed by the reaper. |
-| `pgbranch_reconcile_runs_total` | counter | — | Reconcile passes. |
-| `pgbranch_reconcile_actions_total` | counter | `action` | Reconcile actions (`fail_stuck`\|`remove_orphan_container`\|`gc_layer`\|`gc_volume`). |
-| `pgbranch_inflight_ops` | gauge | — | Branch operations currently in flight. |
-| `pgbranch_disk_bytes_free` | gauge | — | Free bytes on the **storage-root** filesystem (read via `statfs` on every scrape). |
-| `pgbranch_disk_bytes_total` | gauge | — | Total bytes on the storage-root filesystem. |
+| `pgoverlay_branches_total` | gauge | `state` | Branches by state (reported from the registry on scrape). |
+| `pgoverlay_sources_total` | gauge | `state` | Sources by state. |
+| `pgoverlay_branch_op_duration_seconds` | histogram | `op` | Branch operation latency (`op` = create\|reset\|destroy\|from_branch\|diff). |
+| `pgoverlay_branch_op_errors_total` | counter | `op` | Failed branch operations. |
+| `pgoverlay_masking_duration_seconds` | histogram | — | Time applying a source's masking scripts inside a branch. |
+| `pgoverlay_reaper_runs_total` | counter | — | TTL reaper passes. |
+| `pgoverlay_reaper_reaped_total` | counter | — | Expired branches destroyed by the reaper. |
+| `pgoverlay_reconcile_runs_total` | counter | — | Reconcile passes. |
+| `pgoverlay_reconcile_actions_total` | counter | `action` | Reconcile actions (`fail_stuck`\|`remove_orphan_container`\|`gc_layer`\|`gc_volume`). |
+| `pgoverlay_inflight_ops` | gauge | — | Branch operations currently in flight. |
+| `pgoverlay_disk_bytes_free` | gauge | — | Free bytes on the **storage-root** filesystem (read via `statfs` on every scrape). |
+| `pgoverlay_disk_bytes_total` | gauge | — | Total bytes on the storage-root filesystem. |
 
 The disk gauges cover the filesystem that holds **all** branch copy-on-write
-volumes **and** the SQLite registry. The storage root is `~/.pgbranch`
-(`$PGBRANCH_HOME`) for the docker/overlay backend, or `--kube-data-root`
-(default `/var/lib/pgbranch`) on the storage node for `--runtime kube
+volumes **and** the SQLite registry. The storage root is `~/.pgoverlay`
+(`$PGOVERLAY_HOME`) for the docker/overlay backend, or `--kube-data-root`
+(default `/var/lib/pgoverlay`) on the storage node for `--runtime kube
 --kube-storage hostpath`. They are **not** emitted for `--kube-storage csi`,
 where each branch gets its own PVC and there is no single shared local root to
 measure — watch the CSI driver's own capacity metrics there instead.
@@ -53,7 +53,7 @@ fleet-wide, not per-branch, failure:
   state transitions), turning a space problem into a control-plane problem.
 
 These surface as confusing Postgres errors with no obvious common cause —
-`pgbranch_disk_bytes_free` is the single signal that explains them.
+`pgoverlay_disk_bytes_free` is the single signal that explains them.
 
 ### Recommended alert
 
@@ -61,12 +61,12 @@ Warn well before the disk is full (10% free) so there is time to reap branches
 or grow the volume:
 
 ```yaml
-- alert: PgbranchStorageRootLow
-  expr: pgbranch_disk_bytes_free / pgbranch_disk_bytes_total < 0.10
+- alert: PgoverlayStorageRootLow
+  expr: pgoverlay_disk_bytes_free / pgoverlay_disk_bytes_total < 0.10
   for: 5m
   labels: { severity: warning }
   annotations:
-    summary: "pgbranch storage root <10% free"
+    summary: "pgoverlay storage root <10% free"
     description: >
       The filesystem holding all branch CoW volumes and the registry is
       nearly full. Overlay copy-up and Postgres writes will start failing
@@ -75,7 +75,7 @@ or grow the volume:
 ```
 
 If you prefer an absolute floor (e.g. on a fixed-size PV), alert on
-`pgbranch_disk_bytes_free < 5e9` (5 GiB) instead of the ratio.
+`pgoverlay_disk_bytes_free < 5e9` (5 GiB) instead of the ratio.
 
 ## Scraping
 

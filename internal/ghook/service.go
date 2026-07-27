@@ -1,9 +1,9 @@
 // Package ghook is a small GitHub webhook receiver that maps pull-request
-// lifecycle events to pgbranch branches (branch-per-PR): opened/reopened →
+// lifecycle events to pgoverlay branches (branch-per-PR): opened/reopened →
 // ensure branch pr-<number> exists, synchronize → ensure (and optionally
 // reset), closed → destroy. It talks to branchd through internal/apiclient
 // and, when GitHub credentials are configured (App or PAT), reports back to
-// the PR: a pgbranch/branch commit status around every branch operation and
+// the PR: a pgoverlay/branch commit status around every branch operation and
 // a live connect-info comment kept current in place.
 package ghook
 
@@ -21,24 +21,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/apiclient"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
 )
 
-// Config is the static service configuration (see cmd/pgbranch-github for
+// Config is the static service configuration (see cmd/pgoverlay-github for
 // the GHOOK_* environment mapping).
 type Config struct {
 	WebhookSecret string   // HMAC key for X-Hub-Signature-256 (required)
-	Source        string   // pgbranch source to branch from (required)
+	Source        string   // pgoverlay source to branch from (required)
 	TTLSeconds    int      // branch TTL passed on create (0 = no TTL)
 	ResetOnPush   bool     // synchronize resets the branch when true
 	Repos         []string // "owner/name" allow-list; empty allows all
-	ProxyHost     string   // host[:port] of the pgbranch proxy, for comments
+	ProxyHost     string   // host[:port] of the pgoverlay proxy, for comments
 	// DiffOnPush, when true, posts a schema/data diff comment on opened/
 	// synchronize after the branch is ready (opt-in, GHOOK_DIFF_ON_PUSH).
 	// Only takes effect when a GitHub client is configured.
 	DiffOnPush bool
-	// BranchNaming picks the pgbranch branch name for a pull request:
+	// BranchNaming picks the pgoverlay branch name for a pull request:
 	//   "pr-number" (default): pr-<number>
 	//   "git-branch": the PR's head ref, sanitized (e.g. feat/login -> feat-login).
 	// git-branch lets preview platforms derive the name from the git ref
@@ -209,7 +209,7 @@ func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 	json.NewEncoder(w).Encode(map[string]string{"branch": branch, "status": "accepted"})
 }
 
-// branchName derives the pgbranch branch name for a pull request according to
+// branchName derives the pgoverlay branch name for a pull request according to
 // Config.BranchNaming. Every name lives under the reserved branchPrefix so a
 // webhook-created branch can never collide with a differently-sourced one
 // (cross-PR or human): pr-number -> "gh-pr-<n>", git-branch -> "gh-<ref>".
@@ -226,7 +226,7 @@ func (s *Service) branchName(p *payload) string {
 	return fmt.Sprintf("%spr-%d", branchPrefix, p.Number)
 }
 
-// sanitizeBranchName maps a git ref to a valid pgbranch branch-name fragment:
+// sanitizeBranchName maps a git ref to a valid pgoverlay branch-name fragment:
 // lowercase, runs of other characters collapse to single dashes, edges
 // trimmed, truncated to maxLen chars. maxLen is the budget left after the
 // caller's prefix so the final prefix+fragment fits ^[a-z0-9][a-z0-9-]{0,40}$.
@@ -361,7 +361,7 @@ func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload
 	return b, didReset, nil
 }
 
-// setStatus posts a pgbranch/branch commit status on the PR head SHA when a
+// setStatus posts a pgoverlay/branch commit status on the PR head SHA when a
 // GitHub client is configured. Failures are logged, never fatal (same policy
 // as comments). Closed events never reach here: statuses on a closed PR
 // don't matter.

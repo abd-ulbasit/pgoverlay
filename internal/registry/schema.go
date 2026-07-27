@@ -133,9 +133,9 @@ ALTER TABLE branches ADD COLUMN password TEXT NOT NULL DEFAULT '';
 
 // v8 (Phase 7): a per-registry key/value meta table. Its first key,
 // 'instance_id', is a stable id minted on first Open (see ensureInstanceID).
-// Managed Docker/K8s resources are tagged pgbranch.instance=<id> so reconcile
+// Managed Docker/K8s resources are tagged pgoverlay.instance=<id> so reconcile
 // only ever reclaims resources belonging to ITS registry — concurrent
-// pgbranch instances (and the IT suite's parallel packages) sharing one Docker
+// pgoverlay instances (and the IT suite's parallel packages) sharing one Docker
 // daemon no longer GC each other's live containers/volumes. The next migration
 // is v9.
 const migrateV8 = `
@@ -147,7 +147,7 @@ CREATE TABLE meta (
 
 // v9 (Phase 7): API tokens for role-based authz. Only a SHA-256 hex digest of
 // each token is stored — the plaintext is shown once at creation and never
-// persisted. role is one of admin/operator/viewer. The built-in PGBRANCH_TOKEN
+// persisted. role is one of admin/operator/viewer. The built-in PGOVERLAY_TOKEN
 // env value is treated as admin and is NOT stored here.
 const migrateV9 = `
 CREATE TABLE api_tokens (
@@ -171,7 +171,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_hash ON api_tokens(token_hash);
 // records the state change but not WHO caused it — after an incident (a reset
 // that lost data, a source deleted) there was no record of which API token did
 // it. actor stores "name (role)" for token-initiated transitions, the sentinel
-// for the built-in PGBRANCH_TOKEN (admin, no stored name), or 'system:reconcile'
+// for the built-in PGOVERLAY_TOKEN (admin, no stored name), or 'system:reconcile'
 // for daemon-initiated ones (reconcile, GC, TTL expiry). Pre-existing rows
 // backfill to the empty string (unknown actor, predating the audit log).
 const migrateV11 = `

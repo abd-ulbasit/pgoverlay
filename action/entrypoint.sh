@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Create a pgbranch branch and wait until it is ready. Used by action.yml,
+# Create a pgoverlay branch and wait until it is ready. Used by action.yml,
 # tested by internal/actiontest against a stub server.
 #
-# In:  PGBRANCH_SERVER (required), PGBRANCH_TOKEN (required),
-#      PGBRANCH_SOURCE (default main), PGBRANCH_BRANCH (default generated),
-#      PGBRANCH_TTL (seconds, default 3600),
-#      PGBRANCH_POLL_MAX / PGBRANCH_POLL_INTERVAL (default 60 x 5s).
+# In:  PGOVERLAY_SERVER (required), PGOVERLAY_TOKEN (required),
+#      PGOVERLAY_SOURCE (default main), PGOVERLAY_BRANCH (default generated),
+#      PGOVERLAY_TTL (seconds, default 3600),
+#      PGOVERLAY_POLL_MAX / PGOVERLAY_POLL_INTERVAL (default 60 x 5s).
 # Out: branch/host/port/database appended to $GITHUB_OUTPUT.
 #      The token is never echoed and the password is never an output.
 set -euo pipefail
 
-: "${PGBRANCH_SERVER:?PGBRANCH_SERVER (input server) is required}"
-: "${PGBRANCH_TOKEN:?PGBRANCH_TOKEN (input token) is required}"
+: "${PGOVERLAY_SERVER:?PGOVERLAY_SERVER (input server) is required}"
+: "${PGOVERLAY_TOKEN:?PGOVERLAY_TOKEN (input token) is required}"
 
-server="${PGBRANCH_SERVER%/}"
-source="${PGBRANCH_SOURCE:-main}"
-ttl="${PGBRANCH_TTL:-3600}"
-name="${PGBRANCH_BRANCH:-}"
-poll_max="${PGBRANCH_POLL_MAX:-60}"
-poll_interval="${PGBRANCH_POLL_INTERVAL:-5}"
+server="${PGOVERLAY_SERVER%/}"
+source="${PGOVERLAY_SOURCE:-main}"
+ttl="${PGOVERLAY_TTL:-3600}"
+name="${PGOVERLAY_BRANCH:-}"
+poll_max="${PGOVERLAY_POLL_MAX:-60}"
+poll_interval="${PGOVERLAY_POLL_INTERVAL:-5}"
 
 case "$ttl" in
   ''|*[!0-9]*) echo "ttl must be a non-negative integer (seconds), got '$ttl'" >&2; exit 1 ;;
@@ -33,7 +33,7 @@ body="$(jq -n --arg name "$name" --arg source "$source" --argjson ttl "$ttl" \
   '{name: $name, source: $source, ttl_seconds: $ttl}')"
 
 resp="$(curl -sS -w '\n%{http_code}' \
-  -H "Authorization: Bearer $PGBRANCH_TOKEN" \
+  -H "Authorization: Bearer $PGOVERLAY_TOKEN" \
   -H 'Content-Type: application/json' \
   -d "$body" "$server/v1/branches")"
 code="${resp##*$'\n'}"
@@ -54,7 +54,7 @@ while [ "$state" != "ready" ]; do
   fi
   sleep "$poll_interval"
   resp="$(curl -sS -w '\n%{http_code}' \
-    -H "Authorization: Bearer $PGBRANCH_TOKEN" "$server/v1/branches/$name")"
+    -H "Authorization: Bearer $PGOVERLAY_TOKEN" "$server/v1/branches/$name")"
   code="${resp##*$'\n'}"
   payload="${resp%$'\n'*}"
   if [ "$code" != "200" ]; then
@@ -75,4 +75,4 @@ database="$(jq -r '.database // empty' <<<"$payload")"
   echo "database=$database"
 } >>"$GITHUB_OUTPUT"
 
-echo "pgbranch: branch '$name' ready at $host:$port/$database"
+echo "pgoverlay: branch '$name' ready at $host:$port/$database"

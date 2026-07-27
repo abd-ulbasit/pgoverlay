@@ -9,9 +9,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 func branchConn(b *registry.Branch) string {
@@ -45,8 +45,8 @@ func mustExec(t *testing.T, ctx context.Context, conn string, q string) {
 }
 
 func TestEndToEndBranching(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -126,8 +126,8 @@ func TestEndToEndBranching(t *testing.T) {
 }
 
 func TestMaskingAppliedToBranchNotSource(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()

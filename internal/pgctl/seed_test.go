@@ -8,12 +8,12 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 func TestSeedFromRunningPostgres(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -32,7 +32,7 @@ func TestSeedFromRunningPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vol := "pgbranch-test-seed"
+	vol := "pgoverlay-test-seed"
 	if err := d.CreateVolume(ctx, vol, nil); err != nil {
 		t.Fatal(err)
 	}

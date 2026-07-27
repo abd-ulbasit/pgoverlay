@@ -15,15 +15,15 @@ import (
 const minWebhookSecretLen = 16
 
 // EnvConfig is the full GHOOK_* environment configuration for the
-// pgbranch-github binary: the service Config plus wiring (listen address,
-// pgbranch server, GitHub credentials).
+// pgoverlay-github binary: the service Config plus wiring (listen address,
+// pgoverlay server, GitHub credentials).
 type EnvConfig struct {
 	Config
-	Listen         string // GHOOK_LISTEN, default :8080
-	PGBranchServer string // GHOOK_PGBRANCH_SERVER (required)
-	PGBranchToken  string // GHOOK_PGBRANCH_TOKEN
-	GitHubToken    string // GHOOK_GITHUB_TOKEN (PAT mode; empty = no comments/statuses)
-	GitHubAPI      string // GHOOK_GITHUB_API, default https://api.github.com
+	Listen          string // GHOOK_LISTEN, default :8080
+	PGOverlayServer string // GHOOK_PGOVERLAY_SERVER (required)
+	PGOverlayToken  string // GHOOK_PGOVERLAY_TOKEN
+	GitHubToken     string // GHOOK_GITHUB_TOKEN (PAT mode; empty = no comments/statuses)
+	GitHubAPI       string // GHOOK_GITHUB_API, default https://api.github.com
 	// GitHub App auth (mutually exclusive with GitHubToken): the service
 	// mints installation tokens from the App's private key.
 	AppID         string // GHOOK_APP_ID
@@ -39,19 +39,19 @@ func LoadEnv(getenv func(string) string) (*EnvConfig, error) {
 			Source:        getenv("GHOOK_SOURCE"),
 			ProxyHost:     getenv("GHOOK_PROXY_HOST"),
 		},
-		Listen:         getenv("GHOOK_LISTEN"),
-		PGBranchServer: getenv("GHOOK_PGBRANCH_SERVER"),
-		PGBranchToken:  getenv("GHOOK_PGBRANCH_TOKEN"),
-		GitHubToken:    getenv("GHOOK_GITHUB_TOKEN"),
-		GitHubAPI:      getenv("GHOOK_GITHUB_API"),
+		Listen:          getenv("GHOOK_LISTEN"),
+		PGOverlayServer: getenv("GHOOK_PGOVERLAY_SERVER"),
+		PGOverlayToken:  getenv("GHOOK_PGOVERLAY_TOKEN"),
+		GitHubToken:     getenv("GHOOK_GITHUB_TOKEN"),
+		GitHubAPI:       getenv("GHOOK_GITHUB_API"),
 	}
 	if ec.Listen == "" {
 		ec.Listen = ":8080"
 	}
 	for name, val := range map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  ec.WebhookSecret,
-		"GHOOK_PGBRANCH_SERVER": ec.PGBranchServer,
-		"GHOOK_SOURCE":          ec.Source,
+		"GHOOK_WEBHOOK_SECRET":   ec.WebhookSecret,
+		"GHOOK_PGOVERLAY_SERVER": ec.PGOverlayServer,
+		"GHOOK_SOURCE":           ec.Source,
 	} {
 		if val == "" {
 			return nil, fmt.Errorf("%s is required", name)

@@ -67,7 +67,7 @@ jobs:
       # with published ephemeral ports; running packages in parallel on one
       # daemon races those ports ("address already in use"). Serializing trades
       # a little speed for determinism.
-      - run: PGBRANCH_IT=1 go test ./... -count=1 -p 1 -timeout 25m
+      - run: PGOVERLAY_IT=1 go test ./... -count=1 -p 1 -timeout 25m
 
   helm:
     runs-on: ubuntu-latest
@@ -94,7 +94,7 @@ jobs:
       # pods, branch pods, overlay-in-pod). It bootstraps the kind cluster
       # (hack/kind-up.sh) and loads its images itself.
       - name: Kubernetes runtime ITs (kind, hostPath)
-        run: PGBRANCH_K8S_IT=1 go test ./internal/runtime/ -count=1 -timeout 25m
+        run: PGOVERLAY_K8S_IT=1 go test ./internal/runtime/ -count=1 -timeout 25m
       # Gate: the end-to-end helm-deploy and HA-failover suites. These were
       # `continue-on-error: true` while their timing was "still being hardened
       # for hosted runners" — but what they were actually reporting was two
@@ -104,8 +104,8 @@ jobs:
       # which is worse than having no badge. Fixed and green on two
       # consecutive runs, so it gates again.
       - name: Helm deploy + HA-failover ITs (kind)
-        run: PGBRANCH_K8S_IT=1 go test ./internal/deploy/ -count=1 -timeout 25m
-      # Still best-effort, and for a reason that is not pgbranch's code: the
+        run: PGOVERLAY_K8S_IT=1 go test ./internal/deploy/ -count=1 -timeout 25m
+      # Still best-effort, and for a reason that is not pgoverlay's code: the
       # csi-driver-host-path install itself is flaky on hosted runners. It does
       # not gate, but the summary step below makes sure "does not gate" never
       # again means "nobody finds out".
@@ -114,7 +114,7 @@ jobs:
         continue-on-error: true
         run: |
           hack/kind-csi-up.sh
-          PGBRANCH_CSI_IT=1 go test ./internal/runtime/ -run CSI -count=1 -timeout 20m
+          PGOVERLAY_CSI_IT=1 go test ./internal/runtime/ -run CSI -count=1 -timeout 20m
       - name: Best-effort suite outcomes
         if: always()
         env:

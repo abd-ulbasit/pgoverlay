@@ -1,6 +1,6 @@
 #!/bin/sh
-# pgbranch branch entrypoint, direct (zfs/csi) backends: the writable clone
-# (ZFS clone dataset or CSI PVC clone) mounted at /pgbranch/rw is already a
+# pgoverlay branch entrypoint, direct (zfs/csi) backends: the writable clone
+# (ZFS clone dataset or CSI PVC clone) mounted at /pgoverlay/rw is already a
 # copy-on-write view of the source data dir — no overlay assembly. Fix perms,
 # clear the stale postmaster.pid the clone inherited, and hand off to the
 # stock postgres entrypoint (WAL crash recovery runs there).

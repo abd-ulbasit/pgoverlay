@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Lints the pgbranch chart and grep-asserts the critical fields in rendered
+# Lints the pgoverlay chart and grep-asserts the critical fields in rendered
 # templates (default-ish and custom values), without a cluster (make helm-test).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-CHART=deploy/helm/pgbranch
+CHART=deploy/helm/pgoverlay
 
 has() { grep -qF -- "$2" <<<"$1" || { echo "FAIL: missing '$2' in $3 render" >&2; exit 1; }; }
 hasnt() { ! grep -qF -- "$2" <<<"$1" || { echo "FAIL: unexpected '$2' in $3 render" >&2; exit 1; }; }
@@ -11,14 +11,14 @@ hasnt() { ! grep -qF -- "$2" <<<"$1" || { echo "FAIL: unexpected '$2' in $3 rend
 helm lint "$CHART" --set node=test-node --set token=t >/dev/null
 
 # default values (only the two required ones set)
-out=$(helm template pgbranch "$CHART" --set node=storage-1 --set token=s3cret)
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret)
 has "$out" '--runtime=kube' default
 has "$out" '--kube-node=storage-1' default
-has "$out" '--kube-data-root=/var/lib/pgbranch' default
+has "$out" '--kube-data-root=/var/lib/pgoverlay' default
 has "$out" 'nodeName: storage-1' default
-has "$out" 'path: /var/lib/pgbranch/state' default
-has "$out" 'value: /var/lib/pgbranch/state' default # PGBRANCH_HOME
-has "$out" 'name: pgbranch-token' default           # secretKeyRef + rendered Secret
+has "$out" 'path: /var/lib/pgoverlay/state' default
+has "$out" 'value: /var/lib/pgoverlay/state' default # PGOVERLAY_HOME
+has "$out" 'name: pgoverlay-token' default           # secretKeyRef + rendered Secret
 has "$out" 'kind: Secret' default
 has "$out" 'pods/exec' default
 # The chart deploys only branchd; SYS_ADMIN belongs to the branch pods branchd
@@ -27,11 +27,11 @@ hasnt "$out" 'SYS_ADMIN' default
 
 # custom values: existing secret, custom data root, NodePort proxy
 out=$(helm template rel "$CHART" --set node=worker-9 --set existingSecret=my-token \
-  --set dataRoot=/mnt/pgbranch --set proxy.service.type=NodePort --set proxy.service.nodePort=30432)
+  --set dataRoot=/mnt/pgoverlay --set proxy.service.type=NodePort --set proxy.service.nodePort=30432)
 has "$out" '--kube-node=worker-9' custom
-has "$out" '--kube-data-root=/mnt/pgbranch' custom
+has "$out" '--kube-data-root=/mnt/pgoverlay' custom
 has "$out" 'nodeName: worker-9' custom
-has "$out" 'path: /mnt/pgbranch/state' custom
+has "$out" 'path: /mnt/pgoverlay/state' custom
 has "$out" 'name: my-token' custom
 hasnt "$out" 'kind: Secret' custom # existingSecret suppresses the chart Secret
 has "$out" 'type: NodePort' custom
@@ -57,14 +57,14 @@ hasnt "$out" 'SYS_ADMIN' csi
 out=$(helm template rel "$CHART" --set node=n --set token=t \
   --set storage.mode=csi --set storage.storageClass=fast-clone)
 has "$out" 'kind: PersistentVolumeClaim' csi-persistence
-has "$out" 'claimName: rel-pgbranch-state' csi-persistence
-hasnt "$out" 'path: /var/lib/pgbranch/state' csi-persistence
+has "$out" 'claimName: rel-pgoverlay-state' csi-persistence
+hasnt "$out" 'path: /var/lib/pgoverlay/state' csi-persistence
 out=$(helm template rel "$CHART" --set node=n --set token=t \
   --set storage.mode=csi --set storage.storageClass=fast-clone \
   --set persistence.enabled=false)
 hasnt "$out" 'kind: PersistentVolumeClaim' csi-no-persistence
-has "$out" 'path: /var/lib/pgbranch/state' csi-no-persistence
-out=$(helm template pgbranch "$CHART" --set node=storage-1 --set token=s3cret)
+has "$out" 'path: /var/lib/pgoverlay/state' csi-no-persistence
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret)
 hasnt "$out" 'kind: PersistentVolumeClaim' default
 
 # csi without the optional values renders no empty flags
@@ -75,7 +75,7 @@ hasnt "$out" '--csi-snapshot-class' csi-minimal
 hasnt "$out" '--csi-volume-size' csi-minimal
 
 # default (hostpath) renders no csi args and no PVC RBAC
-out=$(helm template pgbranch "$CHART" --set node=storage-1 --set token=s3cret)
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret)
 hasnt "$out" '--kube-storage' default
 hasnt "$out" '--csi-storage-class' default
 hasnt "$out" 'persistentvolumeclaims' default
@@ -89,7 +89,7 @@ if helm template "$CHART" --set node=n --set token=t --set storage.mode=nfs >/de
 fi
 
 # ghook is off by default: no webhook resources in the default render
-out=$(helm template pgbranch "$CHART" --set node=storage-1 --set token=s3cret)
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret)
 hasnt "$out" 'ghook' default
 hasnt "$out" 'GHOOK_' default
 
@@ -98,10 +98,10 @@ out=$(helm template rel "$CHART" --set node=worker-9 --set token=s3cret \
   --set ghook.enabled=true --set ghook.webhookSecret=whsec --set ghook.source=main \
   --set ghook.githubToken=ghp_abc --set ghook.repos='acme/widgets' \
   --set ghook.proxyHost=pg.example.com:30432 --set ghook.resetOnPush=true)
-has "$out" 'ghcr.io/abd-ulbasit/pgbranch-ghook:dev' ghook
-has "$out" 'name: rel-pgbranch-ghook' ghook # deployment/service/secret share the name
-has "$out" 'GHOOK_PGBRANCH_SERVER' ghook
-has "$out" 'value: http://rel-pgbranch-api:7070' ghook # in-cluster DNS to branchd
+has "$out" 'ghcr.io/abd-ulbasit/pgoverlay-ghook:dev' ghook
+has "$out" 'name: rel-pgoverlay-ghook' ghook # deployment/service/secret share the name
+has "$out" 'GHOOK_PGOVERLAY_SERVER' ghook
+has "$out" 'value: http://rel-pgoverlay-api:7070' ghook # in-cluster DNS to branchd
 has "$out" 'GHOOK_WEBHOOK_SECRET' ghook
 has "$out" 'key: webhook-secret' ghook
 has "$out" 'key: github-token' ghook

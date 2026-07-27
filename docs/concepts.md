@@ -28,7 +28,7 @@ This works, but it scales badly on **two axes at once**:
 The waste is structural: the ten branches differ only in the handful of rows a test touches,
 yet you paid to materialize ten full datasets.
 
-**The pgbranch insight:** the dataset is mostly shared and read-only. Don't copy it. *Share the
+**The pgoverlay insight:** the dataset is mostly shared and read-only. Don't copy it. *Share the
 base, and copy only what each branch actually changes.* That single idea — copy-on-write — is
 the conceptual heart of the project. A branch becomes near-instant to create and costs almost
 nothing in storage until something is written to it.
@@ -44,7 +44,7 @@ flowchart LR
     base1 -.dump+restore.-> c2
     base1 -.dump+restore.-> c3
   end
-  subgraph cow["pgbranch: copy-on-write"]
+  subgraph cow["pgoverlay: copy-on-write"]
     base2[(20 GB shared base, read-only)]
     d1[PR-1 writes only]
     d2[PR-2 writes only]
@@ -80,7 +80,7 @@ This is why a CoW branch is **instant to create** (you just hand out a fresh bla
 and **near-zero storage at creation** (the transparency is empty until written). Storage grows
 only in proportion to what the branch *changes*, not to the size of the dataset.
 
-pgbranch supports three CoW mechanisms behind one abstraction (`internal/cow/plan.go`,
+pgoverlay supports three CoW mechanisms behind one abstraction (`internal/cow/plan.go`,
 `Backend`): **overlay** (the default), **zfs**, and **csi**. The rest of this document mostly
 follows the overlay path, then contrasts the alternatives in §7.
 
@@ -115,11 +115,11 @@ A Postgres data directory (`PGDATA`) is just a directory tree. So:
 
 The layout constants live in `internal/cow/plan.go`:
 
-- `MergedPath = /pgbranch/merged` — the overlay mount, used as `PGDATA` inside the branch
+- `MergedPath = /pgoverlay/merged` — the overlay mount, used as `PGDATA` inside the branch
   container.
-- `RWPath = /pgbranch/rw` — where the branch's writable volume is mounted; `upper/` and `work/`
+- `RWPath = /pgoverlay/rw` — where the branch's writable volume is mounted; `upper/` and `work/`
   live under it.
-- Lower layers are mounted at `/pgbranch/lower0`, `/pgbranch/lower1`, … (`LowerMountTarget`).
+- Lower layers are mounted at `/pgoverlay/lower0`, `/pgoverlay/lower1`, … (`LowerMountTarget`).
   Lower 0 is always the source; higher indices are frozen layers (see §5).
 
 `PlanBranch` (pure, no I/O) computes the overlay stack. The seeded cluster lives in a `data/`
@@ -131,7 +131,7 @@ subdirectory of the source volume — `pg_basebackup` insists on creating that d
 lowers = append(lowers, LowerMountTarget(0)+"/data") // source is the LAST (deepest) lower
 ```
 
-The lowers are ordered **newest-first, source last**, joined into `PGBRANCH_LOWERS` (colon-
+The lowers are ordered **newest-first, source last**, joined into `PGOVERLAY_LOWERS` (colon-
 separated, `Plan.LowerEnv`). The host process never mounts anything — it only decides volume
 names and mount targets. The mount itself happens **inside the branch container** via the
 embedded entrypoint script (`internal/cow/entrypoint.sh`):
@@ -139,7 +139,7 @@ embedded entrypoint script (`internal/cow/entrypoint.sh`):
 ```sh
 # internal/cow/entrypoint.sh
 mount -t overlay overlay \
-  -o "lowerdir=${PGBRANCH_LOWERS},upperdir=/pgbranch/rw/upper,workdir=/pgbranch/rw/work" \
+  -o "lowerdir=${PGOVERLAY_LOWERS},upperdir=/pgoverlay/rw/upper,workdir=/pgoverlay/rw/work" \
   "$PGDATA"
 ...
 exec docker-entrypoint.sh postgres -c recovery_init_sync_method=syncfs
@@ -147,16 +147,16 @@ exec docker-entrypoint.sh postgres -c recovery_init_sync_method=syncfs
 
 `startOverlayBranch` (`internal/engine/saga.go`) wires this up: it mounts the source volume
 read-only at `lower0`, each frozen layer read-only at `lower1..N`, the writable volume at
-`RWPath`, sets `PGDATA=/pgbranch/merged` and `PGBRANCH_LOWERS=...`, and runs the entrypoint.
+`RWPath`, sets `PGDATA=/pgoverlay/merged` and `PGOVERLAY_LOWERS=...`, and runs the entrypoint.
 
 ```mermaid
 flowchart TB
-  subgraph branch["Branch container PGDATA = /pgbranch/merged (overlay)"]
+  subgraph branch["Branch container PGDATA = /pgoverlay/merged (overlay)"]
     merged["merged view\n(what Postgres sees)"]
   end
-  upper["upperdir  /pgbranch/rw/upper\n(this branch's writes — copy-on-write)"]
-  work["workdir  /pgbranch/rw/work\n(kernel scratch)"]
-  lower0["lowerdir  /pgbranch/lower0/data\n(source seed — read only, SHARED)"]
+  upper["upperdir  /pgoverlay/rw/upper\n(this branch's writes — copy-on-write)"]
+  work["workdir  /pgoverlay/rw/work\n(kernel scratch)"]
+  lower0["lowerdir  /pgoverlay/lower0/data\n(source seed — read only, SHARED)"]
   merged --> upper
   merged --> lower0
   upper -. atomic copy-up .- work
@@ -187,7 +187,7 @@ storage layer instead, so branch pods need no extra capabilities and can schedul
 
 A CoW branch needs a shared base to fall through to. **Seeding** is how that base is first
 created — it's the one expensive, one-time operation, paid once per source (not per branch).
-pgbranch never touches data files from the host; all seeding runs inside helper containers
+pgoverlay never touches data files from the host; all seeding runs inside helper containers
 through the runtime driver (`internal/pgctl` package doc).
 
 Two seeding modes (`internal/engine/engine.go`, `seedSource`, selected by `Source.SeedVia`):
@@ -313,7 +313,7 @@ branch returns it to its derived base chain, not to the raw source — `provisio
 ### Refcounting: a layer can't be deleted while a child needs it
 
 Frozen layers are shared, so deleting one out from under a live descendant would corrupt it.
-pgbranch **derives** refcounts rather than storing them. `CountBranchesReferencingLayer`
+pgoverlay **derives** refcounts rather than storing them. `CountBranchesReferencingLayer`
 (`internal/registry/registry.go`) runs a recursive CTE counting the distinct **live** branches
 whose chain contains a layer (directly or via descendants). On `DestroyBranch`
 (`internal/engine/saga.go`), `gcLayers` walks the chain topmost-first and removes only

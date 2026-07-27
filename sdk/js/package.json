@@ -1,7 +1,7 @@
 {
-  "name": "pgbranch-test",
+  "name": "pgoverlay-test",
   "version": "0.1.0",
-  "description": "A disposable copy-on-write Postgres branch for every test, backed by a pgbranch server",
+  "description": "A disposable copy-on-write Postgres branch for every test, backed by a pgoverlay server",
   "license": "Apache-2.0",
   "type": "module",
   "main": "index.mjs",
@@ -24,7 +24,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/abd-ulbasit/pgbranch.git",
+    "url": "git+https://github.com/abd-ulbasit/pgoverlay.git",
     "directory": "sdk/js"
   },
   "keywords": [
@@ -33,6 +33,6 @@
     "database",
     "branch",
     "copy-on-write",
-    "pgbranch"
+    "pgoverlay"
   ]
 }

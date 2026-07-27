@@ -1,9 +1,9 @@
 # Branch per pull request (GitHub App)
 
-`pgbranch-github` (Helm: the `ghook` sub-deployment) is a small webhook
+`pgoverlay-github` (Helm: the `ghook` sub-deployment) is a small webhook
 service that gives every pull request its own Postgres branch:
 
-| PR event | pgbranch action |
+| PR event | pgoverlay action |
 |---|---|
 | opened / reopened | create branch `pr-<number>` from the configured source (no-op if it exists) |
 | synchronize (push) | ensure the branch exists; reset it to the source snapshot only when `GHOOK_RESET_ON_PUSH=true` |
@@ -11,7 +11,7 @@ service that gives every pull request its own Postgres branch:
 
 With GitHub credentials configured, the service also reports back to the PR:
 
-- **Commit status** (context `pgbranch/branch`) on the PR head SHA:
+- **Commit status** (context `pgoverlay/branch`) on the PR head SHA:
   `pending` while the branch is being created or reset, then `success`
   ("branch pr-42 ready — connect via pg.example.com:30432") or `failure`
   (the error, truncated to 140 chars). CI jobs can gate on the status
@@ -26,7 +26,7 @@ With GitHub credentials configured, the service also reports back to the PR:
 1. Developer opens PR #42 against `acme/widgets`.
 2. GitHub delivers a signed `pull_request` webhook to `POST /webhook`.
 3. The service verifies the HMAC signature, acks the delivery, sets the
-   `pgbranch/branch` status to `pending`, and asks branchd to create branch
+   `pgoverlay/branch` status to `pending`, and asks branchd to create branch
    `pr-42` from source `main` with a 72h TTL.
 4. When the branch is ready the status flips to `success` and the PR
    comment shows
@@ -49,7 +49,7 @@ Create the App manually (org or user → *Settings* → *Developer settings* →
    `openssl rand -hex 32` value.
 2. **Repository permissions**:
    - *Pull requests*: **Read-only** (the webhook payloads)
-   - *Commit statuses*: **Read and write** (the `pgbranch/branch` status)
+   - *Commit statuses*: **Read and write** (the `pgoverlay/branch` status)
    - *Issues*: **Read and write** (PR comments go through the issues API)
 3. **Subscribe to events**: **Pull request**.
 4. After creation: note the **App ID**, then **generate a private key**
@@ -62,7 +62,7 @@ are present):
 
 ```sh
 GHOOK_APP_ID=12345
-GHOOK_APP_PRIVATE_KEY_FILE=/etc/pgbranch/app.pem   # or GHOOK_APP_PRIVATE_KEY with the PEM inline
+GHOOK_APP_PRIVATE_KEY_FILE=/etc/pgoverlay/app.pem   # or GHOOK_APP_PRIVATE_KEY with the PEM inline
 GHOOK_WEBHOOK_SECRET=<the webhook secret>
 ```
 
@@ -100,9 +100,9 @@ startup).
 |---|---|---|---|
 | `GHOOK_LISTEN` | no | `:8080` | HTTP listen address (`POST /webhook`, `GET /healthz`) |
 | `GHOOK_WEBHOOK_SECRET` | **yes** | — | HMAC secret shared with GitHub |
-| `GHOOK_PGBRANCH_SERVER` | **yes** | — | branchd base URL, e.g. `http://pgbranch-api:7070` |
-| `GHOOK_PGBRANCH_TOKEN` | no | — | branchd API bearer token |
-| `GHOOK_SOURCE` | **yes** | — | pgbranch source to branch from |
+| `GHOOK_PGOVERLAY_SERVER` | **yes** | — | branchd base URL, e.g. `http://pgoverlay-api:7070` |
+| `GHOOK_PGOVERLAY_TOKEN` | no | — | branchd API bearer token |
+| `GHOOK_SOURCE` | **yes** | — | pgoverlay source to branch from |
 | `GHOOK_APP_ID` | no | — | GitHub App id (App auth; needs the private key) |
 | `GHOOK_APP_PRIVATE_KEY` | no | — | App private key PEM, inline |
 | `GHOOK_APP_PRIVATE_KEY_FILE` | no | — | path to the App private key PEM (exclusive with the inline form) |
@@ -111,7 +111,7 @@ startup).
 | `GHOOK_RESET_ON_PUSH` | no | `false` | reset the branch on every push (synchronize) |
 | `GHOOK_REPOS` | no | allow all | comma-separated `owner/name` allow-list |
 | `GHOOK_GITHUB_API` | no | `https://api.github.com` | GitHub API base (GitHub Enterprise) |
-| `GHOOK_PROXY_HOST` | no | — | `host[:port]` of the pgbranch proxy shown in comments/statuses |
+| `GHOOK_PROXY_HOST` | no | — | `host[:port]` of the pgoverlay proxy shown in comments/statuses |
 
 Comments and statuses require either App auth (`GHOOK_APP_ID` +
 `GHOOK_APP_PRIVATE_KEY`/`_FILE`) or a PAT — never both. With neither, only
@@ -119,12 +119,12 @@ branch operations run.
 
 ## Running on Kubernetes (Helm)
 
-The pgbranch chart ships the service as an optional sub-deployment
-(`deploy/helm/pgbranch`, image `ghcr.io/abd-ulbasit/pgbranch-ghook` — `make docker-build-ghook`):
+The pgoverlay chart ships the service as an optional sub-deployment
+(`deploy/helm/pgoverlay`, image `ghcr.io/abd-ulbasit/pgoverlay-ghook` — `make docker-build-ghook`):
 
 ```sh
-helm upgrade --install pgbranch deploy/helm/pgbranch \
-  --set node=storage-1 --set token=$PGBRANCH_TOKEN \
+helm upgrade --install pgoverlay deploy/helm/pgoverlay \
+  --set node=storage-1 --set token=$PGOVERLAY_TOKEN \
   --set ghook.enabled=true \
   --set ghook.webhookSecret=$WEBHOOK_SECRET \
   --set ghook.appId=12345 \

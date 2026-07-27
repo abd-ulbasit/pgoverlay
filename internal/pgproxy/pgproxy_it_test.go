@@ -18,11 +18,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/pgproxy"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgproxy"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // selfSignedTLSConfig builds a server tls.Config for 127.0.0.1/localhost.
@@ -34,7 +34,7 @@ func selfSignedTLSConfig(t *testing.T) *tls.Config {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "pgbranch-it"},
+		Subject:      pkix.Name{CommonName: "pgoverlay-it"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -52,8 +52,8 @@ func selfSignedTLSConfig(t *testing.T) *tls.Config {
 // TestProxyIntegration routes a real pgx connection through the proxy to a
 // real branch: database=postgres@proxy-pr-1, SCRAM password auth relayed untouched.
 func TestProxyIntegration(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -132,7 +132,7 @@ func TestProxyIntegration(t *testing.T) {
 	if err == nil {
 		t.Fatal("connect without @branch suffix should fail")
 	}
-	if !strings.Contains(err.Error(), "pgbranch: connect with dbname@branch") {
+	if !strings.Contains(err.Error(), "pgoverlay: connect with dbname@branch") {
 		t.Errorf("missing-suffix error %q lacks guidance", err)
 	}
 

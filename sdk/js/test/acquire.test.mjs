@@ -122,24 +122,24 @@ test("acquire honors explicit options", async () => {
   }
 });
 
-test("acquire reads PGBRANCH_* env when options are omitted", async () => {
+test("acquire reads PGOVERLAY_* env when options are omitted", async () => {
   const stub = await startStub();
   const saved = { ...process.env };
   try {
-    process.env.PGBRANCH_SERVER = stub.url;
-    process.env.PGBRANCH_TOKEN = "env-tok";
-    process.env.PGBRANCH_TEST_SOURCE = "env-src";
-    process.env.PGBRANCH_PASSWORD = "env-pw";
+    process.env.PGOVERLAY_SERVER = stub.url;
+    process.env.PGOVERLAY_TOKEN = "env-tok";
+    process.env.PGOVERLAY_TEST_SOURCE = "env-src";
+    process.env.PGOVERLAY_PASSWORD = "env-pw";
     const b = await acquire();
     const create = stub.requests.find((r) => r.method === "POST");
     assert.equal(create.auth, "Bearer env-tok");
     assert.equal(create.body.source, "env-src");
     assert.equal(b.password, "env-pw");
   } finally {
-    process.env.PGBRANCH_SERVER = saved.PGBRANCH_SERVER ?? "";
-    process.env.PGBRANCH_TOKEN = saved.PGBRANCH_TOKEN ?? "";
-    process.env.PGBRANCH_TEST_SOURCE = saved.PGBRANCH_TEST_SOURCE ?? "";
-    process.env.PGBRANCH_PASSWORD = saved.PGBRANCH_PASSWORD ?? "";
+    process.env.PGOVERLAY_SERVER = saved.PGOVERLAY_SERVER ?? "";
+    process.env.PGOVERLAY_TOKEN = saved.PGOVERLAY_TOKEN ?? "";
+    process.env.PGOVERLAY_TEST_SOURCE = saved.PGOVERLAY_TEST_SOURCE ?? "";
+    process.env.PGOVERLAY_PASSWORD = saved.PGOVERLAY_PASSWORD ?? "";
     await stub.close();
   }
 });
@@ -160,12 +160,12 @@ test("acquire polls GET until the branch is ready", async () => {
 });
 
 test("acquire rejects when the server is missing", async () => {
-  const saved = process.env.PGBRANCH_SERVER;
-  delete process.env.PGBRANCH_SERVER;
+  const saved = process.env.PGOVERLAY_SERVER;
+  delete process.env.PGOVERLAY_SERVER;
   try {
     await assert.rejects(() => acquire({ token: "t" }), /server/i);
   } finally {
-    if (saved !== undefined) process.env.PGBRANCH_SERVER = saved;
+    if (saved !== undefined) process.env.PGOVERLAY_SERVER = saved;
   }
 });
 

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/diffutil"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/diffutil"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // TableDelta is one table's row-estimate comparison between a branch and its

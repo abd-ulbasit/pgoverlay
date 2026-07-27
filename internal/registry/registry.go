@@ -35,7 +35,7 @@ var ErrNotFound = errors.New("not found")
 // recovery_init_sync_method=syncfs, which PG 13 and older do not have.
 var ErrUnsupportedPGVersion = errors.New("unsupported pg_version")
 
-// supportedPGVersions is the allowlist of Postgres majors pgbranch supports
+// supportedPGVersions is the allowlist of Postgres majors pgoverlay supports
 // ("" defaults to the engine's image, postgres:17).
 var supportedPGVersions = []string{"14", "15", "16", "17", "18"}
 
@@ -96,7 +96,7 @@ type Registry struct {
 }
 
 // SetSecretKey enables at-rest encryption of branch passwords with the given
-// 32-byte key (derive it from PGBRANCH_TOKEN via DeriveSecretKey). Call it once
+// 32-byte key (derive it from PGOVERLAY_TOKEN via DeriveSecretKey). Call it once
 // right after Open, before serving. A nil/empty key is a no-op, leaving the
 // registry in plaintext mode (inherit-mode setups and tests need no key). A
 // wrong-length key is a configuration error and is returned. Once set,
@@ -149,7 +149,7 @@ func ensureInstanceID(db *sql.DB) (string, error) {
 }
 
 // InstanceID returns this registry's stable instance id. The engine stamps it
-// onto every managed Docker/K8s resource (label pgbranch.instance) so reconcile
+// onto every managed Docker/K8s resource (label pgoverlay.instance) so reconcile
 // reclaims only resources owned by this registry.
 func (r *Registry) InstanceID() string { return r.instanceID }
 
@@ -603,7 +603,7 @@ func (r *Registry) ListStuckBranches(before string) ([]*Branch, error) {
 // source still depends on: every live branch's rw volume and source volume,
 // every current source-generation volume, and every layer volume. Reconcile's
 // volume GC keeps only volumes in this set; everything else carrying the
-// pgbranch.managed label is an orphan. Computed in one snapshot so a volume
+// pgoverlay.managed label is an orphan. Computed in one snapshot so a volume
 // can never be GC'd out from under a concurrently provisioning branch whose
 // row was already committed.
 func (r *Registry) LiveVolumeSet() (map[string]bool, error) {

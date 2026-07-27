@@ -1,14 +1,14 @@
-# Delete a pgbranch branch by name. Run it with `if: always()` so the branch
+# Delete a pgoverlay branch by name. Run it with `if: always()` so the branch
 # goes away even when the tests fail:
 #
-#   - uses: abd-ulbasit/pgbranch/action/destroy@v1.0.0-rc.3
+#   - uses: abd-ulbasit/pgoverlay/action/destroy@v1.0.0-rc.3
 #     if: always()
 #     with:
-#       server: ${{ vars.PGBRANCH_SERVER }}
-#       token: ${{ secrets.PGBRANCH_TOKEN }}
+#       server: ${{ vars.PGOVERLAY_SERVER }}
+#       token: ${{ secrets.PGOVERLAY_TOKEN }}
 #       branch: ${{ steps.branch.outputs.branch }}
-name: pgbranch destroy
-description: Delete a pgbranch branch by name (404 counts as success)
+name: pgoverlay destroy
+description: Delete a pgoverlay branch by name (404 counts as success)
 author: abd-ulbasit
 branding:
   icon: trash-2
@@ -16,10 +16,10 @@ branding:
 
 inputs:
   server:
-    description: branchd base URL (e.g. https://pgbranch.example.com)
+    description: branchd base URL (e.g. https://pgoverlay.example.com)
     required: true
   token:
-    description: pgbranch API bearer token (store it as a secret)
+    description: pgoverlay API bearer token (store it as a secret)
     required: true
   branch:
     description: branch name to delete (the create action's `branch` output)
@@ -30,7 +30,7 @@ runs:
   steps:
     - shell: bash
       env:
-        PGBRANCH_SERVER: ${{ inputs.server }}
-        PGBRANCH_TOKEN: ${{ inputs.token }}
-        PGBRANCH_BRANCH: ${{ inputs.branch }}
+        PGOVERLAY_SERVER: ${{ inputs.server }}
+        PGOVERLAY_TOKEN: ${{ inputs.token }}
+        PGOVERLAY_BRANCH: ${{ inputs.branch }}
       run: '"$GITHUB_ACTION_PATH/entrypoint.sh"'

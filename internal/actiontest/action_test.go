@@ -130,7 +130,7 @@ func run(t *testing.T, script string, env map[string]string) (string, map[string
 	cmd.Env = append(os.Environ(),
 		"GITHUB_OUTPUT="+outFile,
 		"GITHUB_RUN_ID=4242",
-		"PGBRANCH_POLL_INTERVAL=0", // no real sleeps in tests
+		"PGOVERLAY_POLL_INTERVAL=0", // no real sleeps in tests
 	)
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
@@ -154,10 +154,10 @@ func TestCreateHappyPath(t *testing.T) {
 	script := scriptPath(t, "action/entrypoint.sh")
 
 	out, outputs, err := run(t, script, map[string]string{
-		"PGBRANCH_SERVER": s.ts.URL + "/", // trailing slash tolerated
-		"PGBRANCH_TOKEN":  "act-tok",
-		"PGBRANCH_SOURCE": "staging",
-		"PGBRANCH_TTL":    "900",
+		"PGOVERLAY_SERVER": s.ts.URL + "/", // trailing slash tolerated
+		"PGOVERLAY_TOKEN":  "act-tok",
+		"PGOVERLAY_SOURCE": "staging",
+		"PGOVERLAY_TTL":    "900",
 	})
 	if err != nil {
 		t.Fatalf("entrypoint failed: %v\n%s", err, out)
@@ -205,9 +205,9 @@ func TestCreateExplicitName(t *testing.T) {
 	s := newStub(t)
 	script := scriptPath(t, "action/entrypoint.sh")
 	out, outputs, err := run(t, script, map[string]string{
-		"PGBRANCH_SERVER": s.ts.URL,
-		"PGBRANCH_TOKEN":  "act-tok",
-		"PGBRANCH_BRANCH": "pr-77-ci",
+		"PGOVERLAY_SERVER": s.ts.URL,
+		"PGOVERLAY_TOKEN":  "act-tok",
+		"PGOVERLAY_BRANCH": "pr-77-ci",
 	})
 	if err != nil {
 		t.Fatalf("entrypoint failed: %v\n%s", err, out)
@@ -238,7 +238,7 @@ func TestCreateServerError(t *testing.T) {
 	})
 	script := scriptPath(t, "action/entrypoint.sh")
 	out, _, err := run(t, script, map[string]string{
-		"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t",
+		"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t",
 	})
 	if err == nil {
 		t.Fatalf("entrypoint succeeded on a 409:\n%s", out)
@@ -254,8 +254,8 @@ func TestCreateNeverReady(t *testing.T) {
 	s.setStates("creating")
 	script := scriptPath(t, "action/entrypoint.sh")
 	out, _, err := run(t, script, map[string]string{
-		"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t",
-		"PGBRANCH_POLL_MAX": "3",
+		"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t",
+		"PGOVERLAY_POLL_MAX": "3",
 	})
 	if err == nil {
 		t.Fatalf("entrypoint succeeded although the branch never became ready:\n%s", out)
@@ -268,8 +268,8 @@ func TestCreateNeverReady(t *testing.T) {
 func TestCreateMissingEnv(t *testing.T) {
 	requireTools(t)
 	script := scriptPath(t, "action/entrypoint.sh")
-	if out, _, err := run(t, script, map[string]string{"PGBRANCH_TOKEN": "t"}); err == nil {
-		t.Fatalf("entrypoint succeeded without PGBRANCH_SERVER:\n%s", out)
+	if out, _, err := run(t, script, map[string]string{"PGOVERLAY_TOKEN": "t"}); err == nil {
+		t.Fatalf("entrypoint succeeded without PGOVERLAY_SERVER:\n%s", out)
 	}
 }
 
@@ -280,7 +280,7 @@ func TestDestroy(t *testing.T) {
 	t.Run("deletes the branch", func(t *testing.T) {
 		s := newStub(t)
 		out, _, err := run(t, script, map[string]string{
-			"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "act-tok", "PGBRANCH_BRANCH": "pr-77-ci",
+			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "act-tok", "PGOVERLAY_BRANCH": "pr-77-ci",
 		})
 		if err != nil {
 			t.Fatalf("destroy failed: %v\n%s", err, out)
@@ -299,7 +299,7 @@ func TestDestroy(t *testing.T) {
 		s := newStub(t)
 		s.setDelete(func(w http.ResponseWriter) { w.WriteHeader(http.StatusNotFound) })
 		if out, _, err := run(t, script, map[string]string{
-			"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t", "PGBRANCH_BRANCH": "gone",
+			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t", "PGOVERLAY_BRANCH": "gone",
 		}); err != nil {
 			t.Fatalf("destroy failed on 404: %v\n%s", err, out)
 		}
@@ -309,7 +309,7 @@ func TestDestroy(t *testing.T) {
 		s := newStub(t)
 		s.setDelete(func(w http.ResponseWriter) { w.WriteHeader(http.StatusInternalServerError) })
 		if out, _, err := run(t, script, map[string]string{
-			"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t", "PGBRANCH_BRANCH": "b",
+			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t", "PGOVERLAY_BRANCH": "b",
 		}); err == nil {
 			t.Fatalf("destroy succeeded on a 500:\n%s", out)
 		}
@@ -318,7 +318,7 @@ func TestDestroy(t *testing.T) {
 	t.Run("missing branch name fails", func(t *testing.T) {
 		s := newStub(t)
 		if out, _, err := run(t, script, map[string]string{
-			"PGBRANCH_SERVER": s.ts.URL, "PGBRANCH_TOKEN": "t",
+			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t",
 		}); err == nil {
 			t.Fatalf("destroy succeeded without a branch name:\n%s", out)
 		}

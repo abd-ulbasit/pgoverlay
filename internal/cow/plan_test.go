@@ -7,29 +7,29 @@ import (
 
 func TestSourceVolumeName(t *testing.T) {
 	// gen 1 keeps the legacy P1 name for backward compat with existing volumes
-	if got := SourceVolumeName("main", 1); got != "pgbranch-src-main" {
+	if got := SourceVolumeName("main", 1); got != "pgoverlay-src-main" {
 		t.Fatalf("gen1=%q", got)
 	}
-	if got := SourceVolumeName("main", 2); got != "pgbranch-src-main-g2" {
+	if got := SourceVolumeName("main", 2); got != "pgoverlay-src-main-g2" {
 		t.Fatalf("gen2=%q", got)
 	}
-	if got := SourceVolumeName("main", 10); got != "pgbranch-src-main-g10" {
+	if got := SourceVolumeName("main", 10); got != "pgoverlay-src-main-g10" {
 		t.Fatalf("gen10=%q", got)
 	}
 }
 
 func TestPlanBranch(t *testing.T) {
-	p := PlanBranch("pgbranch-br-pr-1-rw", "pgbranch-src-main", nil)
-	if p.RWVolume != "pgbranch-br-pr-1-rw" {
+	p := PlanBranch("pgoverlay-br-pr-1-rw", "pgoverlay-src-main", nil)
+	if p.RWVolume != "pgoverlay-br-pr-1-rw" {
 		t.Fatalf("RWVolume=%q", p.RWVolume)
 	}
-	if p.Lowers[0] != "/pgbranch/lower0/data" {
+	if p.Lowers[0] != "/pgoverlay/lower0/data" {
 		t.Fatalf("Lowers=%v", p.Lowers)
 	}
-	if p.LowerEnv() != "/pgbranch/lower0/data" {
+	if p.LowerEnv() != "/pgoverlay/lower0/data" {
 		t.Fatalf("LowerEnv=%q", p.LowerEnv())
 	}
-	if p.SourceVolume != "pgbranch-src-main" {
+	if p.SourceVolume != "pgoverlay-src-main" {
 		t.Fatalf("SourceVolume=%q", p.SourceVolume)
 	}
 	if len(p.LayerVolumes) != 0 {
@@ -38,23 +38,23 @@ func TestPlanBranch(t *testing.T) {
 }
 
 // PlanBranch with frozen layers: layer volumes are given newest-first and
-// mount at /pgbranch/lower1..N; each frozen rw volume holds its writes in an
+// mount at /pgoverlay/lower1..N; each frozen rw volume holds its writes in an
 // upper/ subdir, so its overlay lower path is <mount>/upper. lowerdir order
-// (= PGBRANCH_LOWERS) is NEWEST layer first, source volume LAST.
+// (= PGOVERLAY_LOWERS) is NEWEST layer first, source volume LAST.
 func TestPlanBranchWithLayerChain(t *testing.T) {
 	cases := []struct {
 		name       string
 		layers     []string
 		wantLowers string
 	}{
-		{"no layers", nil, "/pgbranch/lower0/data"},
-		{"one layer", []string{"pgbranch-br-p-rw"},
-			"/pgbranch/lower1/upper:/pgbranch/lower0/data"},
-		{"two layers", []string{"pgbranch-br-p-rw-g2", "pgbranch-br-p-rw"},
-			"/pgbranch/lower1/upper:/pgbranch/lower2/upper:/pgbranch/lower0/data"},
+		{"no layers", nil, "/pgoverlay/lower0/data"},
+		{"one layer", []string{"pgoverlay-br-p-rw"},
+			"/pgoverlay/lower1/upper:/pgoverlay/lower0/data"},
+		{"two layers", []string{"pgoverlay-br-p-rw-g2", "pgoverlay-br-p-rw"},
+			"/pgoverlay/lower1/upper:/pgoverlay/lower2/upper:/pgoverlay/lower0/data"},
 	}
 	for _, c := range cases {
-		p := PlanBranch("pgbranch-br-c-rw", "pgbranch-src-main", c.layers)
+		p := PlanBranch("pgoverlay-br-c-rw", "pgoverlay-src-main", c.layers)
 		if got := p.LowerEnv(); got != c.wantLowers {
 			t.Errorf("%s: LowerEnv=%q want %q", c.name, got, c.wantLowers)
 		}
@@ -69,7 +69,7 @@ func TestPlanBranchWithLayerChain(t *testing.T) {
 				t.Errorf("%s: LayerVolumes[%d]=%q want %q (order must be preserved: newest first)", c.name, i, p.LayerVolumes[i], c.layers[i])
 			}
 		}
-		if p.SourceVolume != "pgbranch-src-main" || p.RWVolume != "pgbranch-br-c-rw" {
+		if p.SourceVolume != "pgoverlay-src-main" || p.RWVolume != "pgoverlay-br-c-rw" {
 			t.Errorf("%s: plan %+v", c.name, p)
 		}
 	}
@@ -77,10 +77,10 @@ func TestPlanBranchWithLayerChain(t *testing.T) {
 
 // LowerMountTarget maps a lower index to its in-container mount point.
 func TestLowerMountTarget(t *testing.T) {
-	if got := LowerMountTarget(0); got != "/pgbranch/lower0" {
+	if got := LowerMountTarget(0); got != "/pgoverlay/lower0" {
 		t.Fatalf("LowerMountTarget(0)=%q", got)
 	}
-	if got := LowerMountTarget(2); got != "/pgbranch/lower2" {
+	if got := LowerMountTarget(2); got != "/pgoverlay/lower2" {
 		t.Fatalf("LowerMountTarget(2)=%q", got)
 	}
 }
@@ -88,13 +88,13 @@ func TestLowerMountTarget(t *testing.T) {
 // BranchRWVolumeNameGen names the fresh rw volume a branch moves onto after
 // each freeze; gen 1 is the original (legacy) name.
 func TestBranchRWVolumeNameGen(t *testing.T) {
-	if got := BranchRWVolumeNameGen("pr-1", 1); got != "pgbranch-br-pr-1-rw" {
+	if got := BranchRWVolumeNameGen("pr-1", 1); got != "pgoverlay-br-pr-1-rw" {
 		t.Fatalf("gen1=%q", got)
 	}
-	if got := BranchRWVolumeNameGen("pr-1", 2); got != "pgbranch-br-pr-1-rw-g2" {
+	if got := BranchRWVolumeNameGen("pr-1", 2); got != "pgoverlay-br-pr-1-rw-g2" {
 		t.Fatalf("gen2=%q", got)
 	}
-	if got := BranchRWVolumeNameGen("pr-1", 3); got != "pgbranch-br-pr-1-rw-g3" {
+	if got := BranchRWVolumeNameGen("pr-1", 3); got != "pgoverlay-br-pr-1-rw-g3" {
 		t.Fatalf("gen3=%q", got)
 	}
 }
@@ -102,9 +102,9 @@ func TestBranchRWVolumeNameGen(t *testing.T) {
 func TestEntrypointScriptContent(t *testing.T) {
 	for _, want := range []string{
 		"mount -t overlay overlay",
-		"lowerdir=${PGBRANCH_LOWERS}",
-		"upperdir=/pgbranch/rw/upper",
-		"workdir=/pgbranch/rw/work",
+		"lowerdir=${PGOVERLAY_LOWERS}",
+		"upperdir=/pgoverlay/rw/upper",
+		"workdir=/pgoverlay/rw/work",
 		"rm -f \"$PGDATA/postmaster.pid\"",
 		"exec docker-entrypoint.sh postgres -c recovery_init_sync_method=syncfs",
 	} {
@@ -138,10 +138,10 @@ func TestPlannerOverlayNames(t *testing.T) {
 	if got := p.SourceLayerName("main", 1); got != SourceVolumeName("main", 1) {
 		t.Fatalf("gen1 = %q", got)
 	}
-	if got := p.SourceLayerName("main", 3); got != "pgbranch-src-main-g3" {
+	if got := p.SourceLayerName("main", 3); got != "pgoverlay-src-main-g3" {
 		t.Fatalf("gen3 = %q", got)
 	}
-	if got := p.BranchLayerName("pr-1"); got != "pgbranch-br-pr-1-rw" {
+	if got := p.BranchLayerName("pr-1"); got != "pgoverlay-br-pr-1-rw" {
 		t.Fatalf("branch layer = %q", got)
 	}
 	if p.Entrypoint() != EntrypointScript {
@@ -153,13 +153,13 @@ func TestPlannerCSINames(t *testing.T) {
 	// csi "volumes" are PVCs; they reuse the overlay volume names (valid
 	// DNS-1123 PVC names) and the direct (no-overlay) entrypoint.
 	p := Planner{Backend: BackendCSI}
-	if got := p.SourceLayerName("main", 1); got != "pgbranch-src-main" {
+	if got := p.SourceLayerName("main", 1); got != "pgoverlay-src-main" {
 		t.Fatalf("gen1 = %q", got)
 	}
-	if got := p.SourceLayerName("main", 3); got != "pgbranch-src-main-g3" {
+	if got := p.SourceLayerName("main", 3); got != "pgoverlay-src-main-g3" {
 		t.Fatalf("gen3 = %q", got)
 	}
-	if got := p.BranchLayerName("pr-1"); got != "pgbranch-br-pr-1-rw" {
+	if got := p.BranchLayerName("pr-1"); got != "pgoverlay-br-pr-1-rw" {
 		t.Fatalf("branch layer = %q", got)
 	}
 	if p.Entrypoint() != EntrypointScriptDirect {
@@ -168,23 +168,23 @@ func TestPlannerCSINames(t *testing.T) {
 }
 
 func TestPlannerZFSNames(t *testing.T) {
-	p := Planner{Backend: BackendZFS, Dataset: "tank/pgbranch"}
+	p := Planner{Backend: BackendZFS, Dataset: "tank/pgoverlay"}
 	// zfs datasets are namespaced under the configured prefix; generation 1
 	// has no legacy exception (the backend is new)
-	if got := p.SourceLayerName("main", 1); got != "tank/pgbranch/src-main-g1" {
+	if got := p.SourceLayerName("main", 1); got != "tank/pgoverlay/src-main-g1" {
 		t.Fatalf("gen1 = %q", got)
 	}
-	if got := p.SourceLayerName("main", 4); got != "tank/pgbranch/src-main-g4" {
+	if got := p.SourceLayerName("main", 4); got != "tank/pgoverlay/src-main-g4" {
 		t.Fatalf("gen4 = %q", got)
 	}
-	if got := p.BranchLayerName("pr-1"); got != "tank/pgbranch/br-pr-1" {
+	if got := p.BranchLayerName("pr-1"); got != "tank/pgoverlay/br-pr-1" {
 		t.Fatalf("branch layer = %q", got)
 	}
-	if got := p.SnapshotName("tank/pgbranch/src-main-g1", "pr-1"); got != "tank/pgbranch/src-main-g1@br-pr-1" {
+	if got := p.SnapshotName("tank/pgoverlay/src-main-g1", "pr-1"); got != "tank/pgoverlay/src-main-g1@br-pr-1" {
 		t.Fatalf("snapshot = %q", got)
 	}
 	// default zfs mountpoint: /<dataset>
-	if got := p.Mountpoint("tank/pgbranch/br-pr-1"); got != "/tank/pgbranch/br-pr-1" {
+	if got := p.Mountpoint("tank/pgoverlay/br-pr-1"); got != "/tank/pgoverlay/br-pr-1" {
 		t.Fatalf("mountpoint = %q", got)
 	}
 	if p.Entrypoint() != EntrypointScriptDirect {
@@ -193,19 +193,19 @@ func TestPlannerZFSNames(t *testing.T) {
 }
 
 func TestPlannerZFSCommands(t *testing.T) {
-	p := Planner{Backend: BackendZFS, Dataset: "tank/pgbranch"}
+	p := Planner{Backend: BackendZFS, Dataset: "tank/pgoverlay"}
 	cases := []struct {
 		name string
 		got  []string
 		want string
 	}{
-		{"create", p.ZFSCreate("tank/pgbranch/src-main-g1"), "zfs create -p tank/pgbranch/src-main-g1"},
-		{"snapshot", p.ZFSSnapshot("tank/pgbranch/src-main-g1", "pr-1"), "zfs snapshot tank/pgbranch/src-main-g1@br-pr-1"},
-		{"clone", p.ZFSClone("tank/pgbranch/src-main-g1", "pr-1"), "zfs clone tank/pgbranch/src-main-g1@br-pr-1 tank/pgbranch/br-pr-1"},
-		{"destroy clone", p.ZFSDestroyClone("pr-1"), "zfs destroy -r tank/pgbranch/br-pr-1"},
-		{"destroy snapshot", p.ZFSDestroySnapshot("tank/pgbranch/src-main-g1", "pr-1"), "zfs destroy -r tank/pgbranch/src-main-g1@br-pr-1"},
-		{"destroy dataset", p.ZFSDestroyDataset("tank/pgbranch/src-main-g1"), "zfs destroy -r tank/pgbranch/src-main-g1"},
-		{"used", p.ZFSUsed("tank/pgbranch/br-pr-1"), "zfs list -Hp -o used tank/pgbranch/br-pr-1"},
+		{"create", p.ZFSCreate("tank/pgoverlay/src-main-g1"), "zfs create -p tank/pgoverlay/src-main-g1"},
+		{"snapshot", p.ZFSSnapshot("tank/pgoverlay/src-main-g1", "pr-1"), "zfs snapshot tank/pgoverlay/src-main-g1@br-pr-1"},
+		{"clone", p.ZFSClone("tank/pgoverlay/src-main-g1", "pr-1"), "zfs clone tank/pgoverlay/src-main-g1@br-pr-1 tank/pgoverlay/br-pr-1"},
+		{"destroy clone", p.ZFSDestroyClone("pr-1"), "zfs destroy -r tank/pgoverlay/br-pr-1"},
+		{"destroy snapshot", p.ZFSDestroySnapshot("tank/pgoverlay/src-main-g1", "pr-1"), "zfs destroy -r tank/pgoverlay/src-main-g1@br-pr-1"},
+		{"destroy dataset", p.ZFSDestroyDataset("tank/pgoverlay/src-main-g1"), "zfs destroy -r tank/pgoverlay/src-main-g1"},
+		{"used", p.ZFSUsed("tank/pgoverlay/br-pr-1"), "zfs list -Hp -o used tank/pgoverlay/br-pr-1"},
 	}
 	for _, c := range cases {
 		if got := strings.Join(c.got, " "); got != c.want {
@@ -227,7 +227,7 @@ func TestZFSEntrypointScriptContent(t *testing.T) {
 			t.Fatalf("zfs entrypoint script missing %q", want)
 		}
 	}
-	for _, reject := range []string{"mount -t overlay", "lowerdir", "upperdir", "workdir", "PGBRANCH_LOWERS"} {
+	for _, reject := range []string{"mount -t overlay", "lowerdir", "upperdir", "workdir", "PGOVERLAY_LOWERS"} {
 		if strings.Contains(EntrypointScriptDirect, reject) {
 			t.Fatalf("zfs entrypoint script must not contain %q", reject)
 		}
@@ -237,7 +237,7 @@ func TestZFSEntrypointScriptContent(t *testing.T) {
 func TestDirectDataPath(t *testing.T) {
 	// seeding writes the cluster into <layer>/data; the clone mountpoint is
 	// bind-mounted at RWPath, so PGDATA is RWPath/data
-	if DirectDataPath != "/pgbranch/rw/data" {
+	if DirectDataPath != "/pgoverlay/rw/data" {
 		t.Fatalf("DirectDataPath = %q", DirectDataPath)
 	}
 }

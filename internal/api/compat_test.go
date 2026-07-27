@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
 // The /v1 REST surface is a backward-compatibility promise: fields may be

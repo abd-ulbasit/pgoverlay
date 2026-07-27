@@ -46,9 +46,9 @@ type kubeStorage interface {
 	createVolume(ctx context.Context, name string, labels map[string]string) error
 	removeVolume(ctx context.Context, name string) error
 	cloneVolume(ctx context.Context, src, dst string, labels map[string]string) error
-	// listVolumes returns the names of every pgbranch-managed volume owned by
-	// instanceID (hostPath: dirs under the data root whose .pgbranch-labels.json
-	// carries the id; csi: PVCs labelled pgbranch.managed=true,pgbranch.instance=<id>).
+	// listVolumes returns the names of every pgoverlay-managed volume owned by
+	// instanceID (hostPath: dirs under the data root whose .pgoverlay-labels.json
+	// carries the id; csi: PVCs labelled pgoverlay.managed=true,pgoverlay.instance=<id>).
 	listVolumes(ctx context.Context, instanceID string) ([]string, error)
 	// podVolumes translates driver mounts to pod volumes + container mounts.
 	podVolumes(ms []Mount) ([]corev1.Volume, []corev1.VolumeMount)
@@ -107,7 +107,7 @@ func NewKubeDriver(kubeconfig, namespace, nodeName, dataRoot string) (*KubeDrive
 		namespace = "default"
 	}
 	if dataRoot == "" {
-		dataRoot = "/var/lib/pgbranch"
+		dataRoot = "/var/lib/pgoverlay"
 	}
 	if nodeName == "" {
 		return nil, fmt.Errorf("kube driver requires a storage node name")
@@ -119,13 +119,13 @@ func NewKubeDriver(kubeconfig, namespace, nodeName, dataRoot string) (*KubeDrive
 
 // CSIConfig configures the csi storage strategy.
 type CSIConfig struct {
-	// StorageClass provisions every pgbranch PVC; it must support PVC
+	// StorageClass provisions every pgoverlay PVC; it must support PVC
 	// dataSource cloning (or VolumeSnapshots when SnapshotClass is set).
 	StorageClass string
 	// SnapshotClass switches branch cloning from PVC dataSource clones to
 	// VolumeSnapshot + restore ("" = direct PVC clones).
 	SnapshotClass string
-	// VolumeSize is the storage request of every pgbranch PVC ("" = 10Gi).
+	// VolumeSize is the storage request of every pgoverlay PVC ("" = 10Gi).
 	VolumeSize string
 }
 
@@ -182,7 +182,7 @@ func (d *KubeDriver) CreateVolume(ctx context.Context, name string, labels map[s
 	return nil
 }
 
-// ListManagedVolumes returns every pgbranch-managed volume name (delegated to
+// ListManagedVolumes returns every pgoverlay-managed volume name (delegated to
 // the storage strategy: hostPath dirs or labelled PVCs).
 func (d *KubeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
 	return d.storage.listVolumes(ctx, instanceID)
@@ -252,15 +252,15 @@ func (s *hostPathStorage) podVolumes(ms []Mount) ([]corev1.Volume, []corev1.Volu
 }
 
 // createVolume mkdirs the volume dir on the storage node via a helper pod and
-// records the labels in <vol>/.pgbranch-labels.json.
+// records the labels in <vol>/.pgoverlay-labels.json.
 func (s *hostPathStorage) createVolume(ctx context.Context, name string, labels map[string]string) error {
 	j, err := json.Marshal(labels)
 	if err != nil {
 		return err
 	}
 	dir := dataRootMountPath + "/" + name
-	cmd := fmt.Sprintf(`mkdir -p %s && printf '%%s' "$PGBRANCH_VOLUME_LABELS" > %s/%s`, dir, dir, volumeLabelsFile)
-	_, err = s.runRootHelper(ctx, cmd, []string{"PGBRANCH_VOLUME_LABELS=" + string(j)})
+	cmd := fmt.Sprintf(`mkdir -p %s && printf '%%s' "$PGOVERLAY_VOLUME_LABELS" > %s/%s`, dir, dir, volumeLabelsFile)
+	_, err = s.runRootHelper(ctx, cmd, []string{"PGOVERLAY_VOLUME_LABELS=" + string(j)})
 	return err
 }
 
@@ -279,14 +279,14 @@ func (s *hostPathStorage) cloneVolume(ctx context.Context, src, dst string, labe
 		return err
 	}
 	srcDir, dstDir := dataRootMountPath+"/"+src, dataRootMountPath+"/"+dst
-	cmd := fmt.Sprintf(`rm -rf %s && mkdir -p %s && cp -a %s/. %s/ && printf '%%s' "$PGBRANCH_VOLUME_LABELS" > %s/%s`,
+	cmd := fmt.Sprintf(`rm -rf %s && mkdir -p %s && cp -a %s/. %s/ && printf '%%s' "$PGOVERLAY_VOLUME_LABELS" > %s/%s`,
 		dstDir, dstDir, srcDir, dstDir, dstDir, volumeLabelsFile)
-	_, err = s.runRootHelper(ctx, cmd, []string{"PGBRANCH_VOLUME_LABELS=" + string(j)})
+	_, err = s.runRootHelper(ctx, cmd, []string{"PGOVERLAY_VOLUME_LABELS=" + string(j)})
 	return err
 }
 
 // listVolumes enumerates the volume dirs under the data root and returns only
-// those whose .pgbranch-labels.json records pgbranch.instance=<instanceID>.
+// those whose .pgoverlay-labels.json records pgoverlay.instance=<instanceID>.
 // Each managed volume dir is emitted on its own line followed by its label
 // file's contents on the next (NUL-padded marker lines bracket each entry); a
 // dir whose marker is missing or names a different instance is foreign and
@@ -326,7 +326,7 @@ func (s *hostPathStorage) listVolumes(ctx context.Context, instanceID string) ([
 // listVolumesSentinel brackets each volume entry in the hostPath listVolumes
 // helper output so a name can be split cleanly from its (possibly empty) label
 // JSON; chosen to never collide with a volume name or JSON content.
-const listVolumesSentinel = "\x00--pgbranch-vol--\x00"
+const listVolumesSentinel = "\x00--pgoverlay-vol--\x00"
 
 // runRootHelper runs sh -c cmd in a helper pod with the whole data root
 // mounted at dataRootMountPath (needed to create/remove volume dirs).
@@ -501,7 +501,7 @@ func (d *KubeDriver) StopRemove(ctx context.Context, id string) error {
 
 func (d *KubeDriver) ListManaged(ctx context.Context) ([]ContainerInfo, error) {
 	pods, err := d.cs.CoreV1().Pods(d.namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: "pgbranch.managed=true,pgbranch.role=branch"})
+		metav1.ListOptions{LabelSelector: "pgoverlay.managed=true,pgoverlay.role=branch"})
 	if err != nil {
 		return nil, err
 	}

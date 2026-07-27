@@ -1,9 +1,9 @@
 export interface AcquireOptions {
-  /** branchd base URL. Default: PGBRANCH_SERVER. Required (here or in env). */
+  /** branchd base URL. Default: PGOVERLAY_SERVER. Required (here or in env). */
   server?: string;
-  /** API bearer token. Default: PGBRANCH_TOKEN. */
+  /** API bearer token. Default: PGOVERLAY_TOKEN. */
   token?: string;
-  /** Source to branch from. Default: PGBRANCH_TEST_SOURCE, else "main". */
+  /** Source to branch from. Default: PGOVERLAY_TEST_SOURCE, else "main". */
   source?: string;
   /** Branch TTL in seconds — a server-side safety net; destroy() is the
    * primary cleanup. 0 = never reaped. Default: 3600. */
@@ -12,7 +12,7 @@ export interface AcquireOptions {
    * Default: a generated "t-js-<random>". */
   name?: string;
   /** Database password used to build dsn/proxyDsn when the server does not
-   * return a per-branch one. Default: PGBRANCH_PASSWORD. */
+   * return a per-branch one. Default: PGOVERLAY_PASSWORD. */
   password?: string;
   /** Ready-poll interval in milliseconds. Default: 1000. */
   pollIntervalMs?: number;
@@ -32,7 +32,7 @@ export interface Branch {
   database: string;
   /** postgres:// URL targeting the branch directly. */
   dsn: string;
-  /** postgres:// URL through the pgbranch router (server host, port 6432,
+  /** postgres:// URL through the pgoverlay router (server host, port 6432,
    * database "db@branch"). */
   proxyDsn: string;
   /** Delete the branch. Idempotent: a 404 (already gone) is not an error. */
@@ -40,7 +40,7 @@ export interface Branch {
 }
 
 /**
- * Create a copy-on-write Postgres branch on a pgbranch server and wait until
+ * Create a copy-on-write Postgres branch on a pgoverlay server and wait until
  * it is ready. Call branch.destroy() when the test finishes; the TTL reaps
  * leaked branches as a fallback.
  */

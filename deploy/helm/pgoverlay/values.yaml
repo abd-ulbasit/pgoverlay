@@ -1,4 +1,4 @@
-# pgbranch has two storage modes (docs/kubernetes.md): csi — branches as PVC
+# pgoverlay has two storage modes (docs/kubernetes.md): csi — branches as PVC
 # clones, schedulable on any node, the recommended production-ish deployment
 # — and hostpath (default), which keeps all CoW data on ONE designated
 # storage node (single-node/dev scope). branchd itself is always pinned to
@@ -9,7 +9,7 @@ node: ""
 
 # Host directory on the storage node holding all CoW volumes. branchd's own
 # state (sqlite registry) lives under <dataRoot>/state.
-dataRoot: /var/lib/pgbranch
+dataRoot: /var/lib/pgoverlay
 
 # CoW backend: this chart deploys branchd with the default OverlayFS backend
 # (hostpath storage) or the csi backend (storage.mode=csi). The experimental
@@ -27,12 +27,12 @@ dataRoot: /var/lib/pgbranch
 #    `node` is still required: branchd itself keeps its sqlite state on it.
 storage:
   mode: hostpath
-  # REQUIRED when mode=csi: StorageClass for all pgbranch PVCs.
+  # REQUIRED when mode=csi: StorageClass for all pgoverlay PVCs.
   storageClass: ""
   # Optional (mode=csi): VolumeSnapshotClass — branches then clone via
   # VolumeSnapshot + restore instead of direct PVC dataSource clones.
   snapshotClass: ""
-  # Optional (mode=csi): size of every pgbranch PVC (branchd defaults to
+  # Optional (mode=csi): size of every pgoverlay PVC (branchd defaults to
   # 10Gi; CSI drivers thin-provision, so roomy is cheap).
   volumeSize: ""
 
@@ -65,17 +65,17 @@ persistence:
 replicaCount: 1
 
 # HA leader election (branchd --leader-elect). When on (or replicaCount > 1),
-# replicas contend for a coordination.k8s.io Lease (pgbranch-branchd) in the
+# replicas contend for a coordination.k8s.io Lease (pgoverlay-branchd) in the
 # release namespace; the chart adds the leases RBAC and wires POD_NAME. Off by
 # default for the single-replica deployment. See docs/ha.md.
 leaderElection:
   enabled: false
 
-# Fully qualified on purpose. An unqualified name like "pgbranch/branchd"
-# resolves to docker.io/pgbranch/branchd — a namespace nobody here owns, so a
+# Fully qualified on purpose. An unqualified name like "pgoverlay/branchd"
+# resolves to docker.io/pgoverlay/branchd — a namespace nobody here owns, so a
 # cluster that missed the side-load would silently pull whoever claims it next.
 image:
-  repository: ghcr.io/abd-ulbasit/pgbranch-branchd
+  repository: ghcr.io/abd-ulbasit/pgoverlay-branchd
   tag: dev
   # The dev tag is built locally (make docker-build) and side-loaded
   # (e.g. `kind load`); change to Always for a pushed registry image.
@@ -189,12 +189,12 @@ networkPolicy:
     - protocol: TCP
       port: 5432
 
-# Optional GitHub webhook service (pgbranch-github): branch-per-PR. Disabled
+# Optional GitHub webhook service (pgoverlay-github): branch-per-PR. Disabled
 # by default; see docs/github-app.md for the full setup walkthrough.
 ghook:
   enabled: false
   image:
-    repository: ghcr.io/abd-ulbasit/pgbranch-ghook
+    repository: ghcr.io/abd-ulbasit/pgoverlay-ghook
     tag: dev
     pullPolicy: IfNotPresent
   # Webhook HMAC secret (X-Hub-Signature-256). Exactly one is required when
@@ -209,7 +209,7 @@ ghook:
   webhookSecret: ""
   existingSecret: ""
   # GitHub credentials enable the live connect-info PR comment and the
-  # pgbranch/branch commit status. Two auth modes, mutually exclusive:
+  # pgoverlay/branch commit status. Two auth modes, mutually exclusive:
   #
   #  - GitHub App (recommended): set appId + appPrivateKey; the service
   #    mints short-lived installation tokens itself (nothing to rotate, bot
@@ -226,7 +226,7 @@ ghook:
   appPrivateKey: ""
   # GitHub API token (PAT mode); mutually exclusive with appId.
   githubToken: ""
-  # REQUIRED when enabled: pgbranch source to create PR branches from.
+  # REQUIRED when enabled: pgoverlay source to create PR branches from.
   source: ""
   # Branch TTL (Go duration, e.g. 72h); empty = branches never expire.
   ttl: 72h
@@ -244,7 +244,7 @@ ghook:
   # git ref they already know, e.g. Vercel's VERCEL_GIT_COMMIT_REF, which is
   # present from the first build before any PR association exists).
   branchNaming: ""
-  # host[:port] of the pgbranch proxy as reachable by developers (shown in
+  # host[:port] of the pgoverlay proxy as reachable by developers (shown in
   # PR comments), e.g. a NodePort or LB address for proxy.service.
   proxyHost: ""
   # GitHub API base URL override (GitHub Enterprise).

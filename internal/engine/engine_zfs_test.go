@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // Unit tests for the zfs backend: every layer step must become a privileged
@@ -23,13 +23,13 @@ func zfsEngine(t *testing.T, d runtime.Driver) (*Engine, *registry.Registry) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { r.Close() })
-	return NewWithPlanner(r, d, "postgres:17", cow.Planner{Backend: cow.BackendZFS, Dataset: "tank/pgbranch"}), r
+	return NewWithPlanner(r, d, "postgres:17", cow.Planner{Backend: cow.BackendZFS, Dataset: "tank/pgoverlay"}), r
 }
 
 // readyZFSSource registers a ready source whose layer is a zfs dataset.
 func readyZFSSource(t *testing.T, r *registry.Registry) *registry.Source {
 	t.Helper()
-	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "tank/pgbranch/src-main-g1"}
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "tank/pgoverlay/src-main-g1"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}
@@ -81,14 +81,14 @@ func TestZFSAddSourceCreatesDatasetAndSeedsMountpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Volume != "tank/pgbranch/src-main-g1" {
-		t.Fatalf("source layer = %q, want tank/pgbranch/src-main-g1", got.Volume)
+	if got.Volume != "tank/pgoverlay/src-main-g1" {
+		t.Fatalf("source layer = %q, want tank/pgoverlay/src-main-g1", got.Volume)
 	}
 	if got.State != registry.SourceReady {
 		t.Fatalf("state = %q", got.State)
 	}
 	// the dataset is created by a privileged zfs helper, not a docker volume
-	findZFSHelper(t, d.helpers, "zfs create -p tank/pgbranch/src-main-g1")
+	findZFSHelper(t, d.helpers, "zfs create -p tank/pgoverlay/src-main-g1")
 	if len(d.volumes) != 0 {
 		t.Fatalf("zfs mode created docker volumes: %v", d.volumes)
 	}
@@ -98,8 +98,8 @@ func TestZFSAddSourceCreatesDatasetAndSeedsMountpoint(t *testing.T) {
 		for _, m := range h.Mounts {
 			if m.Target == "/seed" {
 				seeded = true
-				if m.Kind != runtime.MountHostPath || m.Volume != "/tank/pgbranch/src-main-g1" {
-					t.Fatalf("seed mount = %+v, want hostpath /tank/pgbranch/src-main-g1", m)
+				if m.Kind != runtime.MountHostPath || m.Volume != "/tank/pgoverlay/src-main-g1" {
+					t.Fatalf("seed mount = %+v, want hostpath /tank/pgoverlay/src-main-g1", m)
 				}
 			}
 		}
@@ -121,12 +121,12 @@ func TestZFSCreateBranchSnapshotsClonesAndMountsClone(t *testing.T) {
 	if b.State != registry.BranchReady {
 		t.Fatalf("state = %q", b.State)
 	}
-	if b.RWVolume != "tank/pgbranch/br-pr-1" {
+	if b.RWVolume != "tank/pgoverlay/br-pr-1" {
 		t.Fatalf("branch layer = %q, want the clone dataset", b.RWVolume)
 	}
 	// snapshot then clone, both privileged zfs helpers, in that order
-	findZFSHelper(t, d.helpers, "zfs snapshot tank/pgbranch/src-main-g1@br-pr-1")
-	findZFSHelper(t, d.helpers, "zfs clone tank/pgbranch/src-main-g1@br-pr-1 tank/pgbranch/br-pr-1")
+	findZFSHelper(t, d.helpers, "zfs snapshot tank/pgoverlay/src-main-g1@br-pr-1")
+	findZFSHelper(t, d.helpers, "zfs clone tank/pgoverlay/src-main-g1@br-pr-1 tank/pgoverlay/br-pr-1")
 	if snap, clone := helperIndex(d.helpers, "zfs snapshot"), helperIndex(d.helpers, "zfs clone"); snap > clone {
 		t.Fatalf("snapshot (helper %d) must precede clone (helper %d)", snap, clone)
 	}
@@ -140,10 +140,10 @@ func TestZFSCreateBranchSnapshotsClonesAndMountsClone(t *testing.T) {
 	if ep.Privileged {
 		t.Fatal("entrypoint install must not be privileged")
 	}
-	if len(ep.Env) != 1 || ep.Env[0] != "PGBRANCH_ENTRYPOINT="+cow.EntrypointScriptDirect {
+	if len(ep.Env) != 1 || ep.Env[0] != "PGOVERLAY_ENTRYPOINT="+cow.EntrypointScriptDirect {
 		t.Fatalf("entrypoint helper env = %v, want the zfs entrypoint script", ep.Env)
 	}
-	if len(ep.Mounts) != 1 || ep.Mounts[0].Kind != runtime.MountHostPath || ep.Mounts[0].Volume != "/tank/pgbranch/br-pr-1" {
+	if len(ep.Mounts) != 1 || ep.Mounts[0].Kind != runtime.MountHostPath || ep.Mounts[0].Volume != "/tank/pgoverlay/br-pr-1" {
 		t.Fatalf("entrypoint helper mounts = %+v, want hostpath clone mountpoint", ep.Mounts)
 	}
 	// branch container: clone mountpoint bind-mounted rw, PGDATA in its
@@ -153,7 +153,7 @@ func TestZFSCreateBranchSnapshotsClonesAndMountsClone(t *testing.T) {
 	}
 	bs := d.branches[0]
 	if len(bs.Mounts) != 1 || bs.Mounts[0].Kind != runtime.MountHostPath ||
-		bs.Mounts[0].Volume != "/tank/pgbranch/br-pr-1" || bs.Mounts[0].Target != cow.RWPath || bs.Mounts[0].ReadOnly {
+		bs.Mounts[0].Volume != "/tank/pgoverlay/br-pr-1" || bs.Mounts[0].Target != cow.RWPath || bs.Mounts[0].ReadOnly {
 		t.Fatalf("branch mounts = %+v, want rw hostpath clone mountpoint at %s", bs.Mounts, cow.RWPath)
 	}
 	if len(bs.Env) != 1 || bs.Env[0] != "PGDATA="+cow.DirectDataPath {
@@ -175,11 +175,11 @@ func TestZFSDestroyBranchDestroysCloneThenSnapshot(t *testing.T) {
 	if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
 		t.Fatal(err)
 	}
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-1")
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/src-main-g1@br-pr-1")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/br-pr-1")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/src-main-g1@br-pr-1")
 	// the clone depends on the snapshot: it must be destroyed first
-	ci := helperIndex(d.helpers, "zfs destroy -r tank/pgbranch/br-pr-1")
-	si := helperIndex(d.helpers, "zfs destroy -r tank/pgbranch/src-main-g1@br-pr-1")
+	ci := helperIndex(d.helpers, "zfs destroy -r tank/pgoverlay/br-pr-1")
+	si := helperIndex(d.helpers, "zfs destroy -r tank/pgoverlay/src-main-g1@br-pr-1")
 	if ci > si {
 		t.Fatalf("clone destroy (helper %d) must precede snapshot destroy (helper %d)", ci, si)
 	}
@@ -201,8 +201,8 @@ func TestZFSCreateBranchUnwindsSnapshotAndClone(t *testing.T) {
 		t.Fatal("want error")
 	}
 	// compensations must zfs-destroy both the clone and the snapshot
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-1")
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/src-main-g1@br-pr-1")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/br-pr-1")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/src-main-g1@br-pr-1")
 	b, err := r.GetBranchByName("pr-1")
 	if err != nil {
 		t.Fatal(err)
@@ -231,13 +231,13 @@ func TestZFSResetBranchReclones(t *testing.T) {
 		return
 	}
 	// reset destroys the old clone+snapshot and re-snapshots/re-clones
-	if n := count("zfs snapshot tank/pgbranch/src-main-g1@br-pr-1"); n != 2 {
+	if n := count("zfs snapshot tank/pgoverlay/src-main-g1@br-pr-1"); n != 2 {
 		t.Fatalf("snapshot invocations = %d, want 2 (create + reset)", n)
 	}
 	if n := count("zfs clone "); n != 2 {
 		t.Fatalf("clone invocations = %d, want 2", n)
 	}
-	if n := count("zfs destroy -r tank/pgbranch/br-pr-1"); n != 1 {
+	if n := count("zfs destroy -r tank/pgoverlay/br-pr-1"); n != 1 {
 		t.Fatalf("clone destroy invocations = %d, want 1", n)
 	}
 }
@@ -260,7 +260,7 @@ func TestZFSBranchUsage(t *testing.T) {
 	}
 	// measured by zfs (space unique to the clone), not du on a volume
 	last := d.helpers[len(d.helpers)-1]
-	if !strings.Contains(helperCmd(last), "zfs list -Hp -o used tank/pgbranch/br-pr-1") {
+	if !strings.Contains(helperCmd(last), "zfs list -Hp -o used tank/pgoverlay/br-pr-1") {
 		t.Fatalf("usage helper cmd = %q, want zfs list -Hp -o used", helperCmd(last))
 	}
 	if !last.Privileged {
@@ -276,7 +276,7 @@ func TestZFSRemoveSourceDestroysDataset(t *testing.T) {
 	if err := e.RemoveSource(context.Background(), "main"); err != nil {
 		t.Fatal(err)
 	}
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/src-main-g1")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/src-main-g1")
 	if _, err := r.GetSourceByName("main"); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("want source gone, got %v", err)
 	}
@@ -294,12 +294,12 @@ func TestZFSRefreshSourceCreatesNextGenerationDataset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Generation != 2 || s.Volume != "tank/pgbranch/src-main-g2" {
+	if s.Generation != 2 || s.Volume != "tank/pgoverlay/src-main-g2" {
 		t.Fatalf("source after refresh: gen=%d layer=%q", s.Generation, s.Volume)
 	}
-	findZFSHelper(t, d.helpers, "zfs create -p tank/pgbranch/src-main-g2")
+	findZFSHelper(t, d.helpers, "zfs create -p tank/pgoverlay/src-main-g2")
 	// no live branches -> the old generation dataset is GC'd
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/src-main-g1")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/src-main-g1")
 }
 
 // ZFS branch-from-branch is block-level CoW: snapshot the parent's clone and
@@ -319,14 +319,14 @@ func TestZFSCreateBranchFromSnapshotsParentClone(t *testing.T) {
 	if b.State != registry.BranchReady || b.ParentBranchName != "pr-1" {
 		t.Fatalf("child %+v", b)
 	}
-	if b.RWVolume != "tank/pgbranch/br-pr-2" || b.SourceVolume != "tank/pgbranch/br-pr-1" {
+	if b.RWVolume != "tank/pgoverlay/br-pr-2" || b.SourceVolume != "tank/pgoverlay/br-pr-1" {
 		t.Fatalf("child datasets: rw=%q source=%q", b.RWVolume, b.SourceVolume)
 	}
 	// snapshot the PARENT'S CLONE, then clone it
-	findZFSHelper(t, d.helpers, "zfs snapshot tank/pgbranch/br-pr-1@br-pr-2")
-	findZFSHelper(t, d.helpers, "zfs clone tank/pgbranch/br-pr-1@br-pr-2 tank/pgbranch/br-pr-2")
+	findZFSHelper(t, d.helpers, "zfs snapshot tank/pgoverlay/br-pr-1@br-pr-2")
+	findZFSHelper(t, d.helpers, "zfs clone tank/pgoverlay/br-pr-1@br-pr-2 tank/pgoverlay/br-pr-2")
 	// no freeze: the parent keeps running, is never checkpointed or restarted
-	if !d.containers["cid-pgbranch-br-pr-1"] {
+	if !d.containers["cid-pgoverlay-br-pr-1"] {
 		t.Fatal("parent container was stopped")
 	}
 	if d.starts != 2 {
@@ -371,12 +371,12 @@ func TestZFSDestroyParentWithChildRefusedAndChildCleansUp(t *testing.T) {
 	if err := e.DestroyBranch(context.Background(), "pr-2"); err != nil {
 		t.Fatal(err)
 	}
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-2")
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-1@br-pr-2")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/br-pr-2")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/br-pr-1@br-pr-2")
 	// the parent's live clone dataset must NOT have been destroyed by GC
 	for _, h := range d.helpers {
-		if strings.Contains(helperCmd(h), "zfs destroy -r tank/pgbranch/br-pr-1 ") ||
-			strings.HasSuffix(helperCmd(h), "zfs destroy -r tank/pgbranch/br-pr-1") {
+		if strings.Contains(helperCmd(h), "zfs destroy -r tank/pgoverlay/br-pr-1 ") ||
+			strings.HasSuffix(helperCmd(h), "zfs destroy -r tank/pgoverlay/br-pr-1") {
 			t.Fatalf("child destroy GC'd the parent's clone: %q", helperCmd(h))
 		}
 	}
@@ -384,7 +384,7 @@ func TestZFSDestroyParentWithChildRefusedAndChildCleansUp(t *testing.T) {
 	if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
 		t.Fatal(err)
 	}
-	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-1")
+	findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/br-pr-1")
 }
 
 // Resetting a zfs child re-clones from its parent's dataset, not the source.
@@ -409,10 +409,10 @@ func TestZFSResetChildReclonesFromParent(t *testing.T) {
 		}
 		return
 	}
-	if n := count("zfs snapshot tank/pgbranch/br-pr-1@br-pr-2"); n != 2 {
+	if n := count("zfs snapshot tank/pgoverlay/br-pr-1@br-pr-2"); n != 2 {
 		t.Fatalf("parent snapshot invocations = %d, want 2 (create + reset)", n)
 	}
-	if n := count("zfs snapshot tank/pgbranch/src-main-g1@br-pr-2"); n != 0 {
+	if n := count("zfs snapshot tank/pgoverlay/src-main-g1@br-pr-2"); n != 0 {
 		t.Fatal("child reset snapshotted the SOURCE, want its parent")
 	}
 }
@@ -429,7 +429,7 @@ func TestZFSDestroyHelpersAreIdempotent(t *testing.T) {
 	if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
 		t.Fatal(err)
 	}
-	h := findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgbranch/br-pr-1")
+	h := findZFSHelper(t, d.helpers, "zfs destroy -r tank/pgoverlay/br-pr-1")
 	if !strings.Contains(helperCmd(h), "|| ! zfs list -t all") {
 		t.Fatalf("destroy helper %q has no missing-target guard", helperCmd(h))
 	}

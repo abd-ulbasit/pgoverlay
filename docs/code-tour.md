@@ -4,7 +4,7 @@ A package-by-package map of the codebase for an engineer who has not read it
 yet: what each component owns, how the two run modes differ, and the two request
 paths that matter most — creating a branch, and connecting to one. Every claim
 cites the file it comes from, so you can read along in the source. Module:
-`github.com/abd-ulbasit/pgbranch`, Go 1.26.
+`github.com/abd-ulbasit/pgoverlay`, Go 1.26.
 
 If you want the prose overview instead, read [architecture](architecture.md)
 first; for the reasoning behind the structure, see
@@ -14,7 +14,7 @@ first; for the reasoning behind the structure, see
 
 ## 1. The one-paragraph mental model
 
-pgbranch gives every git branch / pull request its own **instant, isolated,
+pgoverlay gives every git branch / pull request its own **instant, isolated,
 production-shaped Postgres database** — Neon-style branching, but self-hosted on
 your own Docker host or Kubernetes cluster. The trick is **copy-on-write**: you
 seed a source database *once* into a read-only base layer, and each "branch" is
@@ -43,7 +43,7 @@ boot — is documented in `docs/architecture.md`.
 graph TD
     subgraph clients["Clients"]
         pgb["pgb (CLI, cobra)<br/>internal/cli<br/>local mode: embeds engine<br/>server mode: REST client"]
-        ghook["pgbranch-github<br/>internal/ghook<br/>PR webhook → branch-per-PR"]
+        ghook["pgoverlay-github<br/>internal/ghook<br/>PR webhook → branch-per-PR"]
         psql["psql / app<br/>Postgres wire client"]
     end
 
@@ -87,7 +87,7 @@ One sentence per box, then a short subsection each.
 `cli.NewRootCmd().Execute()`. The real CLI lives in `internal/cli/root.go`
 (cobra commands: `source`, `branch`, `connect`, `diff`, `history`, `doctor`,
 `gc`, `token`). It has **two modes**, chosen by the `--server` flag /
-`PGBRANCH_SERVER` env:
+`PGOVERLAY_SERVER` env:
 
 - **Local mode** (`--server` unset): `open()` in `root.go` builds an `engine`
   directly over a Docker driver and the local SQLite registry — the CLI *is*
@@ -95,7 +95,7 @@ One sentence per box, then a short subsection each.
   and tests never touch Docker.
 - **Server mode** (`--server http://branchd:7070`): `serverClient()` returns an
   `apiclient.Client` and the CLI becomes a thin REST caller; the token comes
-  from `PGBRANCH_TOKEN`.
+  from `PGOVERLAY_TOKEN`.
 
 Depends on: `internal/engine`, `internal/registry`, `internal/runtime`
 (local) or `internal/apiclient` (server).
@@ -114,15 +114,15 @@ Depends on: `internal/engine`, `internal/registry`, `internal/runtime`
 4. Optionally **leader election** (`--leader-elect`, kube only) — `internal/ha`.
 
 It wires `internal/metrics` into the engine and serves `/metrics`, and it
-encrypts branch passwords at rest with a key derived from `PGBRANCH_TOKEN`
+encrypts branch passwords at rest with a key derived from `PGOVERLAY_TOKEN`
 (`reg.SetSecretKey(registry.DeriveSecretKey(token))`). Storage backend selection
 (`--runtime` docker|kube, `--cow` overlay|zfs|csi, `--kube-storage`
 hostpath|csi) is validated in `resolveStorage`. Graceful shutdown closes the
 listeners but **leaves branch containers running** — they are durable state.
 
-### `cmd/pgbranch-github` → `internal/ghook` — the GitHub App webhook receiver
+### `cmd/pgoverlay-github` → `internal/ghook` — the GitHub App webhook receiver
 
-`cmd/pgbranch-github/main.go` boots an HTTP server; the logic is in
+`cmd/pgoverlay-github/main.go` boots an HTTP server; the logic is in
 `internal/ghook/service.go`. It receives GitHub `pull_request` webhooks
 (`POST /webhook`), verifies the HMAC-SHA256 signature in constant time
 (`verifySignature`), and maps PR lifecycle to branches via the REST API
@@ -135,7 +135,7 @@ listeners but **leaves branch containers running** — they are durable state.
 Branch names are namespaced under a reserved `gh-` prefix
 (`gh-pr-<n>` or `gh-<sanitized-ref>`) so a webhook can never collide with a
 human-created branch. When GitHub App / PAT creds are configured it posts a
-`pgbranch/branch` commit status and keeps a live PR comment with the connect
+`pgoverlay/branch` commit status and keeps a live PR comment with the connect
 string (and, with `DiffOnPush`, a schema/data diff). Webhook deliveries are
 acked immediately and the branch op runs **detached** (a 5-minute background
 context) because GitHub abandons deliveries after ~10s but provisioning at pod
@@ -187,7 +187,7 @@ Postgres), `Exec`/`ExecOutput`, `Inspect`, `StopRemove`, `ListManaged`,
 - **`kube.go` / `kube_podspec.go` / `kube_csi.go`** — `KubeDriver`: branches as
   pods, two storage strategies (hostPath on one node, or CSI PVC clones).
 
-Every managed resource is labelled `pgbranch.instance=<id>` (see
+Every managed resource is labelled `pgoverlay.instance=<id>` (see
 `LabelInstance`) so reconcile only ever reclaims resources belonging to *its*
 registry.
 
@@ -197,13 +197,13 @@ registry.
 overlay mount itself happens *inside* the branch container via an embedded
 entrypoint script (`//go:embed entrypoint.sh`). `PlanBranch` lays out the
 lowerdirs (frozen layers newest-first, source last) and renders
-`PGBRANCH_LOWERS`. The `Planner` also produces the exact `zfs` argv the engine
+`PGOVERLAY_LOWERS`. The `Planner` also produces the exact `zfs` argv the engine
 runs in privileged helpers, and the source/branch layer names for every backend.
 
 ### `internal/pgctl` — seeding helpers
 
 `seed.go` (`pg_basebackup`) and `seeddump.go` (`pg_dump`) run the source copy
-**through the runtime driver** as one-shot helper containers — pgbranch never
+**through the runtime driver** as one-shot helper containers — pgoverlay never
 touches data files from the host. `pg_basebackup` is physical/crash-consistent
 (needs `REPLICATION`); `pg_dump` is logical (works against managed Postgres like
 RDS/Neon/Supabase that forbid physical replication).
@@ -215,8 +215,8 @@ server mode and by ghook. Speaks the wire types defined in `internal/api`.
 
 ### SDKs and the GitHub Action
 
-- `pgbranchtest/` (Go) — spin up an ephemeral branch in a test, get a DSN, tear
-  it down. `pgbranchconnect/` (Go) — resolve a connect string at runtime.
+- `pgoverlaytest/` (Go) — spin up an ephemeral branch in a test, get a DSN, tear
+  it down. `pgoverlayconnect/` (Go) — resolve a connect string at runtime.
 - `sdk/js` and `sdk/js-connect` — JS equivalents (`index.mjs` + `.d.ts`).
 - `action/` — a composite GitHub Action (`action.yml` + `entrypoint.sh`, plus a
   separate `action/destroy`) for CI pipelines.
@@ -225,20 +225,20 @@ server mode and by ghook. Speaks the wire types defined in `internal/api`.
 
 ## 3. The two ways it runs
 
-pgbranch is **one engine with two frontends**. The same `engine` code runs in
+pgoverlay is **one engine with two frontends**. The same `engine` code runs in
 both modes; only what wraps it changes.
 
 ```mermaid
 graph LR
     subgraph local["Local mode (laptop / dev)"]
         cli1["pgb"] --> eng1["engine (embedded)"]
-        eng1 --> reg1["SQLite ~/.pgbranch"]
+        eng1 --> reg1["SQLite ~/.pgoverlay"]
         eng1 --> dkr["Docker daemon<br/>branch = container"]
     end
 
     subgraph deployed["Deployed mode (Kubernetes)"]
         cli2["pgb --server"] --> bd["branchd<br/>(Deployment)"]
-        ghk["pgbranch-github"] --> bd
+        ghk["pgoverlay-github"] --> bd
         app["app / psql"] --> bd
         bd --> eng2["engine"]
         eng2 --> reg2["SQLite on PVC/hostPath"]
@@ -247,12 +247,12 @@ graph LR
 ```
 
 - **Local**: `pgb` embeds the engine (`cli/root.go: open()`), uses the Docker
-  driver, and writes the SQLite registry under `~/.pgbranch`. Great for a single
+  driver, and writes the SQLite registry under `~/.pgoverlay`. Great for a single
   developer. Because SQLite is single-writer, you must not run this while a
   `branchd` shares the same registry.
 - **Deployed**: `branchd` runs as a normal Kubernetes Deployment (no CRDs, no
   operator — `docs/architecture.md`), owns the registry, and exposes the REST
-  API + the Postgres router. `pgb` (with `--server`) and `pgbranch-github`
+  API + the Postgres router. `pgb` (with `--server`) and `pgoverlay-github`
   become REST clients; apps connect through the proxy. HA runs multiple
   replicas with leader election so only one accepts writes.
 
@@ -317,9 +317,9 @@ Walking each step with the file that does it:
      that writes `cow.EntrypointScript` into the rw volume and creates
      `upper/` and `work/`.
    - **start branch** — `startOverlayBranch` mounts the source `ro` at
-     `/pgbranch/lower0`, frozen layers `ro` at `/pgbranch/lower1..N`, the rw
-     volume at `/pgbranch/rw`, sets `PGDATA=/pgbranch/merged` and
-     `PGBRANCH_LOWERS`, and runs the entrypoint that assembles the OverlayFS
+     `/pgoverlay/lower0`, frozen layers `ro` at `/pgoverlay/lower1..N`, the rw
+     volume at `/pgoverlay/rw`, sets `PGDATA=/pgoverlay/merged` and
+     `PGOVERLAY_LOWERS`, and runs the entrypoint that assembles the OverlayFS
      mount *inside the container* and execs Postgres. Compensation:
      `StopRemove`.
    - If any step fails, `fail()` unwinds the `undo` stack in reverse — **no
@@ -370,7 +370,7 @@ sequenceDiagram
     P->>P: splitDatabase → dbname="app", branch="pr-42"
     P->>R: ResolveBranch("pr-42") → host:port (ready only)
     alt unknown / not-ready / unreachable
-        P-->>C: FATAL "pgbranch: database not available" (uniform refusal)
+        P-->>C: FATAL "pgoverlay: database not available" (uniform refusal)
     else resolved
         P->>P: rewrite database back to "app", re-encode startup
         P->>B: dial host:port, replay StartupMessage
@@ -414,16 +414,16 @@ the `KubeDriver`. There are two storage models.
 
 ```mermaid
 graph TB
-    subgraph cluster["Kubernetes namespace: pgbranch"]
+    subgraph cluster["Kubernetes namespace: pgoverlay"]
         direction TB
-        ghk["pgbranch-github<br/>(Deployment)"]
+        ghk["pgoverlay-github<br/>(Deployment)"]
         bd["branchd<br/>(Deployment; HA = N replicas<br/>+ Lease leader election)"]
-        lease["coordination.k8s.io/Lease<br/>pgbranch-branchd"]
+        lease["coordination.k8s.io/Lease<br/>pgoverlay-branchd"]
         svcapi["Service :7070 (REST)"]
         svcpx["Service :6432 (pg router)"]
 
         subgraph hostpath["hostPath model (default)"]
-            node["one storage node (--kube-node)<br/>data root /var/lib/pgbranch"]
+            node["one storage node (--kube-node)<br/>data root /var/lib/pgoverlay"]
             bp1["branch pod pr-1<br/>SYS_ADMIN, nodeName-pinned<br/>overlay mounted in-container"]
             bp2["branch pod pr-2"]
             node --- bp1
@@ -449,7 +449,7 @@ graph TB
 ```
 
 - **hostPath (default)** — "volumes" are subdirectories of `--kube-data-root`
-  (default `/var/lib/pgbranch`) on one **storage node** named by `--kube-node`;
+  (default `/var/lib/pgoverlay`) on one **storage node** named by `--kube-node`;
   helper pods are one-shot, branch pods are plain pods, all pinned with
   `nodeName`, and branch pods carry `SYS_ADMIN` for the in-container overlay
   mount (`internal/runtime/kube.go`). Single-node scope, but works on any
@@ -463,7 +463,7 @@ graph TB
   (`internal/ha/leader.go`); only the leader runs reconcile and accepts mutating
   `/v1` writes (the `LeaderGate` in `internal/api/leader.go` returns 503 on
   non-leaders), which keeps the single-writer SQLite registry safe.
-- Helm chart and manifests live under `deploy/helm/pgbranch/` (deployment,
+- Helm chart and manifests live under `deploy/helm/pgoverlay/` (deployment,
   services for API and proxy, RBAC, PVC, NetworkPolicy, the ghook Deployment).
 
 ---

@@ -18,14 +18,14 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // genericRouteRefusal is the single client-facing message for every routing
 // failure (unknown branch, not-ready branch, any resolver error). It is
 // deliberately uniform so an UNAUTHENTICATED client cannot enumerate branch
 // names or distinguish branch state; the real reason is logged server-side.
-const genericRouteRefusal = "pgbranch: database not available"
+const genericRouteRefusal = "pgoverlay: database not available"
 
 // BranchResolver maps a branch name to the "host:port" address of its
 // Postgres instance. Implementations must only resolve branches that can
@@ -184,7 +184,7 @@ func (p *Proxy) handleConn(client net.Conn) {
 			if inTLS {
 				// A second SSLRequest inside the TLS session is a protocol
 				// violation (matches the PG server's behavior).
-				writeRefusal(client, "08P01", "pgbranch: SSLRequest received after TLS was already established")
+				writeRefusal(client, "08P01", "pgoverlay: SSLRequest received after TLS was already established")
 				return
 			}
 			if _, err := client.Write([]byte{'S'}); err != nil {
@@ -206,7 +206,7 @@ func (p *Proxy) handleConn(client net.Conn) {
 		}
 		var startup pgproto3.StartupMessage
 		if err := startup.Decode(payload); err != nil {
-			writeRefusal(client, "08P01", "pgbranch: "+err.Error()) // protocol_violation
+			writeRefusal(client, "08P01", "pgoverlay: "+err.Error()) // protocol_violation
 			return
 		}
 		p.route(client, &startup)
@@ -221,7 +221,7 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 	dbname, branch, ok := splitDatabase(db)
 	if !ok {
 		writeRefusal(client, "3D000", // invalid_catalog_name
-			fmt.Sprintf("pgbranch: connect with dbname@branch (got database %q)", db))
+			fmt.Sprintf("pgoverlay: connect with dbname@branch (got database %q)", db))
 		return
 	}
 	addr, err := p.Resolver.ResolveBranch(branch)
@@ -235,7 +235,7 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 	startup.Parameters["database"] = dbname
 	raw, err := startup.Encode(nil)
 	if err != nil {
-		writeRefusal(client, "08P01", "pgbranch: "+err.Error())
+		writeRefusal(client, "08P01", "pgoverlay: "+err.Error())
 		return
 	}
 	backend, err := net.DialTimeout("tcp", addr, p.DialTimeout)

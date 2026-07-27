@@ -1,7 +1,7 @@
 # Vendored CSI test manifests
 
-Manifests for the `PGBRANCH_CSI_IT=1` integration tests (`hack/kind-csi-up.sh`
-applies them onto the `pgbranch-test` kind cluster). Vendored — instead of
+Manifests for the `PGOVERLAY_CSI_IT=1` integration tests (`hack/kind-csi-up.sh`
+applies them onto the `pgoverlay-test` kind cluster). Vendored — instead of
 `kubectl apply`-ing raw.githubusercontent URLs at test time — so the install
 is reproducible and pinned.
 

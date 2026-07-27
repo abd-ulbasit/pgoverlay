@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
 func newDiffCmd() *cobra.Command {

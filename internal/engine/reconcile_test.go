@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // seedReady marks a freshly-created creating branch ready so it counts as live
@@ -23,11 +23,11 @@ func TestReconcileFailsStuckCreating(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-stuck-rw"}
+	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-stuck-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-stuck-rw"] = true
+	d.volumes["pgoverlay-br-stuck-rw"] = true
 
 	// now in the future so the just-inserted row is past the 10m timeout.
 	taken, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
@@ -41,7 +41,7 @@ func TestReconcileFailsStuckCreating(t *testing.T) {
 	if got.State != registry.BranchFailed {
 		t.Fatalf("state=%q want failed", got.State)
 	}
-	if d.volumes["pgbranch-br-stuck-rw"] {
+	if d.volumes["pgoverlay-br-stuck-rw"] {
 		t.Fatal("stuck rw volume not removed")
 	}
 }
@@ -51,11 +51,11 @@ func TestReconcileLeavesFreshCreating(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	b := &registry.Branch{Name: "fresh", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-fresh-rw"}
+	b := &registry.Branch{Name: "fresh", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-fresh-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-fresh-rw"] = true
+	d.volumes["pgoverlay-br-fresh-rw"] = true
 
 	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
 	if err != nil {
@@ -76,11 +76,11 @@ func TestReconcileRemovesOrphanContainer(t *testing.T) {
 	e, r := testEngine(t, d)
 	readySource(t, r)
 	// a live ready branch with a known container.
-	b := &registry.Branch{Name: "live", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-live-rw"}
+	b := &registry.Branch{Name: "live", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-live-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-live-rw"] = true
+	d.volumes["pgoverlay-br-live-rw"] = true
 	markReady(t, r, b, "cid-live")
 	d.addOrphanContainer("cid-live", r.InstanceID())
 	// an orphan with no row.
@@ -109,7 +109,7 @@ func TestReconcileSkipsInflightProvisioningContainer(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	b := &registry.Branch{Name: "inflight", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-inflight-rw"}
+	b := &registry.Branch{Name: "inflight", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-inflight-rw"}
 	if err := r.CreateBranch(b); err != nil { // state = creating
 		t.Fatal(err)
 	}
@@ -139,23 +139,23 @@ func TestReconcileGCsDanglingLayerKeepsReferenced(t *testing.T) {
 	src := readySource(t, r)
 
 	// dangling layer: refcount 0.
-	dangling := &registry.Layer{SourceID: src.ID, Volume: "pgbranch-layer-dangling"}
+	dangling := &registry.Layer{SourceID: src.ID, Volume: "pgoverlay-layer-dangling"}
 	if err := r.CreateLayer(dangling); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-layer-dangling"] = true
+	d.volumes["pgoverlay-layer-dangling"] = true
 
 	// referenced layer: a live branch chains onto it.
-	referenced := &registry.Layer{SourceID: src.ID, Volume: "pgbranch-layer-referenced"}
+	referenced := &registry.Layer{SourceID: src.ID, Volume: "pgoverlay-layer-referenced"}
 	if err := r.CreateLayer(referenced); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-layer-referenced"] = true
-	b := &registry.Branch{Name: "child", SourceID: src.ID, RWVolume: "pgbranch-br-child-rw", BaseLayerID: referenced.ID}
+	d.volumes["pgoverlay-layer-referenced"] = true
+	b := &registry.Branch{Name: "child", SourceID: src.ID, RWVolume: "pgoverlay-br-child-rw", BaseLayerID: referenced.ID}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-child-rw"] = true
+	d.volumes["pgoverlay-br-child-rw"] = true
 	markReady(t, r, b, "cid-child")
 	d.containers["cid-child"] = true
 
@@ -163,16 +163,16 @@ func TestReconcileGCsDanglingLayerKeepsReferenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasAction(taken, ActionGCLayer, "pgbranch-layer-dangling") {
+	if !hasAction(taken, ActionGCLayer, "pgoverlay-layer-dangling") {
 		t.Fatalf("dangling layer not GC'd: %+v", taken.Actions)
 	}
-	if hasAction(taken, ActionGCLayer, "pgbranch-layer-referenced") {
+	if hasAction(taken, ActionGCLayer, "pgoverlay-layer-referenced") {
 		t.Fatalf("referenced layer GC'd: %+v", taken.Actions)
 	}
-	if d.volumes["pgbranch-layer-dangling"] {
+	if d.volumes["pgoverlay-layer-dangling"] {
 		t.Fatal("dangling layer volume survived")
 	}
-	if !d.volumes["pgbranch-layer-referenced"] {
+	if !d.volumes["pgoverlay-layer-referenced"] {
 		t.Fatal("referenced layer volume removed")
 	}
 	if _, err := r.GetLayer(dangling.ID); err == nil {
@@ -188,34 +188,34 @@ func TestReconcileGCsOrphanVolumeKeepsInUse(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true // source generation: in use
+	d.volumes["pgoverlay-src-main"] = true // source generation: in use
 
 	// in-use rw volume: a live branch owns it.
-	b := &registry.Branch{Name: "live", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-live-rw"}
+	b := &registry.Branch{Name: "live", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-live-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-live-rw"] = true
+	d.volumes["pgoverlay-br-live-rw"] = true
 	markReady(t, r, b, "cid-live")
 	d.containers["cid-live"] = true
 
 	// orphan volume: no branch, no source, no layer references it.
-	d.addOrphanVolume("pgbranch-br-orphan-rw", r.InstanceID())
+	d.addOrphanVolume("pgoverlay-br-orphan-rw", r.InstanceID())
 
 	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasAction(taken, ActionGCVolume, "pgbranch-br-orphan-rw") {
+	if !hasAction(taken, ActionGCVolume, "pgoverlay-br-orphan-rw") {
 		t.Fatalf("orphan volume not GC'd: %+v", taken.Actions)
 	}
-	if d.volumes["pgbranch-br-orphan-rw"] {
+	if d.volumes["pgoverlay-br-orphan-rw"] {
 		t.Fatal("orphan volume survived")
 	}
-	if !d.volumes["pgbranch-br-live-rw"] {
+	if !d.volumes["pgoverlay-br-live-rw"] {
 		t.Fatal("in-use rw volume removed")
 	}
-	if !d.volumes["pgbranch-src-main"] {
+	if !d.volumes["pgoverlay-src-main"] {
 		t.Fatal("source generation volume removed")
 	}
 }
@@ -228,14 +228,14 @@ func TestPlanReconcileDryRunDoesNotApply(t *testing.T) {
 	readySource(t, r)
 
 	// stuck row.
-	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgbranch-br-stuck-rw"}
+	b := &registry.Branch{Name: "stuck", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-stuck-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-stuck-rw"] = true
+	d.volumes["pgoverlay-br-stuck-rw"] = true
 	// orphan container + orphan volume.
 	d.addOrphanContainer("cid-ghost", r.InstanceID())
-	d.addOrphanVolume("pgbranch-br-orphan-rw", r.InstanceID())
+	d.addOrphanVolume("pgoverlay-br-orphan-rw", r.InstanceID())
 
 	before := len(d.log)
 	plan, err := e.PlanReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
@@ -247,7 +247,7 @@ func TestPlanReconcileDryRunDoesNotApply(t *testing.T) {
 	}
 	if !hasAction(plan, ActionFailStuck, "stuck") ||
 		!hasAction(plan, ActionRemoveOrphanContainer, "cid-ghost") ||
-		!hasAction(plan, ActionGCVolume, "pgbranch-br-orphan-rw") {
+		!hasAction(plan, ActionGCVolume, "pgoverlay-br-orphan-rw") {
 		t.Fatalf("plan missing expected actions: %+v", plan.Actions)
 	}
 	// nothing mutated: driver log unchanged, registry row still creating,
@@ -255,7 +255,7 @@ func TestPlanReconcileDryRunDoesNotApply(t *testing.T) {
 	if len(d.log) != before {
 		t.Fatalf("dry-run mutated the driver: %v", d.log[before:])
 	}
-	if !d.containers["cid-ghost"] || !d.volumes["pgbranch-br-orphan-rw"] || !d.volumes["pgbranch-br-stuck-rw"] {
+	if !d.containers["cid-ghost"] || !d.volumes["pgoverlay-br-orphan-rw"] || !d.volumes["pgoverlay-br-stuck-rw"] {
 		t.Fatal("dry-run removed resources")
 	}
 	if got, _ := r.GetBranchByName("stuck"); got.State != registry.BranchCreating {
@@ -279,7 +279,7 @@ func TestPlanReconcileCleanNoDrift(t *testing.T) {
 
 // Reconcile is instance-scoped: an engine bound to registry A must reclaim its
 // OWN orphaned managed container and volume, but must leave a managed container
-// and volume tagged with a different instance id (a sibling pgbranch sharing
+// and volume tagged with a different instance id (a sibling pgoverlay sharing
 // the daemon) untouched. This is the regression guard for the CI bug where one
 // IT package's reconcile deleted another package's live resources.
 func TestReconcileIgnoresForeignInstanceResources(t *testing.T) {
@@ -290,10 +290,10 @@ func TestReconcileIgnoresForeignInstanceResources(t *testing.T) {
 
 	// our own orphans (tagged with this registry's instance id) -> reclaimed.
 	d.addOrphanContainer("cid-mine", r.InstanceID())
-	d.addOrphanVolume("pgbranch-br-mine-rw", r.InstanceID())
+	d.addOrphanVolume("pgoverlay-br-mine-rw", r.InstanceID())
 	// a sibling instance's live resources -> must be left alone.
 	d.addOrphanContainer("cid-foreign", foreign)
-	d.addOrphanVolume("pgbranch-br-foreign-rw", foreign)
+	d.addOrphanVolume("pgoverlay-br-foreign-rw", foreign)
 
 	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
 	if err != nil {
@@ -303,23 +303,23 @@ func TestReconcileIgnoresForeignInstanceResources(t *testing.T) {
 	if !hasAction(taken, ActionRemoveOrphanContainer, "cid-mine") {
 		t.Fatalf("own orphan container not reclaimed: %+v", taken.Actions)
 	}
-	if !hasAction(taken, ActionGCVolume, "pgbranch-br-mine-rw") {
+	if !hasAction(taken, ActionGCVolume, "pgoverlay-br-mine-rw") {
 		t.Fatalf("own orphan volume not reclaimed: %+v", taken.Actions)
 	}
-	if d.containers["cid-mine"] || d.volumes["pgbranch-br-mine-rw"] {
+	if d.containers["cid-mine"] || d.volumes["pgoverlay-br-mine-rw"] {
 		t.Fatal("own orphans survived reconcile")
 	}
 	// foreign resources untouched in plan and in the driver.
 	if hasAction(taken, ActionRemoveOrphanContainer, "cid-foreign") {
 		t.Fatalf("foreign container reclaimed: %+v", taken.Actions)
 	}
-	if hasAction(taken, ActionGCVolume, "pgbranch-br-foreign-rw") {
+	if hasAction(taken, ActionGCVolume, "pgoverlay-br-foreign-rw") {
 		t.Fatalf("foreign volume reclaimed: %+v", taken.Actions)
 	}
 	if !d.containers["cid-foreign"] {
 		t.Fatal("foreign instance's container was removed")
 	}
-	if !d.volumes["pgbranch-br-foreign-rw"] {
+	if !d.volumes["pgoverlay-br-foreign-rw"] {
 		t.Fatal("foreign instance's volume was removed")
 	}
 }
@@ -349,11 +349,11 @@ func TestReconcileStuckResettingParentKeepsReferencedRWVolume(t *testing.T) {
 
 	// parent: a ready branch with real data in its rw volume.
 	parent := &registry.Branch{Name: "parent", SourceID: src.ID,
-		RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+		RWVolume: "pgoverlay-br-parent-rw", SourceVolume: "pgoverlay-src-main"}
 	if err := r.CreateBranch(parent); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-parent-rw"] = true
+	d.volumes["pgoverlay-br-parent-rw"] = true
 	markReady(t, r, parent, "cid-parent")
 
 	// child: created (creating) by freezeAndProvision before CommitFreeze. The
@@ -361,12 +361,12 @@ func TestReconcileStuckResettingParentKeepsReferencedRWVolume(t *testing.T) {
 	// by name; csi/zfs would record source_volume = parent.RWVolume. Cover the
 	// stricter overlay shape (parent_branch_name only).
 	child := &registry.Branch{Name: "child", SourceID: src.ID,
-		RWVolume: "pgbranch-br-child-rw", SourceVolume: "pgbranch-src-main",
+		RWVolume: "pgoverlay-br-child-rw", SourceVolume: "pgoverlay-src-main",
 		ParentBranchName: parent.Name}
 	if err := r.CreateBranch(child); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-child-rw"] = true
+	d.volumes["pgoverlay-br-child-rw"] = true
 
 	// freeze parks the parent in resetting (legal ready->resetting); reconciling
 	// an hour in the future makes the row look stuck past the 10m timeout.
@@ -388,7 +388,7 @@ func TestReconcileStuckResettingParentKeepsReferencedRWVolume(t *testing.T) {
 	}
 	// ...but it MUST NOT delete the parent's live data volume (the child still
 	// references it).
-	if !d.volumes["pgbranch-br-parent-rw"] {
+	if !d.volumes["pgoverlay-br-parent-rw"] {
 		t.Fatal("DATA LOSS: reconcile deleted the freeze parent's live rw volume")
 	}
 }
@@ -401,21 +401,21 @@ func TestReconcileStuckResettingParentKeepsRWReferencedBySourceVolume(t *testing
 	src := readySource(t, r)
 
 	parent := &registry.Branch{Name: "parent", SourceID: src.ID,
-		RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+		RWVolume: "pgoverlay-br-parent-rw", SourceVolume: "pgoverlay-src-main"}
 	if err := r.CreateBranch(parent); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-parent-rw"] = true
+	d.volumes["pgoverlay-br-parent-rw"] = true
 	markReady(t, r, parent, "cid-parent")
 
 	// csi/zfs child: source_volume = parent.RWVolume.
 	child := &registry.Branch{Name: "child", SourceID: src.ID,
-		RWVolume: "pgbranch-br-child-rw", SourceVolume: parent.RWVolume,
+		RWVolume: "pgoverlay-br-child-rw", SourceVolume: parent.RWVolume,
 		ParentBranchName: parent.Name}
 	if err := r.CreateBranch(child); err != nil {
 		t.Fatal(err)
 	}
-	d.volumes["pgbranch-br-child-rw"] = true
+	d.volumes["pgoverlay-br-child-rw"] = true
 
 	if err := r.TransitionBranch(parent.ID, registry.BranchResetting, "freeze for child"); err != nil {
 		t.Fatal(err)
@@ -424,7 +424,7 @@ func TestReconcileStuckResettingParentKeepsRWReferencedBySourceVolume(t *testing
 	if _, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if !d.volumes["pgbranch-br-parent-rw"] {
+	if !d.volumes["pgoverlay-br-parent-rw"] {
 		t.Fatal("DATA LOSS: reconcile deleted the csi/zfs freeze parent's rw volume")
 	}
 }

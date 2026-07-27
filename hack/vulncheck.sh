@@ -9,7 +9,7 @@
 # plugin-privilege and `docker cp` advisories faster than it ships fixed
 # releases for github.com/docker/docker (four so far, none with a fix on that
 # module path), so an ID list is a standing false alarm that trains you to
-# ignore the one job whose purpose is to be believed. pgbranch drives the
+# ignore the one job whose purpose is to be believed. pgoverlay drives the
 # Docker client only to manage branch containers: it installs no plugins and
 # never calls `docker cp`, so those paths are not reachable. Rationale and the
 # current advisory list live in SECURITY.md.
@@ -24,7 +24,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALLOW_MODULE=${PGBRANCH_VULN_ALLOW_MODULE:-github.com/docker/docker}
+ALLOW_MODULE=${PGOVERLAY_VULN_ALLOW_MODULE:-github.com/docker/docker}
 
 command -v jq >/dev/null || { echo "vuln: jq is required (brew install jq / apt install jq)" >&2; exit 2; }
 
@@ -39,10 +39,10 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 go build -o "$work/branchd" ./cmd/branchd
-go build -o "$work/pgbranch-github" ./cmd/pgbranch-github
+go build -o "$work/pgoverlay-github" ./cmd/pgoverlay-github
 
 rc=0
-for bin in "$work/branchd" "$work/pgbranch-github"; do
+for bin in "$work/branchd" "$work/pgoverlay-github"; do
   echo "== $(basename "$bin") =="
   # Text mode is the source of truth for WHICH advisories count: in binary mode
   # the JSON lists every advisory affecting every linked module (23 at last

@@ -1,5 +1,5 @@
-// Kubernetes integration tests against the pgbranch-test kind cluster
-// (hack/kind-up.sh). Gated by PGBRANCH_K8S_IT=1. External test package:
+// Kubernetes integration tests against the pgoverlay-test kind cluster
+// (hack/kind-up.sh). Gated by PGOVERLAY_K8S_IT=1. External test package:
 // the e2e test drives the engine, which imports runtime.
 package runtime_test
 
@@ -25,24 +25,24 @@ import (
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
 
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	rt "github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	rt "github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 const (
-	kindCluster  = "pgbranch-test"
+	kindCluster  = "pgoverlay-test"
 	kubeNS       = "default"
-	kindNodeName = "pgbranch-test-control-plane" // single node = storage node
-	kubeDataRoot = "/var/lib/pgbranch"           // inside the kind node container (under its /var volume, so overlay upperdirs work)
+	kindNodeName = "pgoverlay-test-control-plane" // single node = storage node
+	kubeDataRoot = "/var/lib/pgoverlay"           // inside the kind node container (under its /var volume, so overlay upperdirs work)
 )
 
 // kubeIT ensures the kind cluster exists and returns the driver plus raw
 // client-go handles (for the source pod and port-forwarding).
 func kubeIT(t *testing.T) (*rt.KubeDriver, *kubernetes.Clientset, *rest.Config) {
 	t.Helper()
-	if os.Getenv("PGBRANCH_K8S_IT") != "1" {
-		t.Skip("set PGBRANCH_K8S_IT=1 to run kubernetes integration tests")
+	if os.Getenv("PGOVERLAY_K8S_IT") != "1" {
+		t.Skip("set PGOVERLAY_K8S_IT=1 to run kubernetes integration tests")
 	}
 	if out, err := exec.Command("../../hack/kind-up.sh").CombinedOutput(); err != nil {
 		t.Fatalf("hack/kind-up.sh: %v\n%s", err, out)
@@ -75,8 +75,8 @@ func TestKubeVolumeAndHelperRoundtrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	vol := "pgbranch-test-vol"
-	if err := drv.CreateVolume(ctx, vol, map[string]string{"pgbranch.managed": "true"}); err != nil {
+	vol := "pgoverlay-test-vol"
+	if err := drv.CreateVolume(ctx, vol, map[string]string{"pgoverlay.managed": "true"}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -98,7 +98,7 @@ func TestKubeVolumeAndHelperRoundtrip(t *testing.T) {
 	// successful helpers return their captured output (pod logs)
 	out, err := drv.RunHelper(ctx, rt.HelperSpec{
 		Image:  "alpine:3.21",
-		Cmd:    []string{"sh", "-c", "cat /data/probe && grep -q pgbranch.managed /data/.pgbranch-labels.json"},
+		Cmd:    []string{"sh", "-c", "cat /data/probe && grep -q pgoverlay.managed /data/.pgoverlay-labels.json"},
 		Mounts: []rt.Mount{{Volume: vol, Target: "/data", ReadOnly: true}},
 	})
 	if err != nil {
@@ -122,7 +122,7 @@ func TestKubeVolumeAndHelperRoundtrip(t *testing.T) {
 // replication pg_hba entry appended + reloaded after startup.
 func startSourcePod(t *testing.T, ctx context.Context, drv *rt.KubeDriver, cs *kubernetes.Clientset) (podIP string) {
 	t.Helper()
-	const name = "pgbranch-it-source"
+	const name = "pgoverlay-it-source"
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: kubeNS},
 		Spec: corev1.PodSpec{
@@ -261,7 +261,7 @@ func TestKubeEndToEndBranching(t *testing.T) {
 	defer cancel()
 
 	srcIP := startSourcePod(t, ctx, drv, cs)
-	if err := drv.Exec(ctx, "pgbranch-it-source", []string{"psql", "-U", "postgres", "-c",
+	if err := drv.Exec(ctx, "pgoverlay-it-source", []string{"psql", "-U", "postgres", "-c",
 		`CREATE TABLE accounts(id int primary key, balance int);
 		 INSERT INTO accounts SELECT i, 100 FROM generate_series(1,10000) i`}); err != nil {
 		t.Fatal(err)
@@ -305,7 +305,7 @@ func TestKubeEndToEndBranching(t *testing.T) {
 			t.Errorf("destroy k8s-pr-1: %v", err)
 		}
 	})
-	if b.ContainerID != "pgbranch-br-k8s-pr-1" {
+	if b.ContainerID != "pgoverlay-br-k8s-pr-1" {
 		t.Errorf("branch pod name = %q", b.ContainerID)
 	}
 	if b.Host == "" || b.Host == "127.0.0.1" || b.Port != 5432 {
@@ -328,7 +328,7 @@ func TestKubeEndToEndBranching(t *testing.T) {
 		}
 		c.Close(ctx)
 	}
-	srcPort := forwardPort(t, cfg, cs, "pgbranch-it-source")
+	srcPort := forwardPort(t, cfg, cs, "pgoverlay-it-source")
 	if n := queryInt(t, ctx, srcPort, `SELECT sum(balance) FROM accounts`); n != 1000000 {
 		t.Fatalf("source mutated! sum=%d", n)
 	}

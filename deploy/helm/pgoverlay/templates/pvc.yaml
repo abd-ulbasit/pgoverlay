@@ -1,13 +1,13 @@
-{{- if eq (include "pgbranch.persistenceEnabled" .) "true" }}
+{{- if eq (include "pgoverlay.persistenceEnabled" .) "true" }}
 # branchd's state dir (the sqlite registry) on a PVC: survives node
 # loss/rollover. Auto-enabled with storage.mode=csi; see values.yaml
 # `persistence` for the tri-state override.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "pgbranch.fullname" . }}-state
+  name: {{ include "pgoverlay.fullname" . }}-state
   labels:
-    {{- include "pgbranch.labels" . | nindent 4 }}
+    {{- include "pgoverlay.labels" . | nindent 4 }}
 spec:
   accessModes:
     - ReadWriteOnce

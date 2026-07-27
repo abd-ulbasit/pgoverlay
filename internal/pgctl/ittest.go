@@ -12,7 +12,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // StartSourcePG starts a "production" postgres:17 on a dedicated docker

@@ -15,8 +15,8 @@ import (
 
 func TestVolumeHostPath(t *testing.T) {
 	cases := []struct{ dataRoot, volume, want string }{
-		{"/var/lib/pgbranch", "pgbranch-src-main", "/var/lib/pgbranch/pgbranch-src-main"},
-		{"/var/lib/pgbranch/", "pgbranch-br-pr-1-rw", "/var/lib/pgbranch/pgbranch-br-pr-1-rw"},
+		{"/var/lib/pgoverlay", "pgoverlay-src-main", "/var/lib/pgoverlay/pgoverlay-src-main"},
+		{"/var/lib/pgoverlay/", "pgoverlay-br-pr-1-rw", "/var/lib/pgoverlay/pgoverlay-br-pr-1-rw"},
 	}
 	for _, c := range cases {
 		if got := volumeHostPath(c.dataRoot, c.volume); got != c.want {
@@ -26,7 +26,7 @@ func TestVolumeHostPath(t *testing.T) {
 }
 
 func TestValidVolumeName(t *testing.T) {
-	for _, ok := range []string{"pgbranch-src-main", "pgbranch-br-pr-1-rw", "a"} {
+	for _, ok := range []string{"pgoverlay-src-main", "pgoverlay-br-pr-1-rw", "a"} {
 		if err := validVolumeName(ok); err != nil {
 			t.Errorf("validVolumeName(%q) = %v, want nil", ok, err)
 		}
@@ -44,20 +44,20 @@ func TestBuildHelperPod(t *testing.T) {
 		Cmd:   []string{"pg_basebackup", "-D", "/seed/data"},
 		Env:   []string{"PGPASSWORD=secret"},
 		Mounts: []Mount{
-			{Volume: "pgbranch-src-main", Target: "/seed"},
+			{Volume: "pgoverlay-src-main", Target: "/seed"},
 		},
 		Network: "ignored-on-k8s",
 		User:    "postgres",
 	}
-	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, spec)
+	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, spec)
 
-	if pod.GenerateName != "pgbranch-helper-" {
+	if pod.GenerateName != "pgoverlay-helper-" {
 		t.Errorf("GenerateName = %q", pod.GenerateName)
 	}
 	if pod.Namespace != "pgb" {
 		t.Errorf("Namespace = %q", pod.Namespace)
 	}
-	if pod.Labels["pgbranch.managed"] != "true" || pod.Labels["pgbranch.role"] != "helper" {
+	if pod.Labels["pgoverlay.managed"] != "true" || pod.Labels["pgoverlay.role"] != "helper" {
 		t.Errorf("labels = %v", pod.Labels)
 	}
 	if pod.Spec.NodeName != "node-1" {
@@ -93,7 +93,7 @@ func TestBuildHelperPod(t *testing.T) {
 		t.Fatalf("volumes/mounts = %d/%d", len(pod.Spec.Volumes), len(c.VolumeMounts))
 	}
 	v := pod.Spec.Volumes[0]
-	if v.HostPath == nil || v.HostPath.Path != "/var/lib/pgbranch/pgbranch-src-main" {
+	if v.HostPath == nil || v.HostPath.Path != "/var/lib/pgoverlay/pgoverlay-src-main" {
 		t.Errorf("hostPath = %+v", v.HostPath)
 	}
 	if v.HostPath.Type == nil || *v.HostPath.Type != corev1.HostPathDirectoryOrCreate {
@@ -106,7 +106,7 @@ func TestBuildHelperPod(t *testing.T) {
 }
 
 func TestBuildHelperPodNoUser(t *testing.T) {
-	pod := buildHelperPod("default", &hostPathStorage{node: "n", dataRoot: "/var/lib/pgbranch"}, HelperSpec{Image: "alpine:3.21", Cmd: []string{"true"}})
+	pod := buildHelperPod("default", &hostPathStorage{node: "n", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{Image: "alpine:3.21", Cmd: []string{"true"}})
 	if sc := pod.Spec.Containers[0].SecurityContext; sc != nil {
 		t.Errorf("SecurityContext = %+v, want nil when User empty", sc)
 	}
@@ -118,9 +118,9 @@ func TestBuildHelperPodNoUser(t *testing.T) {
 func TestBuildHelperPodPrivileged(t *testing.T) {
 	// zfs helpers: privileged pod (a privileged container sees host devices,
 	// so HostDevices needs no explicit kube mapping)
-	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, HelperSpec{
+	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{
 		Image:       "alpine:3.21",
-		Cmd:         []string{"sh", "-c", "zfs snapshot tank/pgbranch/src-main-g1@br-pr-1"},
+		Cmd:         []string{"sh", "-c", "zfs snapshot tank/pgoverlay/src-main-g1@br-pr-1"},
 		Privileged:  true,
 		HostDevices: []string{"/dev/zfs"},
 	})
@@ -129,7 +129,7 @@ func TestBuildHelperPodPrivileged(t *testing.T) {
 		t.Fatalf("SecurityContext = %+v, want privileged", sc)
 	}
 	// privileged + user compose (not used today, but must not panic or drop one)
-	pod = buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, HelperSpec{
+	pod = buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{
 		Image: "alpine:3.21", Cmd: []string{"true"}, User: "postgres", Privileged: true,
 	})
 	sc = pod.Spec.Containers[0].SecurityContext
@@ -141,23 +141,23 @@ func TestBuildHelperPodPrivileged(t *testing.T) {
 func TestBuildHelperPodHostPathMount(t *testing.T) {
 	// MountHostPath mounts an absolute host path (a zfs dataset mountpoint)
 	// directly — not a dataRoot subdirectory — and requires it to exist.
-	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, HelperSpec{
+	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{
 		Image: "alpine:3.21",
 		Cmd:   []string{"true"},
 		Mounts: []Mount{
-			{Kind: MountHostPath, Volume: "/tank/pgbranch/br-pr-1", Target: "/pgbranch/rw"},
-			{Volume: "pgbranch-src-main", Target: "/seed"},
+			{Kind: MountHostPath, Volume: "/tank/pgoverlay/br-pr-1", Target: "/pgoverlay/rw"},
+			{Volume: "pgoverlay-src-main", Target: "/seed"},
 		},
 	})
 	v0 := pod.Spec.Volumes[0]
-	if v0.HostPath == nil || v0.HostPath.Path != "/tank/pgbranch/br-pr-1" {
-		t.Fatalf("hostpath mount path = %+v, want /tank/pgbranch/br-pr-1", v0.HostPath)
+	if v0.HostPath == nil || v0.HostPath.Path != "/tank/pgoverlay/br-pr-1" {
+		t.Fatalf("hostpath mount path = %+v, want /tank/pgoverlay/br-pr-1", v0.HostPath)
 	}
 	if v0.HostPath.Type == nil || *v0.HostPath.Type != corev1.HostPathDirectory {
 		t.Errorf("hostpath mount type = %v, want Directory (must already exist)", v0.HostPath.Type)
 	}
 	v1 := pod.Spec.Volumes[1]
-	if v1.HostPath == nil || v1.HostPath.Path != "/var/lib/pgbranch/pgbranch-src-main" {
+	if v1.HostPath == nil || v1.HostPath.Path != "/var/lib/pgoverlay/pgoverlay-src-main" {
 		t.Fatalf("volume mount path = %+v, want dataRoot subdir", v1.HostPath)
 	}
 	if v1.HostPath.Type == nil || *v1.HostPath.Type != corev1.HostPathDirectoryOrCreate {
@@ -167,23 +167,23 @@ func TestBuildHelperPodHostPathMount(t *testing.T) {
 
 func TestBuildBranchPod(t *testing.T) {
 	labels := map[string]string{
-		"pgbranch.managed": "true", "pgbranch.role": "branch",
-		"pgbranch.branch.id": "b1", "pgbranch.branch.name": "pr-1",
+		"pgoverlay.managed": "true", "pgoverlay.role": "branch",
+		"pgoverlay.branch.id": "b1", "pgoverlay.branch.name": "pr-1",
 	}
 	spec := BranchSpec{
-		Name:  "pgbranch-br-pr-1",
+		Name:  "pgoverlay-br-pr-1",
 		Image: "postgres:17",
-		Env:   []string{"PGDATA=/pgbranch/merged", "PGBRANCH_LOWERS=/pgbranch/lower0/data"},
+		Env:   []string{"PGDATA=/pgoverlay/merged", "PGOVERLAY_LOWERS=/pgoverlay/lower0/data"},
 		Mounts: []Mount{
-			{Volume: "pgbranch-src-main", Target: "/pgbranch/lower0", ReadOnly: true},
-			{Volume: "pgbranch-br-pr-1-rw", Target: "/pgbranch/rw"},
+			{Volume: "pgoverlay-src-main", Target: "/pgoverlay/lower0", ReadOnly: true},
+			{Volume: "pgoverlay-br-pr-1-rw", Target: "/pgoverlay/rw"},
 		},
-		Entrypoint: []string{"/bin/sh", "/pgbranch/rw/entrypoint.sh"},
+		Entrypoint: []string{"/bin/sh", "/pgoverlay/rw/entrypoint.sh"},
 		Labels:     labels,
 	}
-	pod := buildBranchPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}, spec)
+	pod := buildBranchPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, spec)
 
-	if pod.Name != "pgbranch-br-pr-1" || pod.Namespace != "pgb" {
+	if pod.Name != "pgoverlay-br-pr-1" || pod.Namespace != "pgb" {
 		t.Errorf("name/ns = %q/%q", pod.Name, pod.Namespace)
 	}
 	for k, v := range labels {
@@ -205,11 +205,11 @@ func TestBuildBranchPod(t *testing.T) {
 	if c.Name != "postgres" || c.Image != "postgres:17" {
 		t.Errorf("container = %q/%q", c.Name, c.Image)
 	}
-	if len(c.Command) != 2 || c.Command[0] != "/bin/sh" || c.Command[1] != "/pgbranch/rw/entrypoint.sh" {
+	if len(c.Command) != 2 || c.Command[0] != "/bin/sh" || c.Command[1] != "/pgoverlay/rw/entrypoint.sh" {
 		t.Errorf("Command = %v", c.Command)
 	}
-	if len(c.Env) != 2 || c.Env[0].Name != "PGDATA" || c.Env[0].Value != "/pgbranch/merged" ||
-		c.Env[1].Name != "PGBRANCH_LOWERS" || c.Env[1].Value != "/pgbranch/lower0/data" {
+	if len(c.Env) != 2 || c.Env[0].Name != "PGDATA" || c.Env[0].Value != "/pgoverlay/merged" ||
+		c.Env[1].Name != "PGOVERLAY_LOWERS" || c.Env[1].Value != "/pgoverlay/lower0/data" {
 		t.Errorf("Env = %v", c.Env)
 	}
 	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 5432 {
@@ -222,17 +222,17 @@ func TestBuildBranchPod(t *testing.T) {
 	if len(pod.Spec.Volumes) != 2 || len(c.VolumeMounts) != 2 {
 		t.Fatalf("volumes/mounts = %d/%d", len(pod.Spec.Volumes), len(c.VolumeMounts))
 	}
-	if p := pod.Spec.Volumes[0].HostPath.Path; p != "/var/lib/pgbranch/pgbranch-src-main" {
+	if p := pod.Spec.Volumes[0].HostPath.Path; p != "/var/lib/pgoverlay/pgoverlay-src-main" {
 		t.Errorf("volume[0] hostPath = %q", p)
 	}
-	if p := pod.Spec.Volumes[1].HostPath.Path; p != "/var/lib/pgbranch/pgbranch-br-pr-1-rw" {
+	if p := pod.Spec.Volumes[1].HostPath.Path; p != "/var/lib/pgoverlay/pgoverlay-br-pr-1-rw" {
 		t.Errorf("volume[1] hostPath = %q", p)
 	}
-	if m := c.VolumeMounts[0]; m.MountPath != "/pgbranch/lower0" || !m.ReadOnly {
-		t.Errorf("mount[0] = %+v, want read-only /pgbranch/lower0", m)
+	if m := c.VolumeMounts[0]; m.MountPath != "/pgoverlay/lower0" || !m.ReadOnly {
+		t.Errorf("mount[0] = %+v, want read-only /pgoverlay/lower0", m)
 	}
-	if m := c.VolumeMounts[1]; m.MountPath != "/pgbranch/rw" || m.ReadOnly {
-		t.Errorf("mount[1] = %+v, want rw /pgbranch/rw", m)
+	if m := c.VolumeMounts[1]; m.MountPath != "/pgoverlay/rw" || m.ReadOnly {
+		t.Errorf("mount[1] = %+v, want rw /pgoverlay/rw", m)
 	}
 }
 
@@ -251,7 +251,7 @@ func fakeKubeDriver(t *testing.T) (*KubeDriver, *fake.Clientset) {
 		return false, nil, nil
 	})
 	d := &KubeDriver{cs: cs, namespace: "default"}
-	d.storage = &hostPathStorage{d: d, node: "n", dataRoot: "/var/lib/pgbranch"}
+	d.storage = &hostPathStorage{d: d, node: "n", dataRoot: "/var/lib/pgoverlay"}
 	return d, cs
 }
 
@@ -330,9 +330,9 @@ func TestKubeInspectAndListManaged(t *testing.T) {
 	d, cs := fakeKubeDriver(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	pod := buildBranchPod("default", &hostPathStorage{node: "n", dataRoot: "/var/lib/pgbranch"}, BranchSpec{
-		Name: "pgbranch-br-x", Image: "postgres:17",
-		Labels: map[string]string{"pgbranch.managed": "true", "pgbranch.role": "branch"},
+	pod := buildBranchPod("default", &hostPathStorage{node: "n", dataRoot: "/var/lib/pgoverlay"}, BranchSpec{
+		Name: "pgoverlay-br-x", Image: "postgres:17",
+		Labels: map[string]string{"pgoverlay.managed": "true", "pgoverlay.role": "branch"},
 	})
 	if _, err := cs.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
@@ -342,21 +342,21 @@ func TestKubeInspectAndListManaged(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("default").UpdateStatus(ctx, pod, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	info, err := d.Inspect(ctx, "pgbranch-br-x")
+	info, err := d.Inspect(ctx, "pgoverlay-br-x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.ID != "pgbranch-br-x" || !info.Running || info.Host != "10.244.0.7" || info.Port != 5432 {
+	if info.ID != "pgoverlay-br-x" || !info.Running || info.Host != "10.244.0.7" || info.Port != 5432 {
 		t.Errorf("Inspect = %+v", info)
 	}
-	if info.Labels["pgbranch.role"] != "branch" {
+	if info.Labels["pgoverlay.role"] != "branch" {
 		t.Errorf("labels = %v", info.Labels)
 	}
 	list, err := d.ListManaged(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 1 || list[0].ID != "pgbranch-br-x" || !list[0].Running {
+	if len(list) != 1 || list[0].ID != "pgoverlay-br-x" || !list[0].Running {
 		t.Errorf("ListManaged = %+v", list)
 	}
 }

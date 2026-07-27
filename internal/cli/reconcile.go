@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
 // newDoctorCmd reports reconcile drift read-only: stuck rows, orphaned

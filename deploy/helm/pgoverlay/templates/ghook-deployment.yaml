@@ -11,19 +11,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "pgbranch.ghook.fullname" . }}
+  name: {{ include "pgoverlay.ghook.fullname" . }}
   labels:
-    {{- include "pgbranch.labels" . | nindent 4 }}
+    {{- include "pgoverlay.labels" . | nindent 4 }}
     app.kubernetes.io/component: ghook
 spec:
   replicas: 1
   selector:
     matchLabels:
-      {{- include "pgbranch.ghook.selectorLabels" . | nindent 6 }}
+      {{- include "pgoverlay.ghook.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "pgbranch.ghook.selectorLabels" . | nindent 8 }}
+        {{- include "pgoverlay.ghook.selectorLabels" . | nindent 8 }}
     spec:
       containers:
         - name: ghook
@@ -35,18 +35,18 @@ spec:
             - name: GHOOK_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgbranch.ghook.secretName" . }}
+                  name: {{ include "pgoverlay.ghook.secretName" . }}
                   key: webhook-secret
             # branchd's REST API via in-cluster DNS
-            - name: GHOOK_PGBRANCH_SERVER
-              value: http://{{ include "pgbranch.fullname" . }}-api:{{ .Values.api.port }}
-            - name: GHOOK_PGBRANCH_TOKEN
+            - name: GHOOK_PGOVERLAY_SERVER
+              value: http://{{ include "pgoverlay.fullname" . }}-api:{{ .Values.api.port }}
+            - name: GHOOK_PGOVERLAY_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgbranch.tokenSecretName" . }}
+                  name: {{ include "pgoverlay.tokenSecretName" . }}
                   key: token
             - name: GHOOK_SOURCE
-              value: {{ required "set ghook.source (pgbranch source to branch from)" .Values.ghook.source | quote }}
+              value: {{ required "set ghook.source (pgoverlay source to branch from)" .Values.ghook.source | quote }}
             {{- with .Values.ghook.ttl }}
             - name: GHOOK_TTL
               value: {{ . | quote }}
@@ -82,14 +82,14 @@ spec:
             - name: GHOOK_APP_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgbranch.ghook.secretName" . }}
+                  name: {{ include "pgoverlay.ghook.secretName" . }}
                   key: app-private-key
             {{- else }}
             # optional PAT: enables the live PR comment and commit statuses
             - name: GHOOK_GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgbranch.ghook.secretName" . }}
+                  name: {{ include "pgoverlay.ghook.secretName" . }}
                   key: github-token
                   optional: true
             {{- end }}

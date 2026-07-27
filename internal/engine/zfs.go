@@ -6,9 +6,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // ZFS backend (experimental): layer operations become zfs commands run in

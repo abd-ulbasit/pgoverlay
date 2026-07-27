@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // SeedDumpSpec seeds a source with pg_dump instead of pg_basebackup: a

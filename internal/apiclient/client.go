@@ -1,5 +1,5 @@
 // Package apiclient is a thin typed client for branchd's REST API, used by
-// the CLI in server mode (PGBRANCH_SERVER / --server).
+// the CLI in server mode (PGOVERLAY_SERVER / --server).
 package apiclient
 
 import (
@@ -18,21 +18,21 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
 type Client struct {
 	BaseURL string // e.g. http://localhost:7070 or https://branchd.example:7070
-	Token   string // bearer token (PGBRANCH_TOKEN)
+	Token   string // bearer token (PGOVERLAY_TOKEN)
 	HTTP    *http.Client
 }
 
 // New builds a client for the given base URL (http or https). Transport
 // safety, in order of preference:
-//   - PGBRANCH_CA_CERT=<pem-file> trusts a self-signed branchd properly by
+//   - PGOVERLAY_CA_CERT=<pem-file> trusts a self-signed branchd properly by
 //     adding the PEM to the root pool (the right way to use a private CA).
-//   - PGBRANCH_TLS_SKIP_VERIFY=1 disables certificate verification entirely;
+//   - PGOVERLAY_TLS_SKIP_VERIFY=1 disables certificate verification entirely;
 //     supported as an escape hatch but warned about loudly (MITM-exposed).
 //
 // It also warns once, to stderr, when the token would be sent over plaintext
@@ -42,21 +42,21 @@ func New(baseURL, token string) *Client {
 	baseURL = strings.TrimRight(baseURL, "/")
 	httpClient := http.DefaultClient
 
-	if caPath := os.Getenv("PGBRANCH_CA_CERT"); caPath != "" {
+	if caPath := os.Getenv("PGOVERLAY_CA_CERT"); caPath != "" {
 		if tlsCfg, err := tlsConfigWithCA(caPath); err != nil {
-			warnf("pgbranch: PGBRANCH_CA_CERT %q could not be loaded (%v); falling back to system roots", caPath, err)
+			warnf("pgoverlay: PGOVERLAY_CA_CERT %q could not be loaded (%v); falling back to system roots", caPath, err)
 		} else {
 			httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
 		}
 	}
-	if os.Getenv("PGBRANCH_TLS_SKIP_VERIFY") == "1" {
-		warnf("pgbranch: PGBRANCH_TLS_SKIP_VERIFY=1 disables TLS certificate verification — the connection is exposed to man-in-the-middle attacks")
+	if os.Getenv("PGOVERLAY_TLS_SKIP_VERIFY") == "1" {
+		warnf("pgoverlay: PGOVERLAY_TLS_SKIP_VERIFY=1 disables TLS certificate verification — the connection is exposed to man-in-the-middle attacks")
 		httpClient = &http.Client{Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}}
 	}
 	if token != "" && plaintextTokenLeak(baseURL) {
-		warnf("pgbranch: sending bearer token in cleartext over http to a non-loopback host (%s) — use https or PGBRANCH_CA_CERT", baseURL)
+		warnf("pgoverlay: sending bearer token in cleartext over http to a non-loopback host (%s) — use https or PGOVERLAY_CA_CERT", baseURL)
 	}
 
 	return &Client{BaseURL: baseURL, Token: token, HTTP: httpClient}

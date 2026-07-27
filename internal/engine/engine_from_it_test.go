@@ -12,10 +12,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/pgproxy"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgproxy"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // dockerVolumeExists asks the docker CLI whether a named volume exists —
@@ -43,8 +43,8 @@ func dockerVolumeExists(t *testing.T, name string) bool {
 //	its base chain (including b1's marker); destroying b2 GCs the layers and
 //	the volumes are actually gone.
 func TestBranchFromBranchEndToEnd(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -147,9 +147,9 @@ func TestBranchFromBranchEndToEnd(t *testing.T) {
 	}
 	pconn.Close(ctx)
 
-	frozenLayerVol := "pgbranch-br-bfb-b1-rw" // b1's original rw, frozen
-	parentNewRW := b1.RWVolume                // b1's post-freeze rw (g2)
-	if parentNewRW != "pgbranch-br-bfb-b1-rw-g2" {
+	frozenLayerVol := "pgoverlay-br-bfb-b1-rw" // b1's original rw, frozen
+	parentNewRW := b1.RWVolume                 // b1's post-freeze rw (g2)
+	if parentNewRW != "pgoverlay-br-bfb-b1-rw-g2" {
 		t.Fatalf("parent rw after freeze = %q", parentNewRW)
 	}
 
@@ -185,7 +185,7 @@ func TestBranchFromBranchEndToEnd(t *testing.T) {
 	if err := e.DestroyBranch(ctx, "bfb-b2"); err != nil {
 		t.Fatal(err)
 	}
-	for _, v := range []string{"pgbranch-br-bfb-b2-rw", frozenLayerVol, parentNewRW} {
+	for _, v := range []string{"pgoverlay-br-bfb-b2-rw", frozenLayerVol, parentNewRW} {
 		if dockerVolumeExists(t, v) {
 			t.Errorf("volume %q still exists after final destroy", v)
 		}

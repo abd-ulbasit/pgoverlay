@@ -1,24 +1,24 @@
-// Package pgbranchtest gives every Go test its own disposable Postgres
-// database: Acquire creates a copy-on-write branch on a running pgbranch
+// Package pgoverlaytest gives every Go test its own disposable Postgres
+// database: Acquire creates a copy-on-write branch on a running pgoverlay
 // server (branchd), waits until it is ready, and destroys it when the test
 // finishes.
 //
 //	func TestOrders(t *testing.T) {
-//		b := pgbranchtest.Acquire(t)
+//		b := pgoverlaytest.Acquire(t)
 //		db, _ := sql.Open("pgx", b.DSN)
 //		// full production-shaped data, isolated writes
 //	}
 //
-// Configuration comes from the environment: PGBRANCH_SERVER (base URL of
+// Configuration comes from the environment: PGOVERLAY_SERVER (base URL of
 // branchd; tests are skipped when unset — the SDK is integration-only by
-// nature), PGBRANCH_TOKEN (API bearer token), PGBRANCH_TEST_SOURCE (default
-// source name, else "main"), and PGBRANCH_PASSWORD (database password used in
+// nature), PGOVERLAY_TOKEN (API bearer token), PGOVERLAY_TEST_SOURCE (default
+// source name, else "main"), and PGOVERLAY_PASSWORD (database password used in
 // the returned DSNs; branch credentials are inherited from the source unless
 // the server rotates them per branch and returns one).
 //
 // The package is intentionally self-contained (stdlib only): it speaks the
-// branchd REST API directly and never imports pgbranch internals.
-package pgbranchtest
+// branchd REST API directly and never imports pgoverlay internals.
+package pgoverlaytest
 
 import (
 	"bytes"
@@ -39,7 +39,7 @@ import (
 )
 
 // Branch is an acquired database branch. DSN targets the branch's Postgres
-// directly; ProxyDSN goes through the pgbranch wire-protocol router on the
+// directly; ProxyDSN goes through the pgoverlay wire-protocol router on the
 // server host (port 6432, database "db@branch").
 type Branch struct {
 	Name     string
@@ -60,7 +60,7 @@ type config struct {
 // Option customizes Acquire.
 type Option func(*config)
 
-// WithSource selects the source to branch from. Default: PGBRANCH_TEST_SOURCE,
+// WithSource selects the source to branch from. Default: PGOVERLAY_TEST_SOURCE,
 // else "main".
 func WithSource(name string) Option { return func(c *config) { c.source = name } }
 
@@ -78,14 +78,14 @@ const acquireTimeout = 5 * time.Minute
 
 // Acquire creates a branch named t-<test name>-<random> and registers its
 // destruction with t.Cleanup. It is safe for parallel tests: every call gets
-// its own branch. The test is skipped when PGBRANCH_SERVER is unset.
+// its own branch. The test is skipped when PGOVERLAY_SERVER is unset.
 func Acquire(t testing.TB, opts ...Option) *Branch {
 	t.Helper()
-	server := os.Getenv("PGBRANCH_SERVER")
+	server := os.Getenv("PGOVERLAY_SERVER")
 	if server == "" {
-		t.Skip("pgbranchtest: PGBRANCH_SERVER not set, skipping")
+		t.Skip("pgoverlaytest: PGOVERLAY_SERVER not set, skipping")
 	}
-	cfg := config{source: os.Getenv("PGBRANCH_TEST_SOURCE"), ttl: time.Hour}
+	cfg := config{source: os.Getenv("PGOVERLAY_TEST_SOURCE"), ttl: time.Hour}
 	if cfg.source == "" {
 		cfg.source = "main"
 	}
@@ -93,7 +93,7 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 		o(&cfg)
 	}
 
-	c := &client{base: strings.TrimRight(server, "/"), token: os.Getenv("PGBRANCH_TOKEN")}
+	c := &client{base: strings.TrimRight(server, "/"), token: os.Getenv("PGOVERLAY_TOKEN")}
 	name := branchName(t.Name(), randHex(6))
 
 	ctx, cancel := context.WithTimeout(context.Background(), acquireTimeout)
@@ -103,14 +103,14 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 		Name: name, Source: cfg.source, TTLSeconds: int(cfg.ttl / time.Second),
 	})
 	if err != nil {
-		t.Fatalf("pgbranchtest: create branch %q from %q: %v", name, cfg.source, err)
+		t.Fatalf("pgoverlaytest: create branch %q from %q: %v", name, cfg.source, err)
 	}
 	// register destruction first so a failed ready-wait still cleans up
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		if err := c.destroyBranch(ctx, name); err != nil {
-			t.Errorf("pgbranchtest: destroy branch %q: %v", name, err)
+			t.Errorf("pgoverlaytest: destroy branch %q: %v", name, err)
 		}
 	})
 
@@ -119,12 +119,12 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 	for b.State != "ready" {
 		select {
 		case <-ctx.Done():
-			t.Fatalf("pgbranchtest: branch %q not ready after %s (state %q)", name, acquireTimeout, b.State)
+			t.Fatalf("pgoverlaytest: branch %q not ready after %s (state %q)", name, acquireTimeout, b.State)
 		case <-time.After(pollInterval):
 		}
 		b, err = c.getBranch(ctx, name)
 		if err != nil {
-			t.Fatalf("pgbranchtest: wait for branch %q: %v", name, err)
+			t.Fatalf("pgoverlaytest: wait for branch %q: %v", name, err)
 		}
 	}
 	return newBranch(b, c.base)
@@ -133,7 +133,7 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 // newBranch maps the wire shape to the public Branch, building DSNs. The
 // direct host falls back to the server's hostname for older servers that
 // don't send one; the password prefers a server-returned per-branch secret
-// (credential-rotation mode) over the PGBRANCH_PASSWORD fallback.
+// (credential-rotation mode) over the PGOVERLAY_PASSWORD fallback.
 func newBranch(w *wireBranch, baseURL string) *Branch {
 	serverHost := ""
 	if u, err := url.Parse(baseURL); err == nil {
@@ -153,7 +153,7 @@ func newBranch(w *wireBranch, baseURL string) *Branch {
 		b.Database = "postgres"
 	}
 	if b.Password == "" {
-		b.Password = os.Getenv("PGBRANCH_PASSWORD")
+		b.Password = os.Getenv("PGOVERLAY_PASSWORD")
 	}
 	b.DSN = dsn(b.User, b.Password, b.Host, b.Port, b.Database)
 	b.ProxyDSN = dsn(b.User, b.Password, serverHost, 6432, w.ProxyDatabase)
@@ -204,7 +204,7 @@ func branchName(testName, suffix string) string {
 func randHex(n int) string {
 	b := make([]byte, (n+1)/2)
 	if _, err := rand.Read(b); err != nil {
-		panic("pgbranchtest: crypto/rand: " + err.Error())
+		panic("pgoverlaytest: crypto/rand: " + err.Error())
 	}
 	return hex.EncodeToString(b)[:n]
 }

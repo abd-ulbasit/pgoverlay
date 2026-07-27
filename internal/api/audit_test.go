@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // findActor returns the recorded actor for the first history entry whose

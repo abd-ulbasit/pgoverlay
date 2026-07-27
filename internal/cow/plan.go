@@ -19,8 +19,8 @@ var EntrypointScript string
 var EntrypointScriptDirect string
 
 const (
-	MergedPath = "/pgbranch/merged" // PGDATA inside branch container (overlay)
-	RWPath     = "/pgbranch/rw"     // branch rw layer mountpoint
+	MergedPath = "/pgoverlay/merged" // PGDATA inside branch container (overlay)
+	RWPath     = "/pgoverlay/rw"     // branch rw layer mountpoint
 	// DirectDataPath is PGDATA in the direct (zfs/csi) modes: the writable
 	// clone (dataset mountpoint or PVC) is mounted at RWPath and seeding put
 	// the cluster in its data/ subdir.
@@ -49,7 +49,7 @@ func ParseBackend(s string) (Backend, error) {
 // exact zfs argv the engine runs through privileged helpers. Pure — no I/O.
 type Planner struct {
 	Backend Backend
-	Dataset string // zfs only: dataset prefix all pgbranch datasets live under, e.g. "tank/pgbranch"
+	Dataset string // zfs only: dataset prefix all pgoverlay datasets live under, e.g. "tank/pgoverlay"
 }
 
 // SourceLayerName names the layer a source generation is seeded into:
@@ -114,9 +114,9 @@ func (p Planner) ZFSUsed(dataset string) []string {
 }
 
 type Plan struct {
-	SourceVolume string   // mounted ro at /pgbranch/lower0
+	SourceVolume string   // mounted ro at /pgoverlay/lower0
 	RWVolume     string   // upper+work live here
-	LayerVolumes []string // frozen layer volumes, NEWEST first, mounted ro at /pgbranch/lower1..N
+	LayerVolumes []string // frozen layer volumes, NEWEST first, mounted ro at /pgoverlay/lower1..N
 	Lowers       []string // in overlay order, topmost (newest) first, source last
 }
 
@@ -124,11 +124,11 @@ type Plan struct {
 // Generation 1 keeps the legacy Phase 1 name so existing volumes keep working.
 func SourceVolumeName(source string, gen int) string {
 	if gen <= 1 {
-		return "pgbranch-src-" + source
+		return "pgoverlay-src-" + source
 	}
-	return fmt.Sprintf("pgbranch-src-%s-g%d", source, gen)
+	return fmt.Sprintf("pgoverlay-src-%s-g%d", source, gen)
 }
-func BranchRWVolumeName(branch string) string { return "pgbranch-br-" + branch + "-rw" }
+func BranchRWVolumeName(branch string) string { return "pgoverlay-br-" + branch + "-rw" }
 
 // BranchRWVolumeNameGen names a branch's writable volume after gen-1 freezes:
 // every freeze turns the current rw volume into an immutable layer (keeping
@@ -143,7 +143,7 @@ func BranchRWVolumeNameGen(branch string, gen int) string {
 
 // LowerMountTarget is the in-container mount point of lower layer i
 // (0 = the source volume, 1..N = frozen layer volumes, newest first).
-func LowerMountTarget(i int) string { return fmt.Sprintf("/pgbranch/lower%d", i) }
+func LowerMountTarget(i int) string { return fmt.Sprintf("/pgoverlay/lower%d", i) }
 
 // PlanBranch lays out a branch's overlay: rwVolume holds upper/work,
 // layerVolumes are the branch's frozen layer chain (NEWEST first, possibly
@@ -168,5 +168,5 @@ func PlanBranch(rwVolume, sourceVolume string, layerVolumes []string) Plan {
 	}
 }
 
-// LowerEnv renders PGBRANCH_LOWERS for the entrypoint (colon-separated).
+// LowerEnv renders PGOVERLAY_LOWERS for the entrypoint (colon-separated).
 func (p Plan) LowerEnv() string { return strings.Join(p.Lowers, ":") }

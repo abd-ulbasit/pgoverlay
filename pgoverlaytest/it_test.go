@@ -1,11 +1,11 @@
-package pgbranchtest_test
+package pgoverlaytest_test
 
 // Integration test for the public SDK: starts the REST API in-process on a
 // real engine + docker driver (same bootstrap as internal/api's IT), points
-// PGBRANCH_SERVER at it, and exercises Acquire end to end — connect, write,
+// PGOVERLAY_SERVER at it, and exercises Acquire end to end — connect, write,
 // and automatic destruction when the subtest ends.
 //
-// Run: PGBRANCH_IT=1 go test ./pgbranchtest/ -v -timeout 15m
+// Run: PGOVERLAY_IT=1 go test ./pgoverlaytest/ -v -timeout 15m
 
 import (
 	"context"
@@ -19,19 +19,19 @@ import (
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
-	"github.com/abd-ulbasit/pgbranch/pgbranchtest"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/pgoverlaytest"
 )
 
 const sdkITToken = "sdk-it-token"
 
 func TestSDKAcquire(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -78,14 +78,14 @@ func TestSDKAcquire(t *testing.T) {
 		}
 	})
 
-	t.Setenv("PGBRANCH_SERVER", ts.URL)
-	t.Setenv("PGBRANCH_TOKEN", sdkITToken)
-	t.Setenv("PGBRANCH_TEST_SOURCE", "sdk-main")
-	t.Setenv("PGBRANCH_PASSWORD", "secret")
+	t.Setenv("PGOVERLAY_SERVER", ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", sdkITToken)
+	t.Setenv("PGOVERLAY_TEST_SOURCE", "sdk-main")
+	t.Setenv("PGOVERLAY_PASSWORD", "secret")
 
 	var branchName string
 	t.Run("acquire-write", func(t *testing.T) {
-		b := pgbranchtest.Acquire(t)
+		b := pgoverlaytest.Acquire(t)
 		branchName = b.Name
 		t.Logf("acquired branch %q at %s:%d", b.Name, b.Host, b.Port)
 

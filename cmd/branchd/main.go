@@ -1,6 +1,6 @@
-// branchd is pgbranch's daemon: REST control plane (--api-addr) and Postgres
+// branchd is pgoverlay's daemon: REST control plane (--api-addr) and Postgres
 // wire-protocol router (--pg-addr) over one shared engine/registry, plus a
-// TTL reaper. Auth is a single bearer token from PGBRANCH_TOKEN (required).
+// TTL reaper. Auth is a single bearer token from PGOVERLAY_TOKEN (required).
 //
 // Shutdown (SIGINT/SIGTERM) is graceful: listeners close, in-flight requests
 // finish, and branch containers keep running — they are durable state.
@@ -25,15 +25,15 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/config"
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/ha"
-	"github.com/abd-ulbasit/pgbranch/internal/metrics"
-	"github.com/abd-ulbasit/pgbranch/internal/pgproxy"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/config"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/ha"
+	"github.com/abd-ulbasit/pgoverlay/internal/metrics"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgproxy"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 func main() {
@@ -181,7 +181,7 @@ func resolveStorage(o storageOptions) (cow.Backend, error) {
 
 // storageRoot returns the on-disk path whose filesystem holds all branch CoW
 // data and the SQLite registry, for the disk-free gauge. docker/overlay use
-// cfg.Home (~/.pgbranch); kube hostpath uses --kube-data-root on the storage
+// cfg.Home (~/.pgoverlay); kube hostpath uses --kube-data-root on the storage
 // node. CSI has no single shared local root (one PVC per branch), so it returns
 // "" and the gauge is left unregistered.
 func storageRoot(runtimeName, kubeStorage, kubeDataRoot, home string) string {
@@ -201,25 +201,25 @@ func run() error {
 	reapInterval := flag.Duration("reap-interval", 0, "DEPRECATED alias for --reconcile-interval (folded into the unified reconcile loop)")
 	stuckTimeout := flag.Duration("stuck-timeout", 10*time.Minute, "age past which a creating/resetting branch row is considered stuck and failed by reconcile")
 	runtimeName := flag.String("runtime", "docker", "container runtime: docker or kube")
-	kubeNamespace := flag.String("kube-namespace", "", `namespace for branch/helper pods (default: POD_NAMESPACE when in-cluster, else "pgbranch")`)
+	kubeNamespace := flag.String("kube-namespace", "", `namespace for branch/helper pods (default: POD_NAMESPACE when in-cluster, else "pgoverlay")`)
 	kubeNode := flag.String("kube-node", "", "storage node name (required with --runtime kube --kube-storage hostpath; all CoW data lives on this node)")
-	kubeDataRoot := flag.String("kube-data-root", "/var/lib/pgbranch", "CoW data root on the storage node (hostpath storage only)")
+	kubeDataRoot := flag.String("kube-data-root", "/var/lib/pgoverlay", "CoW data root on the storage node (hostpath storage only)")
 	kubeconfig := flag.String("kubeconfig", "", "kubeconfig path (default: in-cluster config, then KUBECONFIG / ~/.kube/config)")
 	kubeStorage := flag.String("kube-storage", "hostpath", "kube storage mode: hostpath (single node, data under --kube-data-root) or csi (multi-node, PVC clones; see docs/kubernetes.md)")
-	csiStorageClass := flag.String("csi-storage-class", "", "StorageClass for pgbranch PVCs (required with --kube-storage csi; its CSI driver must support PVC cloning, or snapshots with --csi-snapshot-class)")
+	csiStorageClass := flag.String("csi-storage-class", "", "StorageClass for pgoverlay PVCs (required with --kube-storage csi; its CSI driver must support PVC cloning, or snapshots with --csi-snapshot-class)")
 	csiSnapshotClass := flag.String("csi-snapshot-class", "", "VolumeSnapshotClass: clone branches via VolumeSnapshot+restore instead of direct PVC clones (--kube-storage csi only)")
-	csiVolumeSize := flag.String("csi-volume-size", "", "size of every pgbranch PVC, e.g. 50Gi (default 10Gi; --kube-storage csi only)")
+	csiVolumeSize := flag.String("csi-volume-size", "", "size of every pgoverlay PVC, e.g. 50Gi (default 10Gi; --kube-storage csi only)")
 	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default), zfs (experimental, see docs/zfs.md) or csi (forced by --kube-storage csi)")
-	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgbranch datasets, e.g. tank/pgbranch (required with --cow zfs)")
+	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgoverlay datasets, e.g. tank/pgoverlay (required with --cow zfs)")
 	rotateCreds := flag.Bool("rotate-branch-credentials", false, "give every branch its own generated password instead of inheriting the source's (returned as `password` in branch API responses; see docs/architecture.md)")
-	maxBranches := flag.Int("max-branches", envInt("PGBRANCH_MAX_BRANCHES", 0), "cap on live (non-destroyed) branches; creates past the cap return 403 (0 = unlimited; env PGBRANCH_MAX_BRANCHES)")
-	defaultTTL := flag.Duration("default-ttl", envDuration("PGBRANCH_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGBRANCH_DEFAULT_TTL)")
-	maxTTL := flag.Duration("max-ttl", envDuration("PGBRANCH_MAX_TTL", 0), "upper bound on any requested branch TTL; longer TTLs are capped to this, e.g. 168h (0 = no cap; env PGBRANCH_MAX_TTL)")
+	maxBranches := flag.Int("max-branches", envInt("PGOVERLAY_MAX_BRANCHES", 0), "cap on live (non-destroyed) branches; creates past the cap return 403 (0 = unlimited; env PGOVERLAY_MAX_BRANCHES)")
+	defaultTTL := flag.Duration("default-ttl", envDuration("PGOVERLAY_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGOVERLAY_DEFAULT_TTL)")
+	maxTTL := flag.Duration("max-ttl", envDuration("PGOVERLAY_MAX_TTL", 0), "upper bound on any requested branch TTL; longer TTLs are capped to this, e.g. 168h (0 = no cap; env PGOVERLAY_MAX_TTL)")
 	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
 	pgTLSKey := flag.String("pg-tls-key", "", "PEM private key for the Postgres router (requires --pg-tls-cert)")
-	leaderElect := flag.Bool("leader-elect", false, "HA: contend for a coordination.k8s.io Lease (pgbranch-branchd) so only the leader runs reconcile and accepts mutating /v1 requests (kube runtime only; off = single-instance, always leader)")
+	leaderElect := flag.Bool("leader-elect", false, "HA: contend for a coordination.k8s.io Lease (pgoverlay-branchd) so only the leader runs reconcile and accepts mutating /v1 requests (kube runtime only; off = single-instance, always leader)")
 	flag.Parse()
 
 	// --reap-interval is a deprecated alias: when set (non-zero) it folds into
@@ -238,9 +238,9 @@ func run() error {
 		return err
 	}
 
-	token := os.Getenv("PGBRANCH_TOKEN")
+	token := os.Getenv("PGOVERLAY_TOKEN")
 	if token == "" {
-		return errors.New("PGBRANCH_TOKEN must be set (bearer token for the REST API)")
+		return errors.New("PGOVERLAY_TOKEN must be set (bearer token for the REST API)")
 	}
 
 	cfg, err := config.Load()
@@ -255,10 +255,10 @@ func run() error {
 		return err
 	}
 	defer reg.Close()
-	// Encrypt branch passwords at rest with a key derived from PGBRANCH_TOKEN
+	// Encrypt branch passwords at rest with a key derived from PGOVERLAY_TOKEN
 	// (key = sha256(token)). The registry DB sits on a hostPath/PVC; without
 	// this a reader of the file gets every live branch's working credential.
-	// Trade-off: rotating PGBRANCH_TOKEN makes existing encrypted passwords
+	// Trade-off: rotating PGOVERLAY_TOKEN makes existing encrypted passwords
 	// unrecoverable — re-run credential rotation after a token change. (token
 	// is non-empty here: branchd refused to start above otherwise.)
 	if err := reg.SetSecretKey(registry.DeriveSecretKey(token)); err != nil {
@@ -279,7 +279,7 @@ func run() error {
 		return err
 	}
 	if backend == cow.BackendZFS && *zfsDataset == "" {
-		return errors.New("--zfs-dataset is required with --cow zfs (the dataset prefix pgbranch owns, e.g. tank/pgbranch)")
+		return errors.New("--zfs-dataset is required with --cow zfs (the dataset prefix pgoverlay owns, e.g. tank/pgoverlay)")
 	}
 	var drv runtime.Driver
 	var kubeNS string // resolved branchd namespace (kube runtime); also the Lease namespace
@@ -292,7 +292,7 @@ func run() error {
 			ns = os.Getenv("POD_NAMESPACE")
 		}
 		if ns == "" {
-			ns = "pgbranch"
+			ns = "pgoverlay"
 		}
 		kubeNS = ns
 		if backend == cow.BackendCSI {
@@ -313,7 +313,7 @@ func run() error {
 	m.SetStateCounter(reg)
 	// Disk-free visibility on the storage-root filesystem that holds all CoW
 	// branch volumes plus the SQLite registry. For docker/overlay that root is
-	// cfg.Home (~/.pgbranch); for kube hostpath it is --kube-data-root on the
+	// cfg.Home (~/.pgoverlay); for kube hostpath it is --kube-data-root on the
 	// storage node. CSI gives each branch its own PVC with no single shared
 	// local root to statfs, so the gauge is wired only for the local-FS modes.
 	if diskRoot := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home); diskRoot != "" {

@@ -11,13 +11,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // ErrInvalidName rejects branch names that cannot be used across runtimes
-// (docker container names, k8s pod names — RFC 1123 after the pgbranch-br-
+// (docker container names, k8s pod names — RFC 1123 after the pgoverlay-br-
 // prefix). The API maps it to 400.
 var ErrInvalidName = errors.New("invalid branch name")
 
@@ -44,7 +44,7 @@ func validateBranchName(name string) error {
 
 // validateSourceName enforces the same anchored naming rule on source names.
 // A source name flows into volume/dataset names (e.g. the ZFS backend builds
-// `tank/pgbranch/src-<name>-gN`), so without this gate a name like
+// `tank/pgoverlay/src-<name>-gN`), so without this gate a name like
 // `../../rpool/ROOT` would traverse the dataset namespace. Gated at the engine
 // boundary (AddSource) so every backend and caller is covered.
 func validateSourceName(name string) error {
@@ -133,7 +133,7 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	bg := context.WithoutCancel(ctx)
 
 	// 1. rw volume (upper/work + entrypoint script live here)
-	if err := e.drv.CreateVolume(ctx, plan.RWVolume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID})); err != nil {
+	if err := e.drv.CreateVolume(ctx, plan.RWVolume, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.branch.id": b.ID})); err != nil {
 		return fail(fmt.Errorf("create rw volume: %w", err))
 	}
 	undo = append(undo, func() {
@@ -180,8 +180,8 @@ func layerVolumes(chain []registry.Layer) []string {
 func (e *Engine) installOverlayEntrypoint(ctx context.Context, rwVolume string) error {
 	_, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
 		Image:  "alpine:3.21",
-		Cmd:    []string{"sh", "-c", `printf '%s' "$PGBRANCH_ENTRYPOINT" > /pgbranch/rw/entrypoint.sh && chmod 0755 /pgbranch/rw/entrypoint.sh && mkdir -p /pgbranch/rw/upper /pgbranch/rw/work`},
-		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScript},
+		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh && mkdir -p /pgoverlay/rw/upper /pgoverlay/rw/work`},
+		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScript},
 		Mounts: []runtime.Mount{{Volume: rwVolume, Target: cow.RWPath}},
 	})
 	return err
@@ -189,7 +189,7 @@ func (e *Engine) installOverlayEntrypoint(ctx context.Context, rwVolume string) 
 
 // startOverlayBranch starts a branch container assembling the overlay stack
 // from plan: source volume ro at lower0, frozen layer volumes (newest first)
-// ro at lower1..N, the rw volume at RWPath. PGBRANCH_LOWERS lists the overlay
+// ro at lower1..N, the rw volume at RWPath. PGOVERLAY_LOWERS lists the overlay
 // lowerdirs newest-first with the source last (see cow.PlanBranch).
 func (e *Engine) startOverlayBranch(ctx context.Context, name string, plan cow.Plan, image string, labels map[string]string) (string, error) {
 	mounts := make([]runtime.Mount, 0, len(plan.LayerVolumes)+2)
@@ -199,11 +199,11 @@ func (e *Engine) startOverlayBranch(ctx context.Context, name string, plan cow.P
 	}
 	mounts = append(mounts, runtime.Mount{Volume: plan.RWVolume, Target: cow.RWPath})
 	return e.drv.StartBranch(ctx, runtime.BranchSpec{
-		Name:  "pgbranch-br-" + name,
+		Name:  "pgoverlay-br-" + name,
 		Image: image,
 		Env: []string{
 			"PGDATA=" + cow.MergedPath,
-			"PGBRANCH_LOWERS=" + plan.LowerEnv(),
+			"PGOVERLAY_LOWERS=" + plan.LowerEnv(),
 		},
 		Mounts:     mounts,
 		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
@@ -250,8 +250,8 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	cloneMount := runtime.Mount{Kind: runtime.MountHostPath, Volume: e.planner.Mountpoint(b.RWVolume), Target: cow.RWPath}
 	if _, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
 		Image:  "alpine:3.21",
-		Cmd:    []string{"sh", "-c", `printf '%s' "$PGBRANCH_ENTRYPOINT" > /pgbranch/rw/entrypoint.sh && chmod 0755 /pgbranch/rw/entrypoint.sh`},
-		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScriptDirect},
+		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh`},
+		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScriptDirect},
 		Mounts: []runtime.Mount{cloneMount},
 	}); err != nil {
 		return fail(fmt.Errorf("install entrypoint: %w", err))
@@ -259,7 +259,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 
 	// 4. branch container on the clone mountpoint
 	cid, err := e.drv.StartBranch(ctx, runtime.BranchSpec{
-		Name:       "pgbranch-br-" + b.Name,
+		Name:       "pgoverlay-br-" + b.Name,
 		Image:      e.image(src.PGVersion),
 		Env:        []string{"PGDATA=" + cow.DirectDataPath},
 		Mounts:     []runtime.Mount{cloneMount},
@@ -282,15 +282,15 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 
 func (e *Engine) branchLabels(b *registry.Branch) map[string]string {
 	return e.instanceLabels(map[string]string{
-		"pgbranch.managed": "true", "pgbranch.role": "branch",
-		"pgbranch.branch.id": b.ID, "pgbranch.branch.name": b.Name,
+		"pgoverlay.managed": "true", "pgoverlay.role": "branch",
+		"pgoverlay.branch.id": b.ID, "pgoverlay.branch.name": b.Name,
 	})
 }
 
 // instanceLabels stamps the owning registry's instance id onto a label map so
 // reconcile reclaims only resources belonging to THIS registry. Every managed
 // resource (volumes, branch containers/pods) is labelled through here — the one
-// place the pgbranch.instance label is added — so no call site can omit it.
+// place the pgoverlay.instance label is added — so no call site can omit it.
 func (e *Engine) instanceLabels(labels map[string]string) map[string]string {
 	if labels == nil {
 		labels = map[string]string{}

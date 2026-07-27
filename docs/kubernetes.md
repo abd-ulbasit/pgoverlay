@@ -1,6 +1,6 @@
 # Kubernetes
 
-> Adapted from the [README](https://github.com/abd-ulbasit/pgbranch); the
+> Adapted from the [README](https://github.com/abd-ulbasit/pgoverlay); the
 > README stays the canonical copy of this walkthrough.
 
 branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm
@@ -15,9 +15,9 @@ mode — branches live in PersistentVolumeClaims (surviving node loss), pods
 schedule on any node and need no extra capabilities:
 
 ```bash
-make docker-build                          # builds ghcr.io/abd-ulbasit/pgbranch-branchd:dev (push it, or `kind load` for local clusters)
-helm install pgbranch deploy/helm/pgbranch \
-  --namespace pgbranch-system --create-namespace \
+make docker-build                          # builds ghcr.io/abd-ulbasit/pgoverlay-branchd:dev (push it, or `kind load` for local clusters)
+helm install pgoverlay deploy/helm/pgoverlay \
+  --namespace pgoverlay-system --create-namespace \
   --set node=<node-for-branchd-state> \
   --set token=$(openssl rand -hex 16) \
   --set storage.mode=csi \
@@ -32,7 +32,7 @@ Requirements:
 - Alternatively (or additionally) **VolumeSnapshot** support: set
   `storage.snapshotClass` and branches clone via VolumeSnapshot + restore
   instead. The external-snapshotter CRDs + controller must be installed.
-- `storage.volumeSize` sizes every pgbranch PVC (default 10Gi; clones are
+- `storage.volumeSize` sizes every pgoverlay PVC (default 10Gi; clones are
   thin on CoW drivers).
 
 In csi mode the chart also puts branchd's own state (the sqlite registry)
@@ -55,7 +55,7 @@ is an independent volume: destroying a parent never breaks its children
 Two csi-mode caveats: branch disk usage (`pgb branch ls` SIZE) reports the
 full clone size as the filesystem sees it, not the CoW delta — what a delta
 costs depends on the driver. And whether a *live* source PVC can be cloned
-while a helper pod holds it is driver-specific; pgbranch only clones source
+while a helper pod holds it is driver-specific; pgoverlay only clones source
 PVCs with no pod attached (seeding helpers are one-shot), so this does not
 come up in normal flows.
 
@@ -68,8 +68,8 @@ overlay mount). It is the simplest honest setup, and what `make k8s-it`
 exercises on kind:
 
 ```bash
-helm install pgbranch deploy/helm/pgbranch \
-  --namespace pgbranch-system --create-namespace \
+helm install pgoverlay deploy/helm/pgoverlay \
+  --namespace pgoverlay-system --create-namespace \
   --set node=<storage-node-name> \
   --set token=$(openssl rand -hex 16)
 ```
@@ -87,7 +87,7 @@ helm install pgbranch deploy/helm/pgbranch \
   (`kubectl get nodes`); its sqlite registry lives there in a `hostPath`
   (unless `persistence` puts it on a PVC). In the default `hostpath`
   storage mode it is also the **storage node**: all CoW data lives under
-  `dataRoot` (default `/var/lib/pgbranch`) on this one node as plain
+  `dataRoot` (default `/var/lib/pgoverlay`) on this one node as plain
   directories, and every branch/helper pod is pinned there.
 - **`storage.mode`** — `csi` (recommended, multi-node, branches as PVC
   clones) or `hostpath` (default, single-node/dev — see above).
@@ -118,17 +118,17 @@ issuer for in-cluster trust, or an ACME issuer for a publicly reachable LB):
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: pgbranch-proxy-tls
-  namespace: pgbranch-system
+  name: pgoverlay-proxy-tls
+  namespace: pgoverlay-system
 spec:
-  secretName: pgbranch-proxy-tls           # <- the Secret the chart consumes
-  dnsNames: ["pgbranch-proxy.example.com"] # how clients address the proxy
+  secretName: pgoverlay-proxy-tls           # <- the Secret the chart consumes
+  dnsNames: ["pgoverlay-proxy.example.com"] # how clients address the proxy
   issuerRef:
     name: my-issuer
     kind: ClusterIssuer
 ```
 
-Then install/upgrade with `--set proxy.tls.certSecret=pgbranch-proxy-tls`.
+Then install/upgrade with `--set proxy.tls.certSecret=pgoverlay-proxy-tls`.
 cert-manager renews the Secret in place; restart branchd (or rely on its
 Recreate strategy on the next chart upgrade) to pick up the rotated cert.
 Clients then connect with `sslmode=require` (or stricter) through `dbname@branch`.
@@ -153,8 +153,8 @@ the storage node — or in a PVC when `persistence` is on, which is automatic
 in csi mode), a namespace-scoped Role (pods create/delete/get/list/
 watch, pods/exec, pods/log — plus persistentvolumeclaims and volumesnapshots
 when `storage.mode=csi`; branchd manages resources only in its own
-namespace), and two Services: `pgbranch-api` (REST, :7070) and
-`pgbranch-proxy` (Postgres router, :6432). The branchd container runs as
+namespace), and two Services: `pgoverlay-api` (REST, :7070) and
+`pgoverlay-proxy` (Postgres router, :6432). The branchd container runs as
 root for write access to its hostPath state dir; in hostpath mode branch
 pods get `CAP_SYS_ADMIN` for their in-container overlay mount, same as on
 Docker (csi branch pods need nothing).
@@ -190,7 +190,7 @@ policy-enforcing CNI such as Calico or Cilium) to lock traffic down:
 
 - ingress to branchd API/proxy is limited to the ghook pod, the peers in
   `networkPolicy.allowedClients`, and `networkPolicy.metricsFrom` (Prometheus);
-- ingress to branch pods (selected by `pgbranch.managed=true,pgbranch.role=branch`)
+- ingress to branch pods (selected by `pgoverlay.managed=true,pgoverlay.role=branch`)
   is limited to branchd;
 - egress from branch pods is limited to cluster DNS (`networkPolicy.dnsFrom`,
   default kube-dns) and the Postgres source(s) in `networkPolicy.sourceEgress`.
@@ -216,19 +216,19 @@ Same REST API as on Docker; branch hosts are pod IPs, so connect via the
 proxy Service:
 
 ```bash
-kubectl -n pgbranch-system port-forward svc/pgbranch-api 7070 &
+kubectl -n pgoverlay-system port-forward svc/pgoverlay-api 7070 &
 curl -H "$AUTH" -d '{"name":"main","host":"db.prod.internal","port":5432,
   "user":"postgres","password":"secret"}' localhost:7070/v1/sources
 curl -H "$AUTH" -d '{"name":"pr-42","source":"main"}' localhost:7070/v1/branches
 
-# in-cluster: psql "host=pgbranch-proxy.pgbranch-system port=6432 dbname=postgres@pr-42 user=postgres"
-kubectl -n pgbranch-system port-forward svc/pgbranch-proxy 6432 &
+# in-cluster: psql "host=pgoverlay-proxy.pgoverlay-system port=6432 dbname=postgres@pr-42 user=postgres"
+kubectl -n pgoverlay-system port-forward svc/pgoverlay-proxy 6432 &
 psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
 ```
 
 ## Branch per pull request
 
-The chart ships `pgbranch-github` as an optional sub-deployment
+The chart ships `pgoverlay-github` as an optional sub-deployment
 (`--set ghook.enabled=true ...`): a signed GitHub webhook creates
 `pr-<number>` when a PR opens, optionally resets it on every push, destroys
 it on close, and can post a one-time connect-info comment. Setup,
@@ -240,7 +240,7 @@ permissions, and the full `GHOOK_*` environment reference live in
 `make helm-test` lints and grep-asserts the rendered chart; `make k8s-it`
 runs the full integration suite against a local
 [kind](https://kind.sigs.k8s.io) cluster (`hack/kind-up.sh` creates
-`pgbranch-test` and preloads images). `make csi-it` exercises the csi mode
+`pgoverlay-test` and preloads images). `make csi-it` exercises the csi mode
 end-to-end on the same cluster: `hack/kind-csi-up.sh` installs the
 external-snapshotter CRDs/controller and
 [csi-driver-host-path](https://github.com/kubernetes-csi/csi-driver-host-path)

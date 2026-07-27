@@ -10,7 +10,7 @@ undisclosed vulnerabilities.
 
 Fixes land on `main` and ship in the next release; nothing is backported to
 older tags. Run the newest published
-[release](https://github.com/abd-ulbasit/pgbranch/releases).
+[release](https://github.com/abd-ulbasit/pgoverlay/releases).
 
 There is no stable `v1.0.0` yet — the current line is `v1.0.0-rc`, and the last
 stable tag is `v0.3.0`. The `/v1` REST contract in `docs/api.md` is written and
@@ -21,7 +21,7 @@ as pre-1.0.
 ## Supply-chain scanning
 
 CI runs [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) in
-binary mode against the compiled `branchd` and `pgbranch-github` images on every
+binary mode against the compiled `branchd` and `pgoverlay-github` images on every
 push and pull request (the `vuln` job), and the full unit suite runs under the
 Go race detector (`go test -race`). The build toolchain is pinned via the `go`
 directive in `go.mod`; bumping it is how stdlib CVEs are cleared.
@@ -36,9 +36,9 @@ in CI.
 
 | ID | Module | Status | Why accepted |
 |----|--------|--------|--------------|
-| [GO-2026-4887](https://pkg.go.dev/vuln/GO-2026-4887) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Moby plugin-privilege validation. pgbranch uses the Docker **client** only to manage branch containers and **installs no Docker plugins**, so the affected code path is not exercised. |
-| [GO-2026-4883](https://pkg.go.dev/vuln/GO-2026-4883) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Same as above — plugin-privilege off-by-one; unreachable in pgbranch's usage. |
-| [GO-2026-5617](https://pkg.go.dev/vuln/GO-2026-5617) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Race in `docker cp` allowing bind-mount redirection to a host path. pgbranch never calls `docker cp`: branch data reaches a container through the OverlayFS mount assembled in its own mount namespace (`internal/cow/entrypoint.sh`), and seeding uses `pg_basebackup` against a running source. |
+| [GO-2026-4887](https://pkg.go.dev/vuln/GO-2026-4887) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Moby plugin-privilege validation. pgoverlay uses the Docker **client** only to manage branch containers and **installs no Docker plugins**, so the affected code path is not exercised. |
+| [GO-2026-4883](https://pkg.go.dev/vuln/GO-2026-4883) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Same as above — plugin-privilege off-by-one; unreachable in pgoverlay's usage. |
+| [GO-2026-5617](https://pkg.go.dev/vuln/GO-2026-5617) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Race in `docker cp` allowing bind-mount redirection to a host path. pgoverlay never calls `docker cp`: branch data reaches a container through the OverlayFS mount assembled in its own mount namespace (`internal/cow/entrypoint.sh`), and seeding uses `pg_basebackup` against a running source. |
 | [GO-2026-5668](https://pkg.go.dev/vuln/GO-2026-5668) | `github.com/docker/docker` v28.5.2 | No fix on this module path | Another plugin-privilege off-by-one; unreachable for the same reason as GO-2026-4887. |
 
 ### Why the allowlist is scoped to a module, not a list of IDs
@@ -64,13 +64,13 @@ it.
 
 ### When the allowlist expires — and what watches for it
 
-"No fixed release" above means *no fixed release on the module path pgbranch
+"No fixed release" above means *no fixed release on the module path pgoverlay
 depends on*. Upstream has fixed all four, but only in the **renamed** module
 `github.com/moby/moby/v2` (v2.0.0-beta.8 and v2.0.0-beta.14), which is still a
 beta. `github.com/docker/docker` itself has published nothing since
 v28.5.2+incompatible (2025-11-05), so taking the fixes today would mean moving
 to a pre-release under a new module path — a bigger change than the advisories
-justify, given none of the affected code is reachable from pgbranch.
+justify, given none of the affected code is reachable from pgoverlay.
 
 That promise is not left to anyone's memory. `hack/vulncheck.sh` reads each
 allowlisted advisory's OSV affected-ranges for `github.com/docker/docker` and
@@ -80,7 +80,7 @@ same script is `make vuln`, so it behaves identically on a laptop.
 
 Everything else here is manual and worth saying plainly: the four rows above
 are hand-written, and nothing checks that the *reasons* in the last column are
-still true. If pgbranch ever starts installing Docker plugins or calling
+still true. If pgoverlay ever starts installing Docker plugins or calling
 `docker cp`, this table becomes wrong and no job will notice.
 
 Dependency updates themselves are automated — Dependabot **alerts** are on, with
@@ -102,7 +102,7 @@ something. Two such failures were enough to demonstrate it.
 Nothing is hidden by this. The alerts stay visible on the Security tab, the
 `vuln` job still gates every push, and `hack/vulncheck.sh` still fails the build
 the day any of these four gains a fixed release. Turning the PR opener back on
-is one API call once `github.com/docker/docker` ships again, or once pgbranch
+is one API call once `github.com/docker/docker` ships again, or once pgoverlay
 moves to `github.com/moby/moby/v2`.
 
 ## Hardening posture

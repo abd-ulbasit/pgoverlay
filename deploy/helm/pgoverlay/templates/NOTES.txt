@@ -1,17 +1,17 @@
-pgbranch ({{ include "pgbranch.fullname" . }}) is installed.
+pgoverlay ({{ include "pgoverlay.fullname" . }}) is installed.
 
-branchd API:   {{ include "pgbranch.fullname" . }}-api:{{ .Values.api.port }}   (ClusterIP{{ if ne .Values.api.service.type "ClusterIP" }} / {{ .Values.api.service.type }}{{ end }})
-Postgres proxy: {{ include "pgbranch.fullname" . }}-proxy:{{ .Values.proxy.port }} ({{ .Values.proxy.service.type }})
+branchd API:   {{ include "pgoverlay.fullname" . }}-api:{{ .Values.api.port }}   (ClusterIP{{ if ne .Values.api.service.type "ClusterIP" }} / {{ .Values.api.service.type }}{{ end }})
+Postgres proxy: {{ include "pgoverlay.fullname" . }}-proxy:{{ .Values.proxy.port }} ({{ .Values.proxy.service.type }})
 Storage mode:  {{ .Values.storage.mode }}{{ if eq .Values.storage.mode "hostpath" }} (single-node / trusted-workload posture){{ end }}
 
 Get the API token:
 {{- if .Values.existingSecret }}
   kubectl -n {{ .Release.Namespace }} get secret {{ .Values.existingSecret }} -o jsonpath='{.data.token}' | base64 -d
 {{- else }}
-  kubectl -n {{ .Release.Namespace }} get secret {{ include "pgbranch.fullname" . }}-token -o jsonpath='{.data.token}' | base64 -d
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "pgoverlay.fullname" . }}-token -o jsonpath='{.data.token}' | base64 -d
 {{- end }}
 
-SECURITY — read before exposing pgbranch beyond a single trusted node:
+SECURITY — read before exposing pgoverlay beyond a single trusted node:
 
 {{- if not .Values.existingSecret }}
 

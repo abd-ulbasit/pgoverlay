@@ -1,4 +1,4 @@
-// pgbranch-connect: resolve a ready Postgres connection string for a pgbranch
+// pgoverlay-connect: resolve a ready Postgres connection string for a pgoverlay
 // branch by fetching its current credentials from branchd. Zero dependencies
 // (Node 18+ global fetch).
 //
@@ -6,15 +6,15 @@
 // app holds the API endpoint + a scoped (viewer) token, and fetches the
 // per-branch password at startup.
 //
-//   import { resolve } from "pgbranch-connect";
+//   import { resolve } from "pgoverlay-connect";
 //   const { proxyDsn } = await resolve({
-//     server: process.env.PGBRANCH_API,
-//     token: process.env.PGBRANCH_TOKEN,
+//     server: process.env.PGOVERLAY_API,
+//     token: process.env.PGOVERLAY_TOKEN,
 //     ref: process.env.GIT_REF,            // "feat/login" -> feat-login
 //     proxyHost: "proxy.example.com:6432",
 //   });
 
-/** Sanitize a git ref to a pgbranch branch name (^[a-z0-9][a-z0-9-]{0,40}$). */
+/** Sanitize a git ref to a pgoverlay branch name (^[a-z0-9][a-z0-9-]{0,40}$). */
 export function sanitizeRef(ref) {
   return (ref ?? "")
     .toLowerCase()
@@ -36,20 +36,20 @@ function dsn(user, password, host, port, database) {
  * mode (server returns no password) opts.password or $PGPASSWORD is required.
  */
 export async function resolve(opts = {}) {
-  const server = (opts.server ?? process.env.PGBRANCH_API ?? "").replace(/\/+$/, "");
-  if (!server) throw new Error("pgbranch-connect: server (PGBRANCH_API) is required");
-  const token = opts.token ?? process.env.PGBRANCH_TOKEN ?? "";
-  if (!token) throw new Error("pgbranch-connect: token is required");
+  const server = (opts.server ?? process.env.PGOVERLAY_API ?? "").replace(/\/+$/, "");
+  if (!server) throw new Error("pgoverlay-connect: server (PGOVERLAY_API) is required");
+  const token = opts.token ?? process.env.PGOVERLAY_TOKEN ?? "";
+  if (!token) throw new Error("pgoverlay-connect: token is required");
   const name = opts.branch || sanitizeRef(opts.ref);
-  if (!name) throw new Error("pgbranch-connect: a branch or ref is required");
+  if (!name) throw new Error("pgoverlay-connect: a branch or ref is required");
 
   const res = await fetch(`${server}/v1/branches/${encodeURIComponent(name)}`, {
     headers: { authorization: `Bearer ${token}` },
   });
   const text = await res.text();
-  if (res.status === 404) throw new Error(`pgbranch-connect: branch "${name}" not found`);
+  if (res.status === 404) throw new Error(`pgoverlay-connect: branch "${name}" not found`);
   if (res.status !== 200)
-    throw new Error(`pgbranch-connect: GET branch "${name}": HTTP ${res.status}: ${text.trim()}`);
+    throw new Error(`pgoverlay-connect: GET branch "${name}": HTTP ${res.status}: ${text.trim()}`);
   const b = JSON.parse(text);
 
   const serverHost = new URL(server).hostname;
@@ -59,7 +59,7 @@ export async function resolve(opts = {}) {
   let password = b.password || opts.password || process.env.PGPASSWORD || "";
   if (!password)
     throw new Error(
-      `pgbranch-connect: branch "${name}" returned no password (inherit mode) and no opts.password/PGPASSWORD set`,
+      `pgoverlay-connect: branch "${name}" returned no password (inherit mode) and no opts.password/PGPASSWORD set`,
     );
 
   let proxyHost = serverHost,

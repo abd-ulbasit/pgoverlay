@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // mintToken creates a token of the given role via the admin REST endpoint
@@ -89,7 +89,7 @@ func TestAuthzAdminToken(t *testing.T) {
 	}
 }
 
-// The legacy PGBRANCH_TOKEN env value (testToken) is treated as a built-in
+// The legacy PGOVERLAY_TOKEN env value (testToken) is treated as a built-in
 // admin: it can reach every route, including token management.
 func TestAuthzLegacyEnvTokenIsAdmin(t *testing.T) {
 	ts, _ := newTestServer(t)

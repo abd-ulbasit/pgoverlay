@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // TestReconcileGCEndToEnd drives the unified reconcile loop against real
@@ -17,8 +17,8 @@ import (
 // one reconcile pass. Names use a gc- prefix so they cannot collide with other
 // IT suites' resources.
 func TestReconcileGCEndToEnd(t *testing.T) {
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -57,14 +57,14 @@ func TestReconcileGCEndToEnd(t *testing.T) {
 
 	// a stray managed volume owned by no branch (tagged with this registry's
 	// instance id so reconcile recognizes it as ITS orphan to reclaim).
-	strayVol := "pgbranch-br-gc-stray-rw"
-	if err := d.CreateVolume(ctx, strayVol, map[string]string{"pgbranch.managed": "true", runtime.LabelInstance: r.InstanceID()}); err != nil {
+	strayVol := "pgoverlay-br-gc-stray-rw"
+	if err := d.CreateVolume(ctx, strayVol, map[string]string{"pgoverlay.managed": "true", runtime.LabelInstance: r.InstanceID()}); err != nil {
 		t.Fatal(err)
 	}
 
 	// a stuck `creating` registry row with its own rw volume.
-	stuckVol := "pgbranch-br-gc-stuck-rw"
-	if err := d.CreateVolume(ctx, stuckVol, map[string]string{"pgbranch.managed": "true", runtime.LabelInstance: r.InstanceID()}); err != nil {
+	stuckVol := "pgoverlay-br-gc-stuck-rw"
+	if err := d.CreateVolume(ctx, stuckVol, map[string]string{"pgoverlay.managed": "true", runtime.LabelInstance: r.InstanceID()}); err != nil {
 		t.Fatal(err)
 	}
 	stuck := &registry.Branch{Name: "gc-stuck", SourceID: src.ID, RWVolume: stuckVol, SourceVolume: src.Volume}

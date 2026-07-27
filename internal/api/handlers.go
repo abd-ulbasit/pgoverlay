@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

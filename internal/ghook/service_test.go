@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/apiclient"
+	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
 )
 
 const testSecret = "wh-s3cret"
@@ -36,7 +36,7 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// newService wires a Service to a pgbranch API base URL; gh may be nil.
+// newService wires a Service to a pgoverlay API base URL; gh may be nil.
 func newService(cfg Config, pgURL string, gh *GitHub) *Service {
 	if cfg.WebhookSecret == "" {
 		cfg.WebhookSecret = testSecret
@@ -63,7 +63,7 @@ func post(t *testing.T, h http.Handler, event, sig string, body []byte) *httptes
 }
 
 func TestWebhookRejectsBadSignatures(t *testing.T) {
-	// pgbranch API that must never be reached
+	// pgoverlay API that must never be reached
 	called := false
 	pg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true }))
 	defer pg.Close()
@@ -85,13 +85,13 @@ func TestWebhookRejectsBadSignatures(t *testing.T) {
 		}
 	}
 	if called {
-		t.Fatal("pgbranch API was called despite invalid signature")
+		t.Fatal("pgoverlay API was called despite invalid signature")
 	}
 }
 
 func TestWebhookAcceptsValidSignatureAndIgnoresOtherEvents(t *testing.T) {
 	pg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("unexpected pgbranch call %s %s", r.Method, r.URL.Path)
+		t.Errorf("unexpected pgoverlay call %s %s", r.Method, r.URL.Path)
 	}))
 	defer pg.Close()
 	h := newService(Config{}, pg.URL, nil).Handler()
@@ -130,7 +130,7 @@ func TestWebhookMethodAndPathHandling(t *testing.T) {
 // buffering the whole thing — MaxBytesReader makes io.ReadAll error out. A
 // normal signed payload of ordinary size still verifies and is accepted.
 func TestWebhookBodySizeLimited(t *testing.T) {
-	// pgbranch stub: a 404 from GetBranch makes the detached "opened" handler
+	// pgoverlay stub: a 404 from GetBranch makes the detached "opened" handler
 	// take the create path; a 201 from create finishes it cleanly. We only
 	// need it to not error out on the normal-payload leg.
 	pg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -1,6 +1,6 @@
 # Quickstart
 
-> Adapted from the [README](https://github.com/abd-ulbasit/pgbranch); the
+> Adapted from the [README](https://github.com/abd-ulbasit/pgoverlay); the
 > README stays the canonical copy of this walkthrough.
 
 Requirements: Docker (Colima works on macOS), Go 1.26.5+ to build. The source
@@ -54,7 +54,7 @@ docker rm -f demo-src
 `--host` must be reachable *from containers* (use `host.docker.internal` for
 a host-local DB, or `--network <net>` for a DB on a Docker network). The
 password is read from the env var named by `--password-env` (default
-`PGPASSWORD`). State lives in `~/.pgbranch` (override with `PGBRANCH_HOME`).
+`PGPASSWORD`). State lives in `~/.pgoverlay` (override with `PGOVERLAY_HOME`).
 
 ## Seeding from managed Postgres (Supabase, Neon, RDS)
 
@@ -98,7 +98,7 @@ in one process, sharing the engine the CLI embeds, plus a TTL reaper for
 abandoned branches.
 
 ```bash
-PGBRANCH_TOKEN=$(openssl rand -hex 16) ./bin/branchd
+PGOVERLAY_TOKEN=$(openssl rand -hex 16) ./bin/branchd
 # REST API listening on :7070
 # pg router listening on :6432 (connect with dbname@branch)
 ```
@@ -107,7 +107,7 @@ Flags: `--api-addr :7070` (REST), `--pg-addr :6432` (router),
 `--reconcile-interval 60s` (unified reconcile loop tick: TTL reap + leak GC;
 `--reap-interval` is a deprecated alias), `--stuck-timeout 10m` (age past which
 a half-built branch row is failed and cleaned), `--cow overlay|zfs` (CoW
-backend — zfs is [experimental](zfs.md)). `PGBRANCH_TOKEN` is required; every
+backend — zfs is [experimental](zfs.md)). `PGOVERLAY_TOKEN` is required; every
 `/v1` request needs `Authorization: Bearer <token>` (`GET /healthz` is open).
 
 Reconcile is also exposed on demand: `pgb doctor` prints the drift plan
@@ -118,7 +118,7 @@ Both work locally and against a server (`GET /v1/reconcile/plan`,
 ### REST API
 
 ```bash
-AUTH="Authorization: Bearer $PGBRANCH_TOKEN"
+AUTH="Authorization: Bearer $PGOVERLAY_TOKEN"
 
 # sources (the password is used for pg_basebackup only — never stored)
 curl -H "$AUTH" -d '{"name":"main","host":"host.docker.internal","port":5432,
@@ -153,20 +153,20 @@ the branch's Postgres, untouched.
 ### CLI against the server
 
 ```bash
-export PGBRANCH_SERVER=http://localhost:7070   # or --server per command
-export PGBRANCH_TOKEN=<same token as branchd>
+export PGOVERLAY_SERVER=http://localhost:7070   # or --server per command
+export PGOVERLAY_TOKEN=<same token as branchd>
 pgb branch create pr-42 --from main --ttl 24h
 pgb connect pr-42        # direct-port URL and the :6432 proxy URL
 pgb branch ls --usage    # adds a SIZE column (one helper container per branch)
 ```
 
 The registry is SQLite (single-writer): don't run local-mode CLI commands
-against the same `PGBRANCH_HOME` while branchd is running — use server mode.
+against the same `PGOVERLAY_HOME` while branchd is running — use server mode.
 
 ### Web UI
 
 branchd serves a small embedded web UI at `http://localhost:7070/ui/` — a
-single static page baked into the binary. Paste your `PGBRANCH_TOKEN` once
+single static page baked into the binary. Paste your `PGOVERLAY_TOKEN` once
 (kept in localStorage); the page lists sources and branches with state,
 endpoint, expiry countdown and disk usage, with create/reset/destroy
 controls. Auto-refreshes every 5 seconds.

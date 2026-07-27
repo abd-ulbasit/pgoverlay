@@ -5,9 +5,9 @@ import "context"
 
 // LabelInstance tags every managed resource with the owning registry's
 // instance id (registry.InstanceID()). Reconcile reclaims only resources
-// carrying ITS id, so concurrent pgbranch instances sharing one Docker daemon
+// carrying ITS id, so concurrent pgoverlay instances sharing one Docker daemon
 // (and the parallel IT suite) never GC each other's live containers/volumes.
-const LabelInstance = "pgbranch.instance"
+const LabelInstance = "pgoverlay.instance"
 
 // MountKind selects how Mount.Volume is interpreted.
 type MountKind string
@@ -47,7 +47,7 @@ type HelperSpec struct {
 
 // BranchSpec is a long-running branch Postgres container.
 type BranchSpec struct {
-	Name       string // container name, e.g. pgbranch-br-pr-1
+	Name       string // container name, e.g. pgoverlay-br-pr-1
 	Image      string
 	Env        []string
 	Mounts     []Mount
@@ -83,9 +83,9 @@ type Driver interface {
 	ExecOutput(ctx context.Context, containerID string, cmd []string) (string, error)
 	Inspect(ctx context.Context, containerID string) (ContainerInfo, error)
 	StopRemove(ctx context.Context, containerID string) error
-	ListManaged(ctx context.Context) ([]ContainerInfo, error) // label pgbranch.managed=true
+	ListManaged(ctx context.Context) ([]ContainerInfo, error) // label pgoverlay.managed=true
 	// ListManagedVolumes returns the names of every volume carrying both the
-	// pgbranch.managed=true label AND pgbranch.instance=<instanceID> (docker
+	// pgoverlay.managed=true label AND pgoverlay.instance=<instanceID> (docker
 	// named volumes / kube PVCs). Reconcile uses it to find orphaned rw and
 	// source-layer volumes owned by THIS registry; scoping by instance id keeps
 	// one instance from GC'ing another's volumes on a shared daemon. The zfs

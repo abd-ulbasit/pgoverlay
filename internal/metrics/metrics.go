@@ -1,4 +1,4 @@
-// Package metrics owns pgbranch's Prometheus instrumentation: a private
+// Package metrics owns pgoverlay's Prometheus instrumentation: a private
 // *prometheus.Registry (never the global default) holding the operation,
 // reaper and reconcile series, plus a Collector that, on every scrape, reports
 // the live branch/source counts by state from the registry.
@@ -23,19 +23,19 @@ type StateCounter interface {
 	CountSourcesByState() (map[string]int, error)
 }
 
-// Metrics is pgbranch's metric set over a private registry.
+// Metrics is pgoverlay's metric set over a private registry.
 type Metrics struct {
 	reg *prometheus.Registry
 
-	opDuration    *prometheus.HistogramVec // pgbranch_branch_op_duration_seconds{op}
-	opErrors      *prometheus.CounterVec   // pgbranch_branch_op_errors_total{op}
-	maskingDur    prometheus.Histogram     // pgbranch_masking_duration_seconds
-	reaperRuns    prometheus.Counter       // pgbranch_reaper_runs_total
-	reaperReaped  prometheus.Counter       // pgbranch_reaper_reaped_total
-	reconcileRuns prometheus.Counter       // pgbranch_reconcile_runs_total
-	reconcileActs *prometheus.CounterVec   // pgbranch_reconcile_actions_total{action}
-	inflight      prometheus.Gauge         // pgbranch_inflight_ops
-	compFailures  *prometheus.CounterVec   // pgbranch_compensation_failures_total{kind}
+	opDuration    *prometheus.HistogramVec // pgoverlay_branch_op_duration_seconds{op}
+	opErrors      *prometheus.CounterVec   // pgoverlay_branch_op_errors_total{op}
+	maskingDur    prometheus.Histogram     // pgoverlay_masking_duration_seconds
+	reaperRuns    prometheus.Counter       // pgoverlay_reaper_runs_total
+	reaperReaped  prometheus.Counter       // pgoverlay_reaper_reaped_total
+	reconcileRuns prometheus.Counter       // pgoverlay_reconcile_runs_total
+	reconcileActs *prometheus.CounterVec   // pgoverlay_reconcile_actions_total{action}
+	inflight      prometheus.Gauge         // pgoverlay_inflight_ops
+	compFailures  *prometheus.CounterVec   // pgoverlay_compensation_failures_total{kind}
 }
 
 // New builds a Metrics over its own registry. The branch/source gauges are
@@ -44,41 +44,41 @@ func New() *Metrics {
 	m := &Metrics{
 		reg: prometheus.NewRegistry(),
 		opDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "pgbranch_branch_op_duration_seconds",
+			Name:    "pgoverlay_branch_op_duration_seconds",
 			Help:    "Duration of branch operations by op (create|reset|destroy|from_branch|diff).",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"op"}),
 		opErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "pgbranch_branch_op_errors_total",
+			Name: "pgoverlay_branch_op_errors_total",
 			Help: "Failed branch operations by op.",
 		}, []string{"op"}),
 		maskingDur: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "pgbranch_masking_duration_seconds",
+			Name:    "pgoverlay_masking_duration_seconds",
 			Help:    "Duration of applying a source's masking scripts inside a branch.",
 			Buckets: prometheus.DefBuckets,
 		}),
 		reaperRuns: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "pgbranch_reaper_runs_total",
+			Name: "pgoverlay_reaper_runs_total",
 			Help: "Number of TTL reaper passes.",
 		}),
 		reaperReaped: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "pgbranch_reaper_reaped_total",
+			Name: "pgoverlay_reaper_reaped_total",
 			Help: "Number of expired branches destroyed by the reaper.",
 		}),
 		reconcileRuns: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "pgbranch_reconcile_runs_total",
+			Name: "pgoverlay_reconcile_runs_total",
 			Help: "Number of reconcile passes.",
 		}),
 		reconcileActs: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "pgbranch_reconcile_actions_total",
+			Name: "pgoverlay_reconcile_actions_total",
 			Help: "Reconcile actions taken by action (fail_stuck|remove_orphan_container|gc_layer|gc_volume).",
 		}, []string{"action"}),
 		inflight: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "pgbranch_inflight_ops",
+			Name: "pgoverlay_inflight_ops",
 			Help: "Branch operations currently in flight.",
 		}),
 		compFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "pgbranch_compensation_failures_total",
+			Name: "pgoverlay_compensation_failures_total",
 			Help: "Best-effort saga compensation/failure-transition errors by kind (transition|undo|cleanup).",
 		}, []string{"kind"}),
 	}
@@ -101,7 +101,7 @@ func (m *Metrics) SetStateCounter(sc StateCounter) {
 
 // SetDiskRoot registers the disk-free collector for the storage-root path
 // (the filesystem holding all branch CoW volumes plus the SQLite registry).
-// It reports pgbranch_disk_bytes_free / _total via statfs on every scrape, so
+// It reports pgoverlay_disk_bytes_free / _total via statfs on every scrape, so
 // the values are always fresh. Call once at wire-up (branchd). No-op on a nil
 // receiver or an empty path.
 func (m *Metrics) SetDiskRoot(root string) {

@@ -2,32 +2,32 @@
 #
 # Instead of handing your PR-preview pipeline a cluster-admin kubeconfig, give
 # it this ServiceAccount, scoped to ONE namespace, with only the permissions a
-# `helm upgrade --install` of the pgbranch chart (plus app deploys) needs in
+# `helm upgrade --install` of the pgoverlay chart (plus app deploys) needs in
 # that namespace. There is deliberately NO ClusterRole here — the deployer can
-# touch nothing outside `pgbranch-preview`.
+# touch nothing outside `pgoverlay-preview`.
 #
 # Apply once (cluster-admin, one-time), then mint a token for CI:
 #   kubectl apply -f deploy/preview-deployer-rbac.yaml
-#   kubectl -n pgbranch-preview create token preview-deployer --duration=24h
+#   kubectl -n pgoverlay-preview create token preview-deployer --duration=24h
 # Hand that short-lived token (not a kubeconfig with cluster-admin) to CI.
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: pgbranch-preview
+  name: pgoverlay-preview
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: preview-deployer
-  namespace: pgbranch-preview
+  namespace: pgoverlay-preview
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: preview-deployer
-  namespace: pgbranch-preview
+  namespace: pgoverlay-preview
 rules:
-  # Core workload + config objects a Helm release of pgbranch (and the preview
+  # Core workload + config objects a Helm release of pgoverlay (and the preview
   # app) creates in this namespace. NOTE: secrets are deliberately NOT in this
   # broad rule — see the scoped secrets rule below.
   - apiGroups: [""]
@@ -37,7 +37,7 @@ rules:
   # would let a leaked CI token read EVERY secret in the namespace (other
   # tenants' DB creds, TLS keys, ...). Helm's release-state secrets are named
   # sh.helm.release.v1.<release>.v<n>; the chart's own token Secret is
-  # <release>-pgbranch-token (and -ghook). We allow create (Helm needs it for
+  # <release>-pgoverlay-token (and -ghook). We allow create (Helm needs it for
   # release state + the chart Secret) but restrict get/delete/patch/update to
   # those known names via resourceNames, and grant NO list/watch (no
   # namespace-wide enumeration). Best practice: pass token/webhookSecret via a
@@ -51,18 +51,18 @@ rules:
     verbs: ["get", "delete", "patch", "update"]
     resourceNames:
       # Helm release state (covers v1..v9; extend if a release exceeds 9 revs).
-      - sh.helm.release.v1.pgbranch.v1
-      - sh.helm.release.v1.pgbranch.v2
-      - sh.helm.release.v1.pgbranch.v3
-      - sh.helm.release.v1.pgbranch.v4
-      - sh.helm.release.v1.pgbranch.v5
-      - sh.helm.release.v1.pgbranch.v6
-      - sh.helm.release.v1.pgbranch.v7
-      - sh.helm.release.v1.pgbranch.v8
-      - sh.helm.release.v1.pgbranch.v9
+      - sh.helm.release.v1.pgoverlay.v1
+      - sh.helm.release.v1.pgoverlay.v2
+      - sh.helm.release.v1.pgoverlay.v3
+      - sh.helm.release.v1.pgoverlay.v4
+      - sh.helm.release.v1.pgoverlay.v5
+      - sh.helm.release.v1.pgoverlay.v6
+      - sh.helm.release.v1.pgoverlay.v7
+      - sh.helm.release.v1.pgoverlay.v8
+      - sh.helm.release.v1.pgoverlay.v9
       # Chart-managed Secrets (when not using existingSecret).
-      - pgbranch-token
-      - pgbranch-ghook
+      - pgoverlay-token
+      - pgoverlay-ghook
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
     verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
@@ -76,7 +76,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: preview-deployer
-  namespace: pgbranch-preview
+  namespace: pgoverlay-preview
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -84,4 +84,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: preview-deployer
-    namespace: pgbranch-preview
+    namespace: pgoverlay-preview

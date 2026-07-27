@@ -1,12 +1,12 @@
-// HA leader-election integration test against the pgbranch-test kind cluster
-// (hack/kind-up.sh), gated by PGBRANCH_K8S_IT=1. It installs the chart with
+// HA leader-election integration test against the pgoverlay-test kind cluster
+// (hack/kind-up.sh), gated by PGOVERLAY_K8S_IT=1. It installs the chart with
 // replicaCount=2 (which turns on --leader-elect + the leases RBAC), asserts
-// exactly one replica holds the pgbranch-branchd Lease and serves mutations,
+// exactly one replica holds the pgoverlay-branchd Lease and serves mutations,
 // kills the leader pod, and asserts the surviving replica acquires the Lease
 // and a branch create succeeds within the renew deadline.
 //
 // NOT RUN in this change's sandbox (no kind/Docker) and NOT in default CI
-// (CI runs PGBRANCH_IT only, not PGBRANCH_K8S_IT). Written to compile and be
+// (CI runs PGOVERLAY_IT only, not PGOVERLAY_K8S_IT). Written to compile and be
 // correct; reuses the helm/port-forward/source-pod helpers in helm_it_test.go.
 package deploy
 
@@ -18,23 +18,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/apiclient"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
 )
 
 const (
-	haNS      = "pgbranch-ha"
-	haRelease = "pgbranch"
+	haNS      = "pgoverlay-ha"
+	haRelease = "pgoverlay"
 	haToken   = "ha-it-token"
-	haSrcPod  = "pgbranch-ha-source"
-	leaseName = "pgbranch-branchd"
+	haSrcPod  = "pgoverlay-ha-source"
+	leaseName = "pgoverlay-branchd"
 	// failover budget: the lease duration is 15s, so a survivor can acquire
 	// within ~15s of the old holder going away; allow generous slack for the
 	// re-acquire and the subsequent mutating create through the Service.
 	renewBound = 60 * time.Second
 )
 
-// leaseHolder returns the holderIdentity of the pgbranch-branchd Lease ("" if
+// leaseHolder returns the holderIdentity of the pgoverlay-branchd Lease ("" if
 // the Lease does not exist yet).
 func leaseHolder(t *testing.T, kc string) string {
 	t.Helper()
@@ -61,8 +61,8 @@ func waitLeaseHolder(t *testing.T, kc string, timeout time.Duration) string {
 }
 
 func TestHelmLeaderElectionFailover(t *testing.T) {
-	if os.Getenv("PGBRANCH_K8S_IT") != "1" {
-		t.Skip("set PGBRANCH_K8S_IT=1 to run kubernetes integration tests")
+	if os.Getenv("PGOVERLAY_K8S_IT") != "1" {
+		t.Skip("set PGOVERLAY_K8S_IT=1 to run kubernetes integration tests")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	defer cancel()
@@ -83,7 +83,7 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 
 	// 2 replicas → the chart renders --leader-elect, POD_NAME and the leases
 	// RBAC. Both pods co-schedule to the storage node (RWO state dir).
-	run(t, "helm", "--kubeconfig", kc, "install", haRelease, "deploy/helm/pgbranch",
+	run(t, "helm", "--kubeconfig", kc, "install", haRelease, "deploy/helm/pgoverlay",
 		"-n", haNS, "--create-namespace",
 		"--set", "node="+storageNode,
 		"--set", "token="+haToken,
@@ -95,7 +95,7 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 	holder := waitLeaseHolder(t, kc, time.Minute)
 	t.Logf("initial Lease holder: %s", holder)
 	pods := strings.Fields(strings.TrimSpace(kubectl("get", "pods",
-		"-l", "app.kubernetes.io/name=pgbranch", "-o", "jsonpath={.items[*].metadata.name}")))
+		"-l", "app.kubernetes.io/name=pgoverlay", "-o", "jsonpath={.items[*].metadata.name}")))
 	if len(pods) != 2 {
 		t.Fatalf("want 2 branchd pods, got %d: %v", len(pods), pods)
 	}

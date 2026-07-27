@@ -1,6 +1,6 @@
-// CSI-mode integration tests against the pgbranch-test kind cluster with the
+// CSI-mode integration tests against the pgoverlay-test kind cluster with the
 // csi-driver-host-path stack (hack/kind-csi-up.sh). Gated by
-// PGBRANCH_CSI_IT=1. Mirrors kube_it_test.go: branchd-less, driving the
+// PGOVERLAY_CSI_IT=1. Mirrors kube_it_test.go: branchd-less, driving the
 // driver + engine in-process; reuses its source-pod / port-forward helpers.
 package runtime_test
 
@@ -20,10 +20,10 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	rt "github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	rt "github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 const csiStorageClassName = "csi-hostpath-sc"
@@ -32,8 +32,8 @@ const csiStorageClassName = "csi-hostpath-sc"
 // returns a csi-mode driver plus raw client-go handles.
 func csiIT(t *testing.T, snapshotClass string) (*rt.KubeDriver, *kubernetes.Clientset, *rest.Config) {
 	t.Helper()
-	if os.Getenv("PGBRANCH_CSI_IT") != "1" {
-		t.Skip("set PGBRANCH_CSI_IT=1 to run csi integration tests")
+	if os.Getenv("PGOVERLAY_CSI_IT") != "1" {
+		t.Skip("set PGOVERLAY_CSI_IT=1 to run csi integration tests")
 	}
 	if out, err := exec.Command("../../hack/kind-csi-up.sh").CombinedOutput(); err != nil {
 		t.Fatalf("hack/kind-csi-up.sh: %v\n%s", err, out)
@@ -65,12 +65,12 @@ func csiIT(t *testing.T, snapshotClass string) (*rt.KubeDriver, *kubernetes.Clie
 	return drv, cs, cfg
 }
 
-// pgbranchPVCs lists the names of PVCs the engine/driver created (they all
-// carry pgbranch.managed=true).
-func pgbranchPVCs(t *testing.T, ctx context.Context, cs *kubernetes.Clientset) []string {
+// pgoverlayPVCs lists the names of PVCs the engine/driver created (they all
+// carry pgoverlay.managed=true).
+func pgoverlayPVCs(t *testing.T, ctx context.Context, cs *kubernetes.Clientset) []string {
 	t.Helper()
 	pvcs, err := cs.CoreV1().PersistentVolumeClaims(kubeNS).List(ctx,
-		metav1.ListOptions{LabelSelector: "pgbranch.managed=true"})
+		metav1.ListOptions{LabelSelector: "pgoverlay.managed=true"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestKubeCSIEndToEndBranching(t *testing.T) {
 	defer cancel()
 
 	srcIP := startSourcePod(t, ctx, drv, cs)
-	execSQL(t, ctx, drv, "pgbranch-it-source",
+	execSQL(t, ctx, drv, "pgoverlay-it-source",
 		`CREATE TABLE accounts(id int primary key, balance int);
 		 INSERT INTO accounts SELECT i, 100 FROM generate_series(1,10000) i`)
 
@@ -120,12 +120,12 @@ func TestKubeCSIEndToEndBranching(t *testing.T) {
 		if err := e.RemoveSource(ctx, "csi-main"); err != nil {
 			t.Errorf("remove source: %v", err)
 		}
-		if left := pgbranchPVCs(t, ctx, cs); len(left) != 0 {
+		if left := pgoverlayPVCs(t, ctx, cs); len(left) != 0 {
 			t.Errorf("PVCs left after full teardown: %v", left)
 		}
 	})
 	// the source layer is a PVC
-	if _, err := cs.CoreV1().PersistentVolumeClaims(kubeNS).Get(ctx, "pgbranch-src-csi-main", metav1.GetOptions{}); err != nil {
+	if _, err := cs.CoreV1().PersistentVolumeClaims(kubeNS).Get(ctx, "pgoverlay-src-csi-main", metav1.GetOptions{}); err != nil {
 		t.Fatalf("source PVC: %v", err)
 	}
 
@@ -147,11 +147,11 @@ func TestKubeCSIEndToEndBranching(t *testing.T) {
 			t.Errorf("destroy csi-pr-1: %v", err)
 		}
 	})
-	pvc, err := cs.CoreV1().PersistentVolumeClaims(kubeNS).Get(ctx, "pgbranch-br-csi-pr-1-rw", metav1.GetOptions{})
+	pvc, err := cs.CoreV1().PersistentVolumeClaims(kubeNS).Get(ctx, "pgoverlay-br-csi-pr-1-rw", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pvc.Spec.DataSource == nil || pvc.Spec.DataSource.Kind != "PersistentVolumeClaim" || pvc.Spec.DataSource.Name != "pgbranch-src-csi-main" {
+	if pvc.Spec.DataSource == nil || pvc.Spec.DataSource.Kind != "PersistentVolumeClaim" || pvc.Spec.DataSource.Name != "pgoverlay-src-csi-main" {
 		t.Errorf("branch PVC dataSource = %+v, want clone of the source PVC", pvc.Spec.DataSource)
 	}
 	// multi-node payoff: the branch pod is NOT pinned and needs NO capabilities
@@ -181,7 +181,7 @@ func TestKubeCSIEndToEndBranching(t *testing.T) {
 		}
 		c.Close(ctx)
 	}
-	srcPort := forwardPort(t, cfg, cs, "pgbranch-it-source")
+	srcPort := forwardPort(t, cfg, cs, "pgoverlay-it-source")
 	if n := queryInt(t, ctx, srcPort, `SELECT sum(balance) FROM accounts`); n != 1000000 {
 		t.Fatalf("source mutated! sum=%d", n)
 	}
@@ -205,11 +205,11 @@ func TestKubeCSIEndToEndBranching(t *testing.T) {
 			t.Errorf("destroy csi-pr-2: %v", err)
 		}
 	})
-	pvc2, err := cs.CoreV1().PersistentVolumeClaims(kubeNS).Get(ctx, "pgbranch-br-csi-pr-2-rw", metav1.GetOptions{})
+	pvc2, err := cs.CoreV1().PersistentVolumeClaims(kubeNS).Get(ctx, "pgoverlay-br-csi-pr-2-rw", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pvc2.Spec.DataSource == nil || pvc2.Spec.DataSource.Name != "pgbranch-br-csi-pr-1-rw" {
+	if pvc2.Spec.DataSource == nil || pvc2.Spec.DataSource.Name != "pgoverlay-br-csi-pr-1-rw" {
 		t.Errorf("child PVC dataSource = %+v, want clone of the parent PVC", pvc2.Spec.DataSource)
 	}
 	// the child sees the parent's marker and the parent's writes
@@ -254,7 +254,7 @@ func TestKubeCSIEndToEndBranching(t *testing.T) {
 		t.Fatal(err)
 	}
 	pr1Destroyed = true
-	for _, name := range []string{"pgbranch-br-csi-pr-1-rw", "pgbranch-br-csi-pr-2-rw"} {
+	for _, name := range []string{"pgoverlay-br-csi-pr-1-rw", "pgoverlay-br-csi-pr-2-rw"} {
 		if _, err := cs.CoreV1().PersistentVolumeClaims(kubeNS).Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 			t.Errorf("PVC %s still present after destroy (err=%v)", name, err)
 		}
@@ -273,8 +273,8 @@ func TestKubeCSISnapshotCloneRoundtrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	src, dst := "pgbranch-csi-snap-src", "pgbranch-csi-snap-dst"
-	if err := drv.CreateVolume(ctx, src, map[string]string{"pgbranch.managed": "true"}); err != nil {
+	src, dst := "pgoverlay-csi-snap-src", "pgoverlay-csi-snap-dst"
+	if err := drv.CreateVolume(ctx, src, map[string]string{"pgoverlay.managed": "true"}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -292,7 +292,7 @@ func TestKubeCSISnapshotCloneRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := drv.CloneVolume(ctx, src, dst, map[string]string{"pgbranch.managed": "true"}); err != nil {
+	if err := drv.CloneVolume(ctx, src, dst, map[string]string{"pgoverlay.managed": "true"}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

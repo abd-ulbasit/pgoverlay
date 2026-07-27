@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pgbranch</title>
+<title>pgoverlay</title>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --line: #30363d;
@@ -50,11 +50,11 @@
 </head>
 <body>
 <header>
-  <h1>pgbranch<span class="cursor">_</span></h1>
+  <h1>pgoverlay<span class="cursor">_</span></h1>
   <span class="dim">copy-on-write Postgres branches</span>
   <span class="spacer"></span>
   <label class="dim" for="token">token</label>
-  <input id="token" type="password" placeholder="PGBRANCH_TOKEN" autocomplete="off">
+  <input id="token" type="password" placeholder="PGOVERLAY_TOKEN" autocomplete="off">
 </header>
 <div id="msg"></div>
 
@@ -81,9 +81,9 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const tokenInput = $("token");
-tokenInput.value = localStorage.getItem("pgbranch.token") || "";
+tokenInput.value = localStorage.getItem("pgoverlay.token") || "";
 tokenInput.addEventListener("change", () => {
-  localStorage.setItem("pgbranch.token", tokenInput.value);
+  localStorage.setItem("pgoverlay.token", tokenInput.value);
   refresh();
 });
 
@@ -99,7 +99,7 @@ async function api(path, opts) {
   const r = await fetch(path, Object.assign({
     headers: { "Authorization": "Bearer " + tokenInput.value, "Content-Type": "application/json" },
   }, opts));
-  if (r.status === 401) throw new Error("unauthorized — paste the PGBRANCH_TOKEN above");
+  if (r.status === 401) throw new Error("unauthorized — paste the PGOVERLAY_TOKEN above");
   if (!r.ok) {
     let m = "HTTP " + r.status;
     try { m = (await r.json()).error || m; } catch (e) {}

@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // Wire types. The password in CreateSourceRequest/RefreshSourceRequest is

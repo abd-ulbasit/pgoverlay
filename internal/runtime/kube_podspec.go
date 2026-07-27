@@ -18,10 +18,10 @@ const (
 	helperContainerName = "helper"
 	branchContainerName = "postgres"
 	// dataRootMountPath is where volume-management helpers see the data root.
-	dataRootMountPath = "/pgbranch-root"
+	dataRootMountPath = "/pgoverlay-root"
 	// volumeLabelsFile records CreateVolume labels inside the volume dir
 	// (no etcd objects for volumes — decision 3).
-	volumeLabelsFile = ".pgbranch-labels.json"
+	volumeLabelsFile = ".pgoverlay-labels.json"
 )
 
 // volumeNameRe also guards against path traversal: volume names become
@@ -85,7 +85,7 @@ func hostPathPodVolumes(dataRoot string, ms []Mount) ([]corev1.Volume, []corev1.
 
 // helperSecurityContext maps HelperSpec.User to a numeric runAs identity.
 // Docker resolves names via the image's /etc/passwd; K8s cannot, so the one
-// name pgbranch uses ("postgres", uid/gid 999 in the official images) is
+// name pgoverlay uses ("postgres", uid/gid 999 in the official images) is
 // mapped explicitly and numeric strings pass through. "" means image default.
 func helperSecurityContext(user string) *corev1.SecurityContext {
 	if user == "" {
@@ -115,9 +115,9 @@ func buildHelperPod(namespace string, st kubeStorage, spec HelperSpec) *corev1.P
 	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "pgbranch-helper-",
+			GenerateName: "pgoverlay-helper-",
 			Namespace:    namespace,
-			Labels:       map[string]string{"pgbranch.managed": "true", "pgbranch.role": "helper"},
+			Labels:       map[string]string{"pgoverlay.managed": "true", "pgoverlay.role": "helper"},
 		},
 		Spec: corev1.PodSpec{
 			NodeName:                     st.nodeName(),

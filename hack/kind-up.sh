@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Creates the pgbranch-test kind cluster (single node; the control-plane node
-# doubles as the pgbranch storage node, data-root /var/lib/pgbranch inside the
-# node container) and preloads the images the PGBRANCH_K8S_IT=1 tests need so
+# Creates the pgoverlay-test kind cluster (single node; the control-plane node
+# doubles as the pgoverlay storage node, data-root /var/lib/pgoverlay inside the
+# node container) and preloads the images the PGOVERLAY_K8S_IT=1 tests need so
 # in-cluster pulls don't hit the network. Idempotent.
 set -euo pipefail
 
-CLUSTER=pgbranch-test
+CLUSTER=pgoverlay-test
 
 # Multiple kind clusters exhaust the docker VM's default inotify instance
 # limit (128); the kubelet then crashloops with "too many open files". Bump
@@ -27,7 +27,7 @@ done
 # manifest list whose other-platform blobs are absent. A single-platform
 # archive sidesteps that; fall back to a plain save for older docker.
 arch="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
-tar="$(mktemp "${TMPDIR:-/tmp}/pgbranch-kind-images.XXXXXX")"
+tar="$(mktemp "${TMPDIR:-/tmp}/pgoverlay-kind-images.XXXXXX")"
 trap 'rm -f "$tar"' EXIT
 docker save --platform "$arch" postgres:17 alpine:3.21 -o "$tar" 2>/dev/null ||
   docker save postgres:17 alpine:3.21 -o "$tar"

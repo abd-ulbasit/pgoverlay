@@ -1,15 +1,15 @@
-# pgbranch README demo — recorded with vhs (https://github.com/charmbracelet/vhs)
+# pgoverlay README demo — recorded with vhs (https://github.com/charmbracelet/vhs)
 # against a REAL 1 GiB pgbench database (pgbench -i -s 68); timings are not staged.
 #
 # Prep (outside the recording):
-#   docker run -d --name pgbranch-demo-src -e POSTGRES_PASSWORD=secret postgres:17 \
+#   docker run -d --name pgoverlay-demo-src -e POSTGRES_PASSWORD=secret postgres:17 \
 #     -c wal_level=replica -c max_wal_senders=4
-#   docker exec pgbranch-demo-src sh -c \
+#   docker exec pgoverlay-demo-src sh -c \
 #     'echo "host replication all all scram-sha-256" >> "$PGDATA/pg_hba.conf"'
-#   docker exec pgbranch-demo-src psql -U postgres -c "SELECT pg_reload_conf();"
-#   docker exec pgbranch-demo-src pgbench -i -s 68 -U postgres postgres
-#   mkdir -p /tmp/pgbranch-demo-home
-#   PGBRANCH_HOME=/tmp/pgbranch-demo-home PGPASSWORD=secret \
+#   docker exec pgoverlay-demo-src psql -U postgres -c "SELECT pg_reload_conf();"
+#   docker exec pgoverlay-demo-src pgbench -i -s 68 -U postgres postgres
+#   mkdir -p /tmp/pgoverlay-demo-home
+#   PGOVERLAY_HOME=/tmp/pgoverlay-demo-home PGPASSWORD=secret \
 #     ./bin/pgb source add main --host <container IP> --user postgres
 # Then, from the repo root:  vhs hack/demo.tape
 
@@ -27,7 +27,7 @@ Set WindowBar Colorful
 Set BorderRadius 8
 Set WaitTimeout 60s
 
-Env PGBRANCH_HOME "/tmp/pgbranch-demo-home"
+Env PGOVERLAY_HOME "/tmp/pgoverlay-demo-home"
 Env PGPASSWORD "secret"
 
 Hide
@@ -42,7 +42,7 @@ Enter
 Wait
 Sleep 1s
 
-Type `docker exec pgbranch-demo-src psql -U postgres -c "SELECT count(*) FROM pgbench_accounts"`
+Type `docker exec pgoverlay-demo-src psql -U postgres -c "SELECT count(*) FROM pgbench_accounts"`
 Enter
 Wait
 Sleep 1s
@@ -54,20 +54,20 @@ Wait
 Sleep 2.5s
 
 # The whole dataset is there, instantly.
-Type `docker exec pgbranch-br-pr-42 psql -U postgres -tc "\dt+"`
+Type `docker exec pgoverlay-br-pr-42 psql -U postgres -tc "\dt+"`
 Enter
 Wait
 Sleep 2.2s
 
 # Branches are writable.
-Type `docker exec pgbranch-br-pr-42 psql -U postgres -c "DELETE FROM pgbench_tellers"`
+Type `docker exec pgoverlay-br-pr-42 psql -U postgres -c "DELETE FROM pgbench_tellers"`
 Enter
 Wait
 Sleep 1s
 
 Type "# source is untouched:"
 Enter
-Type `docker exec pgbranch-demo-src psql -U postgres -c "SELECT count(*) FROM pgbench_tellers"`
+Type `docker exec pgoverlay-demo-src psql -U postgres -c "SELECT count(*) FROM pgbench_tellers"`
 Enter
 Wait
 Sleep 2s

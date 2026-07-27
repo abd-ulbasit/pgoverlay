@@ -1,7 +1,7 @@
 {
-  "name": "pgbranch-connect",
+  "name": "pgoverlay-connect",
   "version": "0.1.0",
-  "description": "Resolve a Postgres connection string for a pgbranch branch — fetches per-branch credentials so apps keep static config with credential rotation on",
+  "description": "Resolve a Postgres connection string for a pgoverlay branch — fetches per-branch credentials so apps keep static config with credential rotation on",
   "license": "Apache-2.0",
   "type": "module",
   "main": "index.mjs",
@@ -24,14 +24,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/abd-ulbasit/pgbranch.git",
+    "url": "git+https://github.com/abd-ulbasit/pgoverlay.git",
     "directory": "sdk/js-connect"
   },
   "keywords": [
     "postgres",
     "database",
     "branch",
-    "pgbranch",
+    "pgoverlay",
     "connection-string",
     "credentials"
   ]

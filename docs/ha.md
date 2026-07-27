@@ -12,7 +12,7 @@ applies until you opt in.
 ## How it works
 
 When started with `--leader-elect` (kube runtime only), every branchd replica
-contends for a [coordination.k8s.io `Lease`][lease] named **`pgbranch-branchd`**
+contends for a [coordination.k8s.io `Lease`][lease] named **`pgoverlay-branchd`**
 in its own namespace. Exactly one replica holds the Lease at a time — that's the
 leader. The leader's election identity is its pod name (the `POD_NAME` env var,
 which the chart wires from `metadata.name`; it falls back to the hostname).
@@ -37,7 +37,7 @@ replicas does not add write throughput — they wait to take over.
 Set either knob in the chart:
 
 ```bash
-helm upgrade --install pgbranch deploy/helm/pgbranch \
+helm upgrade --install pgoverlay deploy/helm/pgoverlay \
   --set node=<storage-node> \
   --set token=<api-token> \
   --set replicaCount=2          # ⇒ leader election turns on automatically
@@ -89,7 +89,7 @@ old one going away.
 
 ```bash
 # who holds the Lease right now
-kubectl -n <ns> get lease pgbranch-branchd -o jsonpath='{.spec.holderIdentity}'
+kubectl -n <ns> get lease pgoverlay-branchd -o jsonpath='{.spec.holderIdentity}'
 
 # a follower 503s mutations but still serves reads + probes
 curl -s -o /dev/null -w '%{http_code}\n' http://<follower>:7070/healthz   # 200

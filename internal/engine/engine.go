@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/metrics"
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/metrics"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 type Engine struct {
@@ -56,7 +56,7 @@ func WithCredentialRotation() Option {
 
 // WithMaxBranches caps the number of live (non-destroyed) branches. The create
 // paths return ErrQuotaExceeded once the cap is reached. 0 (the default) is
-// unlimited. branchd --max-branches / PGBRANCH_MAX_BRANCHES.
+// unlimited. branchd --max-branches / PGOVERLAY_MAX_BRANCHES.
 func WithMaxBranches(n int) Option {
 	return func(e *Engine) { e.maxBranches = n }
 }
@@ -177,7 +177,7 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 	if err := e.reg.CreateSource(s); err != nil {
 		return err
 	}
-	if err := e.createSourceLayer(ctx, s.Volume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": s.Name})); err != nil {
+	if err := e.createSourceLayer(ctx, s.Volume, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": s.Name})); err != nil {
 		e.logCompensationErr("transition", "add source: mark source failed after layer create failed",
 			e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed"), "source", s.Name)
 		return err
@@ -205,7 +205,7 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 		return fmt.Errorf("source %q is %s, not ready", name, src.State)
 	}
 	newVol := e.planner.SourceLayerName(name, src.Generation+1)
-	if err := e.createSourceLayer(ctx, newVol, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": name})); err != nil {
+	if err := e.createSourceLayer(ctx, newVol, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": name})); err != nil {
 		return err
 	}
 	if err := e.seedSource(ctx, src, newVol, password); err != nil {

@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
 // newStub records the last request and replies with the given status/body.
@@ -206,7 +206,7 @@ func TestNotFoundErrorsAreDetectable(t *testing.T) {
 
 // TestHTTPSBaseURL: the client works against https servers; with a
 // self-signed cert it fails verification by default and succeeds when
-// PGBRANCH_TLS_SKIP_VERIFY=1 is set (escape hatch for self-signed branchd).
+// PGOVERLAY_TLS_SKIP_VERIFY=1 is set (escape hatch for self-signed branchd).
 func TestHTTPSBaseURL(t *testing.T) {
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -222,11 +222,11 @@ func TestHTTPSBaseURL(t *testing.T) {
 		t.Fatal("expected certificate verification error against self-signed server")
 	}
 
-	// escape hatch: PGBRANCH_TLS_SKIP_VERIFY=1
-	t.Setenv("PGBRANCH_TLS_SKIP_VERIFY", "1")
+	// escape hatch: PGOVERLAY_TLS_SKIP_VERIFY=1
+	t.Setenv("PGOVERLAY_TLS_SKIP_VERIFY", "1")
 	got, err := New(ts.URL, "tok").ListBranches(context.Background())
 	if err != nil {
-		t.Fatalf("with PGBRANCH_TLS_SKIP_VERIFY=1: %v", err)
+		t.Fatalf("with PGOVERLAY_TLS_SKIP_VERIFY=1: %v", err)
 	}
 	if len(got) != 1 || got[0].Name != "pr-1" {
 		t.Fatalf("branches = %+v", got)
@@ -259,7 +259,7 @@ func TestPlaintextTokenLeakDetection(t *testing.T) {
 	}
 }
 
-// TestCACertBuildsRootPool: PGBRANCH_CA_CERT loaded via tlsConfigWithCA yields
+// TestCACertBuildsRootPool: PGOVERLAY_CA_CERT loaded via tlsConfigWithCA yields
 // a tls.Config whose RootCAs is non-nil (the self-signed cert is trusted via
 // the pool, not via skip-verify). A bad path / non-PEM file errors instead.
 func TestCACertBuildsRootPool(t *testing.T) {
@@ -288,10 +288,10 @@ func TestCACertBuildsRootPool(t *testing.T) {
 	}
 }
 
-// TestNewWithCACertUsesPool: New() wired with PGBRANCH_CA_CERT installs an
+// TestNewWithCACertUsesPool: New() wired with PGOVERLAY_CA_CERT installs an
 // http transport whose TLS config carries the loaded root pool (no network).
 func TestNewWithCACertUsesPool(t *testing.T) {
-	t.Setenv("PGBRANCH_CA_CERT", writeTestCACert(t))
+	t.Setenv("PGOVERLAY_CA_CERT", writeTestCACert(t))
 	c := New("https://branchd.example:7070", "tok")
 	tr, ok := c.HTTP.Transport.(*http.Transport)
 	if !ok {
@@ -312,7 +312,7 @@ func writeTestCACert(t *testing.T) string {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "pgbranch-test-ca"},
+		Subject:               pkix.Name{CommonName: "pgoverlay-test-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(time.Hour),
 		IsCA:                  true,

@@ -26,7 +26,7 @@ func writeTestCertPair(t *testing.T, dir string) (certFile, keyFile string) {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "pgbranch-test"},
+		Subject:      pkix.Name{CommonName: "pgoverlay-test"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

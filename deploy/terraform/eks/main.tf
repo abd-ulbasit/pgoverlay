@@ -1,8 +1,8 @@
-# Minimal single-node EKS cluster for running the pgbranch stack
+# Minimal single-node EKS cluster for running the pgoverlay stack
 # (branchd + ghook + prod postgres + branch pods, hostpath storage mode).
 #
 #   terraform init && terraform apply
-#   aws eks update-kubeconfig --name pgbranch --region ap-south-1
+#   aws eks update-kubeconfig --name pgoverlay --region ap-south-1
 #
 # Cost while running: EKS control plane (~$0.10/h) + 1× t3.large (~$0.09/h)
 # + NLBs for the proxy/webhook services. `terraform destroy` removes it all
@@ -22,7 +22,7 @@ variable "region" {
 }
 
 variable "cluster_name" {
-  default = "pgbranch"
+  default = "pgoverlay"
 }
 
 # NEW clusters: never below 1.36 — pick the newest version in EKS standard
@@ -69,7 +69,7 @@ module "eks" {
 
   eks_managed_node_groups = {
     main = {
-      # one node: pgbranch hostpath mode pins all data here anyway
+      # one node: pgoverlay hostpath mode pins all data here anyway
       instance_types = ["t3.large"]
       min_size       = 1
       max_size       = 1
@@ -79,7 +79,7 @@ module "eks" {
   }
 
   tags = {
-    project = "pgbranch-demo"
+    project = "pgoverlay-demo"
   }
 }
 

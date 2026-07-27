@@ -20,22 +20,22 @@ import (
 const encPrefix = "enc:v1:"
 
 // secretBox encrypts/decrypts branch passwords at rest with a key derived from
-// PGBRANCH_TOKEN (key = sha256(token); see DeriveSecretKey). It is OPTIONAL on
+// PGOVERLAY_TOKEN (key = sha256(token); see DeriveSecretKey). It is OPTIONAL on
 // the Registry: a nil *secretBox means no key was configured and the registry
 // stores/reads passwords as plaintext (back-compat for inherit-mode setups and
 // tests). A non-nil box encrypts on write and decrypts the enc:-prefixed rows
 // on read, while still passing legacy plaintext rows through untouched.
 //
-// Trade-off: the key is derived from PGBRANCH_TOKEN, so rotating the token
+// Trade-off: the key is derived from PGOVERLAY_TOKEN, so rotating the token
 // makes every existing encrypted branch password UNRECOVERABLE (decrypt fails
-// with the wrong key). That is acceptable for pgbranch's ephemeral branches —
+// with the wrong key). That is acceptable for pgoverlay's ephemeral branches —
 // re-run credential rotation (reset the branch) after a token change to mint a
 // password the new key can decrypt. Documented in docs/usage.md.
 type secretBox struct {
 	aead cipher.AEAD
 }
 
-// DeriveSecretKey returns the 32-byte AES-256 key for a PGBRANCH_TOKEN:
+// DeriveSecretKey returns the 32-byte AES-256 key for a PGOVERLAY_TOKEN:
 // key = sha256(token). Returns nil for an empty token so callers can pass it
 // straight into SetSecretKey (a nil key disables at-rest encryption).
 func DeriveSecretKey(token string) []byte {
@@ -94,7 +94,7 @@ func (b *secretBox) decrypt(stored string) (string, error) {
 		return stored, nil // legacy plaintext / inherit-mode empty
 	}
 	if b == nil {
-		return "", fmt.Errorf("registry: encrypted branch password found but no secret key configured (PGBRANCH_TOKEN missing?)")
+		return "", fmt.Errorf("registry: encrypted branch password found but no secret key configured (PGOVERLAY_TOKEN missing?)")
 	}
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, encPrefix))
 	if err != nil {
@@ -107,9 +107,9 @@ func (b *secretBox) decrypt(stored string) (string, error) {
 	nonce, ct := raw[:ns], raw[ns:]
 	pt, err := b.aead.Open(nil, nonce, ct, nil)
 	if err != nil {
-		// Almost always a wrong key: PGBRANCH_TOKEN was rotated after this row
+		// Almost always a wrong key: PGOVERLAY_TOKEN was rotated after this row
 		// was encrypted. Recoverable only by re-rotating the branch's creds.
-		return "", fmt.Errorf("registry: decrypt branch password (PGBRANCH_TOKEN rotated since it was stored? re-run credential rotation): %w", err)
+		return "", fmt.Errorf("registry: decrypt branch password (PGOVERLAY_TOKEN rotated since it was stored? re-run credential rotation): %w", err)
 	}
 	return string(pt), nil
 }

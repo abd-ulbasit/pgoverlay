@@ -24,7 +24,7 @@ func openTest(t *testing.T) *Registry {
 func TestSourceLifecycle(t *testing.T) {
 	r := openTest(t)
 	s := &Source{
-		Name: "main", PGVersion: "17", Volume: "pgbranch-src-main",
+		Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main",
 		ConnHost: "db.example.com", ConnPort: 5432, ConnUser: "postgres", ConnDB: "app",
 		Network: "",
 	}
@@ -41,7 +41,7 @@ func TestSourceLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != SourceReady || got.Volume != "pgbranch-src-main" {
+	if got.State != SourceReady || got.Volume != "pgoverlay-src-main" {
 		t.Fatalf("got %+v", got)
 	}
 	// duplicate name rejected
@@ -60,7 +60,7 @@ func TestBranchLifecycleAndTransitions(t *testing.T) {
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}
-	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "pgbranch-br-pr-1-rw"}
+	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "pgoverlay-br-pr-1-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
@@ -145,11 +145,11 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if _, err := db.Exec(schemaV1Fixture); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO sources (id,name,pg_version,volume,state) VALUES ('src1','main','17','pgbranch-src-main','ready')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO sources (id,name,pg_version,volume,state) VALUES ('src1','main','17','pgoverlay-src-main','ready')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO branches (id,name,source_id,state,container_id,rw_volume,port)
-		VALUES ('br1','pr-1','src1','ready','cid1','pgbranch-br-pr-1-rw',54321)`); err != nil {
+		VALUES ('br1','pr-1','src1','ready','cid1','pgoverlay-br-pr-1-rw',54321)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -173,7 +173,7 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.ID != "src1" || s.Volume != "pgbranch-src-main" || s.State != SourceReady {
+	if s.ID != "src1" || s.Volume != "pgoverlay-src-main" || s.State != SourceReady {
 		t.Fatalf("source row not preserved: %+v", s)
 	}
 	if s.Generation != 1 {
@@ -186,7 +186,7 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if b.ID != "br1" || b.ContainerID != "cid1" || b.Port != 54321 || b.State != BranchReady {
 		t.Fatalf("branch row not preserved: %+v", b)
 	}
-	if b.SourceVolume != "pgbranch-src-main" {
+	if b.SourceVolume != "pgoverlay-src-main" {
 		t.Fatalf("SourceVolume=%q want backfill from source", b.SourceVolume)
 	}
 	if b.ExpiresAt != "" {
@@ -370,40 +370,40 @@ func TestListExpiredBranches(t *testing.T) {
 
 func TestBumpSourceGenerationAndCounts(t *testing.T) {
 	r := openTest(t)
-	s := &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	s := &Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}
 	if s2, _ := r.GetSourceByName("main"); s2.Generation != 1 {
 		t.Fatalf("fresh source generation=%d want 1", s2.Generation)
 	}
-	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "rw", SourceVolume: "pgbranch-src-main"}
+	b := &Branch{Name: "pr-1", SourceID: s.ID, RWVolume: "rw", SourceVolume: "pgoverlay-src-main"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.BumpSourceGeneration(s.ID, "pgbranch-src-main-g2"); err != nil {
+	if err := r.BumpSourceGeneration(s.ID, "pgoverlay-src-main-g2"); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := r.GetSourceByName("main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s2.Generation != 2 || s2.Volume != "pgbranch-src-main-g2" {
+	if s2.Generation != 2 || s2.Volume != "pgoverlay-src-main-g2" {
 		t.Fatalf("after bump: %+v", s2)
 	}
 	if n, _ := r.CountLiveBranchesBySource(s.ID); n != 1 {
 		t.Fatalf("live by source=%d want 1", n)
 	}
-	if n, _ := r.CountLiveBranchesByVolume("pgbranch-src-main"); n != 1 {
+	if n, _ := r.CountLiveBranchesByVolume("pgoverlay-src-main"); n != 1 {
 		t.Fatalf("live by volume=%d want 1", n)
 	}
-	if n, _ := r.CountLiveBranchesByVolume("pgbranch-src-main-g2"); n != 0 {
+	if n, _ := r.CountLiveBranchesByVolume("pgoverlay-src-main-g2"); n != 0 {
 		t.Fatalf("live by g2 volume=%d want 0", n)
 	}
 	if n, _ := r.CountLiveBranchesByRWVolume("rw"); n != 1 {
 		t.Fatalf("live by rw volume=%d want 1", n)
 	}
-	if n, _ := r.CountLiveBranchesByRWVolume("pgbranch-src-main"); n != 0 {
+	if n, _ := r.CountLiveBranchesByRWVolume("pgoverlay-src-main"); n != 0 {
 		t.Fatalf("live by rw volume (source vol)=%d want 0", n)
 	}
 	// destroyed branches don't count
@@ -419,7 +419,7 @@ func TestBumpSourceGenerationAndCounts(t *testing.T) {
 	if n, _ := r.CountLiveBranchesBySource(s.ID); n != 0 {
 		t.Fatalf("live by source after destroy=%d want 0", n)
 	}
-	if n, _ := r.CountLiveBranchesByVolume("pgbranch-src-main"); n != 0 {
+	if n, _ := r.CountLiveBranchesByVolume("pgoverlay-src-main"); n != 0 {
 		t.Fatalf("live by volume after destroy=%d want 0", n)
 	}
 }
@@ -509,15 +509,15 @@ func TestResettingTransitions(t *testing.T) {
 // All branches are live (creating).
 func layerFixture(t *testing.T, r *Registry) (src *Source, l1, l2 *Layer, bSrc, bL1, bL2 *Branch) {
 	t.Helper()
-	src = &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	src = &Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
 	if err := r.CreateSource(src); err != nil {
 		t.Fatal(err)
 	}
-	l1 = &Layer{SourceID: src.ID, Volume: "pgbranch-br-p-rw"}
+	l1 = &Layer{SourceID: src.ID, Volume: "pgoverlay-br-p-rw"}
 	if err := r.CreateLayer(l1); err != nil {
 		t.Fatal(err)
 	}
-	l2 = &Layer{SourceID: src.ID, Volume: "pgbranch-br-p-rw-g2", ParentLayerID: l1.ID}
+	l2 = &Layer{SourceID: src.ID, Volume: "pgoverlay-br-p-rw-g2", ParentLayerID: l1.ID}
 	if err := r.CreateLayer(l2); err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +541,7 @@ func TestLayerCRUDAndChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Volume != "pgbranch-br-p-rw-g2" || got.ParentLayerID != l1.ID {
+	if got.Volume != "pgoverlay-br-p-rw-g2" || got.ParentLayerID != l1.ID {
 		t.Fatalf("GetLayer: %+v", got)
 	}
 	if _, err := r.GetLayer("nope"); !errors.Is(err, ErrNotFound) {
@@ -642,41 +642,41 @@ func TestListLayersBySource(t *testing.T) {
 // on the new layer.
 func TestCommitFreeze(t *testing.T) {
 	r := openTest(t)
-	src := &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	src := &Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
 	if err := r.CreateSource(src); err != nil {
 		t.Fatal(err)
 	}
-	parent := &Branch{Name: "p", SourceID: src.ID, RWVolume: "pgbranch-br-p-rw", SourceVolume: src.Volume}
+	parent := &Branch{Name: "p", SourceID: src.ID, RWVolume: "pgoverlay-br-p-rw", SourceVolume: src.Volume}
 	if err := r.CreateBranch(parent); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.MarkBranchReady(parent.ID, "cid-p1", "127.0.0.1", 1001); err != nil {
 		t.Fatal(err)
 	}
-	child := &Branch{Name: "c", SourceID: src.ID, RWVolume: "pgbranch-br-c-rw", SourceVolume: src.Volume, ParentBranchName: "p"}
+	child := &Branch{Name: "c", SourceID: src.ID, RWVolume: "pgoverlay-br-c-rw", SourceVolume: src.Volume, ParentBranchName: "p"}
 	if err := r.CreateBranch(child); err != nil {
 		t.Fatal(err)
 	}
 
 	// freeze requires the parent mid-transition (resetting)
-	if _, err := r.CommitFreeze(parent.ID, child.ID, "pgbranch-br-p-rw", "pgbranch-br-p-rw-g2", "cid-p2", "127.0.0.1", 1002, "freeze for child c"); err == nil {
+	if _, err := r.CommitFreeze(parent.ID, child.ID, "pgoverlay-br-p-rw", "pgoverlay-br-p-rw-g2", "cid-p2", "127.0.0.1", 1002, "freeze for child c"); err == nil {
 		t.Fatal("CommitFreeze on a ready (not resetting) parent must fail")
 	}
 	if err := r.TransitionBranch(parent.ID, BranchResetting, "freeze for child c"); err != nil {
 		t.Fatal(err)
 	}
-	l, err := r.CommitFreeze(parent.ID, child.ID, "pgbranch-br-p-rw", "pgbranch-br-p-rw-g2", "cid-p2", "127.0.0.1", 1002, "freeze for child c")
+	l, err := r.CommitFreeze(parent.ID, child.ID, "pgoverlay-br-p-rw", "pgoverlay-br-p-rw-g2", "cid-p2", "127.0.0.1", 1002, "freeze for child c")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.ID == "" || l.SourceID != src.ID || l.Volume != "pgbranch-br-p-rw" || l.ParentLayerID != "" {
+	if l.ID == "" || l.SourceID != src.ID || l.Volume != "pgoverlay-br-p-rw" || l.ParentLayerID != "" {
 		t.Fatalf("layer: %+v", l)
 	}
 	p, err := r.GetBranchByName("p")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.State != BranchReady || p.RWVolume != "pgbranch-br-p-rw-g2" || p.BaseLayerID != l.ID ||
+	if p.State != BranchReady || p.RWVolume != "pgoverlay-br-p-rw-g2" || p.BaseLayerID != l.ID ||
 		p.ContainerID != "cid-p2" || p.Port != 1002 {
 		t.Fatalf("parent after freeze: %+v", p)
 	}
@@ -692,14 +692,14 @@ func TestCommitFreeze(t *testing.T) {
 	}
 
 	// second freeze of the same parent chains the new layer onto the first
-	child2 := &Branch{Name: "c2", SourceID: src.ID, RWVolume: "pgbranch-br-c2-rw", SourceVolume: src.Volume, ParentBranchName: "p"}
+	child2 := &Branch{Name: "c2", SourceID: src.ID, RWVolume: "pgoverlay-br-c2-rw", SourceVolume: src.Volume, ParentBranchName: "p"}
 	if err := r.CreateBranch(child2); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.TransitionBranch(parent.ID, BranchResetting, "freeze for child c2"); err != nil {
 		t.Fatal(err)
 	}
-	l2, err := r.CommitFreeze(parent.ID, child2.ID, "pgbranch-br-p-rw-g2", "pgbranch-br-p-rw-g3", "cid-p3", "127.0.0.1", 1003, "freeze for child c2")
+	l2, err := r.CommitFreeze(parent.ID, child2.ID, "pgoverlay-br-p-rw-g2", "pgoverlay-br-p-rw-g3", "cid-p3", "127.0.0.1", 1003, "freeze for child c2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,7 +727,7 @@ func TestCommitFreeze(t *testing.T) {
 	if _, err := r.CommitFreeze(parent.ID, "ghost", "x", "y", "cid", "127.0.0.1", 1, "r"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("CommitFreeze(unknown child) err=%v want ErrNotFound", err)
 	}
-	if p, _ := r.GetBranchByName("p"); p.RWVolume != "pgbranch-br-p-rw-g3" {
+	if p, _ := r.GetBranchByName("p"); p.RWVolume != "pgoverlay-br-p-rw-g3" {
 		t.Fatalf("failed CommitFreeze mutated parent: %+v", p)
 	}
 }
@@ -869,7 +869,7 @@ func TestBranchPasswordLegacyPlaintextReadWithKey(t *testing.T) {
 	if err := r.SetBranchPassword(b.ID, legacy); err != nil { // no key yet -> plaintext
 		t.Fatal(err)
 	}
-	// Operator now sets a key (e.g. PGBRANCH_TOKEN configured after an upgrade).
+	// Operator now sets a key (e.g. PGOVERLAY_TOKEN configured after an upgrade).
 	if err := r.SetSecretKey(DeriveSecretKey("token-set-later")); err != nil {
 		t.Fatal(err)
 	}
@@ -1081,7 +1081,7 @@ func TestSetBranchContainerBumpsUpdatedAt(t *testing.T) {
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}
-	b := &Branch{Name: "parent", SourceID: s.ID, RWVolume: "pgbranch-br-parent-rw"}
+	b := &Branch{Name: "parent", SourceID: s.ID, RWVolume: "pgoverlay-br-parent-rw"}
 	if err := r.CreateBranch(b); err != nil {
 		t.Fatal(err)
 	}
@@ -1127,11 +1127,11 @@ func TestSetBranchContainerBumpsUpdatedAt(t *testing.T) {
 // counted as removable while that child is live.
 func TestCountLiveBranchesReferencingRW(t *testing.T) {
 	r := openTest(t)
-	s := &Source{Name: "main", PGVersion: "17", Volume: "pgbranch-src-main"}
+	s := &Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}
-	parent := &Branch{Name: "parent", SourceID: s.ID, RWVolume: "pgbranch-br-parent-rw", SourceVolume: "pgbranch-src-main"}
+	parent := &Branch{Name: "parent", SourceID: s.ID, RWVolume: "pgoverlay-br-parent-rw", SourceVolume: "pgoverlay-src-main"}
 	if err := r.CreateBranch(parent); err != nil {
 		t.Fatal(err)
 	}
@@ -1144,7 +1144,7 @@ func TestCountLiveBranchesReferencingRW(t *testing.T) {
 	}
 
 	// csi/zfs child: records parent.RWVolume as its source_volume.
-	csiChild := &Branch{Name: "csichild", SourceID: s.ID, RWVolume: "pgbranch-br-csichild-rw",
+	csiChild := &Branch{Name: "csichild", SourceID: s.ID, RWVolume: "pgoverlay-br-csichild-rw",
 		SourceVolume: parent.RWVolume, ParentBranchName: parent.Name}
 	if err := r.CreateBranch(csiChild); err != nil {
 		t.Fatal(err)
@@ -1155,8 +1155,8 @@ func TestCountLiveBranchesReferencingRW(t *testing.T) {
 
 	// overlay child: source_volume is the SOURCE, not the parent rw; the link
 	// is parent_branch_name. Still must count.
-	overlayChild := &Branch{Name: "ovchild", SourceID: s.ID, RWVolume: "pgbranch-br-ovchild-rw",
-		SourceVolume: "pgbranch-src-main", ParentBranchName: parent.Name}
+	overlayChild := &Branch{Name: "ovchild", SourceID: s.ID, RWVolume: "pgoverlay-br-ovchild-rw",
+		SourceVolume: "pgoverlay-src-main", ParentBranchName: parent.Name}
 	if err := r.CreateBranch(overlayChild); err != nil {
 		t.Fatal(err)
 	}

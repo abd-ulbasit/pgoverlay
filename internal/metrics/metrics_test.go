@@ -24,16 +24,16 @@ func TestStateCollectorReportsGauges(t *testing.T) {
 	})
 
 	want := `
-# HELP pgbranch_branches_total Number of branches by state.
-# TYPE pgbranch_branches_total gauge
-pgbranch_branches_total{state="failed"} 1
-pgbranch_branches_total{state="ready"} 3
-# HELP pgbranch_sources_total Number of sources by state.
-# TYPE pgbranch_sources_total gauge
-pgbranch_sources_total{state="ready"} 2
+# HELP pgoverlay_branches_total Number of branches by state.
+# TYPE pgoverlay_branches_total gauge
+pgoverlay_branches_total{state="failed"} 1
+pgoverlay_branches_total{state="ready"} 3
+# HELP pgoverlay_sources_total Number of sources by state.
+# TYPE pgoverlay_sources_total gauge
+pgoverlay_sources_total{state="ready"} 2
 `
 	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
-		"pgbranch_branches_total", "pgbranch_sources_total"); err != nil {
+		"pgoverlay_branches_total", "pgoverlay_sources_total"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -44,12 +44,12 @@ func TestObserveOpRecordsHistogram(t *testing.T) {
 	m.ObserveOp("create", 1.5)
 	// the create histogram's sample count reflects both observations
 	want := `
-# HELP pgbranch_branch_op_duration_seconds Duration of branch operations by op (create|reset|destroy|from_branch|diff).
-# TYPE pgbranch_branch_op_duration_seconds histogram
-pgbranch_branch_op_duration_seconds_count{op="create"} 2
+# HELP pgoverlay_branch_op_duration_seconds Duration of branch operations by op (create|reset|destroy|from_branch|diff).
+# TYPE pgoverlay_branch_op_duration_seconds histogram
+pgoverlay_branch_op_duration_seconds_count{op="create"} 2
 `
 	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
-		"pgbranch_branch_op_duration_seconds_count"); err != nil {
+		"pgoverlay_branch_op_duration_seconds_count"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -102,12 +102,12 @@ func TestCompensationFailureRegistered(t *testing.T) {
 	m := New()
 	m.IncCompensationFailure("cleanup")
 	want := `
-# HELP pgbranch_compensation_failures_total Best-effort saga compensation/failure-transition errors by kind (transition|undo|cleanup).
-# TYPE pgbranch_compensation_failures_total counter
-pgbranch_compensation_failures_total{kind="cleanup"} 1
+# HELP pgoverlay_compensation_failures_total Best-effort saga compensation/failure-transition errors by kind (transition|undo|cleanup).
+# TYPE pgoverlay_compensation_failures_total counter
+pgoverlay_compensation_failures_total{kind="cleanup"} 1
 `
 	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
-		"pgbranch_compensation_failures_total"); err != nil {
+		"pgoverlay_compensation_failures_total"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -126,7 +126,7 @@ func TestDiskCollectorReportsFreeBytes(t *testing.T) {
 	got := map[string]float64{}
 	for _, mf := range mfs {
 		switch mf.GetName() {
-		case "pgbranch_disk_bytes_free", "pgbranch_disk_bytes_total":
+		case "pgoverlay_disk_bytes_free", "pgoverlay_disk_bytes_total":
 			ms := mf.GetMetric()
 			if len(ms) != 1 {
 				t.Fatalf("%s: got %d samples, want 1", mf.GetName(), len(ms))
@@ -134,16 +134,16 @@ func TestDiskCollectorReportsFreeBytes(t *testing.T) {
 			got[mf.GetName()] = ms[0].GetGauge().GetValue()
 		}
 	}
-	free, okFree := got["pgbranch_disk_bytes_free"]
-	total, okTotal := got["pgbranch_disk_bytes_total"]
+	free, okFree := got["pgoverlay_disk_bytes_free"]
+	total, okTotal := got["pgoverlay_disk_bytes_total"]
 	if !okFree || !okTotal {
 		t.Fatalf("missing disk gauges: %+v", got)
 	}
 	if free <= 0 {
-		t.Fatalf("pgbranch_disk_bytes_free=%v, want > 0", free)
+		t.Fatalf("pgoverlay_disk_bytes_free=%v, want > 0", free)
 	}
 	if total <= 0 {
-		t.Fatalf("pgbranch_disk_bytes_total=%v, want > 0", total)
+		t.Fatalf("pgoverlay_disk_bytes_total=%v, want > 0", total)
 	}
 	if free > total {
 		t.Fatalf("free (%v) > total (%v), implausible", free, total)
@@ -160,7 +160,7 @@ func TestSetDiskRootNoOpOnEmptyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, mf := range mfs {
-		if n := mf.GetName(); n == "pgbranch_disk_bytes_free" || n == "pgbranch_disk_bytes_total" {
+		if n := mf.GetName(); n == "pgoverlay_disk_bytes_free" || n == "pgoverlay_disk_bytes_total" {
 			t.Fatalf("disk gauge %s registered for empty root", n)
 		}
 	}

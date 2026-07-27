@@ -1,5 +1,5 @@
 // Package cli wires cobra commands to the engine (local mode) or to a
-// running branchd via the REST API (server mode: --server / PGBRANCH_SERVER).
+// running branchd via the REST API (server mode: --server / PGOVERLAY_SERVER).
 // Engine construction is lazy (inside RunE) so --help and tests never touch
 // Docker.
 package cli
@@ -9,22 +9,22 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/abd-ulbasit/pgbranch/internal/apiclient"
-	"github.com/abd-ulbasit/pgbranch/internal/config"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
+	"github.com/abd-ulbasit/pgoverlay/internal/config"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "pgb",
-		Short:         "pgbranch — git branch for Postgres",
+		Short:         "pgoverlay — git branch for Postgres",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 	}
-	root.PersistentFlags().String("server", os.Getenv("PGBRANCH_SERVER"),
-		"branchd base URL (http:// or https://, e.g. http://localhost:7070); enables server mode [env PGBRANCH_SERVER, token from PGBRANCH_TOKEN; PGBRANCH_TLS_SKIP_VERIFY=1 for self-signed certs]")
+	root.PersistentFlags().String("server", os.Getenv("PGOVERLAY_SERVER"),
+		"branchd base URL (http:// or https://, e.g. http://localhost:7070); enables server mode [env PGOVERLAY_SERVER, token from PGOVERLAY_TOKEN; PGOVERLAY_TLS_SKIP_VERIFY=1 for self-signed certs]")
 	root.AddCommand(newSourceCmd(), newBranchCmd(), newConnectCmd(), newDiffCmd(), newHistoryCmd(), newDoctorCmd(), newGCCmd(), newTokenCmd())
 	return root
 }
@@ -37,7 +37,7 @@ func serverClient(cmd *cobra.Command) *apiclient.Client {
 	if s == "" {
 		return nil
 	}
-	return apiclient.New(s, os.Getenv("PGBRANCH_TOKEN"))
+	return apiclient.New(s, os.Getenv("PGOVERLAY_TOKEN"))
 }
 
 // openRegistry opens just the registry (no runtime driver) for commands that

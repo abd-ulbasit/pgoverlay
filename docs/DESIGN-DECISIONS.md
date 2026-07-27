@@ -1,6 +1,6 @@
 # Design decisions (ADRs)
 
-Ten decisions that shaped pgbranch, each recorded in the same four parts:
+Ten decisions that shaped pgoverlay, each recorded in the same four parts:
 
 - **Context** — the problem and the competing pressures.
 - **Decision** — what was chosen, and where it lives in the code.
@@ -20,7 +20,7 @@ implementation turned out to be wrong.
 
 ## ADR-01: No Kubernetes operator, no CRDs — a plain daemon + CLI + Helm chart
 
-**Context.** pgbranch provisions stateful resources (volumes, Postgres
+**Context.** pgoverlay provisions stateful resources (volumes, Postgres
 containers) and needs a reconcile/GC loop to converge reality with its
 registry — exactly the workload the operator pattern was built for. The pull to
 "just write a controller with a `Branch` CRD" is strong. But the engine must
@@ -28,7 +28,7 @@ also run on a laptop under Docker, with no apiserver in sight.
 
 **Decision.** Ship `branchd`, a single daemon (`cmd/branchd/main.go`) exposing a
 REST control plane (`--api-addr`, default `:7070`) and a Postgres router
-(`--pg-addr`), driven by a CLI and a Helm chart (`deploy/helm/pgbranch`). There
+(`--pg-addr`), driven by a CLI and a Helm chart (`deploy/helm/pgoverlay`). There
 are no CustomResourceDefinitions anywhere in the tree (`grep
 CustomResourceDefinition` over the repo returns nothing). The reconciliation
 benefit is kept as an in-process loop: `Engine.RunReconcile` runs on a ticker
@@ -195,7 +195,7 @@ SQLite registry is single-writer (ADR-02). Two replicas mutating it concurrently
 would corrupt state.
 
 **Decision.** Optional `--leader-elect` (kube only) makes replicas contend for a
-`coordination.k8s.io` Lease named `pgbranch-branchd`
+`coordination.k8s.io` Lease named `pgoverlay-branchd`
 (`internal/ha/leader.go`, client-go `leaderelection`). Only the leader runs the
 reconcile loop and accepts **mutating** `/v1` requests; the API composes a
 `LeaderGate` in front of every mutating route (`internal/api/leader.go` —
@@ -221,21 +221,21 @@ called out in the Helm values).
 
 **Context.** The reconcile loop reaps orphaned containers and volumes. On a
 shared Docker daemon — or in the parallel integration-test suite — several
-pgbranch instances coexist. A naive "reap anything managed" would have one
+pgoverlay instances coexist. A naive "reap anything managed" would have one
 instance destroy another's *live* resources.
 
 **Decision.** Every managed resource is stamped with the owning registry's
-instance id under the label `pgbranch.instance`
+instance id under the label `pgoverlay.instance`
 (`runtime.LabelInstance`). `instanceLabels` in `internal/engine/saga.go` is the
 single chokepoint that adds it, so no call site can forget. The instance id is a
 stable value minted on first registry open and stored in the `meta` table
 (schema v8). Reconcile filters strictly on it: `PlanReconcile`
 (`internal/engine/reconcile.go`) skips any managed container whose
-`pgbranch.instance` label is absent or names another instance, and
+`pgoverlay.instance` label is absent or names another instance, and
 `ListManagedVolumes(ctx, instanceID)` scopes volume GC the same way.
 
 **Alternatives considered.** A dedicated daemon per host (operationally
-heavier); reaping by `pgbranch.managed=true` alone (cross-instance data loss).
+heavier); reaping by `pgoverlay.managed=true` alone (cross-instance data loss).
 
 **Consequences / trade-offs.** Safe multi-tenancy on one daemon and a safe
 parallel test suite. Reconcile additionally re-checks every destructive action
@@ -258,7 +258,7 @@ admin before any token exists.
 creation and is never recoverable. `LookupAPIToken` is an indexed point lookup
 on `token_hash` (unique index `api_tokens_hash`, schema v10) — timing-safe by
 construction because the discriminator is itself a hash of the secret. The
-env var `PGBRANCH_TOKEN` is the **admin bootstrap**: it is never stored, and is
+env var `PGOVERLAY_TOKEN` is the **admin bootstrap**: it is never stored, and is
 matched in the middleware with a **constant-time compare**
 (`crypto/subtle.ConstantTimeCompare`, `internal/api/middleware.go`,
 `resolveActor`) under the `root` audit sentinel. `requireRole` returns 401 for
@@ -286,7 +286,7 @@ read.
 (`internal/registry/crypto.go`, `secretBox`): a random 12-byte nonce is
 prepended to the ciphertext, base64-encoded, and tagged with an `enc:v1:` prefix
 (the prefix versions the scheme so a future KDF/AEAD can coexist). The key is
-`sha256(PGBRANCH_TOKEN)` (`DeriveSecretKey`). Encryption is **optional**: a nil
+`sha256(PGOVERLAY_TOKEN)` (`DeriveSecretKey`). Encryption is **optional**: a nil
 box (no token) stores plaintext, and values without the `enc:` prefix are read
 back as legacy plaintext — back-compat for inherit-mode and pre-encryption rows.
 
@@ -295,7 +295,7 @@ single-binary tool); no encryption (plaintext-at-rest leak).
 
 **Consequences / trade-offs.** Branch passwords are unreadable from the raw DB
 file without the token, with no new dependency. Cost: because the key is derived
-from `PGBRANCH_TOKEN`, **rotating the token orphans every existing encrypted
+from `PGOVERLAY_TOKEN`, **rotating the token orphans every existing encrypted
 password** (decrypt fails with the wrong key). This is deliberate and acceptable
 for ephemeral branches — re-run rotation (reset the branch) after a token change
 to re-encrypt under the new key; `decrypt` returns a loud, actionable error

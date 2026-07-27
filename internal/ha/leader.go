@@ -29,7 +29,7 @@ import (
 )
 
 // LeaseName is the coordination.k8s.io Lease all branchd replicas contend for.
-const LeaseName = "pgbranch-branchd"
+const LeaseName = "pgoverlay-branchd"
 
 // Default lease timings. LeaseDuration > RenewDeadline > RetryPeriod is required
 // by client-go; failover happens within roughly LeaseDuration after a leader

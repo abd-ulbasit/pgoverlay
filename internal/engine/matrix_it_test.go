@@ -8,23 +8,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // TestVersionMatrix runs a compact seed -> branch -> verify -> destroy cycle
-// against every Postgres major in PGBRANCH_MATRIX_VERSIONS (default "14 18",
+// against every Postgres major in PGOVERLAY_MATRIX_VERSIONS (default "14 18",
 // the edges of the supported 14-18 range). Gated separately from the regular
 // docker IT because it pulls one postgres image per version.
 //
-//	PGBRANCH_MATRIX_IT=1 PGBRANCH_MATRIX_VERSIONS="14 15 16 17 18" \
+//	PGOVERLAY_MATRIX_IT=1 PGOVERLAY_MATRIX_VERSIONS="14 15 16 17 18" \
 //	  go test ./internal/engine/ -run Matrix -count=1 -v -timeout 25m
 func TestVersionMatrix(t *testing.T) {
-	if os.Getenv("PGBRANCH_MATRIX_IT") != "1" {
-		t.Skip("set PGBRANCH_MATRIX_IT=1")
+	if os.Getenv("PGOVERLAY_MATRIX_IT") != "1" {
+		t.Skip("set PGOVERLAY_MATRIX_IT=1")
 	}
-	versions := strings.Fields(os.Getenv("PGBRANCH_MATRIX_VERSIONS"))
+	versions := strings.Fields(os.Getenv("PGOVERLAY_MATRIX_VERSIONS"))
 	if len(versions) == 0 {
 		versions = []string{"14", "18"}
 	}

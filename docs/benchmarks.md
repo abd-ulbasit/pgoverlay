@@ -1,7 +1,7 @@
 # Benchmarks
 
-Measured with [`hack/benchmark.sh`](https://github.com/abd-ulbasit/pgbranch/blob/main/hack/benchmark.sh) on 2026-06-10, against
-pgbranch's Docker runtime with the OverlayFS copy-on-write backend. All numbers
+Measured with [`hack/benchmark.sh`](https://github.com/abd-ulbasit/pgoverlay/blob/main/hack/benchmark.sh) on 2026-06-10, against
+pgoverlay's Docker runtime with the OverlayFS copy-on-write backend. All numbers
 are real, single-machine measurements — no extrapolation.
 
 ## Results
@@ -41,7 +41,7 @@ are configurable: `BENCH_SIZES_GIB="1 5 10" hack/benchmark.sh`.
 ## The fix
 
 One flag. The branch entrypoint
-([`internal/cow/entrypoint.sh`](https://github.com/abd-ulbasit/pgbranch/blob/main/internal/cow/entrypoint.sh)) now hands off
+([`internal/cow/entrypoint.sh`](https://github.com/abd-ulbasit/pgoverlay/blob/main/internal/cow/entrypoint.sh)) now hands off
 with:
 
 ```sh
@@ -63,7 +63,7 @@ the durability guarantee the sync pass exists for (no dirty pages from before
 recovery lingering unflushed) is preserved, and WAL crash-recovery semantics
 are unchanged. The documented trade-offs of `syncfs` (errors on unrelated
 files on the same filesystem can be reported, or I/O errors missed on some
-kernels) are irrelevant for pgbranch branches: they are disposable dev/test
+kernels) are irrelevant for pgoverlay branches: they are disposable dev/test
 databases whose filesystem is the branch's own overlay mount. `syncfs` is
 Linux-only and requires Postgres 14+; branch containers are always Linux and
 always `postgres:14+`, which the entrypoint comments.

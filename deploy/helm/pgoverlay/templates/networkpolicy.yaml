@@ -1,5 +1,5 @@
 {{- if .Values.networkPolicy.enabled }}
-# NetworkPolicies for pgbranch. OFF by default (networkPolicy.enabled=false) so
+# NetworkPolicies for pgoverlay. OFF by default (networkPolicy.enabled=false) so
 # existing installs don't suddenly lose connectivity, but RECOMMENDED for any
 # shared/multi-tenant cluster. Requires a CNI that enforces NetworkPolicy
 # (Calico, Cilium, etc.); on a CNI without enforcement these are inert.
@@ -13,13 +13,13 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "pgbranch.fullname" . }}-branchd
+  name: {{ include "pgoverlay.fullname" . }}-branchd
   labels:
-    {{- include "pgbranch.labels" . | nindent 4 }}
+    {{- include "pgoverlay.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "pgbranch.selectorLabels" . | nindent 6 }}
+      {{- include "pgoverlay.selectorLabels" . | nindent 6 }}
   policyTypes:
     - Ingress
   ingress:
@@ -28,7 +28,7 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              {{- include "pgbranch.ghook.selectorLabels" . | nindent 14 }}
+              {{- include "pgoverlay.ghook.selectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.api.port }}
@@ -55,20 +55,20 @@ spec:
     {{- end }}
 ---
 # Branch pods are created by branchd at RUNTIME (not by this chart). The Go
-# runtime stamps them with pgbranch.managed=true and pgbranch.role=branch
+# runtime stamps them with pgoverlay.managed=true and pgoverlay.role=branch
 # (see internal/engine branchLabels / internal/runtime). These policies select
 # on those labels; if the runtime label scheme changes, update them here.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "pgbranch.fullname" . }}-branch-pods
+  name: {{ include "pgoverlay.fullname" . }}-branch-pods
   labels:
-    {{- include "pgbranch.labels" . | nindent 4 }}
+    {{- include "pgoverlay.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      pgbranch.managed: "true"
-      pgbranch.role: branch
+      pgoverlay.managed: "true"
+      pgoverlay.role: branch
   policyTypes:
     - Ingress
     - Egress
@@ -77,7 +77,7 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              {{- include "pgbranch.selectorLabels" . | nindent 14 }}
+              {{- include "pgoverlay.selectorLabels" . | nindent 14 }}
   egress:
     # Cluster DNS (kube-dns / CoreDNS) so the branch pod can resolve names.
     - to:

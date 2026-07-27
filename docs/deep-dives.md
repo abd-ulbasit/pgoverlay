@@ -1,7 +1,7 @@
 # Deep dives
 
 [Architecture](architecture.md) and [design decisions](DESIGN-DECISIONS.md)
-cover what pgbranch is and why it is shaped the way it is. This document covers
+cover what pgoverlay is and why it is shaped the way it is. This document covers
 the six hardest problems in the codebase — the ones where the obvious
 implementation was wrong, the bug was subtle enough to survive review, and the
 fix generalizes past this project.
@@ -22,7 +22,7 @@ disagreed, these notes follow the code and say so.
 
 ### The problem
 
-pgbranch's flagship feature is **branch-from-branch**: take a *ready* branch and
+pgoverlay's flagship feature is **branch-from-branch**: take a *ready* branch and
 fork a new branch off its current state. On the overlay (OverlayFS) backend the
 parent's writable layer cannot be shared read-write with a child, so the parent
 is *frozen* into an immutable layer. The freeze saga
@@ -280,7 +280,7 @@ Two refinements make this robust:
   can't abort control flow (the caller still proceeds to mark the row failed),
   so the failure is recorded via `logCompensationErr`
   (`internal/engine/engine.go:logCompensationErr`), which emits a `slog.Warn`
-  *and* increments `pgbranch_compensation_failures_total{kind}` (kind =
+  *and* increments `pgoverlay_compensation_failures_total{kind}` (kind =
   `transition|undo|cleanup`; `internal/metrics/metrics.go:IncCompensationFailure`).
   The reconcile loop is the backstop that eventually cleans whatever a failed
   compensation leaked.
@@ -297,7 +297,7 @@ sequenceDiagram
     S->>U: fail(): run undo in REVERSE
     U->>U: stopRemove(bg)  (WithoutCancel)
     U->>U: removeVolume(bg)
-    Note over U: any undo error → logCompensationErr +<br/>pgbranch_compensation_failures_total
+    Note over U: any undo error → logCompensationErr +<br/>pgoverlay_compensation_failures_total
     S-->>S: return original error (reconcile is the backstop)
 ```
 
@@ -355,10 +355,10 @@ ways it can go wrong:
   authoritative. This is what `pgb gc` and `POST /v1/reconcile` call.
 
 For cross-instance safety, everything is scoped by ownership. Orphan-container
-detection skips any managed container whose `pgbranch.instance` label
+detection skips any managed container whose `pgoverlay.instance` label
 (`runtime.LabelInstance`) doesn't match this registry's `InstanceID()`
 (`PlanReconcile`, the `c.Labels[runtime.LabelInstance] != instanceID` check), and
-volume GC is scoped via `ListManagedVolumes(ctx, instanceID)`. Two pgbranch
+volume GC is scoped via `ListManagedVolumes(ctx, instanceID)`. Two pgoverlay
 instances on the same daemon never reap each other.
 
 Idempotency falls out naturally: re-running a converged plan is a no-op (every
@@ -381,7 +381,7 @@ before it's trusted to delete.
 
 ### The problem
 
-pgbranch has one registry (SQLite) and multiple writers in-process: API request
+pgoverlay has one registry (SQLite) and multiple writers in-process: API request
 handlers mutating branches, and the reconcile loop converging state — all
 concurrently. Plus, optionally, multiple branchd replicas. What actually
 guarantees correctness?
@@ -446,7 +446,7 @@ boundary people forget.
 
 ### The problem
 
-Before tagging v1, pgbranch went through an adversarial security review rather
+Before tagging v1, pgoverlay went through an adversarial security review rather
 than a "looks fine to me" pass: a threat model built from the outside, and a
 bug-hunting pass over the attack surface, both run so that findings would be
 **re-derived from the code** instead of inherited from the author's mental model
@@ -464,7 +464,7 @@ timer. The review re-derived that root cause from the outside.
 - **The data-loss root cause** (deep-dive #1) — re-derived independently; fixed
   by the `updated_at` bumps + the reference-count guard.
 - **ZFS source-name path injection.** A source name flows into dataset names
-  (e.g. `tank/pgbranch/src-<name>-gN`). A name like `../../rpool/ROOT` is
+  (e.g. `tank/pgoverlay/src-<name>-gN`). A name like `../../rpool/ROOT` is
   shell-*safe* yet would *traverse the dataset namespace*. Fixed by
   `validateSourceName` (`internal/engine/saga.go:validateSourceName`), which
   applies the same anchored regex (`[a-z0-9][a-z0-9-]{0,40}`, no `/` or `.`) as
@@ -480,7 +480,7 @@ timer. The review re-derived that root cause from the outside.
 - **Branch-password plaintext-at-rest.** The registry file lives on a
   hostPath/PVC; a plaintext `password` column hands every live branch's working
   credential to anyone who can read the file. Fixed with **AES-256-GCM**
-  (`internal/registry/crypto.go`): the key is `sha256(PGBRANCH_TOKEN)`
+  (`internal/registry/crypto.go`): the key is `sha256(PGOVERLAY_TOKEN)`
   (`DeriveSecretKey`), encrypted values carry an `enc:` prefix over
   `base64(nonce‖ciphertext)`, and the read path errors loudly if it finds an
   `enc:` value but has no key — so a misconfigured/rotated key surfaces rather
@@ -490,7 +490,7 @@ timer. The review re-derived that root cause from the outside.
   routing, so a distinctive error for "unknown branch" vs "branch not ready" vs
   "backend down" would let an **unauthenticated** client enumerate branch names
   and states. Fixed with a single uniform refusal: every routing failure returns
-  the same `genericRouteRefusal = "pgbranch: database not available"` with
+  the same `genericRouteRefusal = "pgoverlay: database not available"` with
   SQLSTATE `3D000` (`internal/pgproxy/proxy.go`, the `route` method and the
   `genericRouteRefusal` const); the real reason is logged server-side only.
 

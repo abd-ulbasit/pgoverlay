@@ -1,9 +1,9 @@
-# pgbranch v0.3.0 feature tour. Records the CLI against a running branchd.
+# pgoverlay v0.3.0 feature tour. Records the CLI against a running branchd.
 # Endpoints/secrets come from the recorder's environment (not this file):
-#   pgb  → PGBRANCH_SERVER, PGBRANCH_TOKEN
+#   pgb  → PGOVERLAY_SERVER, PGOVERLAY_TOKEN
 #   psql → PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE=postgres@demo
 # Record with:
-#   PGBRANCH_SERVER=… PGBRANCH_TOKEN=… PGHOST=… PGPORT=6432 PGUSER=postgres \
+#   PGOVERLAY_SERVER=… PGOVERLAY_TOKEN=… PGHOST=… PGPORT=6432 PGUSER=postgres \
 #   PGPASSWORD=… PGDATABASE=postgres@demo PATH=/opt/homebrew/opt/libpq/bin:$PATH \
 #   vhs hack/features.tape
 Output docs/features.gif
@@ -20,13 +20,13 @@ Set BorderRadius 8
 Set WaitTimeout 90s
 
 Hide
-Type "alias pgb='/Users/basit/projects/pgbranch/bin/pgb'; export PS1='$ '"
+Type "alias pgb='/Users/basit/projects/pgoverlay/bin/pgb'; export PS1='$ '"
 Enter
 Type "pgb branch destroy exp >/dev/null 2>&1; pgb branch destroy demo >/dev/null 2>&1; clear"
 Enter
 Show
 
-Type "# pgbranch — git branch for Postgres. One seeded source:"
+Type "# pgoverlay — git branch for Postgres. One seeded source:"
 Enter
 Sleep 1500ms
 Type "pgb source ls"

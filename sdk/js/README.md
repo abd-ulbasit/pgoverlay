@@ -1,13 +1,13 @@
-# pgbranch-test
+# pgoverlay-test
 
 A disposable copy-on-write Postgres branch for every test, backed by a
-running [pgbranch](https://github.com/abd-ulbasit/pgbranch) server. Zero
+running [pgoverlay](https://github.com/abd-ulbasit/pgoverlay) server. Zero
 dependencies; Node 18+ (global `fetch`).
 
 ```js
-import { acquire } from "pgbranch-test";
+import { acquire } from "pgoverlay-test";
 
-const b = await acquire(); // PGBRANCH_SERVER / PGBRANCH_TOKEN from env
+const b = await acquire(); // PGOVERLAY_SERVER / PGOVERLAY_TOKEN from env
 try {
   const client = new pg.Client({ connectionString: b.dsn });
   await client.connect();
@@ -18,11 +18,11 @@ try {
 ```
 
 Options (all optional): `{ server, token, source, ttlSeconds, name, password,
-pollIntervalMs, timeoutMs }`. Defaults come from `PGBRANCH_SERVER`,
-`PGBRANCH_TOKEN`, `PGBRANCH_TEST_SOURCE` (else `main`) and
-`PGBRANCH_PASSWORD`; the TTL defaults to 1 hour as a safety net — `destroy()`
+pollIntervalMs, timeoutMs }`. Defaults come from `PGOVERLAY_SERVER`,
+`PGOVERLAY_TOKEN`, `PGOVERLAY_TEST_SOURCE` (else `main`) and
+`PGOVERLAY_PASSWORD`; the TTL defaults to 1 hour as a safety net — `destroy()`
 is the primary cleanup. See `index.d.ts` for the full shapes and the
-[testing guide](https://github.com/abd-ulbasit/pgbranch/blob/main/docs/testing.md)
+[testing guide](https://github.com/abd-ulbasit/pgoverlay/blob/main/docs/testing.md)
 for semantics (naming, parallelism, cleanup).
 
 ## Develop

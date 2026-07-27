@@ -7,12 +7,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // ActionKind enumerates the convergence steps a reconcile pass can take. The
-// values double as the {action} label on pgbranch_reconcile_actions_total.
+// values double as the {action} label on pgoverlay_reconcile_actions_total.
 type ActionKind string
 
 const (
@@ -98,8 +98,8 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 	instanceID := e.reg.InstanceID()
 	for _, c := range managed {
 		// Only reclaim containers this registry owns. A managed container whose
-		// pgbranch.instance label is absent or names another instance belongs to
-		// a different pgbranch on the same daemon — leave it alone.
+		// pgoverlay.instance label is absent or names another instance belongs to
+		// a different pgoverlay on the same daemon — leave it alone.
 		if c.Labels[runtime.LabelInstance] != instanceID {
 			continue
 		}
@@ -157,7 +157,7 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 // It re-checks every destructive action against the live registry immediately
 // before acting (safety: a branch may have been provisioned, a layer
 // referenced, a volume claimed between planning and applying) and only ever
-// touches pgbranch-managed resources. Best-effort: an action that fails is
+// touches pgoverlay-managed resources. Best-effort: an action that fails is
 // recorded as an error but does not abort the pass.
 func (e *Engine) ApplyReconcile(ctx context.Context, now time.Time, stuckTimeout time.Duration) (ReconcilePlan, error) {
 	e.metrics.IncReconcileRun()

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // TestCreateBranchQuotaExceeded verifies --max-branches: with a cap of 2 the

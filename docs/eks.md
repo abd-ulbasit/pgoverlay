@@ -1,6 +1,6 @@
 # Running on EKS
 
-A complete, reproduced-for-real walkthrough of the pgbranch stack on AWS —
+A complete, reproduced-for-real walkthrough of the pgoverlay stack on AWS —
 branchd, the webhook service, the production Postgres, and every branch pod
 in one small EKS cluster, with GitHub and Vercel talking to it over public
 LoadBalancers. Everything below was executed, not imagined; the bugs at the
@@ -8,7 +8,7 @@ end were found doing it.
 
 ## Why in-cluster is the natural deployment
 
-Running pgbranch on a laptop against cloud consumers needs a public TCP
+Running pgoverlay on a laptop against cloud consumers needs a public TCP
 tunnel for the proxy, a webhook forwarder, and (for managed-Postgres
 sources) dump-based seeding. In-cluster, all of that disappears:
 
@@ -27,7 +27,7 @@ one `t3.large`, managed node group):
 ```bash
 cd deploy/terraform/eks
 terraform init && terraform apply
-aws eks update-kubeconfig --name pgbranch --region ap-south-1
+aws eks update-kubeconfig --name pgoverlay --region ap-south-1
 ```
 
 **Cost while running:** control plane ~$0.10/h, node ~$0.09/h, plus ~$0.03/h
@@ -42,7 +42,7 @@ aws eks describe-cluster-versions \
 
 ## Images
 
-The Helm chart defaults to locally-built `ghcr.io/abd-ulbasit/pgbranch-branchd:dev` images. For
+The Helm chart defaults to locally-built `ghcr.io/abd-ulbasit/pgoverlay-branchd:dev` images. For
 a real cluster, push to a registry — and note two practical traps:
 
 - **Cross-compile on the host** (`GOOS=linux GOARCH=amd64 CGO_ENABLED=0`,
@@ -53,24 +53,24 @@ a real cluster, push to a registry — and note two practical traps:
   branchd, and `default` for branch/helper pods):
 
 ```bash
-kubectl -n pgbranch create secret docker-registry ghcr-pull \
+kubectl -n pgoverlay create secret docker-registry ghcr-pull \
   --docker-server=ghcr.io --docker-username=<user> --docker-password=<token>
-kubectl -n pgbranch patch serviceaccount pgbranch \
+kubectl -n pgoverlay patch serviceaccount pgoverlay \
   -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
-kubectl -n pgbranch patch serviceaccount default \
+kubectl -n pgoverlay patch serviceaccount default \
   -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
 ```
 
 ## Deploy
 
 ```bash
-helm install pgbranch deploy/helm/pgbranch -n pgbranch --create-namespace \
+helm install pgoverlay deploy/helm/pgoverlay -n pgoverlay --create-namespace \
   --set node=<storage-node-name> \
-  --set image.repository=ghcr.io/<user>/pgbranch-branchd --set image.tag=<tag> \
+  --set image.repository=ghcr.io/<user>/pgoverlay-branchd --set image.tag=<tag> \
   --set token=$(openssl rand -hex 16) \
   --set proxy.service.type=LoadBalancer \
   --set ghook.enabled=true \
-  --set ghook.image.repository=ghcr.io/<user>/pgbranch-ghook --set ghook.image.tag=<tag> \
+  --set ghook.image.repository=ghcr.io/<user>/pgoverlay-ghook --set ghook.image.tag=<tag> \
   --set ghook.webhookSecret=$(openssl rand -hex 16) \
   --set ghook.githubToken=<token-with-issues-write> \
   --set ghook.source=prod --set ghook.resetOnPush=true \
@@ -84,8 +84,8 @@ required). Once the proxy ELB has a hostname, feed it back so PR comments
 show the right address:
 
 ```bash
-helm upgrade pgbranch deploy/helm/pgbranch -n pgbranch --reuse-values \
-  --set ghook.proxyHost=$(kubectl -n pgbranch get svc pgbranch-proxy \
+helm upgrade pgoverlay deploy/helm/pgoverlay -n pgoverlay --reuse-values \
+  --set ghook.proxyHost=$(kubectl -n pgoverlay get svc pgoverlay-proxy \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'):6432
 ```
 
@@ -93,7 +93,7 @@ Point the GitHub webhook at
 `http://<ghook-elb>:8080/webhook` (`pull_request` events, the same secret) —
 deliveries are HMAC-verified, so public exposure is by design. Seed the
 source the native way (`pgb source add` against the in-cluster service via a
-port-forward of `pgbranch-api`), and external consumers (CI, Vercel) connect
+port-forward of `pgoverlay-api`), and external consumers (CI, Vercel) connect
 through the proxy ELB with `dbname@branch`.
 
 ## Upgrading Kubernetes
@@ -108,7 +108,7 @@ done
 ```
 
 Each step upgrades the control plane (~10 min) and rolls the node group.
-pgbranch itself is indifferent — it uses only stable v1 APIs — but
+pgoverlay itself is indifferent — it uses only stable v1 APIs — but
 **hostpath mode keeps all CoW data and the registry on the storage node's
 disk, and a node rollover recycles that disk**. Branches are disposable by
 design, so the procedure is: upgrade, then re-seed sources and let the
@@ -119,7 +119,7 @@ clones live in EBS, not on the node.
 ## Teardown
 
 ```bash
-kubectl -n pgbranch delete svc pgbranch-proxy pgbranch-ghook   # release the ELBs
+kubectl -n pgoverlay delete svc pgoverlay-proxy pgoverlay-ghook   # release the ELBs
 terraform -chdir=deploy/terraform/eks destroy
 ```
 

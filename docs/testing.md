@@ -1,7 +1,7 @@
 # A real database for every test, in seconds
 
 Mocked repositories and shared "test databases" both lie to you — the first
-about SQL, the second about isolation. pgbranch gives each test its own
+about SQL, the second about isolation. pgoverlay gives each test its own
 copy-on-write branch of a production-shaped database: full schema, full
 (masked) data, isolated writes, destroyed when the test ends.
 
@@ -18,12 +18,12 @@ import (
 
     _ "github.com/jackc/pgx/v5/stdlib"
 
-    "github.com/abd-ulbasit/pgbranch/pgbranchtest"
+    "github.com/abd-ulbasit/pgoverlay/pgoverlaytest"
 )
 
 func TestOrderTotals(t *testing.T) {
     t.Parallel()
-    b := pgbranchtest.Acquire(t) // creates the branch, waits until ready
+    b := pgoverlaytest.Acquire(t) // creates the branch, waits until ready
 
     db, err := sql.Open("pgx", b.DSN)
     if err != nil {
@@ -35,33 +35,33 @@ func TestOrderTotals(t *testing.T) {
 ```
 
 `Acquire` reads its configuration from the environment and **skips the test**
-when `PGBRANCH_SERVER` is unset, so the same suite runs plain unit tests on
+when `PGOVERLAY_SERVER` is unset, so the same suite runs plain unit tests on
 laptops without a server and the real thing in CI:
 
 | Variable | Meaning |
 |---|---|
-| `PGBRANCH_SERVER` | branchd base URL (unset ⇒ `t.Skip`) |
-| `PGBRANCH_TOKEN` | API bearer token |
-| `PGBRANCH_TEST_SOURCE` | default source name (else `main`) |
-| `PGBRANCH_PASSWORD` | database password used in the returned DSNs (branch credentials are inherited from the source) |
+| `PGOVERLAY_SERVER` | branchd base URL (unset ⇒ `t.Skip`) |
+| `PGOVERLAY_TOKEN` | API bearer token |
+| `PGOVERLAY_TEST_SOURCE` | default source name (else `main`) |
+| `PGOVERLAY_PASSWORD` | database password used in the returned DSNs (branch credentials are inherited from the source) |
 
-Options: `pgbranchtest.WithSource("staging")` overrides the source,
-`pgbranchtest.WithTTL(10*time.Minute)` the TTL. The returned `*Branch` has
+Options: `pgoverlaytest.WithSource("staging")` overrides the source,
+`pgoverlaytest.WithTTL(10*time.Minute)` the TTL. The returned `*Branch` has
 `Name`, `Host`, `Port`, `User`, `Password`, `Database`, a direct `DSN`, and a
 `ProxyDSN` that goes through the wire-protocol router (server host, port
 6432, database `db@branch`).
 
-The package is self-contained: importing it pulls in **no pgbranch
+The package is self-contained: importing it pulls in **no pgoverlay
 internals and no third-party dependencies**.
 
 ## JavaScript / TypeScript
 
-`pgbranch-test` is a zero-dependency package (Node 18+, global `fetch`):
+`pgoverlay-test` is a zero-dependency package (Node 18+, global `fetch`):
 
 ```js
-import { acquire } from "pgbranch-test";
+import { acquire } from "pgoverlay-test";
 
-const b = await acquire(); // PGBRANCH_* env, same variables as Go
+const b = await acquire(); // PGOVERLAY_* env, same variables as Go
 try {
   const client = new pg.Client({ connectionString: b.dsn });
   await client.connect();
@@ -74,7 +74,7 @@ try {
 `acquire({server, token, source, ttlSeconds, name, password})` returns
 `{branch, host, port, user, password, database, dsn, proxyDsn, destroy()}`.
 With vitest/jest, call `acquire` in `beforeAll` and `destroy` in `afterAll`.
-The package lives in [`sdk/js/`](https://github.com/abd-ulbasit/pgbranch/tree/main/sdk/js)
+The package lives in [`sdk/js/`](https://github.com/abd-ulbasit/pgoverlay/tree/main/sdk/js)
 (not yet on npm — `npm pack` it or vendor the single `.mjs` file).
 
 ## GitHub Actions
@@ -85,27 +85,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: abd-ulbasit/pgbranch/action@v1.0.0-rc.3
+      - uses: abd-ulbasit/pgoverlay/action@v1.0.0-rc.3
         id: branch
         with:
-          server: ${{ vars.PGBRANCH_SERVER }}
-          token: ${{ secrets.PGBRANCH_TOKEN }}
+          server: ${{ vars.PGOVERLAY_SERVER }}
+          token: ${{ secrets.PGOVERLAY_TOKEN }}
           source: main
       - run: go test ./...
         env:
           DATABASE_URL: postgres://app:${{ secrets.DB_PASSWORD }}@${{ steps.branch.outputs.host }}:${{ steps.branch.outputs.port }}/${{ steps.branch.outputs.database }}
-      - uses: abd-ulbasit/pgbranch/action/destroy@v1.0.0-rc.3
+      - uses: abd-ulbasit/pgoverlay/action/destroy@v1.0.0-rc.3
         if: always()
         with:
-          server: ${{ vars.PGBRANCH_SERVER }}
-          token: ${{ secrets.PGBRANCH_TOKEN }}
+          server: ${{ vars.PGOVERLAY_SERVER }}
+          token: ${{ secrets.PGOVERLAY_TOKEN }}
           branch: ${{ steps.branch.outputs.branch }}
 ```
 
 **Pin it.** The examples use the newest published tag rather than `@main`,
 because `@main` is a moving target that runs whatever was pushed last — the
-thing [SECURITY.md](https://github.com/abd-ulbasit/pgbranch/blob/main/SECURITY.md)
-argues against everywhere else. There is no floating `v1` tag yet (pgbranch has
+thing [SECURITY.md](https://github.com/abd-ulbasit/pgoverlay/blob/main/SECURITY.md)
+argues against everywhere else. There is no floating `v1` tag yet (pgoverlay has
 not cut a stable v1.0.0); pin the commit SHA instead of the tag if you want the
 strict version, since tags can be moved.
 
@@ -140,6 +140,6 @@ clone — typically a few seconds regardless of database size (see
 [benchmarks](benchmarks.md)).
 
 **Credentials.** Branches inherit the source's credentials, so point
-`PGBRANCH_PASSWORD` (or your workflow secret) at the source password. If a
+`PGOVERLAY_PASSWORD` (or your workflow secret) at the source password. If a
 future server rotates per-branch credentials, both SDKs already prefer the
 server-returned password.

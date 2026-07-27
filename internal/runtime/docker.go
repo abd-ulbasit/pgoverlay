@@ -108,10 +108,10 @@ func (d *DockerDriver) CloneVolume(ctx context.Context, src, dst string, labels 
 	}
 	if _, err := d.RunHelper(ctx, HelperSpec{
 		Image: "alpine:3.21",
-		Cmd:   []string{"sh", "-c", "cp -a /pgbranch-clone-src/. /pgbranch-clone-dst/"},
+		Cmd:   []string{"sh", "-c", "cp -a /pgoverlay-clone-src/. /pgoverlay-clone-dst/"},
 		Mounts: []Mount{
-			{Volume: src, Target: "/pgbranch-clone-src", ReadOnly: true},
-			{Volume: dst, Target: "/pgbranch-clone-dst"},
+			{Volume: src, Target: "/pgoverlay-clone-src", ReadOnly: true},
+			{Volume: dst, Target: "/pgoverlay-clone-dst"},
 		},
 	}); err != nil {
 		d.RemoveVolume(context.WithoutCancel(ctx), dst)
@@ -153,7 +153,7 @@ func (d *DockerDriver) RunHelper(ctx context.Context, spec HelperSpec) (string, 
 		return "", err
 	}
 	cfg := &container.Config{Image: spec.Image, Cmd: spec.Cmd, Env: spec.Env, User: spec.User,
-		Labels: map[string]string{"pgbranch.managed": "true", "pgbranch.role": "helper"}}
+		Labels: map[string]string{"pgoverlay.managed": "true", "pgoverlay.role": "helper"}}
 	host := helperHostConfig(spec)
 	cr, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, "")
 	if err != nil {
@@ -322,7 +322,7 @@ func (d *DockerDriver) StopRemove(ctx context.Context, id string) error {
 }
 
 func (d *DockerDriver) ListManaged(ctx context.Context) ([]ContainerInfo, error) {
-	f := filters.NewArgs(filters.Arg("label", "pgbranch.managed=true"), filters.Arg("label", "pgbranch.role=branch"))
+	f := filters.NewArgs(filters.Arg("label", "pgoverlay.managed=true"), filters.Arg("label", "pgoverlay.role=branch"))
 	cs, err := d.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
 	if err != nil {
 		return nil, err
@@ -336,7 +336,7 @@ func (d *DockerDriver) ListManaged(ctx context.Context) ([]ContainerInfo, error)
 
 func (d *DockerDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
 	f := filters.NewArgs(
-		filters.Arg("label", "pgbranch.managed=true"),
+		filters.Arg("label", "pgoverlay.managed=true"),
 		filters.Arg("label", LabelInstance+"="+instanceID),
 	)
 	resp, err := d.cli.VolumeList(ctx, volume.ListOptions{Filters: f})

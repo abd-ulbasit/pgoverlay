@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cli"
+	"github.com/abd-ulbasit/pgoverlay/internal/cli"
 )
 
 func main() {

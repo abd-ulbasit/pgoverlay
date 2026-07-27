@@ -27,8 +27,8 @@ func TestUIServedWithoutAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), "pgbranch") {
-		t.Fatalf("UI page does not mention pgbranch:\n%.200s", body)
+	if !strings.Contains(string(body), "pgoverlay") {
+		t.Fatalf("UI page does not mention pgoverlay:\n%.200s", body)
 	}
 	// the create form offers a parent-branch dropdown (branch-from-branch)
 	if !strings.Contains(string(body), `id="bparent"`) {

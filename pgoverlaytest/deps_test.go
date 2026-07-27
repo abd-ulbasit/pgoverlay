@@ -1,4 +1,4 @@
-package pgbranchtest
+package pgoverlaytest
 
 import (
 	"go/parser"
@@ -9,8 +9,8 @@ import (
 )
 
 // TestNoInternalImports enforces the package contract: the production code of
-// pgbranchtest is a self-contained client (stdlib only) so importing it never
-// couples consumers to pgbranch internals. Test files are exempt — the
+// pgoverlaytest is a self-contained client (stdlib only) so importing it never
+// couples consumers to pgoverlay internals. Test files are exempt — the
 // integration test bootstraps a real server from internal packages.
 func TestNoInternalImports(t *testing.T) {
 	fset := token.NewFileSet()
@@ -26,7 +26,7 @@ func TestNoInternalImports(t *testing.T) {
 			for _, imp := range f.Imports {
 				p := strings.Trim(imp.Path.Value, `"`)
 				if strings.Contains(p, "/internal/") || strings.Contains(p, ".") {
-					t.Errorf("%s imports %q: production pgbranchtest code must be stdlib-only", path, p)
+					t.Errorf("%s imports %q: production pgoverlaytest code must be stdlib-only", path, p)
 				}
 			}
 		}

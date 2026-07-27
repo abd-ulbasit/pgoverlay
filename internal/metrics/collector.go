@@ -2,8 +2,8 @@ package metrics
 
 import "github.com/prometheus/client_golang/prometheus"
 
-// stateCollector reports pgbranch_branches_total{state} and
-// pgbranch_sources_total{state} by querying the registry on every scrape, so
+// stateCollector reports pgoverlay_branches_total{state} and
+// pgoverlay_sources_total{state} by querying the registry on every scrape, so
 // the gauges always reflect current state without a background refresher.
 type stateCollector struct {
 	sc           StateCounter
@@ -15,12 +15,12 @@ func newStateCollector(sc StateCounter) *stateCollector {
 	return &stateCollector{
 		sc: sc,
 		branchesDesc: prometheus.NewDesc(
-			"pgbranch_branches_total",
+			"pgoverlay_branches_total",
 			"Number of branches by state.",
 			[]string{"state"}, nil,
 		),
 		sourcesDesc: prometheus.NewDesc(
-			"pgbranch_sources_total",
+			"pgoverlay_sources_total",
 			"Number of sources by state.",
 			[]string{"state"}, nil,
 		),

@@ -2,7 +2,7 @@
 # hack/benchmark.sh — measured branching benchmarks (source of docs/benchmarks.md).
 #
 # For each target size it seeds a throwaway pgbench database in a local
-# Postgres container, registers it as a pgbranch source, and measures:
+# Postgres container, registers it as a pgoverlay source, and measures:
 #
 #   seed time            wall time of `pgb source add` (pg_basebackup stream
 #                        into the copy-on-write source volume)
@@ -22,7 +22,7 @@
 # WAL headroom) are skipped with a message.
 #
 # Requirements: docker, ./bin/pgb (make build). Everything this script
-# creates — source container, pgbranch volumes, temp registry — is removed on
+# creates — source container, pgoverlay volumes, temp registry — is removed on
 # exit, including on failure.
 #
 # Usage:
@@ -38,18 +38,18 @@ RUNS="${BENCH_RUNS:-5}"
 PG_IMAGE="${BENCH_PG_IMAGE:-postgres:17}"
 HELPER_IMAGE="alpine:3.21"
 
-SRC_CONTAINER="pgbranch-bench-source"
+SRC_CONTAINER="pgoverlay-bench-source"
 SOURCE="benchsrc"
 BRANCH="benchwork"
-PGPASS="pgbranch-bench"
+PGPASS="pgoverlay-bench"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PGB="$ROOT/bin/pgb"
 [ -x "$PGB" ] || { echo "error: $PGB not found — run 'make build' first" >&2; exit 1; }
 
-PGBRANCH_HOME="$(mktemp -d "${TMPDIR:-/tmp}/pgbranch-bench-home.XXXXXX")"
-export PGBRANCH_HOME
-RESULTS_JSON="$(mktemp "${TMPDIR:-/tmp}/pgbranch-bench-results.XXXXXX")"
+PGOVERLAY_HOME="$(mktemp -d "${TMPDIR:-/tmp}/pgoverlay-bench-home.XXXXXX")"
+export PGOVERLAY_HOME
+RESULTS_JSON="$(mktemp "${TMPDIR:-/tmp}/pgoverlay-bench-results.XXXXXX")"
 
 log() { echo "[bench] $*" >&2; }
 
@@ -60,13 +60,13 @@ cleanup() {
     log "cleaning up (exit status $status)"
     "$PGB" branch destroy "$BRANCH" >/dev/null 2>&1
     "$PGB" source rm "$SOURCE" >/dev/null 2>&1
-    docker rm -f "pgbranch-br-$BRANCH" >/dev/null 2>&1
+    docker rm -f "pgoverlay-br-$BRANCH" >/dev/null 2>&1
     docker rm -f "$SRC_CONTAINER" >/dev/null 2>&1
-    docker volume rm -f "pgbranch-br-$BRANCH-rw" >/dev/null 2>&1
-    docker volume ls -q | grep "^pgbranch-src-$SOURCE" | while read -r v; do
+    docker volume rm -f "pgoverlay-br-$BRANCH-rw" >/dev/null 2>&1
+    docker volume ls -q | grep "^pgoverlay-src-$SOURCE" | while read -r v; do
         docker volume rm -f "$v" >/dev/null 2>&1
     done
-    rm -rf "$PGBRANCH_HOME"
+    rm -rf "$PGOVERLAY_HOME"
     exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -79,7 +79,7 @@ free_kib() { docker run --rm "$HELPER_IMAGE" df -Pk / | awk 'NR==2{print $4}'; }
 
 # Branch rw volume size in bytes — same du -sb the engine's usage API runs.
 rw_usage() {
-    docker run --rm -v "pgbranch-br-$BRANCH-rw:/rw:ro" "$HELPER_IMAGE" \
+    docker run --rm -v "pgoverlay-br-$BRANCH-rw:/rw:ro" "$HELPER_IMAGE" \
         du -sb /rw | awk '{print $1}'
 }
 
@@ -177,7 +177,7 @@ run_size() {
 
     rows=$(( scale * 1000 ))  # pgbench_accounts has scale*100000 rows; 1% = scale*1000
     log "write-amplification probe: UPDATE $rows rows (1%) on the branch"
-    docker exec "pgbranch-br-$BRANCH" psql -U postgres -d postgres -q \
+    docker exec "pgoverlay-br-$BRANCH" psql -U postgres -d postgres -q \
         -c "UPDATE pgbench_accounts SET abalance = abalance + 1 WHERE aid <= $rows" \
         -c "CHECKPOINT"
     post=$(rw_usage)

@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // By default (no leader election) the gate is leader=true, so mutating routes

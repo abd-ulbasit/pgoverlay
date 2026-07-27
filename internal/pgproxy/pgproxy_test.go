@@ -21,7 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 type fakeResolver map[string]string
@@ -63,7 +63,7 @@ func testTLSConfig(t *testing.T) *tls.Config {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "pgbranch-test"},
+		Subject:      pkix.Name{CommonName: "pgoverlay-test"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -505,7 +505,7 @@ func TestMissingBranchSuffixRefused(t *testing.T) {
 	if er.Severity != "FATAL" {
 		t.Errorf("severity = %q, want FATAL", er.Severity)
 	}
-	if !strings.Contains(er.Message, "pgbranch: connect with dbname@branch") {
+	if !strings.Contains(er.Message, "pgoverlay: connect with dbname@branch") {
 		t.Errorf("message %q missing guidance", er.Message)
 	}
 	if _, err := fe.Receive(); err == nil {
@@ -523,7 +523,7 @@ func TestNoDatabaseParamRefused(t *testing.T) {
 	if er.Code != "3D000" {
 		t.Errorf("code = %q, want 3D000", er.Code)
 	}
-	if !strings.Contains(er.Message, "pgbranch: connect with dbname@branch") {
+	if !strings.Contains(er.Message, "pgoverlay: connect with dbname@branch") {
 		t.Errorf("message %q missing guidance", er.Message)
 	}
 }

@@ -1,23 +1,23 @@
-// Package pgbranchconnect resolves a ready Postgres connection string for a
-// pgbranch branch by asking branchd for the branch's current credentials.
+// Package pgoverlayconnect resolves a ready Postgres connection string for a
+// pgoverlay branch by asking branchd for the branch's current credentials.
 //
-// It exists to reconcile two pgbranch features that are otherwise in tension:
+// It exists to reconcile two pgoverlay features that are otherwise in tension:
 // per-branch credential rotation (each branch has its own password) and
 // static application configuration (a 12-factor app holds fixed env vars, not
 // a per-branch password). With this helper the static config an app holds is
 // the branchd API endpoint plus a scoped (viewer) token; the per-branch
 // password is fetched at startup:
 //
-//	res, err := pgbranchconnect.Resolve(ctx, pgbranchconnect.Options{
-//		Server: os.Getenv("PGBRANCH_API"),    // https://branchd:7070
-//		Token:  os.Getenv("PGBRANCH_TOKEN"),  // a viewer token is enough
+//	res, err := pgoverlayconnect.Resolve(ctx, pgoverlayconnect.Options{
+//		Server: os.Getenv("PGOVERLAY_API"),    // https://branchd:7070
+//		Token:  os.Getenv("PGOVERLAY_TOKEN"),  // a viewer token is enough
 //		Ref:    os.Getenv("GIT_REF"),         // e.g. "feat/login" -> feat-login
 //	})
 //	db, _ := sql.Open("pgx", res.ProxyDSN)
 //
-// The package is self-contained (stdlib only) and never imports pgbranch
+// The package is self-contained (stdlib only) and never imports pgoverlay
 // internals: it speaks the branchd REST API directly.
-package pgbranchconnect
+package pgoverlayconnect
 
 import (
 	"context"
@@ -34,21 +34,21 @@ import (
 )
 
 // Options configures Resolve. Exactly one of Branch or Ref identifies the
-// branch; Ref is sanitized the same way pgbranch's ghook names branches from a
+// branch; Ref is sanitized the same way pgoverlay's ghook names branches from a
 // git ref (lowercase, non-alphanumerics collapse to single dashes, trimmed,
 // ≤41 chars), so an app and the webhook agree on the name with no coordination.
 type Options struct {
-	Server    string // branchd base URL (PGBRANCH_API), required
+	Server    string // branchd base URL (PGOVERLAY_API), required
 	Token     string // API bearer token (a viewer token suffices), required
 	Branch    string // exact branch name; or set Ref
 	Ref       string // git ref, sanitized to a branch name; used when Branch == ""
-	ProxyHost string // host[:port] of the pgbranch router for ProxyDSN; "" => server host + :6432
+	ProxyHost string // host[:port] of the pgoverlay router for ProxyDSN; "" => server host + :6432
 	Password  string // fallback password for inherit-mode branches (else PGPASSWORD)
 	HTTP      *http.Client
 }
 
 // Result is the resolved connection info. DSN targets the branch's Postgres
-// directly (its host:port); ProxyDSN goes through the pgbranch wire-protocol
+// directly (its host:port); ProxyDSN goes through the pgoverlay wire-protocol
 // router (database "db@branch") and is what apps usually want — one stable
 // host, routing by name.
 type Result struct {
@@ -79,17 +79,17 @@ type wireBranch struct {
 // Options.Password, then $PGPASSWORD, and errors if neither is set.
 func Resolve(ctx context.Context, opts Options) (Result, error) {
 	if opts.Server == "" {
-		return Result{}, fmt.Errorf("pgbranchconnect: Server (PGBRANCH_API) is required")
+		return Result{}, fmt.Errorf("pgoverlayconnect: Server (PGOVERLAY_API) is required")
 	}
 	if opts.Token == "" {
-		return Result{}, fmt.Errorf("pgbranchconnect: Token is required")
+		return Result{}, fmt.Errorf("pgoverlayconnect: Token is required")
 	}
 	name := opts.Branch
 	if name == "" {
 		name = SanitizeRef(opts.Ref)
 	}
 	if name == "" {
-		return Result{}, fmt.Errorf("pgbranchconnect: a Branch or Ref is required")
+		return Result{}, fmt.Errorf("pgoverlayconnect: a Branch or Ref is required")
 	}
 
 	w, err := getBranch(ctx, opts, name)
@@ -121,7 +121,7 @@ func Resolve(ctx context.Context, opts Options) (Result, error) {
 			password = os.Getenv("PGPASSWORD")
 		}
 		if password == "" {
-			return Result{}, fmt.Errorf("pgbranchconnect: branch %q returned no password (inherit mode) and no Options.Password/PGPASSWORD set", name)
+			return Result{}, fmt.Errorf("pgoverlayconnect: branch %q returned no password (inherit mode) and no Options.Password/PGPASSWORD set", name)
 		}
 	}
 
@@ -158,19 +158,19 @@ func getBranch(ctx context.Context, opts Options, name string) (*wireBranch, err
 	req.Header.Set("Authorization", "Bearer "+opts.Token)
 	resp, err := cl.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("pgbranchconnect: GET branch %q: %w", name, err)
+		return nil, fmt.Errorf("pgoverlayconnect: GET branch %q: %w", name, err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("pgbranchconnect: branch %q not found", name)
+		return nil, fmt.Errorf("pgoverlayconnect: branch %q not found", name)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("pgbranchconnect: GET branch %q: HTTP %d: %s", name, resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("pgoverlayconnect: GET branch %q: HTTP %d: %s", name, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var w wireBranch
 	if err := json.Unmarshal(body, &w); err != nil {
-		return nil, fmt.Errorf("pgbranchconnect: decode branch %q: %w", name, err)
+		return nil, fmt.Errorf("pgoverlayconnect: decode branch %q: %w", name, err)
 	}
 	return &w, nil
 }
@@ -185,7 +185,7 @@ func dsn(user, password, host string, port int, db string) string {
 	return fmt.Sprintf("postgres://%s@%s/%s", auth, net.JoinHostPort(host, strconv.Itoa(port)), db)
 }
 
-// SanitizeRef maps a git ref to a pgbranch branch name (^[a-z0-9][a-z0-9-]{0,40}$),
+// SanitizeRef maps a git ref to a pgoverlay branch name (^[a-z0-9][a-z0-9-]{0,40}$),
 // matching ghook's git-branch naming: lowercase, runs of other characters
 // collapse to single dashes, edges trimmed, truncated to 41 chars.
 func SanitizeRef(ref string) string {

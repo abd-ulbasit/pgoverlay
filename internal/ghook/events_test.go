@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
 // fakePG is an httptest stand-in for branchd's REST API. It records every
@@ -120,7 +120,7 @@ func TestOpenedCreatesMissingBranch(t *testing.T) {
 	}
 }
 
-// git-branch naming: the pgbranch branch is keyed by the PR's head ref
+// git-branch naming: the pgoverlay branch is keyed by the PR's head ref
 // (sanitized), so preview platforms can derive it from the git ref alone —
 // available from the very first build, before any PR association exists.
 func TestGitBranchNamingUsesSanitizedHeadRef(t *testing.T) {
@@ -255,7 +255,7 @@ func TestRepoAllowListFiltersEvents(t *testing.T) {
 // Branch-operation failures are logged by the detached worker, never
 // surfaced to GitHub: the delivery was already acked with 202 (re-delivery
 // wouldn't help, and slow operations must not look like webhook outages).
-func TestPGBranchFailureStillAcked(t *testing.T) {
+func TestPGOverlayFailureStillAcked(t *testing.T) {
 	pg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "kaboom"})

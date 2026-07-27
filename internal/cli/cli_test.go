@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 func TestCommandTree(t *testing.T) {
@@ -77,7 +77,7 @@ func TestServerModeBranchLs(t *testing.T) {
 		json.NewEncoder(w).Encode([]api.Branch{{Name: "pr-9", State: "ready", Port: 32788, CreatedAt: "2026-06-10"}})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "branch", "ls", "--server", ts.URL)
 	if !strings.Contains(out, "pr-9") || !strings.Contains(out, "32788") {
@@ -97,7 +97,7 @@ func TestServerModeBranchLsUsage(t *testing.T) {
 		}
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	// without --usage there is no SIZE column (it costs a helper run per branch)
 	out := run(t, "branch", "ls", "--server", ts.URL)
@@ -121,7 +121,7 @@ func TestServerModeConnectPrintsDirectAndProxyURLs(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "connect", "pr-9", "--server", ts.URL)
 	// direct URL uses the branch's recorded host (pod IP on k8s)
@@ -145,7 +145,7 @@ func TestServerModeConnectIncludesRotatedPassword(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "connect", "pr-9", "--server", ts.URL)
 	if !strings.Contains(out, "postgres://postgres:feedfacefeedfacefeedfacefeedface@10.0.0.7:32788/postgres") {
@@ -166,7 +166,7 @@ func TestServerModeConnectNoPasswordInheritMode(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "connect", "pr-9", "--server", ts.URL)
 	if !strings.Contains(out, "postgres://postgres@10.0.0.7:32788/postgres") {
@@ -183,7 +183,7 @@ func TestServerModeBranchLsHidesPassword(t *testing.T) {
 		}})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "branch", "ls", "--server", ts.URL)
 	if strings.Contains(out, "feedface") {
@@ -199,7 +199,7 @@ func TestServerModeConnectFallsBackToServerHost(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "connect", "pr-9", "--server", ts.URL)
 	// no host from the server (pre-v3 row): fall back to the server's host
@@ -215,12 +215,12 @@ func TestServerModeFromEnv(t *testing.T) {
 		json.NewEncoder(w).Encode([]api.Branch{})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_SERVER", ts.URL)
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_SERVER", ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	run(t, "branch", "ls")
 	if !called {
-		t.Fatal("PGBRANCH_SERVER env did not enable server mode")
+		t.Fatal("PGOVERLAY_SERVER env did not enable server mode")
 	}
 }
 
@@ -243,7 +243,7 @@ func TestServerModeSetMask(t *testing.T) {
 		json.NewEncoder(w).Encode(got)
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "source", "set-mask", "main", f1, f2, "--server", ts.URL)
 	if gotMethod != "PUT" || gotPath != "/v1/sources/main/mask" {
@@ -269,7 +269,7 @@ func TestServerModeGetMask(t *testing.T) {
 		json.NewEncoder(w).Encode([]api.MaskScript{{Name: "emails.sql", SQL: "..."}, {Name: "names.sql", SQL: "..."}})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "source", "get-mask", "main", "--server", ts.URL)
 	if !strings.Contains(out, "emails.sql") || !strings.Contains(out, "names.sql") {
@@ -279,11 +279,11 @@ func TestServerModeGetMask(t *testing.T) {
 
 func TestLocalModeSetAndGetMask(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("PGBRANCH_HOME", home)
-	t.Setenv("PGBRANCH_SERVER", "")
+	t.Setenv("PGOVERLAY_HOME", home)
+	t.Setenv("PGOVERLAY_SERVER", "")
 
 	// seed a source row the commands can resolve
-	reg, err := registry.Open(filepath.Join(home, "pgbranch.db"))
+	reg, err := registry.Open(filepath.Join(home, "pgoverlay.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestLocalModeSetAndGetMask(t *testing.T) {
 		t.Fatalf("output %q", out)
 	}
 
-	reg, err = registry.Open(filepath.Join(home, "pgbranch.db"))
+	reg, err = registry.Open(filepath.Join(home, "pgoverlay.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestServerModeBranchCreateTTL(t *testing.T) {
 		json.NewEncoder(w).Encode(api.Branch{Name: got.Name, State: "ready", Port: 1, ProxyDatabase: "postgres@" + got.Name})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	run(t, "branch", "create", "pr-9", "--from", "main", "--ttl", "24h", "--server", ts.URL)
 	if got.Name != "pr-9" || got.Source != "main" || got.TTLSeconds != 86400 {
@@ -345,7 +345,7 @@ func TestServerModeBranchCreateFromBranch(t *testing.T) {
 		json.NewEncoder(w).Encode(api.Branch{Name: got.Name, Parent: got.Parent, State: "ready", Port: 1, ProxyDatabase: "postgres@" + got.Name})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	run(t, "branch", "create", "pr-9", "--from-branch", "pr-1", "--server", ts.URL)
 	if got.Name != "pr-9" || got.Parent != "pr-1" || got.Source != "" {
@@ -394,7 +394,7 @@ func TestServerModeSourceAddViaDump(t *testing.T) {
 		json.NewEncoder(w).Encode(api.Source{Name: got.Name, Via: got.Via, State: "ready"})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 	t.Setenv("PGPASSWORD", "secret")
 
 	run(t, "source", "add", "prod", "--via", "dump",
@@ -420,7 +420,7 @@ func TestServerModeBranchLsShowsParent(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "branch", "ls", "--server", ts.URL)
 	if !strings.Contains(out, "PARENT") {
@@ -494,17 +494,17 @@ func TestServerModeDoctorDriftExitsNonZero(t *testing.T) {
 		}
 		json.NewEncoder(w).Encode(engine.ReconcilePlan{Actions: []engine.Action{
 			{Kind: engine.ActionFailStuck, Target: "stuck-1", Reason: "stuck in creating longer than 10m0s"},
-			{Kind: engine.ActionGCVolume, Target: "pgbranch-br-orphan-rw", Reason: "managed volume owned by no live branch or source"},
+			{Kind: engine.ActionGCVolume, Target: "pgoverlay-br-orphan-rw", Reason: "managed volume owned by no live branch or source"},
 		}})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out, err := runErr(t, "doctor", "--server", ts.URL)
 	if err == nil {
 		t.Fatal("doctor exited 0 on drift; want non-zero")
 	}
-	if !strings.Contains(out, "stuck-1") || !strings.Contains(out, "pgbranch-br-orphan-rw") {
+	if !strings.Contains(out, "stuck-1") || !strings.Contains(out, "pgoverlay-br-orphan-rw") {
 		t.Fatalf("doctor output missing drift rows: %q", out)
 	}
 	if !strings.Contains(out, "fail_stuck") || !strings.Contains(out, "gc_volume") {
@@ -518,7 +518,7 @@ func TestServerModeDoctorCleanExitsZero(t *testing.T) {
 		json.NewEncoder(w).Encode(engine.ReconcilePlan{})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out, err := runErr(t, "doctor", "--server", ts.URL)
 	if err != nil {
@@ -539,7 +539,7 @@ func TestServerModeGCApplies(t *testing.T) {
 		}})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "gc", "--server", ts.URL)
 	if gotMethod != "POST" || gotPath != "/v1/reconcile" {
@@ -561,7 +561,7 @@ func TestServerModeTokenCreate(t *testing.T) {
 		json.NewEncoder(w).Encode(api.CreateTokenResponse{Token: "feedfacefeedfacefeedfacefeedface"})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "token", "create", "ci", "--role", "operator", "--server", ts.URL)
 	if got.Name != "ci" || got.Role != "operator" {
@@ -594,7 +594,7 @@ func TestServerModeTokenLs(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "token", "ls", "--server", ts.URL)
 	if !strings.Contains(out, "ci") || !strings.Contains(out, "operator") ||
@@ -613,7 +613,7 @@ func TestServerModeTokenRevoke(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "token", "revoke", "ci", "--server", ts.URL)
 	if gotMethod != "DELETE" || gotPath != "/v1/tokens/ci" {
@@ -642,7 +642,7 @@ func TestServerModeDiffWithDataSample(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "diff", "pr-7", "--data", "--sample", "5", "--server", ts.URL)
 	if gotQuery != "data=5" {
@@ -681,7 +681,7 @@ func TestServerModeHistory(t *testing.T) {
 		})
 	}))
 	defer ts.Close()
-	t.Setenv("PGBRANCH_TOKEN", "tok")
+	t.Setenv("PGOVERLAY_TOKEN", "tok")
 
 	out := run(t, "history", "pr-7", "--server", ts.URL)
 	for _, want := range []string{

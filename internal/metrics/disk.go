@@ -24,12 +24,12 @@ func newDiskCollector(root string) *diskCollector {
 	return &diskCollector{
 		root: root,
 		freeDesc: prometheus.NewDesc(
-			"pgbranch_disk_bytes_free",
+			"pgoverlay_disk_bytes_free",
 			"Free bytes on the storage-root filesystem (all branch volumes + the registry share it; ENOSPC here fails every branch).",
 			nil, nil,
 		),
 		totalDesc: prometheus.NewDesc(
-			"pgbranch_disk_bytes_total",
+			"pgoverlay_disk_bytes_total",
 			"Total bytes on the storage-root filesystem.",
 			nil, nil,
 		),

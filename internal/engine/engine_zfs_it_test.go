@@ -6,26 +6,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/pgctl"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // TestZFSEndToEndBranching is the zfs-backend twin of TestEndToEndBranching.
 // It cannot run on the usual Colima/macOS dev setup (no ZFS in the VM) — see
 // docs/zfs.md for the environment recipe and a manual walkthrough.
 func TestZFSEndToEndBranching(t *testing.T) {
-	if os.Getenv("PGBRANCH_ZFS_IT") != "1" {
-		t.Skip("set PGBRANCH_ZFS_IT=1 to run: needs a Linux docker host with the zfs kernel module " +
-			"(/dev/zfs present), an imported zpool with a dataset prefix for pgbranch " +
-			"(e.g. `zpool create tank ...; zfs create tank/pgbranch`) named in PGBRANCH_ZFS_DATASET, " +
+	if os.Getenv("PGOVERLAY_ZFS_IT") != "1" {
+		t.Skip("set PGOVERLAY_ZFS_IT=1 to run: needs a Linux docker host with the zfs kernel module " +
+			"(/dev/zfs present), an imported zpool with a dataset prefix for pgoverlay " +
+			"(e.g. `zpool create tank ...; zfs create tank/pgoverlay`) named in PGOVERLAY_ZFS_DATASET, " +
 			"default zfs mountpoints, and network access for the helper's `apk add zfs`. " +
 			"Not available on Colima/macOS — docs/zfs.md has the manual verification walkthrough.")
 	}
-	dataset := os.Getenv("PGBRANCH_ZFS_DATASET")
+	dataset := os.Getenv("PGOVERLAY_ZFS_DATASET")
 	if dataset == "" {
-		t.Fatal("PGBRANCH_ZFS_DATASET must name the dataset prefix, e.g. tank/pgbranch")
+		t.Fatal("PGOVERLAY_ZFS_DATASET must name the dataset prefix, e.g. tank/pgoverlay")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()

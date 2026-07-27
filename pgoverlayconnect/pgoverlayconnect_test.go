@@ -1,4 +1,4 @@
-package pgbranchconnect
+package pgoverlayconnect
 
 import (
 	"context"

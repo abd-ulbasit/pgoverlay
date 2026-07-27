@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // roleRank orders roles by privilege; a higher number satisfies any required
@@ -22,12 +22,12 @@ type ctxKey int
 const roleKey ctxKey = iota
 
 // envTokenActor is the audit name recorded for mutations made with the built-in
-// PGBRANCH_TOKEN env value, which carries admin but has no stored token name.
+// PGOVERLAY_TOKEN env value, which carries admin but has no stored token name.
 const envTokenActor = "root"
 
 // resolveActor maps a presented bearer token to the actor behind it: the
 // resolved role plus the identity recorded in the audit log. The built-in
-// PGBRANCH_TOKEN env value (s.token) is checked first with a constant-time
+// PGOVERLAY_TOKEN env value (s.token) is checked first with a constant-time
 // compare and is always admin under the "root" sentinel (it is never stored in
 // the table, so it has no name). Otherwise the token is looked up by hash and
 // the actor carries its stored name. Returns the zero Actor when no role

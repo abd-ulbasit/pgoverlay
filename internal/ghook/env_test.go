@@ -17,16 +17,16 @@ const validSecret = "0123456789abcdef" // 16 chars
 
 func TestLoadEnvDefaultsAndParsing(t *testing.T) {
 	ec, err := LoadEnv(env(map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  validSecret,
-		"GHOOK_PGBRANCH_SERVER": "http://pgbranch-api:7070",
-		"GHOOK_PGBRANCH_TOKEN":  "tok",
-		"GHOOK_SOURCE":          "main",
-		"GHOOK_TTL":             "72h",
-		"GHOOK_RESET_ON_PUSH":   "true",
-		"GHOOK_DIFF_ON_PUSH":    "true",
-		"GHOOK_REPOS":           "acme/widgets, acme/gadgets",
-		"GHOOK_GITHUB_TOKEN":    "ghp_x",
-		"GHOOK_PROXY_HOST":      "pg.example.com:30432",
+		"GHOOK_WEBHOOK_SECRET":   validSecret,
+		"GHOOK_PGOVERLAY_SERVER": "http://pgoverlay-api:7070",
+		"GHOOK_PGOVERLAY_TOKEN":  "tok",
+		"GHOOK_SOURCE":           "main",
+		"GHOOK_TTL":              "72h",
+		"GHOOK_RESET_ON_PUSH":    "true",
+		"GHOOK_DIFF_ON_PUSH":     "true",
+		"GHOOK_REPOS":            "acme/widgets, acme/gadgets",
+		"GHOOK_GITHUB_TOKEN":     "ghp_x",
+		"GHOOK_PROXY_HOST":       "pg.example.com:30432",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -46,22 +46,22 @@ func TestLoadEnvDefaultsAndParsing(t *testing.T) {
 	if len(ec.Repos) != 2 || ec.Repos[0] != "acme/widgets" || ec.Repos[1] != "acme/gadgets" {
 		t.Errorf("Repos = %v", ec.Repos)
 	}
-	if ec.GitHubToken != "ghp_x" || ec.PGBranchServer != "http://pgbranch-api:7070" ||
-		ec.PGBranchToken != "tok" || ec.ProxyHost != "pg.example.com:30432" {
+	if ec.GitHubToken != "ghp_x" || ec.PGOverlayServer != "http://pgoverlay-api:7070" ||
+		ec.PGOverlayToken != "tok" || ec.ProxyHost != "pg.example.com:30432" {
 		t.Errorf("config = %+v", ec)
 	}
 }
 
 func TestLoadEnvRequiredVars(t *testing.T) {
 	base := map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  validSecret,
-		"GHOOK_PGBRANCH_SERVER": "http://x:7070",
-		"GHOOK_SOURCE":          "main",
+		"GHOOK_WEBHOOK_SECRET":   validSecret,
+		"GHOOK_PGOVERLAY_SERVER": "http://x:7070",
+		"GHOOK_SOURCE":           "main",
 	}
 	if _, err := LoadEnv(env(base)); err != nil {
 		t.Fatalf("minimal config must load: %v", err)
 	}
-	for _, required := range []string{"GHOOK_WEBHOOK_SECRET", "GHOOK_PGBRANCH_SERVER", "GHOOK_SOURCE"} {
+	for _, required := range []string{"GHOOK_WEBHOOK_SECRET", "GHOOK_PGOVERLAY_SERVER", "GHOOK_SOURCE"} {
 		m := map[string]string{}
 		for k, v := range base {
 			m[k] = v
@@ -76,9 +76,9 @@ func TestLoadEnvRequiredVars(t *testing.T) {
 
 func TestLoadEnvAppAuth(t *testing.T) {
 	base := map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  validSecret,
-		"GHOOK_PGBRANCH_SERVER": "http://x:7070",
-		"GHOOK_SOURCE":          "main",
+		"GHOOK_WEBHOOK_SECRET":   validSecret,
+		"GHOOK_PGOVERLAY_SERVER": "http://x:7070",
+		"GHOOK_SOURCE":           "main",
 	}
 	with := func(extra map[string]string) func(string) string {
 		m := map[string]string{}
@@ -134,9 +134,9 @@ func TestLoadEnvAppAuth(t *testing.T) {
 func TestLoadEnvWebhookSecretLength(t *testing.T) {
 	base := func(secret string) func(string) string {
 		return env(map[string]string{
-			"GHOOK_WEBHOOK_SECRET":  secret,
-			"GHOOK_PGBRANCH_SERVER": "http://x:7070",
-			"GHOOK_SOURCE":          "main",
+			"GHOOK_WEBHOOK_SECRET":   secret,
+			"GHOOK_PGOVERLAY_SERVER": "http://x:7070",
+			"GHOOK_SOURCE":           "main",
 		})
 	}
 	// empty -> "required"
@@ -157,9 +157,9 @@ func TestLoadEnvWebhookSecretLength(t *testing.T) {
 
 func TestLoadEnvBadValues(t *testing.T) {
 	base := map[string]string{
-		"GHOOK_WEBHOOK_SECRET":  validSecret,
-		"GHOOK_PGBRANCH_SERVER": "http://x:7070",
-		"GHOOK_SOURCE":          "main",
+		"GHOOK_WEBHOOK_SECRET":   validSecret,
+		"GHOOK_PGOVERLAY_SERVER": "http://x:7070",
+		"GHOOK_SOURCE":           "main",
 	}
 	for k, v := range map[string]string{"GHOOK_TTL": "3 fortnights", "GHOOK_RESET_ON_PUSH": "yep", "GHOOK_DIFF_ON_PUSH": "nope"} {
 		m := map[string]string{k: v}

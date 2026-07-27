@@ -1,6 +1,6 @@
 # Architecture (as built)
 
-How pgbranch actually works — written from the code rather than from the
+How pgoverlay actually works — written from the code rather than from the
 original design spec, so where the two disagree this document follows the
 code. For the file-by-file map of which package does what, see the
 [code tour](code-tour.md); for *why* each major structural choice was made,
@@ -45,12 +45,12 @@ whose entrypoint assembles an OverlayFS mount *inside the container*:
 
 ```
  ┌─ branch container (CAP_SYS_ADMIN) ──────────────────────────┐
- │   PGDATA = /pgbranch/merged   ← overlayfs mount             │
+ │   PGDATA = /pgoverlay/merged   ← overlayfs mount             │
  │                ▲                                            │
  │     ┌──────────┴───────────┐                                │
- │     │ upper+work (writes)  │  volume: pgbranch-br-pr-1-rw   │
+ │     │ upper+work (writes)  │  volume: pgoverlay-br-pr-1-rw   │
  │     ├──────────────────────┤                                │
- │     │ lower (read-only)    │  volume: pgbranch-src-main ────┼─▶ shared by
+ │     │ lower (read-only)    │  volume: pgoverlay-src-main ────┼─▶ shared by
  │     └──────────────────────┘  (pg_basebackup snapshot)      │   all branches
  │   entrypoint.sh: mount overlay → exec docker-entrypoint.sh  │
  └─────────────────────────────────────────────────────────────┘
@@ -85,7 +85,7 @@ branching, refresh generations, masking) is identical.
 
 ## The zfs backend (experimental)
 
-`branchd --cow zfs --zfs-dataset tank/pgbranch` swaps the layer mechanics:
+`branchd --cow zfs --zfs-dataset tank/pgoverlay` swaps the layer mechanics:
 sources seed into datasets (`<prefix>/src-<name>-gN`), branch create is
 `zfs snapshot` + `zfs clone` (block-level CoW — no copy-up problem, no
 overlay assembly; the entrypoint shrinks to perms + pid cleanup + exec), and
@@ -197,7 +197,7 @@ frozen layer read-only:
  child:   [new upper]──┘         (refcounted)
 ```
 
-`PGBRANCH_LOWERS` carries the chain newest-first; frozen layers contribute
+`PGOVERLAY_LOWERS` carries the chain newest-first; frozen layers contribute
 their `/upper` subdir, the source its `/data`. Layers are garbage-collected
 when the last branch whose chain references them is destroyed — destroying
 the parent first leaves the child (and the layer) intact. ZFS and CSI modes
@@ -208,7 +208,7 @@ parent quiesce).
 ## Kubernetes: storage-node and CSI models
 
 The kube driver has two storage strategies. **hostPath** (default) maps
-"volumes" to subdirectories of a data root (default `/var/lib/pgbranch`) on
+"volumes" to subdirectories of a data root (default `/var/lib/pgoverlay`) on
 one designated **storage node**; helpers are one-shot pods and branches are
 plain pods, all pinned with `nodeName`, branch pods carrying `SYS_ADMIN` for
 the overlay mount. **csi** (`--kube-storage csi`) makes every volume a PVC
@@ -228,4 +228,4 @@ normal Deployment with a namespace-scoped Role.
 | seeding | `pg_basebackup` helper, runs as uid 999 (postgres) |
 | disk usage | `du -sb` helper on the rw layer (zfs: `zfs list -o used`) |
 | web UI | single static page, `go:embed`, no build toolchain |
-| GitHub App | separate `pgbranch-github` service driving the REST API |
+| GitHub App | separate `pgoverlay-github` service driving the REST API |

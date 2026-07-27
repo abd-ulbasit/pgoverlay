@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Installs the CSI test stack onto the pgbranch-test kind cluster (creating it
+# Installs the CSI test stack onto the pgoverlay-test kind cluster (creating it
 # via kind-up.sh first): external-snapshotter CRDs + snapshot-controller and
 # csi-driver-host-path (supports PVC clones and VolumeSnapshots), plus the
 # csi-hostpath-sc StorageClass and csi-hostpath-snapclass VolumeSnapshotClass
-# the PGBRANCH_CSI_IT=1 tests use. All manifests are vendored and pinned under
+# the PGOVERLAY_CSI_IT=1 tests use. All manifests are vendored and pinned under
 # hack/csi/ (see hack/csi/README.md). Idempotent.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CLUSTER=pgbranch-test
+CLUSTER=pgoverlay-test
 KCTL=(kubectl --context "kind-$CLUSTER")
 
 hack/kind-up.sh

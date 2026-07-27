@@ -11,17 +11,17 @@ import (
 
 func TestToMountsKinds(t *testing.T) {
 	got := toMounts([]Mount{
-		{Volume: "pgbranch-src-main", Target: "/pgbranch/lower0", ReadOnly: true},
-		{Kind: MountHostPath, Volume: "/tank/pgbranch/br-pr-1", Target: "/pgbranch/rw"},
+		{Volume: "pgoverlay-src-main", Target: "/pgoverlay/lower0", ReadOnly: true},
+		{Kind: MountHostPath, Volume: "/tank/pgoverlay/br-pr-1", Target: "/pgoverlay/rw"},
 	})
 	if len(got) != 2 {
 		t.Fatalf("mounts = %d", len(got))
 	}
-	if string(got[0].Type) != "volume" || got[0].Source != "pgbranch-src-main" || !got[0].ReadOnly {
-		t.Errorf("mount[0] = %+v, want ro volume pgbranch-src-main", got[0])
+	if string(got[0].Type) != "volume" || got[0].Source != "pgoverlay-src-main" || !got[0].ReadOnly {
+		t.Errorf("mount[0] = %+v, want ro volume pgoverlay-src-main", got[0])
 	}
-	if string(got[1].Type) != "bind" || got[1].Source != "/tank/pgbranch/br-pr-1" || got[1].Target != "/pgbranch/rw" || got[1].ReadOnly {
-		t.Errorf("mount[1] = %+v, want rw bind /tank/pgbranch/br-pr-1", got[1])
+	if string(got[1].Type) != "bind" || got[1].Source != "/tank/pgoverlay/br-pr-1" || got[1].Target != "/pgoverlay/rw" || got[1].ReadOnly {
+		t.Errorf("mount[1] = %+v, want rw bind /tank/pgoverlay/br-pr-1", got[1])
 	}
 }
 
@@ -30,7 +30,7 @@ func TestHelperHostConfigPrivilegedDevices(t *testing.T) {
 	host := helperHostConfig(HelperSpec{
 		Privileged:  true,
 		HostDevices: []string{"/dev/zfs"},
-		Mounts:      []Mount{{Kind: MountHostPath, Volume: "/tank/pgbranch/src-main-g1", Target: "/seed"}},
+		Mounts:      []Mount{{Kind: MountHostPath, Volume: "/tank/pgoverlay/src-main-g1", Target: "/seed"}},
 		Network:     "bridge",
 	})
 	if !host.Privileged {
@@ -56,8 +56,8 @@ func TestHelperHostConfigPrivilegedDevices(t *testing.T) {
 
 func itDriver(t *testing.T) Driver {
 	t.Helper()
-	if os.Getenv("PGBRANCH_IT") != "1" {
-		t.Skip("set PGBRANCH_IT=1 to run integration tests")
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1 to run integration tests")
 	}
 	d, err := NewDockerDriver()
 	if err != nil {
@@ -71,8 +71,8 @@ func TestVolumeAndHelperRoundtrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	vol := "pgbranch-test-vol"
-	if err := d.CreateVolume(ctx, vol, map[string]string{"pgbranch.managed": "true"}); err != nil {
+	vol := "pgoverlay-test-vol"
+	if err := d.CreateVolume(ctx, vol, map[string]string{"pgoverlay.managed": "true"}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.RemoveVolume(context.Background(), vol) })

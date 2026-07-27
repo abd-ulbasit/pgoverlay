@@ -1,8 +1,8 @@
-// pgbranch-github is the branch-per-PR webhook service: it receives GitHub
+// pgoverlay-github is the branch-per-PR webhook service: it receives GitHub
 // pull_request webhooks and drives branchd through its REST API — opened or
 // reopened PRs get a branch pr-<number>, pushes optionally reset it, closing
 // the PR destroys it. With GitHub credentials (App or PAT) it also sets the
-// pgbranch/branch commit status and keeps a live connect-info comment.
+// pgoverlay/branch commit status and keeps a live connect-info comment.
 //
 // Configuration is environment-only (GHOOK_*); see docs/github-app.md.
 // Shutdown (SIGINT/SIGTERM) is graceful: in-flight deliveries finish.
@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/apiclient"
-	"github.com/abd-ulbasit/pgbranch/internal/ghook"
+	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
+	"github.com/abd-ulbasit/pgoverlay/internal/ghook"
 )
 
 func main() {
@@ -55,7 +55,7 @@ func run() error {
 		logger.Info("no GitHub credentials (GHOOK_APP_ID or GHOOK_GITHUB_TOKEN): PR comments and commit statuses disabled")
 	}
 
-	svc := ghook.New(cfg.Config, apiclient.New(cfg.PGBranchServer, cfg.PGBranchToken), gh, logger)
+	svc := ghook.New(cfg.Config, apiclient.New(cfg.PGOverlayServer, cfg.PGOverlayToken), gh, logger)
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           svc.Handler(),
@@ -67,8 +67,8 @@ func run() error {
 
 	errc := make(chan error, 1)
 	go func() {
-		logger.Info("pgbranch-github listening", "addr", cfg.Listen,
-			"pgbranch", cfg.PGBranchServer, "source", cfg.Source, "repos", cfg.Repos)
+		logger.Info("pgoverlay-github listening", "addr", cfg.Listen,
+			"pgoverlay", cfg.PGOverlayServer, "source", cfg.Source, "repos", cfg.Repos)
 		errc <- srv.ListenAndServe()
 	}()
 
@@ -83,6 +83,6 @@ func run() error {
 		return err
 	}
 	svc.Wait()
-	logger.Info("pgbranch-github stopped")
+	logger.Info("pgoverlay-github stopped")
 	return nil
 }

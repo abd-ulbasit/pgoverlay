@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // CSI backend: the branch's writable layer is a PVC clone of its base volume
@@ -76,7 +76,7 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 
 	// 1. clone the base PVC into the branch's own PVC
 	if err := e.drv.CloneVolume(ctx, b.SourceVolume, b.RWVolume,
-		e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": b.ID})); err != nil {
+		e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.branch.id": b.ID})); err != nil {
 		return fail(fmt.Errorf("clone volume: %w", err))
 	}
 	undo = append(undo, func() {
@@ -175,8 +175,8 @@ func (e *Engine) restartCSIBranch(ctx context.Context, b *registry.Branch, src *
 func (e *Engine) installDirectEntrypoint(ctx context.Context, volume string) error {
 	_, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
 		Image:  "alpine:3.21",
-		Cmd:    []string{"sh", "-c", `printf '%s' "$PGBRANCH_ENTRYPOINT" > /pgbranch/rw/entrypoint.sh && chmod 0755 /pgbranch/rw/entrypoint.sh`},
-		Env:    []string{"PGBRANCH_ENTRYPOINT=" + cow.EntrypointScriptDirect},
+		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh`},
+		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScriptDirect},
 		Mounts: []runtime.Mount{{Volume: volume, Target: cow.RWPath}},
 	})
 	return err
@@ -186,7 +186,7 @@ func (e *Engine) installDirectEntrypoint(ctx context.Context, volume string) err
 // its writable volume mounted at RWPath (PGDATA = its data/ subdir).
 func (e *Engine) startDirectBranch(ctx context.Context, name, volume, image string, labels map[string]string) (string, error) {
 	return e.drv.StartBranch(ctx, runtime.BranchSpec{
-		Name:       "pgbranch-br-" + name,
+		Name:       "pgoverlay-br-" + name,
 		Image:      image,
 		Env:        []string{"PGDATA=" + cow.DirectDataPath},
 		Mounts:     []runtime.Mount{{Volume: volume, Target: cow.RWPath}},

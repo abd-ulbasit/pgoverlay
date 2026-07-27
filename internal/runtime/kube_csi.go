@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	// defaultPVCSize sizes pgbranch PVCs when no size is configured. CSI
+	// defaultPVCSize sizes pgoverlay PVCs when no size is configured. CSI
 	// drivers thin-provision, so a roomy default costs nothing up front.
 	defaultPVCSize = "10Gi"
 	snapshotGroup  = "snapshot.storage.k8s.io"
@@ -74,7 +74,7 @@ func (s *csiStorage) podVolumes(ms []Mount) ([]corev1.Volume, []corev1.VolumeMou
 	return vols, mounts
 }
 
-// buildPVC renders a pgbranch PVC. dataSource is nil for empty volumes, a
+// buildPVC renders a pgoverlay PVC. dataSource is nil for empty volumes, a
 // PersistentVolumeClaim reference for CSI clones, or a VolumeSnapshot
 // reference for snapshot restores.
 func buildPVC(namespace, name, storageClass string, size resource.Quantity, labels map[string]string,
@@ -155,11 +155,11 @@ func (s *csiStorage) cloneVolume(ctx context.Context, src, dst string, labels ma
 	return nil
 }
 
-// listVolumes returns the names of every pgbranch-managed PVC in the namespace
+// listVolumes returns the names of every pgoverlay-managed PVC in the namespace
 // owned by instanceID.
 func (s *csiStorage) listVolumes(ctx context.Context, instanceID string) ([]string, error) {
 	list, err := s.d.cs.CoreV1().PersistentVolumeClaims(s.d.namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: "pgbranch.managed=true," + LabelInstance + "=" + instanceID})
+		metav1.ListOptions{LabelSelector: "pgoverlay.managed=true," + LabelInstance + "=" + instanceID})
 	if err != nil {
 		return nil, err
 	}

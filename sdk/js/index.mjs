@@ -1,4 +1,4 @@
-// pgbranch-test: a disposable Postgres branch for your JS/TS test suite.
+// pgoverlay-test: a disposable Postgres branch for your JS/TS test suite.
 // Zero dependencies — Node 18+ global fetch and node:crypto only.
 import { randomBytes } from "node:crypto";
 
@@ -35,23 +35,23 @@ function sleep(ms) {
 }
 
 /**
- * Create a copy-on-write Postgres branch on a pgbranch server and wait until
+ * Create a copy-on-write Postgres branch on a pgoverlay server and wait until
  * it is ready. See index.d.ts for the option/result shapes.
  */
 export async function acquire(opts = {}) {
-  const server = (opts.server ?? process.env.PGBRANCH_SERVER ?? "").replace(/\/+$/, "");
+  const server = (opts.server ?? process.env.PGOVERLAY_SERVER ?? "").replace(/\/+$/, "");
   if (!server) {
     throw new Error(
-      "pgbranch-test: no server — pass {server} or set PGBRANCH_SERVER",
+      "pgoverlay-test: no server — pass {server} or set PGOVERLAY_SERVER",
     );
   }
-  const token = opts.token ?? process.env.PGBRANCH_TOKEN ?? "";
-  const source = opts.source ?? process.env.PGBRANCH_TEST_SOURCE ?? "main";
+  const token = opts.token ?? process.env.PGOVERLAY_TOKEN ?? "";
+  const source = opts.source ?? process.env.PGOVERLAY_TEST_SOURCE ?? "main";
   const ttlSeconds = opts.ttlSeconds ?? 3600;
   const name = opts.name ?? `t-js-${randHex(6)}`;
   if (!NAME_RE.test(name)) {
     throw new Error(
-      `pgbranch-test: invalid branch name ${JSON.stringify(name)} (must match ${NAME_RE})`,
+      `pgoverlay-test: invalid branch name ${JSON.stringify(name)} (must match ${NAME_RE})`,
     );
   }
   const pollIntervalMs = opts.pollIntervalMs ?? 1000;
@@ -64,7 +64,7 @@ export async function acquire(opts = {}) {
   });
   if (created.status !== 201) {
     throw new Error(
-      `pgbranch-test: create branch ${name}: HTTP ${created.status}: ${created.text.trim()}`,
+      `pgoverlay-test: create branch ${name}: HTTP ${created.status}: ${created.text.trim()}`,
     );
   }
 
@@ -75,14 +75,14 @@ export async function acquire(opts = {}) {
   while (b.state !== "ready") {
     if (Date.now() > deadline) {
       throw new Error(
-        `pgbranch-test: branch ${name} not ready after ${timeoutMs}ms (state ${JSON.stringify(b.state)})`,
+        `pgoverlay-test: branch ${name} not ready after ${timeoutMs}ms (state ${JSON.stringify(b.state)})`,
       );
     }
     await sleep(pollIntervalMs);
     const got = await request(server, token, "GET", `/v1/branches/${name}`);
     if (got.status !== 200) {
       throw new Error(
-        `pgbranch-test: wait for branch ${name}: HTTP ${got.status}: ${got.text.trim()}`,
+        `pgoverlay-test: wait for branch ${name}: HTTP ${got.status}: ${got.text.trim()}`,
       );
     }
     b = got.json();
@@ -94,7 +94,7 @@ export async function acquire(opts = {}) {
   const database = b.database || "postgres";
   // a server-returned per-branch password (credential rotation) wins over
   // the caller/env fallback
-  const password = b.password || opts.password || process.env.PGBRANCH_PASSWORD || "";
+  const password = b.password || opts.password || process.env.PGOVERLAY_PASSWORD || "";
 
   return {
     branch: name,
@@ -110,7 +110,7 @@ export async function acquire(opts = {}) {
       const res = await request(server, token, "DELETE", `/v1/branches/${name}`);
       if (res.status !== 204 && res.status !== 404) {
         throw new Error(
-          `pgbranch-test: destroy branch ${name}: HTTP ${res.status}: ${res.text.trim()}`,
+          `pgoverlay-test: destroy branch ${name}: HTTP ${res.status}: ${res.text.trim()}`,
         );
       }
     },

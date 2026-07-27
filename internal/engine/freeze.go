@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/abd-ulbasit/pgbranch/internal/cow"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
 // CreateBranchFrom creates a branch whose base is another (ready) branch's
@@ -134,7 +134,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	}
 
 	// 3. fresh rw volume for the parent (the swap), with the entrypoint
-	if err := e.drv.CreateVolume(ctx, newRW, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": parent.ID})); err != nil {
+	if err := e.drv.CreateVolume(ctx, newRW, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.branch.id": parent.ID})); err != nil {
 		return fail(fmt.Errorf("create parent rw volume: %w", err))
 	}
 	undo = append(undo, func() {
@@ -168,7 +168,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 		"branch", child.Name, "branch_id", child.ID)
 
 	// 5. child resources over the same chain
-	if err := e.drv.CreateVolume(ctx, childPlan.RWVolume, e.instanceLabels(map[string]string{"pgbranch.managed": "true", "pgbranch.branch.id": child.ID})); err != nil {
+	if err := e.drv.CreateVolume(ctx, childPlan.RWVolume, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.branch.id": child.ID})); err != nil {
 		return fail(fmt.Errorf("create rw volume: %w", err))
 	}
 	undo = append(undo, func() {

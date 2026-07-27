@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/diffutil"
-	"github.com/abd-ulbasit/pgbranch/internal/registry"
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/diffutil"
+	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // liveDiffBranches returns the names of live registry rows with the internal
@@ -33,7 +33,7 @@ func liveDiffBranches(t *testing.T, r *registry.Registry) []string {
 func throwawaySpec(t *testing.T, d *fakeDriver) runtime.BranchSpec {
 	t.Helper()
 	for _, s := range d.branches {
-		if strings.HasPrefix(s.Name, "pgbranch-br-diff-") {
+		if strings.HasPrefix(s.Name, "pgoverlay-br-diff-") {
 			return s
 		}
 	}
@@ -42,11 +42,11 @@ func throwawaySpec(t *testing.T, d *fakeDriver) runtime.BranchSpec {
 }
 
 // diffFake returns ExecOutput behavior serving schema dumps and row
-// estimates: the throwaway base clone (id embeds pgbranch-br-diff-) sees the
+// estimates: the throwaway base clone (id embeds pgoverlay-br-diff-) sees the
 // original schema, the target branch an extended one.
 func diffFake() func(id string, cmd []string) (string, error) {
 	return func(id string, cmd []string) (string, error) {
-		isBase := strings.Contains(id, "pgbranch-br-diff-")
+		isBase := strings.Contains(id, "pgoverlay-br-diff-")
 		if len(cmd) > 0 && cmd[0] == "pg_dump" {
 			if isBase {
 				return "CREATE TABLE users (\n    id integer\n);\n", nil
@@ -135,7 +135,7 @@ func TestDiffBranchClonesTargetOwnBaseGeneration(t *testing.T) {
 	d.execOutFn = diffFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.volumes["pgbranch-src-main"] = true
+	d.volumes["pgoverlay-src-main"] = true
 	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -148,11 +148,11 @@ func TestDiffBranchClonesTargetOwnBaseGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := throwawaySpec(t, d)
-	if len(spec.Mounts) == 0 || spec.Mounts[0].Volume != "pgbranch-src-main" {
-		t.Errorf("throwaway lower0 = %+v, want the target's own gen-1 volume pgbranch-src-main", spec.Mounts)
+	if len(spec.Mounts) == 0 || spec.Mounts[0].Volume != "pgoverlay-src-main" {
+		t.Errorf("throwaway lower0 = %+v, want the target's own gen-1 volume pgoverlay-src-main", spec.Mounts)
 	}
 	for _, m := range spec.Mounts {
-		if m.Volume == "pgbranch-src-main-g2" {
+		if m.Volume == "pgoverlay-src-main-g2" {
 			t.Errorf("throwaway mounted the CURRENT generation volume: %+v", spec.Mounts)
 		}
 	}
@@ -180,8 +180,8 @@ func TestDiffBranchClonesTargetLayerChain(t *testing.T) {
 		vols = append(vols, m.Volume)
 	}
 	// same stack as the child: source at lower0, frozen parent rw at lower1
-	if len(vols) != 3 || vols[0] != "pgbranch-src-main" || vols[1] != "pgbranch-br-p-rw" {
-		t.Errorf("throwaway stack = %v, want [pgbranch-src-main pgbranch-br-p-rw <its own rw>]", vols)
+	if len(vols) != 3 || vols[0] != "pgoverlay-src-main" || vols[1] != "pgoverlay-br-p-rw" {
+		t.Errorf("throwaway stack = %v, want [pgoverlay-src-main pgoverlay-br-p-rw <its own rw>]", vols)
 	}
 	if names := liveDiffBranches(t, r); len(names) != 0 {
 		t.Errorf("throwaway rows left: %v", names)
@@ -299,7 +299,7 @@ func TestDiffBranchNoDataSampleByDefault(t *testing.T) {
 // grows but has no PK (skipped); users shrinks (never sampled).
 func dataSampleFake() func(id string, cmd []string) (string, error) {
 	return func(id string, cmd []string) (string, error) {
-		isBase := strings.Contains(id, "pgbranch-br-diff-")
+		isBase := strings.Contains(id, "pgoverlay-br-diff-")
 		joined := strings.Join(cmd, " ")
 		switch {
 		case len(cmd) > 0 && cmd[0] == "pg_dump":

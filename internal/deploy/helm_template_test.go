@@ -1,5 +1,5 @@
 // Offline helm-template tests for the chart's env wiring (no cluster, no
-// PGBRANCH_K8S_IT gate — `helm template` renders locally). Skipped when the
+// PGOVERLAY_K8S_IT gate — `helm template` renders locally). Skipped when the
 // helm binary isn't installed.
 package deploy
 
@@ -16,7 +16,7 @@ func helmTemplate(t *testing.T, sets ...string) (string, error) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm not installed")
 	}
-	args := []string{"template", "test-release", "deploy/helm/pgbranch",
+	args := []string{"template", "test-release", "deploy/helm/pgoverlay",
 		"--set", "node=storage-1", "--set", "token=t0k"}
 	for _, s := range sets {
 		args = append(args, "--set", s)
@@ -47,7 +47,7 @@ func TestHelmPersistenceDefaultOffOnHostpath(t *testing.T) {
 	if strings.Contains(out, "kind: PersistentVolumeClaim") {
 		t.Error("hostpath default rendered a state PVC")
 	}
-	if !strings.Contains(out, "path: /var/lib/pgbranch/state") {
+	if !strings.Contains(out, "path: /var/lib/pgoverlay/state") {
 		t.Error("hostpath default lost the hostPath state volume")
 	}
 	if strings.Contains(out, "claimName:") {
@@ -63,10 +63,10 @@ func TestHelmPersistenceAutoOnWithCSI(t *testing.T) {
 	if !strings.Contains(out, "kind: PersistentVolumeClaim") {
 		t.Error("csi mode did not auto-enable the state PVC")
 	}
-	if !strings.Contains(out, "claimName: test-release-pgbranch-state") {
+	if !strings.Contains(out, "claimName: test-release-pgoverlay-state") {
 		t.Errorf("deployment state volume is not the PVC claim:\n%s", out)
 	}
-	if strings.Contains(out, "path: /var/lib/pgbranch/state") {
+	if strings.Contains(out, "path: /var/lib/pgoverlay/state") {
 		t.Error("csi mode still renders the hostPath state volume")
 	}
 	// default size
@@ -83,7 +83,7 @@ func TestHelmPersistenceExplicitTrueOnHostpath(t *testing.T) {
 	if !strings.Contains(out, "kind: PersistentVolumeClaim") || !strings.Contains(out, "claimName:") {
 		t.Errorf("persistence.enabled=true on hostpath did not render the PVC:\n%s", out)
 	}
-	if strings.Contains(out, "path: /var/lib/pgbranch/state") {
+	if strings.Contains(out, "path: /var/lib/pgoverlay/state") {
 		t.Error("explicit persistence still renders the hostPath state volume")
 	}
 }
@@ -96,7 +96,7 @@ func TestHelmPersistenceExplicitFalseOnCSI(t *testing.T) {
 	if strings.Contains(out, "kind: PersistentVolumeClaim") {
 		t.Error("explicit persistence.enabled=false with csi must stay off")
 	}
-	if !strings.Contains(out, "path: /var/lib/pgbranch/state") {
+	if !strings.Contains(out, "path: /var/lib/pgoverlay/state") {
 		t.Error("disabled persistence lost the hostPath state volume")
 	}
 }
@@ -224,9 +224,9 @@ func TestHelmProxyTLSWiredWhenCertSecretSet(t *testing.T) {
 		t.Fatalf("helm template: %v\n%s", err, out)
 	}
 	for _, want := range []string{
-		"--pg-tls-cert=/etc/pgbranch/proxy-tls/tls.crt",
-		"--pg-tls-key=/etc/pgbranch/proxy-tls/tls.key",
-		"mountPath: /etc/pgbranch/proxy-tls",
+		"--pg-tls-cert=/etc/pgoverlay/proxy-tls/tls.crt",
+		"--pg-tls-key=/etc/pgoverlay/proxy-tls/tls.key",
+		"mountPath: /etc/pgoverlay/proxy-tls",
 		"secretName: branchd-proxy-tls",
 	} {
 		if !strings.Contains(out, want) {

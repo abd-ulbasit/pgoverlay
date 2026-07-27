@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
 // recordedStatus is one POST /statuses/{sha} call seen by the fake.
@@ -238,7 +238,7 @@ func TestSetStatusRequestShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := recordedStatus{SHA: "0d1e2f3a4b5c6d7e", State: "pending",
-		Description: "creating branch pr-7", Context: "pgbranch/branch"}
+		Description: "creating branch pr-7", Context: "pgoverlay/branch"}
 	if len(gh.statuses) != 1 || gh.statuses[0] != want {
 		t.Fatalf("statuses = %+v, want [%+v]", gh.statuses, want)
 	}
@@ -260,7 +260,7 @@ func TestSetStatusTruncatesDescriptionTo140(t *testing.T) {
 
 // Every handled ensure event brackets the branch operation with commit
 // statuses on the PR head SHA: pending before, success after — so CI can
-// gate on context pgbranch/branch instead of psql retry loops.
+// gate on context pgoverlay/branch instead of psql retry loops.
 func TestEnsureSetsPendingThenSuccessStatus(t *testing.T) {
 	pg := newFakePG(t, false)
 	gh := newFakeGitHub(t)
@@ -271,7 +271,7 @@ func TestEnsureSetsPendingThenSuccessStatus(t *testing.T) {
 	}
 	pending, success := gh.statuses[0], gh.statuses[1]
 	if pending.State != "pending" || pending.SHA != "0d1e2f3a4b5c6d7e" ||
-		pending.Context != "pgbranch/branch" || !strings.Contains(pending.Description, "creating branch gh-pr-7") {
+		pending.Context != "pgoverlay/branch" || !strings.Contains(pending.Description, "creating branch gh-pr-7") {
 		t.Errorf("pending status = %+v", pending)
 	}
 	if success.State != "success" || success.SHA != "0d1e2f3a4b5c6d7e" ||

@@ -1,4 +1,4 @@
-package pgbranchtest
+package pgoverlaytest
 
 import (
 	"encoding/json"
@@ -141,10 +141,10 @@ func (s *stubServer) lastCreate() createBranchRequest {
 
 func TestAcquireDefaults(t *testing.T) {
 	stub := newStub(t)
-	t.Setenv("PGBRANCH_SERVER", stub.ts.URL)
-	t.Setenv("PGBRANCH_TOKEN", "tok-1")
-	t.Setenv("PGBRANCH_TEST_SOURCE", "")
-	t.Setenv("PGBRANCH_PASSWORD", "")
+	t.Setenv("PGOVERLAY_SERVER", stub.ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
+	t.Setenv("PGOVERLAY_TEST_SOURCE", "")
+	t.Setenv("PGOVERLAY_PASSWORD", "")
 
 	var b *Branch
 	t.Run("inner", func(t *testing.T) { b = Acquire(t) })
@@ -174,9 +174,9 @@ func TestAcquireDefaults(t *testing.T) {
 
 func TestAcquireOptions(t *testing.T) {
 	stub := newStub(t)
-	t.Setenv("PGBRANCH_SERVER", stub.ts.URL)
-	t.Setenv("PGBRANCH_TOKEN", "tok-1")
-	t.Setenv("PGBRANCH_TEST_SOURCE", "env-source")
+	t.Setenv("PGOVERLAY_SERVER", stub.ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
+	t.Setenv("PGOVERLAY_TEST_SOURCE", "env-source")
 
 	t.Run("env source wins over default", func(t *testing.T) { Acquire(t) })
 	if got := stub.lastCreate().Source; got != "env-source" {
@@ -197,9 +197,9 @@ func TestAcquireOptions(t *testing.T) {
 
 func TestAcquireBranchFields(t *testing.T) {
 	stub := newStub(t)
-	t.Setenv("PGBRANCH_SERVER", stub.ts.URL)
-	t.Setenv("PGBRANCH_TOKEN", "tok-1")
-	t.Setenv("PGBRANCH_PASSWORD", "s3cr:t/pw")
+	t.Setenv("PGOVERLAY_SERVER", stub.ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
+	t.Setenv("PGOVERLAY_PASSWORD", "s3cr:t/pw")
 
 	var b *Branch
 	t.Run("inner", func(t *testing.T) { b = Acquire(t) })
@@ -229,9 +229,9 @@ func TestAcquireBranchFields(t *testing.T) {
 func TestAcquireWirePassword(t *testing.T) {
 	stub := newStub(t)
 	stub.branch.Password = "rotated-pw"
-	t.Setenv("PGBRANCH_SERVER", stub.ts.URL)
-	t.Setenv("PGBRANCH_TOKEN", "tok-1")
-	t.Setenv("PGBRANCH_PASSWORD", "env-pw")
+	t.Setenv("PGOVERLAY_SERVER", stub.ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
+	t.Setenv("PGOVERLAY_PASSWORD", "env-pw")
 
 	var b *Branch
 	t.Run("inner", func(t *testing.T) { b = Acquire(t) })
@@ -243,8 +243,8 @@ func TestAcquireWirePassword(t *testing.T) {
 func TestAcquirePollsUntilReady(t *testing.T) {
 	stub := newStub(t)
 	stub.getStates = []string{"creating", "creating", "ready"}
-	t.Setenv("PGBRANCH_SERVER", stub.ts.URL)
-	t.Setenv("PGBRANCH_TOKEN", "tok-1")
+	t.Setenv("PGOVERLAY_SERVER", stub.ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
 
 	old := pollInterval
 	pollInterval = time.Millisecond
@@ -293,11 +293,11 @@ func runWithFakeTB(f *fakeTB, fn func()) {
 }
 
 func TestAcquireSkipsWithoutServer(t *testing.T) {
-	t.Setenv("PGBRANCH_SERVER", "")
+	t.Setenv("PGOVERLAY_SERVER", "")
 	f := &fakeTB{name: "TestAcquireSkipsWithoutServer"}
 	runWithFakeTB(f, func() { Acquire(f) })
 	if !f.skipped {
-		t.Fatal("Acquire did not skip with PGBRANCH_SERVER unset")
+		t.Fatal("Acquire did not skip with PGOVERLAY_SERVER unset")
 	}
 	if f.failed {
 		t.Fatal("Acquire failed instead of skipping")
@@ -309,8 +309,8 @@ func TestAcquireFailsOnServerError(t *testing.T) {
 		http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
 	}))
 	t.Cleanup(ts.Close)
-	t.Setenv("PGBRANCH_SERVER", ts.URL)
-	t.Setenv("PGBRANCH_TOKEN", "tok-1")
+	t.Setenv("PGOVERLAY_SERVER", ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
 	f := &fakeTB{name: "TestAcquireFailsOnServerError"}
 	runWithFakeTB(f, func() { Acquire(f) })
 	if !f.failed {

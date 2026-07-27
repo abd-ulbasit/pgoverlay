@@ -30,12 +30,12 @@ func testCSIStorage(snapshotClass string) (*csiStorage, *fake.Clientset, *dynfak
 }
 
 func TestBuildPVC(t *testing.T) {
-	labels := map[string]string{"pgbranch.managed": "true", "pgbranch.source.name": "main"}
-	pvc := buildPVC("pgb", "pgbranch-src-main", "fast-clone", resource.MustParse("10Gi"), labels, nil)
-	if pvc.Name != "pgbranch-src-main" || pvc.Namespace != "pgb" {
+	labels := map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": "main"}
+	pvc := buildPVC("pgb", "pgoverlay-src-main", "fast-clone", resource.MustParse("10Gi"), labels, nil)
+	if pvc.Name != "pgoverlay-src-main" || pvc.Namespace != "pgb" {
 		t.Errorf("name/ns = %q/%q", pvc.Name, pvc.Namespace)
 	}
-	if pvc.Labels["pgbranch.managed"] != "true" {
+	if pvc.Labels["pgoverlay.managed"] != "true" {
 		t.Errorf("labels = %v", pvc.Labels)
 	}
 	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "fast-clone" {
@@ -54,10 +54,10 @@ func TestBuildPVC(t *testing.T) {
 
 // PVC clone variant: dataSource references the source PVC (CSI cloning).
 func TestBuildPVCCloneDataSource(t *testing.T) {
-	ds := &corev1.TypedLocalObjectReference{Kind: "PersistentVolumeClaim", Name: "pgbranch-src-main"}
-	pvc := buildPVC("pgb", "pgbranch-br-pr-1-rw", "fast-clone", resource.MustParse("10Gi"), nil, ds)
+	ds := &corev1.TypedLocalObjectReference{Kind: "PersistentVolumeClaim", Name: "pgoverlay-src-main"}
+	pvc := buildPVC("pgb", "pgoverlay-br-pr-1-rw", "fast-clone", resource.MustParse("10Gi"), nil, ds)
 	if pvc.Spec.DataSource == nil || pvc.Spec.DataSource.Kind != "PersistentVolumeClaim" ||
-		pvc.Spec.DataSource.Name != "pgbranch-src-main" {
+		pvc.Spec.DataSource.Name != "pgoverlay-src-main" {
 		t.Fatalf("dataSource = %+v", pvc.Spec.DataSource)
 	}
 	if pvc.Spec.DataSource.APIGroup != nil {
@@ -70,17 +70,17 @@ func TestBuildPVCCloneDataSource(t *testing.T) {
 func TestCSICloneVolumePVCDataSource(t *testing.T) {
 	s, cs, dyn := testCSIStorage("")
 	ctx := context.Background()
-	if err := s.cloneVolume(ctx, "pgbranch-src-main", "pgbranch-br-pr-1-rw", map[string]string{"pgbranch.branch.id": "b1"}); err != nil {
+	if err := s.cloneVolume(ctx, "pgoverlay-src-main", "pgoverlay-br-pr-1-rw", map[string]string{"pgoverlay.branch.id": "b1"}); err != nil {
 		t.Fatal(err)
 	}
-	pvc, err := cs.CoreV1().PersistentVolumeClaims("pgb").Get(ctx, "pgbranch-br-pr-1-rw", metav1.GetOptions{})
+	pvc, err := cs.CoreV1().PersistentVolumeClaims("pgb").Get(ctx, "pgoverlay-br-pr-1-rw", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pvc.Spec.DataSource == nil || pvc.Spec.DataSource.Kind != "PersistentVolumeClaim" || pvc.Spec.DataSource.Name != "pgbranch-src-main" {
+	if pvc.Spec.DataSource == nil || pvc.Spec.DataSource.Kind != "PersistentVolumeClaim" || pvc.Spec.DataSource.Name != "pgoverlay-src-main" {
 		t.Fatalf("dataSource = %+v", pvc.Spec.DataSource)
 	}
-	if pvc.Labels["pgbranch.branch.id"] != "b1" {
+	if pvc.Labels["pgoverlay.branch.id"] != "b1" {
 		t.Errorf("labels = %v", pvc.Labels)
 	}
 	if snaps, err := dyn.Resource(snapshotGVR).Namespace("pgb").List(ctx, metav1.ListOptions{}); err != nil || len(snaps.Items) != 0 {
@@ -93,24 +93,24 @@ func TestCSICloneVolumePVCDataSource(t *testing.T) {
 func TestCSICloneVolumeSnapshotDataSource(t *testing.T) {
 	s, cs, dyn := testCSIStorage("csi-snap-class")
 	ctx := context.Background()
-	if err := s.cloneVolume(ctx, "pgbranch-src-main", "pgbranch-br-pr-1-rw", nil); err != nil {
+	if err := s.cloneVolume(ctx, "pgoverlay-src-main", "pgoverlay-br-pr-1-rw", nil); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := dyn.Resource(snapshotGVR).Namespace("pgb").Get(ctx, "pgbranch-br-pr-1-rw-snap", metav1.GetOptions{})
+	snap, err := dyn.Resource(snapshotGVR).Namespace("pgb").Get(ctx, "pgoverlay-br-pr-1-rw-snap", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("VolumeSnapshot not created: %v", err)
 	}
 	class, _, _ := unstructured.NestedString(snap.Object, "spec", "volumeSnapshotClassName")
 	srcPVC, _, _ := unstructured.NestedString(snap.Object, "spec", "source", "persistentVolumeClaimName")
-	if class != "csi-snap-class" || srcPVC != "pgbranch-src-main" {
+	if class != "csi-snap-class" || srcPVC != "pgoverlay-src-main" {
 		t.Errorf("snapshot spec: class=%q source=%q", class, srcPVC)
 	}
-	pvc, err := cs.CoreV1().PersistentVolumeClaims("pgb").Get(ctx, "pgbranch-br-pr-1-rw", metav1.GetOptions{})
+	pvc, err := cs.CoreV1().PersistentVolumeClaims("pgb").Get(ctx, "pgoverlay-br-pr-1-rw", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ds := pvc.Spec.DataSource
-	if ds == nil || ds.Kind != "VolumeSnapshot" || ds.Name != "pgbranch-br-pr-1-rw-snap" ||
+	if ds == nil || ds.Kind != "VolumeSnapshot" || ds.Name != "pgoverlay-br-pr-1-rw-snap" ||
 		ds.APIGroup == nil || *ds.APIGroup != "snapshot.storage.k8s.io" {
 		t.Fatalf("dataSource = %+v", ds)
 	}
@@ -122,20 +122,20 @@ func TestCSIRemoveVolume(t *testing.T) {
 	s, cs, dyn := testCSIStorage("csi-snap-class")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := s.cloneVolume(ctx, "pgbranch-src-main", "pgbranch-br-pr-1-rw", nil); err != nil {
+	if err := s.cloneVolume(ctx, "pgoverlay-src-main", "pgoverlay-br-pr-1-rw", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.removeVolume(ctx, "pgbranch-br-pr-1-rw"); err != nil {
+	if err := s.removeVolume(ctx, "pgoverlay-br-pr-1-rw"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cs.CoreV1().PersistentVolumeClaims("pgb").Get(ctx, "pgbranch-br-pr-1-rw", metav1.GetOptions{}); err == nil {
+	if _, err := cs.CoreV1().PersistentVolumeClaims("pgb").Get(ctx, "pgoverlay-br-pr-1-rw", metav1.GetOptions{}); err == nil {
 		t.Error("PVC still present after removeVolume")
 	}
-	if _, err := dyn.Resource(snapshotGVR).Namespace("pgb").Get(ctx, "pgbranch-br-pr-1-rw-snap", metav1.GetOptions{}); err == nil {
+	if _, err := dyn.Resource(snapshotGVR).Namespace("pgb").Get(ctx, "pgoverlay-br-pr-1-rw-snap", metav1.GetOptions{}); err == nil {
 		t.Error("VolumeSnapshot still present after removeVolume")
 	}
 	// idempotent: nothing left to delete
-	if err := s.removeVolume(ctx, "pgbranch-br-pr-1-rw"); err != nil {
+	if err := s.removeVolume(ctx, "pgoverlay-br-pr-1-rw"); err != nil {
 		t.Errorf("second removeVolume = %v, want nil", err)
 	}
 	// plain mode driver is idempotent too
@@ -149,10 +149,10 @@ func TestCSIRemoveVolume(t *testing.T) {
 func TestCSICreateVolume(t *testing.T) {
 	s, cs, _ := testCSIStorage("")
 	ctx := context.Background()
-	if err := s.createVolume(ctx, "pgbranch-src-main", map[string]string{"pgbranch.managed": "true"}); err != nil {
+	if err := s.createVolume(ctx, "pgoverlay-src-main", map[string]string{"pgoverlay.managed": "true"}); err != nil {
 		t.Fatal(err)
 	}
-	pvc, err := cs.CoreV1().PersistentVolumeClaims("pgb").Get(ctx, "pgbranch-src-main", metav1.GetOptions{})
+	pvc, err := cs.CoreV1().PersistentVolumeClaims("pgb").Get(ctx, "pgoverlay-src-main", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,12 +166,12 @@ func TestCSICreateVolume(t *testing.T) {
 func TestBuildBranchPodCSI(t *testing.T) {
 	s, _, _ := testCSIStorage("")
 	spec := BranchSpec{
-		Name:       "pgbranch-br-pr-1",
+		Name:       "pgoverlay-br-pr-1",
 		Image:      "postgres:17",
-		Env:        []string{"PGDATA=/pgbranch/rw/data"},
-		Mounts:     []Mount{{Volume: "pgbranch-br-pr-1-rw", Target: "/pgbranch/rw"}},
-		Entrypoint: []string{"/bin/sh", "/pgbranch/rw/entrypoint.sh"},
-		Labels:     map[string]string{"pgbranch.managed": "true", "pgbranch.role": "branch"},
+		Env:        []string{"PGDATA=/pgoverlay/rw/data"},
+		Mounts:     []Mount{{Volume: "pgoverlay-br-pr-1-rw", Target: "/pgoverlay/rw"}},
+		Entrypoint: []string{"/bin/sh", "/pgoverlay/rw/entrypoint.sh"},
+		Labels:     map[string]string{"pgoverlay.managed": "true", "pgoverlay.role": "branch"},
 	}
 	pod := buildBranchPod("pgb", s, spec)
 	if pod.Spec.NodeName != "" {
@@ -188,13 +188,13 @@ func TestBuildBranchPodCSI(t *testing.T) {
 		t.Fatalf("volumes = %d", len(pod.Spec.Volumes))
 	}
 	v := pod.Spec.Volumes[0]
-	if v.PersistentVolumeClaim == nil || v.PersistentVolumeClaim.ClaimName != "pgbranch-br-pr-1-rw" {
-		t.Fatalf("volume source = %+v, want PVC pgbranch-br-pr-1-rw", v.VolumeSource)
+	if v.PersistentVolumeClaim == nil || v.PersistentVolumeClaim.ClaimName != "pgoverlay-br-pr-1-rw" {
+		t.Fatalf("volume source = %+v, want PVC pgoverlay-br-pr-1-rw", v.VolumeSource)
 	}
-	if m := c.VolumeMounts[0]; m.MountPath != "/pgbranch/rw" || m.ReadOnly {
+	if m := c.VolumeMounts[0]; m.MountPath != "/pgoverlay/rw" || m.ReadOnly {
 		t.Errorf("mount = %+v", m)
 	}
-	if len(c.Env) != 1 || c.Env[0].Name != "PGDATA" || c.Env[0].Value != "/pgbranch/rw/data" {
+	if len(c.Env) != 1 || c.Env[0].Name != "PGDATA" || c.Env[0].Value != "/pgoverlay/rw/data" {
 		t.Errorf("Env = %v", c.Env)
 	}
 }
@@ -207,7 +207,7 @@ func TestBuildHelperPodCSI(t *testing.T) {
 		Cmd:   []string{"pg_basebackup"},
 		User:  "postgres",
 		Mounts: []Mount{
-			{Volume: "pgbranch-src-main", Target: "/seed"},
+			{Volume: "pgoverlay-src-main", Target: "/seed"},
 			{Volume: "other", Target: "/ro", ReadOnly: true},
 		},
 	})
@@ -220,7 +220,7 @@ func TestBuildHelperPodCSI(t *testing.T) {
 	if len(pod.Spec.Volumes) != 2 {
 		t.Fatalf("volumes = %d", len(pod.Spec.Volumes))
 	}
-	if pvc := pod.Spec.Volumes[0].PersistentVolumeClaim; pvc == nil || pvc.ClaimName != "pgbranch-src-main" || pvc.ReadOnly {
+	if pvc := pod.Spec.Volumes[0].PersistentVolumeClaim; pvc == nil || pvc.ClaimName != "pgoverlay-src-main" || pvc.ReadOnly {
 		t.Errorf("volume[0] = %+v", pod.Spec.Volumes[0].VolumeSource)
 	}
 	if pvc := pod.Spec.Volumes[1].PersistentVolumeClaim; pvc == nil || !pvc.ReadOnly {
@@ -237,7 +237,7 @@ func TestBuildHelperPodCSI(t *testing.T) {
 
 // The hostPath strategy must keep pinning and SYS_ADMIN (zero regression).
 func TestStrategySelection(t *testing.T) {
-	hp := &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgbranch"}
+	hp := &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}
 	if hp.nodeName() != "node-1" {
 		t.Errorf("hostPath nodeName = %q", hp.nodeName())
 	}
@@ -266,7 +266,7 @@ func TestKubeHostPathCloneVolume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	settlePods(cs, corev1.PodSucceeded)
-	if err := d.CloneVolume(ctx, "pgbranch-src-main", "pgbranch-br-pr-1-rw", map[string]string{"pgbranch.branch.id": "b1"}); err != nil {
+	if err := d.CloneVolume(ctx, "pgoverlay-src-main", "pgoverlay-br-pr-1-rw", map[string]string{"pgoverlay.branch.id": "b1"}); err != nil {
 		t.Fatal(err)
 	}
 	// the helper pod is deleted after completion; assert on the recorded create
@@ -280,7 +280,7 @@ func TestKubeHostPathCloneVolume(t *testing.T) {
 			script = pod.Spec.Containers[0].Command[2]
 		}
 	}
-	for _, want := range []string{"cp -a /pgbranch-root/pgbranch-src-main/. /pgbranch-root/pgbranch-br-pr-1-rw/", ".pgbranch-labels.json"} {
+	for _, want := range []string{"cp -a /pgoverlay-root/pgoverlay-src-main/. /pgoverlay-root/pgoverlay-br-pr-1-rw/", ".pgoverlay-labels.json"} {
 		if !strings.Contains(script, want) {
 			t.Errorf("clone helper script %q missing %q", script, want)
 		}

@@ -1,9 +1,9 @@
-# pgbranch docs site. No CI, no hosting — build locally:
+# pgoverlay docs site. No CI, no hosting — build locally:
 #   pip install mkdocs-material && mkdocs serve
-site_name: pgbranch
+site_name: pgoverlay
 site_description: "git branch for Postgres: instant copy-on-write database branches"
-repo_url: https://github.com/abd-ulbasit/pgbranch
-repo_name: abd-ulbasit/pgbranch
+repo_url: https://github.com/abd-ulbasit/pgoverlay
+repo_name: abd-ulbasit/pgoverlay
 edit_uri: ""
 
 theme:

@@ -1,14 +1,20 @@
-# pgbranch
+# pgoverlay
 
 `git branch` for Postgres: seed once from any running database, then spin up
 isolated, writable copies that never write back to it.
+
+Branches are **OverlayFS copy-on-write** mounts over `PGDATA`. Every branch
+shares one read-only copy of the seeded source and stores only the blocks it
+actually changes, so creating one is a mount rather than a copy. Each branch is
+its own live Postgres container, so branches run concurrently, and a branch can
+itself be branched.
 
 ```
 $ pgb branch create pr-1 --from main
 branch "pr-1" ready in 2.533s (port 32774)
 ```
 
-**Measured:** pgbranch branches a 1 GiB database in ~1.9 s and a 5 GiB
+**Measured:** pgoverlay branches a 1 GiB database in ~1.9 s and a 5 GiB
 database in ~1.9 s (p50 of 5 runs) — creation time is independent of database
 size, and a fresh branch costs ~33 MiB of disk, not a copy of the dataset.
 Full results and methodology in [Benchmarks](benchmarks.md).
@@ -25,7 +31,7 @@ apps. The options today:
 - **DBLab (Database Lab Engine)** — self-hosted thin clones, but built around
   ZFS (or LVM) pools you must provision and operate.
 
-pgbranch takes the middle path: plain Docker, plain Postgres images, and
+pgoverlay takes the middle path: plain Docker, plain Postgres images, and
 OverlayFS copy-on-write — the same mechanism container images use — applied
 to `PGDATA`. No special filesystem, no cloud, no fork of Postgres. (If you
 *do* run ZFS, an [experimental zfs backend](zfs.md) does block-level CoW.)
@@ -47,7 +53,7 @@ to `PGDATA`. No special filesystem, no cloud, no fork of Postgres. (If you
 
 ## Scope
 
-pgbranch is a **dev/test tool**: disposable Postgres instances for
+pgoverlay is a **dev/test tool**: disposable Postgres instances for
 development, CI, PR review apps, and migration rehearsal. It is not a
 production database platform — no HA, no backups, and branch containers need
 `CAP_SYS_ADMIN` for their overlay mount. A branch is a point-in-time

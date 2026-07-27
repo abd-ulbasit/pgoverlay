@@ -1,5 +1,5 @@
 // Package pgctl runs Postgres-side operations (seeding, readiness) through
-// the runtime driver — pgbranch never touches data files from the host.
+// the runtime driver — pgoverlay never touches data files from the host.
 package pgctl
 
 import (
@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/abd-ulbasit/pgbranch/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 type SeedSpec struct {

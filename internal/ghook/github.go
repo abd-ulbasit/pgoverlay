@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/abd-ulbasit/pgbranch/internal/api"
-	"github.com/abd-ulbasit/pgbranch/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/api"
+	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
 // TokenProvider supplies the bearer token for a GitHub API call. PAT mode is
@@ -26,7 +26,7 @@ func StaticToken(token string) TokenProvider {
 }
 
 // GitHub is a minimal REST client for what this service does on GitHub: the
-// live connect-info comment and the pgbranch/branch commit status. No SDK
+// live connect-info comment and the pgoverlay/branch commit status. No SDK
 // dependency.
 type GitHub struct {
 	BaseURL string // e.g. https://api.github.com (overridable for tests)
@@ -52,14 +52,14 @@ func (g *GitHub) ForInstallation(id int64) *GitHub {
 // current). diffMarker identifies the separate schema/data diff comment, so
 // the two are upserted independently and never clobber each other.
 const (
-	commentMarker = "<!-- pgbranch -->"
-	diffMarker    = "<!-- pgbranch-diff -->"
+	commentMarker = "<!-- pgoverlay -->"
+	diffMarker    = "<!-- pgoverlay-diff -->"
 )
 
 // statusContext is the commit-status context CI can gate on.
-const statusContext = "pgbranch/branch"
+const statusContext = "pgoverlay/branch"
 
-// SetStatus sets the pgbranch/branch commit status on a commit: pending
+// SetStatus sets the pgoverlay/branch commit status on a commit: pending
 // while a branch operation runs, then success or failure. CI consumers gate
 // on the context instead of polling the branch with psql retry loops.
 // Descriptions are truncated to GitHub's 140-character limit.
@@ -202,7 +202,7 @@ func (g *GitHub) do(ctx context.Context, method, path string, in, out any) error
 func commentBody(proxyHost, branch, state string, b *api.Branch) string {
 	var sb strings.Builder
 	sb.WriteString(commentMarker + "\n")
-	sb.WriteString("**pgbranch** — Postgres branch for this pull request.\n\n")
+	sb.WriteString("**pgoverlay** — Postgres branch for this pull request.\n\n")
 	sb.WriteString("| | |\n|---|---|\n")
 	fmt.Fprintf(&sb, "| Branch | `%s` |\n", branch)
 	fmt.Fprintf(&sb, "| State | %s |\n", state)
@@ -215,7 +215,7 @@ func commentBody(proxyHost, branch, state string, b *api.Branch) string {
 	if state == "destroyed" {
 		sb.WriteString("\nThe branch was destroyed when the pull request closed.\n")
 	} else {
-		sb.WriteString("\nThe database name routes through the pgbranch proxy to the branch. " +
+		sb.WriteString("\nThe database name routes through the pgoverlay proxy to the branch. " +
 			"The branch is destroyed when the pull request is closed.\n")
 	}
 	return sb.String()
@@ -233,7 +233,7 @@ const diffSchemaLimit = 3000
 func diffCommentBody(branch string, res *engine.DiffResult) string {
 	var sb strings.Builder
 	sb.WriteString(diffMarker + "\n")
-	fmt.Fprintf(&sb, "**pgbranch diff** — what changed in `%s` vs its base.\n\n", branch)
+	fmt.Fprintf(&sb, "**pgoverlay diff** — what changed in `%s` vs its base.\n\n", branch)
 
 	if res.SchemaDiff == "" {
 		sb.WriteString("Schema: no differences.\n")
