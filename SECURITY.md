@@ -83,12 +83,27 @@ are hand-written, and nothing checks that the *reasons* in the last column are
 still true. If pgbranch ever starts installing Docker plugins or calling
 `docker cp`, this table becomes wrong and no job will notice.
 
-Dependency updates themselves are automated — Dependabot alerts and security
-updates are on, with a weekly `gomod` / `github-actions` / `docker` schedule in
+Dependency updates themselves are automated — Dependabot **alerts** are on, with
+a weekly `gomod` / `github-actions` / `docker` schedule in
 [`.github/dependabot.yml`](.github/dependabot.yml). The Go toolchain is the
 exception: Dependabot cannot bump the `go` directive, so stdlib CVEs are still
 cleared by hand (that is how `GO-2026-5856` was), and `make check-toolchain`
 keeps the Dockerfiles' base image from drifting away from it.
+
+Dependabot **security updates** — the feature that opens a PR per alert — are
+deliberately off, for the same reason the allowlist is scoped to a module rather
+than a list of IDs. Every open alert on this repository is one of the
+`github.com/docker/docker` rows above, and none of them has a fixed version on
+that module path, so each attempt ends in
+`security_update_not_found` and a failed job. That is a job nobody can ever make
+green, on a repository whose security story depends on its red marks meaning
+something. Two such failures were enough to demonstrate it.
+
+Nothing is hidden by this. The alerts stay visible on the Security tab, the
+`vuln` job still gates every push, and `hack/vulncheck.sh` still fails the build
+the day any of these four gains a fixed release. Turning the PR opener back on
+is one API call once `github.com/docker/docker` ships again, or once pgbranch
+moves to `github.com/moby/moby/v2`.
 
 ## Hardening posture
 
