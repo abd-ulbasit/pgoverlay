@@ -23,8 +23,9 @@ Two consequences worth knowing:
   [benchmarks — The fix](benchmarks.md#the-fix)) isn't load-bearing here. The
   zfs entrypoint keeps it anyway for parity — it is simply harmless on ZFS.
 - The branch entrypoint shrinks to perms + stale-pid cleanup + exec
-  (`internal/cow/entrypoint_zfs.sh`): there is nothing to assemble, the clone
-  *is* the writable data directory.
+  (`internal/cow/entrypoint_direct.sh`, shared with the CSI backend — both
+  hand the container a ready-made writable clone): there is nothing to
+  assemble, the clone *is* the writable data directory.
 
 ## How it works
 

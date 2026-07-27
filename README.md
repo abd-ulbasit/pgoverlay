@@ -25,6 +25,8 @@ Two measurements turned that from a theory into the cause. The writable layer im
 
 Creation is now independent of database size — 1.90 s at 1 GiB, 1.89 s at 5 GiB, on a Colima VM on an M1 Pro. The cost did not disappear, it moved: OverlayFS copies up whole files and Postgres heap/index segments run to 1 GiB each, so a branch that rewrites everything still converges on ~1× the database — paid per file at first write instead of all at once at create. [docs/benchmarks.md](docs/benchmarks.md) has both tables in full, the methodology, the hardware, and the pre-fix numbers kept intact, including the write-amplification column that looked better before the fix than after it.
 
+The long-form write-up of the diagnosis — what `SyncDataDirectory` does, why OverlayFS turns it into a full copy, and how the control run pinned it down — is [**Postgres copied 5 GiB before recovery started**](https://basit.engineer/posts/postgres-copied-5gb-before-recovery-started.html).
+
 ## The alternatives, and where pgbranch sits
 
 Every team wants production-like databases for development, CI, and PR review apps. The options today:
@@ -289,7 +291,7 @@ pgbranch is a **dev/test tool**. Branches are disposable Postgres instances for 
 
 It is **not** a production database platform: no HA, no replication of branches, no backups, no connection pooling, and the branch container needs `CAP_SYS_ADMIN` (for the overlay mount) — fine for a dev box or CI runner, not something to expose to untrusted workloads. A branch is a point-in-time snapshot; it does not follow the source after seeding.
 
-pgbranch also branches only from sources, not from other branches (layer-DAG branching is future work).
+Branching from another branch works (`pgb branch create child --from-branch parent`), with one caveat worth knowing on the default overlay backend: it is a **freeze**, so the parent is checkpointed, stopped and restarted over its now-immutable layer — a brief parent interruption, and roughly 2× the create time of branching from a source ([benchmarks](docs/benchmarks.md#branch-from-branch)). The ZFS and CSI backends snapshot/clone the parent instead, with no freeze and no parent restart.
 
 ## Supported Postgres versions
 
@@ -325,7 +327,7 @@ PG 13 and older are unsupported because branch startup passes `-c recovery_init_
 
 ## How this was built
 
-96 of the 116 commits here carry a `Co-authored-by: Claude` trailer — `git log --grep='^Co-authored-by: Claude' -i --oneline | wc -l` if you want to check. I build with coding agents running in parallel git worktrees — one per phase of the roadmap above — and I review, benchmark, and integrate what comes back; the phase structure in the roadmap is what that parallelism is organised around. The parts that decided the shape of this project were not generated: the OverlayFS copy-up diagnosis at the top of this README came from reading `SyncDataDirectory`, instrumenting the writable layer, and running a single-variable control to prove the mechanism, and [docs/benchmarks.md](docs/benchmarks.md) still carries the pre-fix numbers that contradicted the project's own thesis rather than quietly replacing them. If you want to judge the engineering rather than the tooling, read that file and [docs/deep-dives.md](docs/deep-dives.md).
+Most of the commits here carry a `Co-authored-by: Claude` trailer — run `git log --grep='^Co-authored-by: Claude' -i --oneline | wc -l` against `git log --oneline | wc -l` for the current ratio. I build with coding agents running in parallel git worktrees — one per phase of the roadmap above — and I review, benchmark, and integrate what comes back; the phase structure in the roadmap is what that parallelism is organised around. The parts that decided the shape of this project were not generated: the OverlayFS copy-up diagnosis at the top of this README came from reading `SyncDataDirectory`, instrumenting the writable layer, and running a single-variable control to prove the mechanism, and [docs/benchmarks.md](docs/benchmarks.md) still carries the pre-fix numbers that contradicted the project's own thesis rather than quietly replacing them. If you want to judge the engineering rather than the tooling, read that file and [docs/deep-dives.md](docs/deep-dives.md).
 
 ## Documentation
 
