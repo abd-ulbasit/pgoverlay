@@ -95,19 +95,20 @@ jobs:
       # (hack/kind-up.sh) and loads its images itself.
       - name: Kubernetes runtime ITs (kind, hostPath)
         run: PGBRANCH_K8S_IT=1 go test ./internal/runtime/ -count=1 -timeout 25m
-      # Best-effort: the end-to-end helm-deploy and HA-failover suites and the
-      # CSI suite. These exercise full chart installs / port-forwards / pod
-      # failover whose timing is still being hardened for hosted runners, so
-      # they run and report but don't gate the build yet.
-      #
-      # continue-on-error hides the outcome completely — the badge stayed green
-      # for weeks over "--- FAIL: TestHelmDeployEndToEnd". The summary step
-      # below is the price of keeping these non-gating: a failure has to appear
-      # on the run page as a warning annotation and in the job summary.
-      - name: Helm deploy + HA-failover ITs (best-effort)
-        id: deploy_its
-        continue-on-error: true
+      # Gate: the end-to-end helm-deploy and HA-failover suites. These were
+      # `continue-on-error: true` while their timing was "still being hardened
+      # for hosted runners" — but what they were actually reporting was two
+      # real defects (a Dockerfile toolchain mismatch, and a port-forward
+      # pinned to the wrong namespace and then to the pod the test kills). The
+      # badge stayed green over "--- FAIL: TestHelmDeployEndToEnd" for weeks,
+      # which is worse than having no badge. Fixed and green on two
+      # consecutive runs, so it gates again.
+      - name: Helm deploy + HA-failover ITs (kind)
         run: PGBRANCH_K8S_IT=1 go test ./internal/deploy/ -count=1 -timeout 25m
+      # Still best-effort, and for a reason that is not pgbranch's code: the
+      # csi-driver-host-path install itself is flaky on hosted runners. It does
+      # not gate, but the summary step below makes sure "does not gate" never
+      # again means "nobody finds out".
       - name: CSI ITs (best-effort — csi-driver-host-path install can be flaky)
         id: csi_its
         continue-on-error: true
@@ -117,13 +118,14 @@ jobs:
       - name: Best-effort suite outcomes
         if: always()
         env:
-          DEPLOY: ${{ steps.deploy_its.outcome }}
           CSI: ${{ steps.csi_its.outcome }}
         run: |
-          echo "## Best-effort Kubernetes suites" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "These do not gate the build. A failure here still means something is broken." >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Best-effort Kubernetes suites"
+            echo ""
+            echo "These do not gate the build. A failure here still means something is broken."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
           note() {
             if [ "$2" = "success" ]; then
               echo "- PASS — $1" >> "$GITHUB_STEP_SUMMARY"
@@ -132,5 +134,4 @@ jobs:
               echo "- **FAIL ($2)** — $1" >> "$GITHUB_STEP_SUMMARY"
             fi
           }
-          note "Helm deploy + HA-failover ITs" "$DEPLOY"
           note "CSI ITs" "$CSI"
