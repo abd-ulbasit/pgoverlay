@@ -159,7 +159,7 @@ const pool = new Pool({ host: PGOVERLAY_HOST, port: 6432,
 ```
 
 Two ways to wire the deploy, both demonstrated in
-[pgbranch-demo](https://github.com/abd-ulbasit/pgbranch-demo):
+[pgoverlay-demo](https://github.com/abd-ulbasit/pgoverlay-demo):
 
 - **Managed platform (Vercel/Netlify/Render)** — set `PGOVERLAY_HOST` etc. as
   project env vars pointing at the proxy; the platform builds a preview per

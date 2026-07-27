@@ -149,4 +149,4 @@ running on EKS — they are why "works in kind" is not "works in production":
 3. **CI raced async branch creation.** With the instant ack, a fast runner
    reaches `psql` before the branch pod is ready. Consumers should wait for
    connectivity — see the retry loop in the
-   [demo repo's workflow](https://github.com/abd-ulbasit/pgbranch-demo/blob/main/.github/workflows/pr-db-check.yml).
+   [demo repo's workflow](https://github.com/abd-ulbasit/pgoverlay-demo/blob/main/.github/workflows/pr-db-check.yml).
