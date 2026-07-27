@@ -10,6 +10,10 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /pgbranch-github ./cmd/pgbranch-github
 
 FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+# See Dockerfile: image.source is what links the GHCR package back to this repo.
+LABEL org.opencontainers.image.source="https://github.com/abd-ulbasit/pgbranch" \
+      org.opencontainers.image.description="pgbranch ghook — a Postgres branch per pull request" \
+      org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /pgbranch-github /usr/local/bin/pgbranch-github
 # ghook is the internet-facing webhook receiver and needs no privileges: run as
 # a non-root, non-existent UID so the image is non-root even outside the chart

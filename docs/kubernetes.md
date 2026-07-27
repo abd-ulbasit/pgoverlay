@@ -15,7 +15,7 @@ mode — branches live in PersistentVolumeClaims (surviving node loss), pods
 schedule on any node and need no extra capabilities:
 
 ```bash
-make docker-build                          # builds pgbranch/branchd:dev (push it, or `kind load` for local clusters)
+make docker-build                          # builds ghcr.io/abd-ulbasit/pgbranch-branchd:dev (push it, or `kind load` for local clusters)
 helm install pgbranch deploy/helm/pgbranch \
   --namespace pgbranch-system --create-namespace \
   --set node=<node-for-branchd-state> \

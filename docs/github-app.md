@@ -120,7 +120,7 @@ branch operations run.
 ## Running on Kubernetes (Helm)
 
 The pgbranch chart ships the service as an optional sub-deployment
-(`deploy/helm/pgbranch`, image `pgbranch/ghook` — `make docker-build-ghook`):
+(`deploy/helm/pgbranch`, image `ghcr.io/abd-ulbasit/pgbranch-ghook` — `make docker-build-ghook`):
 
 ```sh
 helm upgrade --install pgbranch deploy/helm/pgbranch \

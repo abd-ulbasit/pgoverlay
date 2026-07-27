@@ -98,7 +98,7 @@ out=$(helm template rel "$CHART" --set node=worker-9 --set token=s3cret \
   --set ghook.enabled=true --set ghook.webhookSecret=whsec --set ghook.source=main \
   --set ghook.githubToken=ghp_abc --set ghook.repos='acme/widgets' \
   --set ghook.proxyHost=pg.example.com:30432 --set ghook.resetOnPush=true)
-has "$out" 'pgbranch/ghook:dev' ghook
+has "$out" 'ghcr.io/abd-ulbasit/pgbranch-ghook:dev' ghook
 has "$out" 'name: rel-pgbranch-ghook' ghook # deployment/service/secret share the name
 has "$out" 'GHOOK_PGBRANCH_SERVER' ghook
 has "$out" 'value: http://rel-pgbranch-api:7070' ghook # in-cluster DNS to branchd

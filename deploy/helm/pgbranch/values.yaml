@@ -71,8 +71,11 @@ replicaCount: 1
 leaderElection:
   enabled: false
 
+# Fully qualified on purpose. An unqualified name like "pgbranch/branchd"
+# resolves to docker.io/pgbranch/branchd — a namespace nobody here owns, so a
+# cluster that missed the side-load would silently pull whoever claims it next.
 image:
-  repository: pgbranch/branchd
+  repository: ghcr.io/abd-ulbasit/pgbranch-branchd
   tag: dev
   # The dev tag is built locally (make docker-build) and side-loaded
   # (e.g. `kind load`); change to Always for a pushed registry image.
@@ -191,7 +194,7 @@ networkPolicy:
 ghook:
   enabled: false
   image:
-    repository: pgbranch/ghook
+    repository: ghcr.io/abd-ulbasit/pgbranch-ghook
     tag: dev
     pullPolicy: IfNotPresent
   # Webhook HMAC secret (X-Hub-Signature-256). Exactly one is required when

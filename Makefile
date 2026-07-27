@@ -44,10 +44,10 @@ check-toolchain:
 	hack/check-toolchain.sh
 
 docker-build:
-	docker build -t pgbranch/branchd:dev .
+	docker build -t ghcr.io/abd-ulbasit/pgbranch-branchd:dev .
 
 docker-build-ghook:
-	docker build -f Dockerfile.ghook -t pgbranch/ghook:dev .
+	docker build -f Dockerfile.ghook -t ghcr.io/abd-ulbasit/pgbranch-ghook:dev .
 
 helm-test:
 	hack/helm-test.sh

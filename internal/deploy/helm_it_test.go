@@ -65,17 +65,17 @@ func writeKubeconfig(t *testing.T) string {
 	return p
 }
 
-// loadBranchdImage builds pgbranch/branchd:dev and side-loads it into kind.
+// loadBranchdImage builds ghcr.io/abd-ulbasit/pgbranch-branchd:dev and side-loads it into kind.
 // `kind load docker-image` fails with Colima's containerd image store on
 // multi-arch manifests, so export a single-platform archive (same trick as
 // hack/kind-up.sh) and fall back to a plain save for older docker.
 func loadBranchdImage(t *testing.T) {
 	t.Helper()
-	run(t, "docker", "build", "-t", "pgbranch/branchd:dev", ".")
+	run(t, "docker", "build", "-t", "ghcr.io/abd-ulbasit/pgbranch-branchd:dev", ".")
 	arch := strings.TrimSpace(run(t, "docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"))
 	tar := filepath.Join(t.TempDir(), "branchd.tar")
-	if cmd := exec.Command("docker", "save", "--platform", arch, "pgbranch/branchd:dev", "-o", tar); cmd.Run() != nil {
-		run(t, "docker", "save", "pgbranch/branchd:dev", "-o", tar)
+	if cmd := exec.Command("docker", "save", "--platform", arch, "ghcr.io/abd-ulbasit/pgbranch-branchd:dev", "-o", tar); cmd.Run() != nil {
+		run(t, "docker", "save", "ghcr.io/abd-ulbasit/pgbranch-branchd:dev", "-o", tar)
 	}
 	run(t, "kind", "load", "image-archive", tar, "--name", kindCluster)
 }

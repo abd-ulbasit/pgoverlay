@@ -42,7 +42,7 @@ aws eks describe-cluster-versions \
 
 ## Images
 
-The Helm chart defaults to locally-built `pgbranch/branchd:dev` images. For
+The Helm chart defaults to locally-built `ghcr.io/abd-ulbasit/pgbranch-branchd:dev` images. For
 a real cluster, push to a registry — and note two practical traps:
 
 - **Cross-compile on the host** (`GOOS=linux GOARCH=amd64 CGO_ENABLED=0`,
