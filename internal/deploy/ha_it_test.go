@@ -80,6 +80,7 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 		exec.Command("kubectl", "--kubeconfig", kc, "delete", "namespace", haNS,
 			"--ignore-not-found", "--wait").Run()
 	})
+	dumpOnFailure(t, kc, haNS)
 
 	// 2 replicas → the chart renders --leader-elect, POD_NAME and the leases
 	// RBAC. Both pods co-schedule to the storage node (RWO state dir).

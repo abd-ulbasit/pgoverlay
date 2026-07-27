@@ -47,6 +47,35 @@ func run(t *testing.T, name string, args ...string) string {
 	return string(out)
 }
 
+// dumpOnFailure prints pod state, events and branchd logs for ns when the test
+// has failed. `helm install --wait` reports only "Deployment not ready,
+// Available: 0/1", which names the symptom and nothing else — without this the
+// only way to find out why a pod never went Ready is to reproduce a kind
+// cluster locally.
+//
+// Register it AFTER the uninstall cleanup: t.Cleanup runs LIFO, so registering
+// it later makes it run earlier, and the evidence still exists when it does.
+func dumpOnFailure(t *testing.T, kc, ns string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		for _, args := range [][]string{
+			{"get", "pods", "-o", "wide"},
+			{"get", "events", "--sort-by=.lastTimestamp"},
+			{"describe", "pods"},
+			{"logs", "-l", "app.kubernetes.io/name=pgoverlay", "--all-containers",
+				"--prefix", "--tail=100"},
+		} {
+			out, err := exec.Command("kubectl",
+				append([]string{"--kubeconfig", kc, "-n", ns}, args...)...).CombinedOutput()
+			t.Logf("=== kubectl -n %s %s (err=%v) ===\n%s",
+				ns, strings.Join(args, " "), err, out)
+		}
+	})
+}
+
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	root, err := filepath.Abs("../..")
@@ -211,6 +240,7 @@ func TestHelmDeployEndToEnd(t *testing.T) {
 		exec.Command("kubectl", "--kubeconfig", kc, "delete", "namespace", helmNS,
 			"--ignore-not-found", "--wait").Run()
 	})
+	dumpOnFailure(t, kc, helmNS)
 
 	start := time.Now()
 	run(t, "helm", "--kubeconfig", kc, "install", release, "deploy/helm/pgoverlay",
