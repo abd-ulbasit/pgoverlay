@@ -15,7 +15,6 @@ mode — branches live in PersistentVolumeClaims (surviving node loss), pods
 schedule on any node and need no extra capabilities:
 
 ```bash
-make docker-build                          # builds ghcr.io/abd-ulbasit/pgoverlay-branchd:dev (push it, or `kind load` for local clusters)
 helm install pgoverlay deploy/helm/pgoverlay \
   --namespace pgoverlay-system --create-namespace \
   --set node=<node-for-branchd-state> \
@@ -23,6 +22,9 @@ helm install pgoverlay deploy/helm/pgoverlay \
   --set storage.mode=csi \
   --set storage.storageClass=<class-with-clone-support>
 ```
+
+Nothing needs building first: the chart pulls a published image (see
+[Images](#images) below).
 
 Requirements:
 
@@ -80,6 +82,30 @@ helm install pgoverlay deploy/helm/pgoverlay \
 > registry are gone. Branches are disposable by design, so for dev/test the
 > recovery is just re-seed and re-branch ([docs/eks.md](eks.md) walks the
 > procedure); if branch survival across node loss matters, use csi mode.
+
+## Images
+
+`image.tag` is empty by default, which means the chart's `appVersion`
+(`deploy/helm/pgoverlay/Chart.yaml`) — a tag published to
+`ghcr.io/abd-ulbasit/pgoverlay-branchd`. So a plain `helm install` pulls a
+real image and there is nothing to build first. `ghook.image.tag` follows the
+same appVersion for `ghcr.io/abd-ulbasit/pgoverlay-ghook`.
+
+To deploy a locally built image instead, build it, get it onto the node, and
+say so explicitly:
+
+```bash
+make docker-build                                                 # ghcr.io/abd-ulbasit/pgoverlay-branchd:dev
+kind load docker-image ghcr.io/abd-ulbasit/pgoverlay-branchd:dev  # or push to a registry the cluster can reach
+helm install pgoverlay deploy/helm/pgoverlay ... --set image.tag=dev
+```
+
+`dev` is only ever built locally and side-loaded; it is not pushed to any
+registry, so it needs both the load/push step and the explicit
+`--set image.tag=dev`. `make docker-build-ghook` and `--set ghook.image.tag=dev`
+are the ghook equivalents. For a private registry, override
+`image.repository`/`ghook.image.repository` too and attach an
+`imagePullSecret` ([docs/eks.md](eks.md#images) shows the EKS version).
 
 ## Values that matter
 

@@ -8,6 +8,16 @@ CHART=deploy/helm/pgoverlay
 has() { grep -qF -- "$2" <<<"$1" || { echo "FAIL: missing '$2' in $3 render" >&2; exit 1; }; }
 hasnt() { ! grep -qF -- "$2" <<<"$1" || { echo "FAIL: unexpected '$2' in $3 render" >&2; exit 1; }; }
 
+# The chart's default image tag is Chart.yaml's appVersion: values.yaml pins
+# image.tag to "" and both deployments render
+# `{{ .Values.image.tag | default .Chart.AppVersion }}`. appVersion is
+# therefore the literal tag kubelet pulls, and it has to be one that was
+# actually pushed to GHCR. `dev` is NOT: it is only ever built locally by
+# `make docker-build` and side-loaded, and defaulting to it is what put a
+# straight-from-the-README `helm install` into ImagePullBackOff.
+APPVERSION=$(awk -F': *' '/^appVersion:/{gsub(/"/,"",$2); print $2; exit}' "$CHART/Chart.yaml")
+[ -n "$APPVERSION" ] || { echo "FAIL: no appVersion in $CHART/Chart.yaml" >&2; exit 1; }
+
 helm lint "$CHART" --set node=test-node --set token=t >/dev/null
 
 # default values (only the two required ones set)
@@ -21,9 +31,17 @@ has "$out" 'value: /var/lib/pgoverlay/state' default # PGOVERLAY_HOME
 has "$out" 'name: pgoverlay-token' default           # secretKeyRef + rendered Secret
 has "$out" 'kind: Secret' default
 has "$out" 'pods/exec' default
+has "$out" "ghcr.io/abd-ulbasit/pgoverlay-branchd:$APPVERSION" default
+hasnt "$out" 'pgoverlay-branchd:dev' default # `dev` was never pushed anywhere
 # The chart deploys only branchd; SYS_ADMIN belongs to the branch pods branchd
 # creates at runtime and must NOT leak into any chart-rendered manifest.
 hasnt "$out" 'SYS_ADMIN' default
+
+# The local-build path stays available: --set image.tag=dev must still reach
+# the image `make docker-build` produces and side-loads (README, docs).
+out=$(helm template pgoverlay "$CHART" --set node=n --set token=t --set image.tag=dev)
+has "$out" 'ghcr.io/abd-ulbasit/pgoverlay-branchd:dev' local-tag
+hasnt "$out" "pgoverlay-branchd:$APPVERSION" local-tag
 
 # custom values: existing secret, custom data root, NodePort proxy
 out=$(helm template rel "$CHART" --set node=worker-9 --set existingSecret=my-token \
@@ -98,7 +116,8 @@ out=$(helm template rel "$CHART" --set node=worker-9 --set token=s3cret \
   --set ghook.enabled=true --set ghook.webhookSecret=whsec --set ghook.source=main \
   --set ghook.githubToken=ghp_abc --set ghook.repos='acme/widgets' \
   --set ghook.proxyHost=pg.example.com:30432 --set ghook.resetOnPush=true)
-has "$out" 'ghcr.io/abd-ulbasit/pgoverlay-ghook:dev' ghook
+has "$out" "ghcr.io/abd-ulbasit/pgoverlay-ghook:$APPVERSION" ghook # follows appVersion, as branchd does
+hasnt "$out" 'pgoverlay-ghook:dev' ghook
 has "$out" 'name: rel-pgoverlay-ghook' ghook # deployment/service/secret share the name
 has "$out" 'GHOOK_PGOVERLAY_SERVER' ghook
 has "$out" 'value: http://rel-pgoverlay-api:7070' ghook # in-cluster DNS to branchd

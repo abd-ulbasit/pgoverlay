@@ -42,8 +42,11 @@ aws eks describe-cluster-versions \
 
 ## Images
 
-The Helm chart defaults to locally-built `ghcr.io/abd-ulbasit/pgoverlay-branchd:dev` images. For
-a real cluster, push to a registry — and note two practical traps:
+The Helm chart defaults to `ghcr.io/abd-ulbasit/pgoverlay-branchd` at the
+chart's `appVersion` (`image.tag` is empty, meaning "follow the chart"), so a
+plain `helm install` pulls a published image. To run your own build — a fork, a
+patch, or an image mirrored into a registry inside the VPC — override both
+halves as the `helm install` below does, and note two practical traps:
 
 - **Cross-compile on the host** (`GOOS=linux GOARCH=amd64 CGO_ENABLED=0`,
   pure-Go thanks to modernc.org/sqlite) and build a copy-only image.

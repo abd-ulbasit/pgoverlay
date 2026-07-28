@@ -167,11 +167,18 @@ branchd serves a small embedded web UI at `http://localhost:7070/ui/` (the exact
 branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm chart deploys the whole thing — for a soup-to-nuts AWS walkthrough (Terraform, images, LoadBalancers, version upgrades, and the production bugs found doing it) see [docs/eks.md](docs/eks.md):
 
 ```bash
-make docker-build                          # builds ghcr.io/abd-ulbasit/pgoverlay-branchd:dev (push it, or `kind load` for local clusters)
 helm install pgoverlay deploy/helm/pgoverlay \
   --namespace pgoverlay-system --create-namespace \
   --set node=<storage-node-name> \
   --set token=$(openssl rand -hex 16)
+```
+
+That pulls the published image at the chart's `appVersion`, so there is nothing to build first. To deploy a local build instead — the usual kind loop — build it, side-load it, and point the chart at that tag:
+
+```bash
+make docker-build                                                 # ghcr.io/abd-ulbasit/pgoverlay-branchd:dev
+kind load docker-image ghcr.io/abd-ulbasit/pgoverlay-branchd:dev
+helm install pgoverlay deploy/helm/pgoverlay ... --set image.tag=dev
 ```
 
 Values that matter:

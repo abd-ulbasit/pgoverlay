@@ -76,9 +76,14 @@ leaderElection:
 # cluster that missed the side-load would silently pull whoever claims it next.
 image:
   repository: ghcr.io/abd-ulbasit/pgoverlay-branchd
-  tag: dev
-  # The dev tag is built locally (make docker-build) and side-loaded
-  # (e.g. `kind load`); change to Always for a pushed registry image.
+  # Empty means the chart's appVersion (Chart.yaml), which is the published
+  # image tag. Keeping it empty leaves one place to bump at release time.
+  # This used to default to `dev`, a tag only ever built locally (make
+  # docker-build) and side-loaded with `kind load`, never pushed anywhere — so
+  # a plain `helm install` straight from the README sat in ImagePullBackOff.
+  # For the local build path pass --set image.tag=dev, after side-loading that
+  # image into the cluster (`kind load docker-image ...`) or pushing it.
+  tag: ""
   pullPolicy: IfNotPresent
 
 # Bearer token for the REST API. Exactly one of these is required:
@@ -195,7 +200,9 @@ ghook:
   enabled: false
   image:
     repository: ghcr.io/abd-ulbasit/pgoverlay-ghook
-    tag: dev
+    # Empty means the chart's appVersion, same as the branchd image block
+    # above; --set ghook.image.tag=dev for a `make docker-build-ghook` build.
+    tag: ""
     pullPolicy: IfNotPresent
   # Webhook HMAC secret (X-Hub-Signature-256). Exactly one is required when
   # enabled:

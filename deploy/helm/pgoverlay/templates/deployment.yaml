@@ -32,7 +32,7 @@ spec:
       nodeName: {{ required "set node to the storage node name (kubectl get nodes)" .Values.node }}
       containers:
         - name: branchd
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if not (has .Values.storage.mode (list "hostpath" "csi")) }}
           {{- fail "storage.mode must be hostpath or csi" }}

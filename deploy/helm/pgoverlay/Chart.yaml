@@ -3,4 +3,10 @@ name: pgoverlay
 description: OverlayFS copy-on-write Postgres branches on Kubernetes (branchd control plane)
 type: application
 version: 0.2.0
-appVersion: "1.0.0-rc.4"
+# appVersion is the literal container image tag the chart pulls by default
+# (see values.yaml image.tag), so it must name a tag that has actually been
+# pushed to ghcr.io/abd-ulbasit/pgoverlay-branchd and -ghook. Every git tag,
+# GitHub release and GHCR tag in this repo is v-prefixed; keep the `v` here so
+# there is no transformation between what this file says and what kubelet
+# pulls. internal/deploy/image_names_test.go pins the shape.
+appVersion: "v1.0.0-rc.4"
