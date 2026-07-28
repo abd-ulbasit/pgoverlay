@@ -27,7 +27,7 @@ Two measurements turned that from a theory into the cause. The writable layer im
 
 Creation is now independent of database size — 1.90 s at 1 GiB, 1.89 s at 5 GiB, on a Colima VM on an M1 Pro. The cost did not disappear, it moved: OverlayFS copies up whole files and Postgres heap/index segments run to 1 GiB each, so a branch that rewrites everything still converges on ~1× the database — paid per file at first write instead of all at once at create. [docs/benchmarks.md](docs/benchmarks.md) has both tables in full, the methodology, the hardware, and the pre-fix numbers kept intact, including the write-amplification column that looked better before the fix than after it.
 
-The long-form write-up of the diagnosis — what `SyncDataDirectory` does, why OverlayFS turns it into a full copy, and how the control run pinned it down — is [**Postgres copied 5 GiB before recovery started**](https://basit.engineer/posts/postgres-copied-5gb-before-recovery-started.html).
+The long-form write-up of the diagnosis — what `SyncDataDirectory` does, why OverlayFS turns it into a full copy, and how the control run pinned it down — is [**Postgres copied 5 GiB before recovery started**](https://www.basit.engineer/posts/postgres-copied-5gb-before-recovery-started.html).
 
 ## The alternatives, and where pgoverlay sits
 
@@ -160,8 +160,6 @@ Honest caveat: the registry is SQLite, which is single-writer. Don't run local-m
 
 branchd serves a small embedded web UI at `http://localhost:7070/ui/` (the exact URL is logged at startup) — a single static page baked into the binary, no build toolchain, no CDN, works air-gapped. Paste your `PGOVERLAY_TOKEN` once (kept in the browser's localStorage); the page lists sources and branches with state, endpoint, expiry countdown and rw-layer disk usage, and has create/reset/destroy controls. Auto-refreshes every 5 seconds.
 
-*(screenshot placeholder: dark monospace dashboard with sources and branches tables)*
-
 ## Run on Kubernetes
 
 branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm chart deploys the whole thing — for a soup-to-nuts AWS walkthrough (Terraform, images, LoadBalancers, version upgrades, and the production bugs found doing it) see [docs/eks.md](docs/eks.md):
@@ -173,7 +171,7 @@ helm install pgoverlay deploy/helm/pgoverlay \
   --set token=$(openssl rand -hex 16)
 ```
 
-That pulls the published image at the chart's `appVersion`, so there is nothing to build first. To deploy a local build instead — the usual kind loop — build it, side-load it, and point the chart at that tag:
+That pulls the published image at the chart's `appVersion`, so there is nothing to build first. The published images are `linux/amd64` only, so on an arm64 cluster (a kind cluster on Apple Silicon, say) take the local-build path below instead. To deploy a local build — the usual kind loop — build it, side-load it, and point the chart at that tag:
 
 ```bash
 make docker-build                                                 # ghcr.io/abd-ulbasit/pgoverlay-branchd:dev
