@@ -2,12 +2,13 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -24,7 +25,7 @@ func TestDiffBranchEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	mustExec(t, ctx, hostConn, `CREATE TABLE dft_users(id int primary key, email text);
 		INSERT INTO dft_users SELECT i, 'u' || i FROM generate_series(1,500) i;
 		ANALYZE dft_users`)
@@ -141,7 +142,7 @@ func TestDiffBranchDataSampleEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	mustExec(t, ctx, hostConn, `CREATE TABLE diffd_users(id int primary key, email text);
 		INSERT INTO diffd_users SELECT i, 'u' || i FROM generate_series(1,10) i;
 		CREATE TABLE diffd_log(msg text);
@@ -234,6 +235,107 @@ func TestDiffBranchDataSampleEndToEnd(t *testing.T) {
 	}
 	if len(live) != 1 || live[0].Name != "diffd-pr-1" {
 		t.Errorf("live branches after diff = %+v, want [diffd-pr-1]", live)
+	}
+}
+
+// TestDiffBranchSchemasAndUnanalyzedEndToEnd covers the review findings on
+// real Postgres: a branch-only PK table is sampled (it used to fail the whole
+// diff with 'relation does not exist'), tables are keyed and queried by
+// schema (a grown table outside search_path used to fail sampling, and
+// same-named tables used to collide), a '|' in a table name parses, a
+// never-analyzed table (reltuples -1) is counted instead of reported as 0,
+// and sampling finds exactly the new keys in a table larger than the cap
+// whose branch also deleted a row. Names use a diffs- prefix.
+func TestDiffBranchSchemasAndUnanalyzedEndToEnd(t *testing.T) {
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
+	mustExec(t, ctx, hostConn, `CREATE SCHEMA app;
+		CREATE TABLE app.orders(id bigint primary key, note text);
+		INSERT INTO app.orders SELECT i, 'o' || i FROM generate_series(1,100) i;
+		CREATE TABLE public.orders(id int primary key);
+		INSERT INTO public.orders SELECT generate_series(1,5);
+		CREATE TABLE "odd|name"(x int);
+		INSERT INTO "odd|name" VALUES (1);
+		ANALYZE app.orders; ANALYZE public.orders; ANALYZE "odd|name";
+		CREATE TABLE unanalyzed(x int) WITH (autovacuum_enabled = false);
+		INSERT INTO unanalyzed SELECT generate_series(1,300)`)
+
+	d, err := runtime.NewDockerDriver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := registry.Open(t.TempDir() + "/it.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	e := New(r, d, "postgres:17")
+
+	src := &registry.Source{Name: "diffs-main", PGVersion: "17", ConnHost: host, ConnPort: port, ConnUser: "postgres", Network: network}
+	if err := e.AddSource(ctx, src, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.RemoveVolume(context.Background(), src.Volume) })
+
+	b, err := e.CreateBranch(ctx, "diffs-pr-1", "diffs-main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := e.DestroyBranch(context.Background(), "diffs-pr-1"); err != nil {
+			t.Errorf("destroy diffs-pr-1: %v", err)
+		}
+	})
+
+	mustExec(t, ctx, branchConn(b), `INSERT INTO app.orders SELECT i, 'new' || i FROM generate_series(101,103) i;
+		DELETE FROM app.orders WHERE id = 7;
+		ANALYZE app.orders;
+		CREATE TABLE audit_log(id bigint primary key, entry text);
+		INSERT INTO audit_log SELECT i, 'e' || i FROM generate_series(1,40) i;
+		ANALYZE audit_log;
+		INSERT INTO unanalyzed SELECT generate_series(301,310)`)
+
+	res, err := e.DiffBranch(ctx, "diffs-pr-1", WithDataSample(5))
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	get := func(schema, table string) TableDelta {
+		t.Helper()
+		for _, td := range res.Tables {
+			if td.Schema == schema && td.Table == table {
+				return td
+			}
+		}
+		t.Fatalf("%s.%s not in deltas: %+v", schema, table, res.Tables)
+		return TableDelta{}
+	}
+	ids := func(td TableDelta) string {
+		var out []float64
+		for _, row := range td.SampleRows {
+			out = append(out, row["id"].(float64))
+		}
+		return fmt.Sprint(out)
+	}
+
+	if o := get("app", "orders"); o.BaseRows != 100 || o.BranchRows != 102 || ids(o) != "[101 102 103]" {
+		t.Errorf("app.orders = %+v (samples %s), want 100 -> 102 with new ids [101 102 103]", o, ids(o))
+	}
+	if o := get("public", "orders"); o.BaseRows != 5 || o.BranchRows != 5 {
+		t.Errorf("public.orders = %+v, want 5/5 (separate from app.orders)", o)
+	}
+	if o := get("public", "odd|name"); o.BaseRows != 1 || o.BranchRows != 1 {
+		t.Errorf(`"odd|name" = %+v, want 1/1`, o)
+	}
+	if u := get("public", "unanalyzed"); u.RowsUnknown || u.BaseRows != 300 || u.BranchRows != 310 || u.Delta != 10 {
+		t.Errorf("unanalyzed = %+v, want exact 300 -> 310 (+10)", u)
+	}
+	if a := get("public", "audit_log"); a.BaseRows != 0 || a.BranchRows != 40 || ids(a) != "[36 37 38 39 40]" {
+		t.Errorf("audit_log = %+v (samples %s), want 0 -> 40 with the 5 newest ids", a, ids(a))
 	}
 }
 

@@ -94,6 +94,8 @@ func TestPathsForNamedResources(t *testing.T) {
 			"DELETE", "/v1/branches/pr%2F1", http.StatusNoContent},
 		{func(c *Client) error { _, err := c.ResetBranch(context.Background(), "pr-1"); return err },
 			"POST", "/v1/branches/pr-1/reset", http.StatusOK},
+		{func(c *Client) error { _, err := c.RecoverBranch(context.Background(), "pr-1"); return err },
+			"POST", "/v1/branches/pr-1/recover", http.StatusOK},
 		{func(c *Client) error { _, err := c.GetBranch(context.Background(), "pr-1"); return err },
 			"GET", "/v1/branches/pr-1", http.StatusOK},
 		{func(c *Client) error { return c.RemoveSource(context.Background(), "main") },
@@ -299,6 +301,42 @@ func TestNewWithCACertUsesPool(t *testing.T) {
 	}
 	if tr.TLSClientConfig == nil || tr.TLSClientConfig.RootCAs == nil {
 		t.Fatal("CA cert env did not install a root pool on the client transport")
+	}
+}
+
+// The custom-TLS transports keep http.DefaultTransport's behaviour (proxy
+// from the environment, handshake timeout), and a loaded CA wins over
+// PGOVERLAY_TLS_SKIP_VERIFY instead of being silently replaced by it.
+func TestCustomTLSTransportKeepsDefaults(t *testing.T) {
+	check := func(label string, c *Client) *http.Transport {
+		t.Helper()
+		tr, ok := c.HTTP.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("%s: transport = %T, want *http.Transport", label, c.HTTP.Transport)
+		}
+		if tr.Proxy == nil {
+			t.Errorf("%s: transport ignores HTTPS_PROXY (no Proxy func)", label)
+		}
+		if tr.TLSHandshakeTimeout <= 0 {
+			t.Errorf("%s: transport has no TLS handshake timeout", label)
+		}
+		return tr
+	}
+
+	t.Setenv("PGOVERLAY_TLS_SKIP_VERIFY", "1")
+	tr := check("skip-verify", New("https://branchd.example:7070", "tok"))
+	if !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Error("skip-verify alone did not disable verification")
+	}
+
+	t.Setenv("PGOVERLAY_CA_CERT", writeTestCACert(t))
+	tr = check("ca+skip-verify", New("https://branchd.example:7070", "tok"))
+	if tr.TLSClientConfig.InsecureSkipVerify || tr.TLSClientConfig.RootCAs == nil {
+		t.Errorf("with a loaded CA, verification must stay on against it: skip=%v roots=%v",
+			tr.TLSClientConfig.InsecureSkipVerify, tr.TLSClientConfig.RootCAs != nil)
+	}
+	if tr == http.DefaultTransport.(*http.Transport) {
+		t.Error("New modified http.DefaultTransport instead of a clone")
 	}
 }
 

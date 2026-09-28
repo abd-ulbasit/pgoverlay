@@ -2,17 +2,20 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // seedReady marks a freshly-created creating branch ready so it counts as live
 // with a stable rw volume (no driver provisioning involved).
 func markReady(t *testing.T, r *registry.Registry, b *registry.Branch, cid string) {
 	t.Helper()
-	if err := r.MarkBranchReady(b.ID, cid, "127.0.0.1", 5432); err != nil {
+	if err := r.MarkBranchReady(b.ID, cid, "127.0.0.1", 54321); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -426,5 +429,746 @@ func TestReconcileStuckResettingParentKeepsRWReferencedBySourceVolume(t *testing
 	}
 	if !d.volumes["pgoverlay-br-parent-rw"] {
 		t.Fatal("DATA LOSS: reconcile deleted the csi/zfs freeze parent's rw volume")
+	}
+}
+
+// --- registry -> runtime drift (issue #8) ---
+
+// readyBranch provisions a branch through the engine (fake driver) and returns
+// its row.
+func readyBranch(t *testing.T, e *Engine, name string) *registry.Branch {
+	t.Helper()
+	b, err := e.CreateBranch(context.Background(), name, "main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func mustBranch(t *testing.T, r *registry.Registry, name string) *registry.Branch {
+	t.Helper()
+	b, err := r.GetBranchByName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// A ready branch whose container was removed behind pgoverlay's back
+// (`docker rm -f`, a deleted or drained pod) is drift: doctor reports it, and
+// reconcile starts a new container on the branch's EXISTING volumes (its
+// writes live there) and records it — instead of leaving a "ready" row that
+// routes to nothing.
+func TestReconcileRestartsReadyBranchWhoseContainerIsGone(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+	delete(d.containers, b.ContainerID) // docker rm -f
+
+	before := len(d.log)
+	plan, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(plan, ActionRestartBranch, "pr-1") {
+		t.Fatalf("doctor does not report the missing container: %+v", plan.Actions)
+	}
+	if len(d.log) != before {
+		t.Fatalf("plan mutated the driver: %v", d.log[before:])
+	}
+
+	starts := d.starts
+	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionRestartBranch, "pr-1") {
+		t.Fatalf("restart not applied: %+v", taken.Actions)
+	}
+	if d.starts != starts+1 {
+		t.Fatalf("starts = %d, want one new container", d.starts-starts)
+	}
+	got := mustBranch(t, r, "pr-1")
+	if got.State != registry.BranchReady || !d.containers[got.ContainerID] || got.Host != "127.0.0.1" || got.Port != 54321 {
+		t.Fatalf("after restart: %+v (container present=%v)", got, d.containers[got.ContainerID])
+	}
+	// the restart reuses the branch's rw volume and overlay stack; it never
+	// creates or removes a volume
+	for _, entry := range d.log[before:] {
+		if strings.HasPrefix(entry, "volume:") || strings.HasPrefix(entry, "rmvolume:") {
+			t.Fatalf("restart touched volumes: %v", d.log[before:])
+		}
+	}
+	spec := d.branches[len(d.branches)-1]
+	if spec.Name != "pgoverlay-br-pr-1" || spec.Mounts[len(spec.Mounts)-1].Volume != b.RWVolume || spec.Mounts[0].Volume != b.SourceVolume {
+		t.Fatalf("restarted spec = %+v, want the branch's own overlay stack", spec)
+	}
+	// converged: the next plan is clean
+	if plan, _ := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute); plan.Drift() {
+		t.Fatalf("drift after restart: %+v", plan.Actions)
+	}
+}
+
+// A container that is stopped for good (docker stop, exited and not restarted
+// by the policy, an evicted pod) is replaced the same way; the dead container
+// is removed first.
+func TestReconcileRestartsStoppedContainer(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+	d.containerState[b.ContainerID] = runtime.ContainerInfo{Stopped: true, Status: "exited (0)"}
+
+	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionRestartBranch, "pr-1") {
+		t.Fatalf("stopped container not restarted: %+v", taken.Actions)
+	}
+	if d.logIndex("stop:"+b.ContainerID) < 0 {
+		t.Fatal("the stopped container was not removed before the restart")
+	}
+	if got := mustBranch(t, r, "pr-1"); got.State != registry.BranchReady || !d.containers[got.ContainerID] {
+		t.Fatalf("after restart: %+v", got)
+	}
+}
+
+// A container the runtime is still bringing back (docker restarting, a
+// Pending or terminating pod) is not drift yet.
+func TestReconcileLeavesContainerInFluxAlone(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+	d.containerState[b.ContainerID] = runtime.ContainerInfo{Status: "restarting"}
+
+	plan, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Drift() {
+		t.Fatalf("container in flux reported as drift: %+v", plan.Actions)
+	}
+}
+
+// A container running on a different address than the registry routes to —
+// docker re-published it on another port, or the pod came back with a new IP —
+// has the new address recorded.
+func TestReconcileRecordsMovedEndpoint(t *testing.T) {
+	for _, moved := range []runtime.ContainerInfo{
+		{Running: true, Host: "127.0.0.1", Port: 40002}, // docker: new host port
+		{Running: true, Host: "10.244.0.9", Port: 5432}, // kube: new pod IP
+	} {
+		d := newFake()
+		e, r := testEngine(t, d)
+		readySource(t, r)
+		b := readyBranch(t, e, "pr-1")
+		d.containerState[b.ContainerID] = moved
+
+		plan, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !hasAction(plan, ActionUpdateEndpoint, "pr-1") {
+			t.Fatalf("moved endpoint %s:%d not reported: %+v", moved.Host, moved.Port, plan.Actions)
+		}
+		starts := d.starts
+		if _, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		got := mustBranch(t, r, "pr-1")
+		if got.Host != moved.Host || got.Port != moved.Port || got.ContainerID != b.ContainerID {
+			t.Fatalf("endpoint = %s:%d (container %s), want %s:%d on the same container", got.Host, got.Port, got.ContainerID, moved.Host, moved.Port)
+		}
+		if d.starts != starts {
+			t.Fatal("a moved endpoint must not restart the branch")
+		}
+	}
+}
+
+// A branch that does not come back after the restart is failed with the
+// reason, through legal transitions, and keeps its volumes; the container that
+// never became ready is removed.
+func TestReconcileFailsBranchThatDoesNotComeBack(t *testing.T) {
+	old := restartReadyTimeout
+	restartReadyTimeout = time.Millisecond
+	t.Cleanup(func() { restartReadyTimeout = old })
+
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+	delete(d.containers, b.ContainerID)
+	d.execErr = errors.New("no response") // pg_isready never succeeds
+
+	_, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "marked failed") {
+		t.Fatalf("ApplyReconcile = %v, want the restart failure reported", err)
+	}
+	got := mustBranch(t, r, "pr-1")
+	if got.State != registry.BranchFailed {
+		t.Fatalf("state = %q, want failed", got.State)
+	}
+	if !d.volumes[b.RWVolume] {
+		t.Fatal("the failed branch's rw volume was removed; its data must be kept")
+	}
+	if d.containers[got.ContainerID] {
+		t.Fatal("the container that never became ready was left running")
+	}
+	hist, err := r.BranchHistory("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := hist[len(hist)-1]
+	if last.FromState != "resetting" || last.ToState != "failed" || !strings.Contains(last.Reason, "restart failed") {
+		t.Fatalf("last transition = %+v", last)
+	}
+	// failed rows are not ready: no further restarts are planned
+	if plan, _ := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute); hasAction(plan, ActionRestartBranch, "pr-1") {
+		t.Fatalf("restart planned again for a failed branch: %+v", plan.Actions)
+	}
+}
+
+// csi branches restart as a direct pod on their own PVC.
+func TestReconcileRestartsCSIBranchOnItsPVC(t *testing.T) {
+	d := newFake()
+	e, r := csiEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+	delete(d.containers, b.ContainerID)
+
+	if _, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	spec := d.branches[len(d.branches)-1]
+	if len(spec.Mounts) != 1 || spec.Mounts[0].Volume != b.RWVolume {
+		t.Fatalf("restarted csi spec mounts = %+v, want only the branch PVC", spec.Mounts)
+	}
+	if len(d.clones) != 1 {
+		t.Fatalf("clones = %v: a restart must not re-clone the PVC", d.clones)
+	}
+	if got := mustBranch(t, r, "pr-1"); got.State != registry.BranchReady || !d.containers[got.ContainerID] {
+		t.Fatalf("after restart: %+v", got)
+	}
+}
+
+// A container that holds the branch's name but was never recorded (a restart
+// interrupted between start and record) is removed before the new one
+// starts; one that belongs to something else stops the restart.
+func TestReconcileRestartClearsStrayContainerName(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+	delete(d.containers, b.ContainerID)
+	// kube-style id == name, labelled for this branch
+	d.containers["pgoverlay-br-pr-1"] = true
+	d.containerLbls["pgoverlay-br-pr-1"] = e.branchLabels(b)
+
+	if _, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if d.logIndex("stop:pgoverlay-br-pr-1") < 0 {
+		t.Fatal("stray same-named container was not removed")
+	}
+
+	// foreign holder of the name: refuse
+	got := mustBranch(t, r, "pr-1")
+	delete(d.containers, got.ContainerID)
+	d.containers["pgoverlay-br-pr-1"] = true
+	d.containerLbls["pgoverlay-br-pr-1"] = map[string]string{runtime.LabelInstance: "someone-else"}
+	_, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "not this branch's container") {
+		t.Fatalf("ApplyReconcile = %v, want the name conflict reported", err)
+	}
+	if !d.containers["pgoverlay-br-pr-1"] {
+		t.Fatal("a container belonging to something else was removed")
+	}
+}
+
+// The Postgres router's dial-failure path re-reads the address from the
+// runtime and records it, rate-limited per branch.
+func TestRefreshBranchEndpoint(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+	d.containerState[b.ContainerID] = runtime.ContainerInfo{Running: true, Host: "127.0.0.1", Port: 40002}
+
+	addr, err := e.RefreshBranchEndpoint(context.Background(), "pr-1")
+	if err != nil || addr != "127.0.0.1:40002" {
+		t.Fatalf("RefreshBranchEndpoint = %q, %v", addr, err)
+	}
+	if got := mustBranch(t, r, "pr-1"); got.Port != 40002 {
+		t.Fatalf("registry port = %d, want 40002", got.Port)
+	}
+	// within the rate limit the runtime is not asked again
+	inspects := d.inspects
+	d.containerState[b.ContainerID] = runtime.ContainerInfo{Running: true, Host: "127.0.0.1", Port: 40003}
+	if addr, _ := e.RefreshBranchEndpoint(context.Background(), "pr-1"); addr != "127.0.0.1:40002" || d.inspects != inspects {
+		t.Fatalf("second refresh = %q (inspects %d -> %d), want the recorded address without an inspect", addr, inspects, d.inspects)
+	}
+	if _, err := e.RefreshBranchEndpoint(context.Background(), "nope"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("unknown branch: %v", err)
+	}
+}
+
+// Every repair that changes a ready branch's container or address is in its
+// history (issue #8): restart_branch and update_endpoint journal a ready ->
+// ready entry naming the reason, by system:reconcile when the reconcile loop
+// ran them, and the router's address refresh does the same. A pass with
+// nothing to repair journals nothing.
+func TestReconcileRepairsAreJournaled(t *testing.T) {
+	ctx := context.Background()
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+
+	// restart_branch: the container was removed
+	delete(d.containers, b.ContainerID)
+	if taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute); err != nil || !hasAction(taken, ActionRestartBranch, "pr-1") {
+		t.Fatalf("restart: %+v, %v", taken.Actions, err)
+	}
+	restarted := mustBranch(t, r, "pr-1")
+	last := lastTransition(t, r, "pr-1")
+	for _, want := range []string{"reconcile:", "container " + b.ContainerID + " of the ready branch is gone", "restarted", restarted.ContainerID, "127.0.0.1:54321"} {
+		if !strings.Contains(last.Reason, want) {
+			t.Errorf("restart entry %q does not mention %q", last.Reason, want)
+		}
+	}
+	if last.FromState != "ready" || last.ToState != "ready" || last.Actor != registry.SystemActor {
+		t.Fatalf("restart entry = %+v, want ready -> ready by %s", last, registry.SystemActor)
+	}
+
+	// restart_branch: the container is stopped for good
+	d.containerState[restarted.ContainerID] = runtime.ContainerInfo{Stopped: true, Status: "exited (0)"}
+	if taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute); err != nil || !hasAction(taken, ActionRestartBranch, "pr-1") {
+		t.Fatalf("restart of the stopped container: %+v, %v", taken.Actions, err)
+	}
+	if last := lastTransition(t, r, "pr-1"); !strings.Contains(last.Reason, "is not running (exited (0))") || !strings.Contains(last.Reason, "restarted") {
+		t.Fatalf("stopped-container entry = %+v", last)
+	}
+
+	// update_endpoint: the container runs on another port
+	cur := mustBranch(t, r, "pr-1")
+	d.containerState[cur.ContainerID] = runtime.ContainerInfo{Running: true, Host: "127.0.0.1", Port: 40002}
+	if taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute); err != nil || !hasAction(taken, ActionUpdateEndpoint, "pr-1") {
+		t.Fatalf("update_endpoint: %+v, %v", taken.Actions, err)
+	}
+	last = lastTransition(t, r, "pr-1")
+	if want := "reconcile: container " + cur.ContainerID + " moved from 127.0.0.1:54321 to 127.0.0.1:40002; recorded the new address"; last.Reason != want ||
+		last.FromState != "ready" || last.ToState != "ready" || last.Actor != registry.SystemActor {
+		t.Fatalf("update_endpoint entry = %+v, want %q by %s", last, want, registry.SystemActor)
+	}
+
+	// nothing to repair: nothing journaled
+	hist, _ := r.BranchHistory("pr-1")
+	if taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute); err != nil || taken.Drift() {
+		t.Fatalf("converged pass: %+v, %v", taken.Actions, err)
+	}
+	if again, _ := r.BranchHistory("pr-1"); len(again) != len(hist) {
+		t.Fatalf("a pass with no repair journaled %+v", again[len(hist):])
+	}
+
+	// the router's refresh after a failed dial
+	d.containerState[cur.ContainerID] = runtime.ContainerInfo{Running: true, Host: "127.0.0.1", Port: 40003}
+	if addr, err := e.RefreshBranchEndpoint(ctx, "pr-1"); err != nil || addr != "127.0.0.1:40003" {
+		t.Fatalf("RefreshBranchEndpoint = %q, %v", addr, err)
+	}
+	if last := lastTransition(t, r, "pr-1"); !strings.HasPrefix(last.Reason, "router: container "+cur.ContainerID+" moved from 127.0.0.1:40002 to 127.0.0.1:40003") {
+		t.Fatalf("router refresh entry = %+v", last)
+	}
+}
+
+// --- in-flight volumes and volume GC grace (issue #11) ---
+
+// Reconcile running while a freeze is between creating the parent's fresh rw
+// volume and CommitFreeze must not GC that volume: no row names it yet.
+func TestReconcileMidFreezeKeepsParentsNewRWVolume(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	readyBranch(t, e, "p")
+	newRW := "pgoverlay-br-p-rw-g2"
+
+	var mid ReconcilePlan
+	ran := false
+	d.onStartBranch = func(s runtime.BranchSpec) {
+		if s.Name != "pgoverlay-br-p" || ran {
+			return
+		}
+		ran = true // the parent's restart over the frozen chain: newRW exists, unrecorded
+		taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+		if err != nil {
+			t.Errorf("mid-freeze reconcile: %v", err)
+		}
+		mid = taken
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "c", "p", 0); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("hook never ran")
+	}
+	if hasAction(mid, ActionGCVolume, newRW) {
+		t.Fatalf("DATA LOSS: mid-freeze reconcile GC'd the parent's new rw volume: %+v", mid.Actions)
+	}
+	if !d.volumes[newRW] {
+		t.Fatal("DATA LOSS: the parent's new rw volume is gone")
+	}
+	if got := mustBranch(t, r, "p"); got.RWVolume != newRW || got.State != registry.BranchReady {
+		t.Fatalf("parent after freeze: %+v", got)
+	}
+}
+
+// Reconcile running while a source refresh is seeding the next generation
+// must not GC that volume: BumpSourceGeneration has not recorded it yet.
+func TestReconcileMidRefreshKeepsNextGenerationVolume(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	next := "pgoverlay-src-main-g2"
+
+	var mid ReconcilePlan
+	ran := false
+	d.onRunHelper = func(runtime.HelperSpec) {
+		if ran || !d.volumes[next] {
+			return
+		}
+		ran = true // seeding into the unrecorded next generation
+		taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+		if err != nil {
+			t.Errorf("mid-refresh reconcile: %v", err)
+		}
+		mid = taken
+	}
+	if err := e.RefreshSource(context.Background(), "main", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("hook never ran")
+	}
+	if hasAction(mid, ActionGCVolume, next) || !d.volumes[next] {
+		t.Fatalf("DATA LOSS: mid-refresh reconcile GC'd the new generation: %+v", mid.Actions)
+	}
+	if src := mustSource(t, r); src.Volume != next {
+		t.Fatalf("source volume = %q, want %q", src.Volume, next)
+	}
+}
+
+// An unrecorded volume younger than the stuck timeout may belong to an
+// operation in another process; it is only GC'd once it is older.
+func TestReconcileVolumeGCGracePeriod(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	now := time.Now()
+	d.addOrphanVolume("pgoverlay-br-young-rw", r.InstanceID())
+	d.volumeCreated["pgoverlay-br-young-rw"] = now.Add(-time.Minute)
+	d.addOrphanVolume("pgoverlay-br-old-rw", r.InstanceID())
+	d.volumeCreated["pgoverlay-br-old-rw"] = now.Add(-time.Hour)
+
+	plan, err := e.PlanReconcile(context.Background(), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasAction(plan, ActionGCVolume, "pgoverlay-br-young-rw") {
+		t.Fatalf("volume younger than the stuck timeout planned for GC: %+v", plan.Actions)
+	}
+	if !hasAction(plan, ActionGCVolume, "pgoverlay-br-old-rw") {
+		t.Fatalf("old orphan volume not planned: %+v", plan.Actions)
+	}
+}
+
+// A volume an in-flight saga has claimed in the registry (pending_volume on
+// its owner row, as a freeze does for the parent's swap volume) is skipped at
+// plan time and re-checked at apply time. The claim is a registry column, so
+// it holds whichever process runs the saga; it stops counting once the owner
+// row leaves creating/resetting (a crashed saga's row is failed by reconcile).
+func TestReconcileSkipsClaimedVolume(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	x := readyBranch(t, e, "x")
+	if err := r.TransitionBranch(x.ID, registry.BranchResetting, "freeze for child c"); err != nil {
+		t.Fatal(err)
+	}
+	const swap = "pgoverlay-br-x-rw-g2"
+	d.addOrphanVolume(swap, r.InstanceID())
+	plan := func() ReconcilePlan {
+		t.Helper()
+		p, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	if err := r.SetBranchPendingVolume(x.ID, swap); err != nil {
+		t.Fatal(err)
+	}
+	if p := plan(); hasAction(p, ActionGCVolume, swap) {
+		t.Fatalf("claimed volume planned for GC: %+v", p.Actions)
+	}
+	if err := r.SetBranchPendingVolume(x.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if p := plan(); !hasAction(p, ActionGCVolume, swap) {
+		t.Fatalf("released volume not planned: %+v", p.Actions)
+	}
+	// claimed between plan and apply: the apply-time re-check keeps it
+	if err := r.SetBranchPendingVolume(x.ID, swap); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := e.applyAction(context.Background(), Action{Kind: ActionGCVolume, Target: swap}, reconcilePass{now: time.Now(), stuckTimeout: 10 * time.Minute})
+	if err != nil || applied || !d.volumes[swap] {
+		t.Fatalf("apply on a claimed volume: applied=%v err=%v present=%v", applied, err, d.volumes[swap])
+	}
+	// the owner row failed (its saga died): the claim no longer pins the volume
+	if err := r.TransitionBranch(x.ID, registry.BranchFailed, "crashed mid-freeze"); err != nil {
+		t.Fatal(err)
+	}
+	if p := plan(); !hasAction(p, ActionGCVolume, swap) {
+		t.Fatalf("dead claim still pins the volume: %+v", p.Actions)
+	}
+}
+
+// --- apply-time races ---
+
+// fail_stuck loses to a saga that finished between plan and apply: the row
+// stays ready and its container and volume are untouched (the compare-and-swap
+// to failed runs before any teardown).
+func TestFailStuckLosesToSagaThatFinished(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := &registry.Branch{Name: "slow", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-slow-rw"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes[b.RWVolume] = true
+	if err := r.SetBranchContainer(b.ID, "cid-slow"); err != nil {
+		t.Fatal(err)
+	}
+	d.containers["cid-slow"] = true
+
+	now := time.Now().Add(time.Hour)
+	plan, err := e.PlanReconcile(context.Background(), now, 10*time.Minute)
+	if err != nil || !hasAction(plan, ActionFailStuck, "slow") {
+		t.Fatalf("plan = %+v, %v", plan.Actions, err)
+	}
+	// the saga wins the race
+	if err := r.MarkBranchReady(b.ID, "cid-slow", "127.0.0.1", 54321); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := e.applyAction(context.Background(), Action{Kind: ActionFailStuck, Target: "slow"}, reconcilePass{now: now, stuckTimeout: 10 * time.Minute})
+	if err != nil || applied {
+		t.Fatalf("applied=%v err=%v, want a silent skip", applied, err)
+	}
+	if got := mustBranch(t, r, "slow"); got.State != registry.BranchReady {
+		t.Fatalf("state = %q, want ready", got.State)
+	}
+	if !d.containers["cid-slow"] || !d.volumes[b.RWVolume] {
+		t.Fatal("fail_stuck tore down a branch whose saga had finished")
+	}
+}
+
+// A reap planned for an expired branch is skipped when a reset started after
+// planning: destroying it would force it out of resetting under the reset.
+func TestReapSkipsBranchThatStartedResetting(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "ttl", "main", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Add(time.Hour)
+	plan, err := e.PlanReconcile(context.Background(), now, 10*time.Minute)
+	if err != nil || !hasAction(plan, ActionReap, "ttl") {
+		t.Fatalf("plan = %+v, %v", plan.Actions, err)
+	}
+	b := mustBranch(t, r, "ttl")
+	if err := r.TransitionBranch(b.ID, registry.BranchResetting, "reset requested"); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := e.applyAction(context.Background(), Action{Kind: ActionReap, Target: "ttl"}, reconcilePass{now: now, stuckTimeout: 10 * time.Minute})
+	if err != nil || applied {
+		t.Fatalf("applied=%v err=%v, want the reap skipped", applied, err)
+	}
+	if got := mustBranch(t, r, "ttl"); got.State != registry.BranchResetting {
+		t.Fatalf("state = %q, want still resetting", got.State)
+	}
+}
+
+// A container a saga has started but not yet recorded carries its branch id
+// label; while that branch is in flight it is not an orphan. Once the branch
+// is failed, the leftover is reclaimed.
+func TestReconcileKeepsUnrecordedContainerOfInFlightBranch(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := &registry.Branch{Name: "inflight", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-inflight-rw"}
+	if err := r.CreateBranch(b); err != nil { // creating, no container recorded yet
+		t.Fatal(err)
+	}
+	d.containers["cid-new"] = true
+	d.containerLbls["cid-new"] = e.branchLabels(b)
+
+	plan, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasAction(plan, ActionRemoveOrphanContainer, "cid-new") {
+		t.Fatalf("in-flight saga's unrecorded container planned as orphan: %+v", plan.Actions)
+	}
+	if err := r.TransitionBranch(b.ID, registry.BranchFailed, "saga died"); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionRemoveOrphanContainer, "cid-new") || d.containers["cid-new"] {
+		t.Fatalf("leftover of a failed branch not reclaimed: %+v", taken.Actions)
+	}
+}
+
+// --- stuck sources, stuck destroys, orphan helpers ---
+
+// A source left in seeding by a process that died (no heartbeat for the stuck
+// timeout) is failed and its half-seeded volume removed, so it no longer
+// blocks branch creates and refreshes forever.
+func TestReconcileFailsSourceStuckInSeeding(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
+	if err := r.CreateSource(s); err != nil { // state seeding
+		t.Fatal(err)
+	}
+	d.volumes[s.Volume] = true
+
+	// fresh: a seed in progress
+	if plan, _ := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute); hasAction(plan, ActionFailStuckSource, "main") {
+		t.Fatalf("fresh seeding source planned: %+v", plan.Actions)
+	}
+	// seeded by this process: skipped however old
+	stop := e.trackSeeding(s.ID)
+	if plan, _ := e.PlanReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute); hasAction(plan, ActionFailStuckSource, "main") {
+		t.Fatalf("source seeded in-process planned: %+v", plan.Actions)
+	}
+	stop()
+
+	taken, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionFailStuckSource, "main") {
+		t.Fatalf("stuck source not failed: %+v", taken.Actions)
+	}
+	got, err := r.GetSourceByID(s.ID)
+	if err != nil || got.State != registry.SourceFailed {
+		t.Fatalf("source = %+v, %v; want failed", got, err)
+	}
+	if d.volumes[s.Volume] {
+		t.Fatal("half-seeded volume not removed")
+	}
+}
+
+// A running seed heartbeats its source row, so a long seed is never mistaken
+// for an abandoned one by another process's reconcile.
+func TestSeedHeartbeatKeepsSourceFresh(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	e.heartbeatEvery = 5 * time.Millisecond // what WithHeartbeatInterval sets
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	start := registry.TimeString(time.Now())
+	if stuck, _ := r.ListStuckSources(start); len(stuck) != 1 {
+		t.Fatalf("precondition: source not older than %s", start)
+	}
+	stop := e.trackSeeding(s.ID)
+	defer stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		stuck, err := r.ListStuckSources(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(stuck) == 0 {
+			return // heartbeat moved updated_at past start
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed heartbeat never refreshed the source row")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A branch wedged in destroying past the stuck timeout gets its teardown
+// retried (DestroyBranch resumes from destroying once issue #10 lands).
+func TestReconcileRetriesStuckDestroy(t *testing.T) {
+	var resumed []string
+	old := resumeDestroy
+	resumeDestroy = func(e *Engine, ctx context.Context, name string) error {
+		resumed = append(resumed, name)
+		return nil
+	}
+	t.Cleanup(func() { resumeDestroy = old })
+
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "gone")
+	if err := r.TransitionBranch(b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
+		t.Fatal(err)
+	}
+	if plan, _ := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute); hasAction(plan, ActionRetryDestroy, "gone") {
+		t.Fatalf("destroy in progress planned for retry: %+v", plan.Actions)
+	}
+	taken, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionRetryDestroy, "gone") || len(resumed) != 1 || resumed[0] != "gone" {
+		t.Fatalf("retry_destroy not applied: taken=%+v resumed=%v", taken.Actions, resumed)
+	}
+}
+
+// A helper container that finished but was never removed (the process that
+// ran it died) is reclaimed once it is older than the grace; running helpers
+// and recent ones are left alone.
+func TestReconcileRemovesFinishedOrphanHelper(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	now := time.Now()
+	helper := func(id string, state runtime.ContainerInfo) {
+		state.ID = id
+		d.containers[id] = true
+		d.containerState[id] = state
+		d.helperList = append(d.helperList, state)
+	}
+	helper("h-old-exited", runtime.ContainerInfo{Stopped: true, Status: "Exited (0)", Created: now.Add(-time.Hour)})
+	helper("h-old-running", runtime.ContainerInfo{Running: true, Created: now.Add(-time.Hour)})
+	helper("h-new-exited", runtime.ContainerInfo{Stopped: true, Created: now.Add(-time.Minute)})
+
+	taken, err := e.ApplyReconcile(context.Background(), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionRemoveOrphanHelper, "h-old-exited") || d.containers["h-old-exited"] {
+		t.Fatalf("finished orphan helper not removed: %+v", taken.Actions)
+	}
+	if hasAction(taken, ActionRemoveOrphanHelper, "h-old-running") || !d.containers["h-old-running"] {
+		t.Fatal("a running helper was removed")
+	}
+	if hasAction(taken, ActionRemoveOrphanHelper, "h-new-exited") || !d.containers["h-new-exited"] {
+		t.Fatal("a helper inside the grace period was removed")
 	}
 }

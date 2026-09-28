@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/abd-ulbasit/pgoverlay/security/advisories/new
+    about: Report vulnerabilities privately through a GitHub security advisory, not in a public issue.
+  - name: Documentation
+    url: https://github.com/abd-ulbasit/pgoverlay/tree/main/docs
+    about: Quickstart, Kubernetes, HA, the GitHub App and the API stability policy.

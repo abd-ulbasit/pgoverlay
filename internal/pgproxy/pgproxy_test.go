@@ -238,10 +238,12 @@ func TestConnectionCapRefusesPastMax(t *testing.T) {
 
 // Once relaying, a session that goes quiet in both directions for longer than
 // IdleTimeout is torn down. The backend stays connected but silent after the
-// initial handshake; with a short idle timeout the client's relayed read ends.
+// handshake (through ReadyForQuery, when idle deadlines take over from the
+// auth deadline); with a short idle timeout the client's relayed read ends.
 func TestRelayIdleTimeoutClosesQuietSession(t *testing.T) {
 	port := fakeBackend(t, func(conn net.Conn, be *pgproto3.Backend, sm *pgproto3.StartupMessage) {
 		be.Send(&pgproto3.AuthenticationOk{})
+		be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		be.Flush()
 		// Then go silent and just hold the connection open.
 		io.Copy(io.Discard, conn)
@@ -261,6 +263,11 @@ func TestRelayIdleTimeoutClosesQuietSession(t *testing.T) {
 		t.Fatalf("first receive: %v", err)
 	} else if _, ok := msg.(*pgproto3.AuthenticationOk); !ok {
 		t.Fatalf("got %T, want *AuthenticationOk", msg)
+	}
+	if msg, err := fe.Receive(); err != nil {
+		t.Fatalf("second receive: %v", err)
+	} else if _, ok := msg.(*pgproto3.ReadyForQuery); !ok {
+		t.Fatalf("got %T, want *ReadyForQuery", msg)
 	}
 
 	// No more traffic either way: the idle timeout should close the relay and
@@ -472,6 +479,8 @@ func TestSSLRequestRepeatedWithoutTLSStaysN(t *testing.T) {
 	}
 }
 
+// A CancelRequest whose key no live session holds is dropped and the
+// connection closed without a reply, as Postgres does.
 func TestCancelRequestClosedSilently(t *testing.T) {
 	addr := startProxy(t, fakeResolver{})
 	conn := dialProxy(t, addr)
@@ -593,6 +602,88 @@ func TestBackendDialFailureRefused(t *testing.T) {
 	}
 }
 
+// refreshingResolver resolves to a stale address and refreshes to a new one.
+type refreshingResolver struct {
+	stale, fresh string
+	refreshed    []string
+}
+
+func (r *refreshingResolver) ResolveBranch(name string) (string, error) { return r.stale, nil }
+func (r *refreshingResolver) RefreshBranch(ctx context.Context, name string) (string, error) {
+	r.refreshed = append(r.refreshed, name)
+	return r.fresh, nil
+}
+
+// When the dial to the recorded address fails and the resolver reports that
+// the branch moved (a pod with a new IP, a container on a new port), the proxy
+// dials the new address instead of refusing until reconcile repairs the row.
+func TestDialFailureRefreshesMovedBranch(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadPort := lis.Addr().(*net.TCPAddr).Port
+	lis.Close()
+	startupCh := make(chan *pgproto3.StartupMessage, 1)
+	port := fakeBackend(t, func(conn net.Conn, be *pgproto3.Backend, sm *pgproto3.StartupMessage) {
+		startupCh <- sm
+	})
+
+	r := &refreshingResolver{stale: local(deadPort), fresh: local(port)}
+	addr := startProxy(t, r)
+	conn := dialProxy(t, addr)
+	fe := pgproto3.NewFrontend(conn, conn)
+	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@pr-1"})
+	select {
+	case sm := <-startupCh:
+		if sm.Parameters["database"] != "postgres" {
+			t.Errorf("backend database = %q", sm.Parameters["database"])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the moved backend never received the startup")
+	}
+	if len(r.refreshed) != 1 || r.refreshed[0] != "pr-1" {
+		t.Errorf("refreshed = %v, want one refresh of pr-1", r.refreshed)
+	}
+}
+
+// A session the proxy re-dialed after its branch moved registers its cancel
+// key against the address it actually dialed, so a CancelRequest reaches the
+// moved backend rather than the dead recorded address.
+func TestCancelAfterRedialReachesMovedBackend(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := lis.Addr().String()
+	lis.Close()
+	key := []byte{0xde, 0xad, 0xbe, 0xef}
+	srv := startPGServer(t, keyedSession(4242, key))
+	addr := startProxy(t, &refreshingResolver{stale: dead, fresh: srv.addr})
+
+	openSession(t, dialProxy(t, addr), "pr-1")
+	frame := cancelFrame(4242, key)
+	sendCancel(t, dialProxy(t, addr), frame)
+	expectCancel(t, srv, frame)
+}
+
+// A refresh that reports the same (dead) address ends in the generic refusal.
+func TestDialFailureRefreshSameAddressRefused(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := local(lis.Addr().(*net.TCPAddr).Port)
+	lis.Close()
+	addr := startProxy(t, &refreshingResolver{stale: dead, fresh: dead})
+	conn := dialProxy(t, addr)
+	fe := pgproto3.NewFrontend(conn, conn)
+	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@pr-1"})
+	if er := recvError(t, fe); er.Message != genericRouteRefusal {
+		t.Errorf("message = %q, want the generic refusal", er.Message)
+	}
+}
+
 func TestRegistryResolver(t *testing.T) {
 	reg, err := registry.Open(t.TempDir() + "/r.db")
 	if err != nil {
@@ -625,5 +716,13 @@ func TestRegistryResolver(t *testing.T) {
 	}
 	if _, err := r.ResolveBranch("missing"); !errors.Is(err, registry.ErrNotFound) {
 		t.Errorf("ResolveBranch(missing) err = %v, want ErrNotFound", err)
+	}
+	// no Refresh hook: RefreshBranch declines, the proxy keeps the dial error
+	if _, err := r.RefreshBranch(context.Background(), "pr-1"); err == nil {
+		t.Error("RefreshBranch without a hook succeeded")
+	}
+	r.Refresh = func(ctx context.Context, name string) (string, error) { return "10.9.9.9:5432", nil }
+	if got, err := r.RefreshBranch(context.Background(), "pr-1"); err != nil || got != "10.9.9.9:5432" {
+		t.Errorf("RefreshBranch = %q, %v", got, err)
 	}
 }

@@ -4,8 +4,18 @@ metadata:
   name: {{ include "pgoverlay.fullname" . }}-proxy
   labels:
     {{- include "pgoverlay.labels" . | nindent 4 }}
+  {{- with .Values.proxy.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.proxy.service.type }}
+  {{- if and (eq .Values.proxy.service.type "LoadBalancer") .Values.proxy.service.loadBalancerSourceRanges }}
+  # Only these client CIDRs reach the Postgres router through the load
+  # balancer (e.g. CI runners' egress addresses).
+  loadBalancerSourceRanges:
+    {{- toYaml .Values.proxy.service.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
   selector:
     {{- include "pgoverlay.selectorLabels" . | nindent 4 }}
   ports:

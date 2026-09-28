@@ -166,8 +166,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 11 {
-		t.Fatalf("user_version=%d want 11", v)
+	if v != currentSchemaVersion() {
+		t.Fatalf("user_version=%d want %d", v, currentSchemaVersion())
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -449,7 +449,7 @@ func TestDeleteSource(t *testing.T) {
 	if err := r.DeleteSource(s.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.GetSourceByName("main"); err != ErrNotFound {
+	if _, err := r.GetSourceByName("main"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	// mask scripts go with the source
@@ -812,7 +812,8 @@ func makeBranch(t *testing.T, r *Registry, name string) *Branch {
 // original plaintext.
 func TestBranchPasswordEncryptedAtRest(t *testing.T) {
 	r := openTest(t)
-	if err := r.SetSecretKey(DeriveSecretKey("super-secret-token")); err != nil {
+	key := testKey(t)
+	if err := r.SetSecretKey(key); err != nil {
 		t.Fatal(err)
 	}
 	b := makeBranch(t, r, "pr-1")
@@ -822,11 +823,12 @@ func TestBranchPasswordEncryptedAtRest(t *testing.T) {
 	}
 
 	raw := rawBranchPassword(t, r, b.ID)
-	if raw == plain {
-		t.Fatalf("raw column stored plaintext %q; want ciphertext", raw)
+	if strings.Contains(raw, plain) {
+		t.Fatalf("raw column %q contains the plaintext; want ciphertext", raw)
 	}
-	if !strings.HasPrefix(raw, encPrefix) {
-		t.Fatalf("raw column %q missing %q prefix", raw, encPrefix)
+	// the stored value names the key it was encrypted under
+	if want := encPrefixV2 + KeyID(key) + ":"; !strings.HasPrefix(raw, want) {
+		t.Fatalf("raw column %q missing %q prefix", raw, want)
 	}
 
 	got, err := r.GetBranchByName("pr-1")
@@ -869,8 +871,8 @@ func TestBranchPasswordLegacyPlaintextReadWithKey(t *testing.T) {
 	if err := r.SetBranchPassword(b.ID, legacy); err != nil { // no key yet -> plaintext
 		t.Fatal(err)
 	}
-	// Operator now sets a key (e.g. PGOVERLAY_TOKEN configured after an upgrade).
-	if err := r.SetSecretKey(DeriveSecretKey("token-set-later")); err != nil {
+	// Operator now sets a key (e.g. after an upgrade).
+	if err := r.SetSecretKey(testKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := r.GetBranchByName("pr-1")
@@ -886,7 +888,7 @@ func TestBranchPasswordLegacyPlaintextReadWithKey(t *testing.T) {
 // never grow an enc: prefix.
 func TestBranchPasswordEmptyStaysEmpty(t *testing.T) {
 	r := openTest(t)
-	if err := r.SetSecretKey(DeriveSecretKey("tok")); err != nil {
+	if err := r.SetSecretKey(testKey(t)); err != nil {
 		t.Fatal(err)
 	}
 	b := makeBranch(t, r, "pr-1")
@@ -904,30 +906,12 @@ func TestSetSecretKeyRejectsBadLength(t *testing.T) {
 	if err := r.SetSecretKey([]byte("short")); err == nil {
 		t.Fatal("want error for 5-byte key")
 	}
+	if err := r.SetSecretKeys(SecretKeys{Primary: testKey(t), Legacy: [][]byte{[]byte("short")}}); err == nil {
+		t.Fatal("want error for a 5-byte legacy key")
+	}
 	// nil key is the no-op (plaintext) path, not an error
 	if err := r.SetSecretKey(nil); err != nil {
 		t.Fatalf("nil key should be a no-op, got %v", err)
-	}
-}
-
-// A value encrypted under one token cannot be decrypted after the token (and
-// thus the derived key) is rotated — surfaces as a decrypt error, not silent
-// corruption. Documents the rotation trade-off at the unit level.
-func TestBranchPasswordUnrecoverableAfterTokenRotation(t *testing.T) {
-	r := openTest(t)
-	if err := r.SetSecretKey(DeriveSecretKey("old-token")); err != nil {
-		t.Fatal(err)
-	}
-	b := makeBranch(t, r, "pr-1")
-	if err := r.SetBranchPassword(b.ID, "secretpw12345678"); err != nil {
-		t.Fatal(err)
-	}
-	// token rotated: key no longer matches the stored ciphertext
-	if err := r.SetSecretKey(DeriveSecretKey("new-token")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.GetBranchByName("pr-1"); err == nil {
-		t.Fatal("want decrypt error reading a password encrypted under the old token")
 	}
 }
 

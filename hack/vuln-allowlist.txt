@@ -1,0 +1,17 @@
+# Accepted govulncheck findings. Read by hack/vulncheck.sh (make vuln, and the
+# vuln CI job); the rationale for each entry is in SECURITY.md.
+#
+# One advisory per line:  <ID> <module> <expires YYYY-MM-DD> <reason...>
+#
+# Every entry names one advisory ID, so a NEW advisory fails the gate until
+# someone decides about it here; nothing is accepted by module alone. The gate
+# also fails when an entry expires, or when its advisory gains a fixed version
+# on the listed module, and warns when an entry no longer matches any finding.
+#
+# Both entries below exist only because internal/runtime/docker.go still uses
+# the frozen github.com/docker/docker client. Its successor,
+# github.com/moby/moby/client (already in go.mod through testcontainers), is not
+# affected by either advisory. Porting docker.go to it retires this file; the
+# expiry date is the deadline for that port, not a date upstream will act on.
+GO-2026-4887 github.com/docker/docker 2026-12-31 Moby daemon AuthZ plugin bypass (CVE-2026-34040); pgoverlay only runs the client
+GO-2026-4883 github.com/docker/docker 2026-12-31 Moby daemon plugin privilege off-by-one (CVE-2026-33997); pgoverlay only runs the client and installs no plugins

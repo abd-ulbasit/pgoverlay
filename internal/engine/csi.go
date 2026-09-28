@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/cow"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
@@ -54,8 +53,14 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 				"branch", parent.Name, "branch_id", parent.ID)
 			return fmt.Errorf("checkpoint parent %q: %w", parent.Name, err)
 		}
-		if err := e.drv.StopRemove(ctx, parent.ContainerID); err != nil {
-			// container state unknown — don't guess; reconcile/destroy can clean
+		// the stop and every later parent step run detached from the request
+		// (bounded): cancelling the child's create must not strand the parent
+		stopCtx, cancelStop := context.WithTimeout(bg, parentStepTimeout)
+		err := e.drv.StopRemove(stopCtx, parent.ContainerID)
+		cancelStop()
+		if err != nil {
+			// container state unknown — don't guess; the parent is marked
+			// failed with its PVC intact (RecoverBranch restarts it)
 			e.logCompensationErr("transition", "csi: mark parent failed after stop parent failed",
 				e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed, "stop for clone to "+b.Name+" failed: "+err.Error()),
 				"branch", parent.Name, "branch_id", parent.ID)
@@ -89,17 +94,18 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 		return fail(fmt.Errorf("install entrypoint: %w", err))
 	}
 
-	// 3. parent back up before the child starts
+	// 3. parent back up before the child starts, detached from the request.
+	// A failed first attempt falls through to fail(), which undoes the clone
+	// and restarts the parent once more before marking it failed.
 	if parent != nil {
-		p := parent
-		parent = nil // restarting now; fail() must not restart again
-		if err := e.restartCSIBranch(ctx, p, src, nil); err != nil {
-			return fail(fmt.Errorf("restart parent %q: %w", p.Name, err))
+		if err := e.restartAndMarkReady(bg, parent, src, nil); err != nil {
+			return fail(fmt.Errorf("restart parent %q: %w", parent.Name, err))
 		}
+		parent = nil // back up; fail() must not restart it again
 	}
 
 	// 4. branch container on the clone
-	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), e.branchLabels(b))
+	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src), e.branchLabels(b))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -138,43 +144,58 @@ func (e *Engine) csiQuiesceTarget(b *registry.Branch) (*registry.Branch, error) 
 	return p, nil
 }
 
+// checkCSIChildBase refuses up-front to re-clone a csi child whose base is
+// gone. A csi child's base is its parent's PVC (SourceVolume), and a csi
+// parent may be destroyed while children live — their own PVCs are
+// independent — but reset and diff clone that base again. Without this check a
+// reset would remove the child's PVC first and then fail the clone, leaving
+// the child failed with its data gone. A live branch now carrying the
+// parent's name but created after the child is a different branch that
+// reuses the name (and so the PVC name), never the child's base. The refusal
+// wraps ErrBaseGone.
+func (e *Engine) checkCSIChildBase(b *registry.Branch) error {
+	if !e.csi() || b.ParentBranchName == "" {
+		return nil
+	}
+	p, err := e.reg.GetBranchByName(b.ParentBranchName)
+	if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return err
+	}
+	if err != nil || p.RWVolume != b.SourceVolume || p.CreatedAt > b.CreatedAt {
+		return fmt.Errorf("%w: branch %q was cloned from parent %q, which has been destroyed: its base volume %s is gone, so it can no longer be reset or diffed (the branch itself still works; destroy it and branch again to start over)",
+			ErrBaseGone, b.Name, b.ParentBranchName, b.SourceVolume)
+	}
+	return nil
+}
+
+// ErrBaseGone is returned by ResetBranch and DiffBranch for a csi branch
+// whose parent, and so its base volume, has been destroyed. The API maps it
+// to 409.
+var ErrBaseGone = errors.New("branch base is gone")
+
 // restartCSIBranch starts a stopped csi branch's pod back on its own PVC,
 // waits for readiness and records the new container/address. On failure the
 // branch is marked failed (cause, when non-nil, is the saga error that
-// triggered the restore); its PVC — the data — is always preserved.
+// triggered the restore); its PVC — the data — is always preserved, and
+// RecoverBranch can restart it later.
 func (e *Engine) restartCSIBranch(ctx context.Context, b *registry.Branch, src *registry.Source, cause error) error {
-	failed := func(err error) error {
+	err := e.restartAndMarkReady(ctx, b, src, nil)
+	if err != nil {
 		msg := "restart failed: " + err.Error()
 		if cause != nil {
 			msg = fmt.Sprintf("clone failed (%v); restart failed: %v", cause, err)
 		}
 		e.logCompensationErr("transition", "restartCSIBranch: mark branch failed after restart failed",
 			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, msg), "branch", b.Name, "branch_id", b.ID)
-		return err
 	}
-	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), e.branchLabels(b))
-	if err != nil {
-		return failed(err)
-	}
-	e.logCompensationErr("transition", "restartCSIBranch: own restarted container before readiness wait",
-		e.reg.SetBranchContainer(b.ID, cid), "branch", b.Name, "container", cid) // own the in-flight container before the readiness wait (reconcile-safe)
-	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
-		e.logCompensationErr("undo", "restartCSIBranch: stop/remove container after readiness wait failed",
-			e.drv.StopRemove(ctx, cid), "branch", b.Name, "container", cid)
-		return failed(err)
-	}
-	info, err := e.inspectAddr(ctx, cid)
-	if err != nil {
-		return failed(err)
-	}
-	return e.reg.MarkBranchReadyCtx(ctx, b.ID, cid, info.Host, info.Port)
+	return err
 }
 
 // installDirectEntrypoint writes the direct (no-overlay) entrypoint into a
 // cloned volume, next to its data/ dir (plain unprivileged helper).
 func (e *Engine) installDirectEntrypoint(ctx context.Context, volume string) error {
 	_, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
-		Image:  "alpine:3.21",
+		Image:  runtime.UtilityImage,
 		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh`},
 		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScriptDirect},
 		Mounts: []runtime.Mount{{Volume: volume, Target: cow.RWPath}},

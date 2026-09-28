@@ -19,8 +19,10 @@ Individual branch-create runs (seconds):
 Branch creation is now **independent of database size** — ~1.9 s p50 at both
 1 GiB and 5 GiB — and a fresh branch costs 33.1 MiB of disk (recycled WAL
 segments written during crash recovery plus overlay bookkeeping), not a copy
-of the dataset. This is the copy-on-write behavior the design promises; it was
-not true before 2026-06-10 (see [Before the fix](#before-the-fix-branch-creation-scaled-with-data-size)).
+of the dataset. That was not true before 2026-06-10 (see
+[Before the fix](#before-the-fix-branch-creation-scaled-with-data-size)).
+What a branch costs after it starts serving queries is a different number:
+see [Reads copy up too](#reads-copy-up-too).
 
 One number needs honest framing: the **rw layer after the 1% UPDATE probe** is
 now ≈ the full dataset size, where the old table showed only +10–179 MiB.
@@ -29,14 +31,68 @@ copied up in full; the new probe pays the copy-up at first write instead.
 OverlayFS copies up whole files, and Postgres heap/index segments are files of
 up to 1 GiB — so a write that touches a segment copies that entire segment
 into the rw layer, and this bulk UPDATE + CHECKPOINT ended up copying up
-essentially the whole pgbench dataset. The cost is pay-per-file-written rather
-than pay-at-create: branches that read mostly and write a little (the dev/test
-case) stay thin; a branch that rewrites everything converges on ~1× the
-database, exactly as before.
+essentially the whole pgbench dataset. The cost moved from create time to
+first use, and, as the next section shows, "use" includes reads: a branch
+converges on the size of the tables it touches, not only the ones it writes.
 
 10 GiB was not run in this pass; the script's disk check skips any size that
 doesn't fit (each size needs ~2.2× the target free in the Docker VM) and sizes
 are configurable: `BENCH_SIZES_GIB="1 5 10" hack/benchmark.sh`.
+
+## Reads copy up too
+
+An earlier version of this page said that branches which mostly read stay
+thin. That was wrong, and the pre-v1 review measured why (issue
+[#13](https://github.com/abd-ulbasit/pgoverlay/issues/13)). Setup: commit
+`c55cab2`, Docker Engine 29.6.2 on Linux amd64 (ext4), PostgreSQL 17, a
+489 MB table that was `VACUUM (FREEZE)`d on the source before seeding, so
+62,500 of its 62,528 pages were all-frozen and setting hint bits could not
+explain any growth. The rw layer was measured with the same `du -sb` helper as
+above.
+
+| Branch state | rw layer |
+|---|---|
+| fresh branch | 33.1 MiB |
+| after a 1-row `UPDATE` on a small table | 33.5 MiB |
+| after `SELECT count(*)` on a tiny table + `CHECKPOINT` | 34.6 MiB |
+| right after `SELECT count(*)` on the 489 MB table, before any checkpoint | **523.1 MiB** |
+
+The file that appeared in the rw layer, `base/5/16384`, was 488.5 MiB: the
+whole table, copied by one read-only query.
+
+**Why.** It is the `SyncDataDirectory` mechanism from [The fix](#the-fix),
+on the normal read path. PostgreSQL's storage manager opens every relation
+segment read-write, whatever the query does: `src/backend/storage/smgr/md.c`
+opens with `O_RDWR | PG_BINARY` in `REL_14_STABLE` (line 494), and through
+`_mdfd_open_flags()` (line 146) in `REL_17_STABLE`. OverlayFS decides on
+copy-up at `open()` time, from the open flags, before any byte is written: a
+read-write open of a file that exists only in a lower layer copies the whole
+file into the upper layer first. So the first query of any kind that touches
+a table copies each segment it opens (up to 1 GiB per segment), and pays for
+that copy inline. A small table costs almost nothing, which is why the 1-row
+`UPDATE` above barely moved the layer.
+
+**What it means.**
+
+- A fresh branch still costs about 33 MiB and still starts in about 2 s;
+  creation is unaffected.
+- A branch grows by the size of every table and index file it opens, read or
+  write, up to roughly the size of the data it touches. A test suite that
+  scans a few large tables will copy those tables once per branch.
+- The first query to touch a large table is slow on a new branch, because it
+  waits for the copy.
+- `syncfs` cannot help here: the open flags are how stock Postgres reads.
+  Avoiding the copy would need a patched Postgres or a filesystem that copies
+  blocks instead of files.
+
+**What to do about it.** For read-heavy branches of large databases, use a
+block-level backend: the [zfs backend](zfs.md) (a clone shares blocks with its
+snapshot and pays only for blocks that change) or Kubernetes
+[csi mode](kubernetes.md#recommended-csi-mode) (the CSI driver's clone
+decides the cost, which is block-level on EBS, Ceph RBD and zfs-localpv). On
+the overlay backend, size the Docker data disk for the tables your branches
+touch rather than for 33 MiB per branch, give branches a TTL, and watch
+`pgb branch ls --usage` and the [disk alerts](observability.md).
 
 ## The fix
 
@@ -135,12 +191,16 @@ instead of one, roughly 2× a plain branch create (~1.9 s p50 above). No data
 is copied; the first (slowest) run replays the 1% UPDATE's WAL in both
 instances, later runs freeze a near-empty rw layer. The ZFS backend
 snapshots+clones the parent's dataset instead — no freeze or parent restart
-at all.
+at all. The CSI backend clones the parent's volume after a `CHECKPOINT` and
+a brief stop of the parent, which is then restarted.
 
 ## Methodology
 
 Everything below is what `hack/benchmark.sh` does; run it yourself with
-`make build && hack/benchmark.sh`.
+`make build && hack/benchmark.sh` (it needs a local Docker engine: branch
+ports are published on the engine host's `127.0.0.1`). The read-path
+measurement in [Reads copy up too](#reads-copy-up-too) was taken by hand, with
+the same `du -sb` helper.
 
 **Source database.** A throwaway `postgres:17` container with
 `-c wal_level=replica -c max_wal_senders=4` and a

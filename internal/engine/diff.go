@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,39 +17,102 @@ import (
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
-// TableDelta is one table's row-estimate comparison between a branch and its
-// base. Counts come from pg_class.reltuples — planner estimates, not exact
-// counts (fresh never-analyzed tables report 0).
+// UnknownRows is the BaseRows/BranchRows value of a side whose row count is
+// unknown (see TableDelta).
+const UnknownRows int64 = -1
+
+// TableDelta is one table's row-count comparison between a branch and its
+// base. Counts are planner estimates (pg_class.reltuples), not exact counts,
+// with one exception: a table the planner has no estimate for on either side
+// (never analyzed or vacuumed, reltuples -1) is counted exactly on both sides
+// where its heap is small (at most 64 MiB). A side that is still unknown
+// after that reports UnknownRows, RowsUnknown is set and Delta is 0 — never a
+// made-up 0 row count. A table present on one side only counts 0 on the other.
 type TableDelta struct {
+	// Schema is the table's schema and Table its name within it: same-named
+	// tables in different schemas are separate entries.
+	Schema     string `json:"schema"`
 	Table      string `json:"table"`
 	BaseRows   int64  `json:"base_rows"`
 	BranchRows int64  `json:"branch_rows"`
 	Delta      int64  `json:"delta"`
+	// RowsUnknown is set when either side's count is unknown (UnknownRows);
+	// Delta is then 0 and carries no information.
+	RowsUnknown bool `json:"rows_unknown,omitempty"`
 	// SampleRows is a bounded set of branch-only rows (present on the branch,
 	// absent on the base, matched by primary key) — populated only when the
 	// diff is requested with data sampling (engine.WithDataSample) and only for
-	// tables whose branch row-estimate exceeds the base estimate. Tables with
-	// no primary key are skipped (sampling needs a stable key to diff by).
+	// tables that grew (see Grew). Tables with no primary key are skipped
+	// (sampling needs a stable key to diff by).
 	SampleRows []map[string]any `json:"sample_rows,omitempty"`
+}
+
+// Name is the table's display name: bare in the public schema, otherwise
+// schema-qualified.
+func (t TableDelta) Name() string {
+	if t.Schema == "" || t.Schema == "public" {
+		return t.Table
+	}
+	return t.Schema + "." + t.Table
+}
+
+// Grew reports whether the branch holds more rows than the base, as far as
+// the counts can tell (unknown counts never classify as grown). Data sampling
+// covers exactly these tables.
+func (t TableDelta) Grew() bool {
+	return !t.RowsUnknown && t.BranchRows > t.BaseRows
+}
+
+// Cells renders the counts for display: "?" for an unknown side or delta,
+// "0" for no change, a signed delta otherwise.
+func (t TableDelta) Cells() (base, branch, delta string) {
+	count := func(n int64) string {
+		if n < 0 {
+			return "?"
+		}
+		return strconv.FormatInt(n, 10)
+	}
+	switch {
+	case t.RowsUnknown:
+		delta = "?"
+	case t.Delta == 0:
+		delta = "0"
+	default:
+		delta = fmt.Sprintf("%+d", t.Delta)
+	}
+	return count(t.BaseRows), count(t.BranchRows), delta
 }
 
 // DiffResult is what changed in a branch relative to its base: a unified
 // schema diff (pg_dump --schema-only of base vs branch; empty = identical)
-// and per-table row-estimate deltas.
+// and per-table row-count deltas.
 type DiffResult struct {
 	SchemaDiff string       `json:"schema_diff"`
 	Tables     []TableDelta `json:"tables"`
 }
 
-// rowEstimateSQL lists every user table with its planner row estimate, one
-// "relname|reltuples" line per table.
-const rowEstimateSQL = `SELECT relname || '|' || reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY relname`
+// tableStatsSQL lists every user table with its planner row estimate
+// (reltuples, -1 = never analyzed) and heap size, as one JSON array so no
+// identifier can break the parse. Other sessions' temp tables are skipped.
+const tableStatsSQL = `SELECT coalesce(json_agg(json_build_object('schema', n.nspname, 'table', c.relname, 'rows', c.reltuples::bigint, 'bytes', pg_relation_size(c.oid))), '[]') FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relpersistence<>'t' AND n.nspname NOT IN ('pg_catalog','information_schema')`
+
+// exactCountMaxBytes bounds the exact-count fallback for tables without a
+// planner estimate: only heaps up to this size are scanned with count(*), so
+// a diff never reads a large table end to end.
+const exactCountMaxBytes = 64 << 20
+
+// countChunk is how many tables one exact-count statement covers, keeping
+// the psql argument far below exec argument-size limits.
+const countChunk = 100
 
 // diffOptions holds the optional tuning for DiffBranch.
 type diffOptions struct {
 	// sample is the per-table cap on branch-only sample rows; 0 disables
 	// data sampling entirely.
 	sample int
+	// quiesceParent permits briefly stopping a csi child's parent around the
+	// base clone (see WithParentQuiesce).
+	quiesceParent bool
 }
 
 // DiffOption tunes DiffBranch.
@@ -57,30 +122,60 @@ type DiffOption func(*diffOptions)
 // requested with a non-positive n.
 const defaultSampleRows = 20
 
-// WithDataSample turns on bounded data sampling: for each table whose branch
-// row-estimate exceeds its base estimate, DiffBranch returns up to n
-// branch-only rows (matched by primary key) in TableDelta.SampleRows. A
-// non-positive n uses the default cap (20). Tables without a primary key are
-// skipped. Off by default.
+// MaxSampleRows is the largest per-table sample WithDataSample honours. The
+// sample is buffered in memory (psql output, then JSON), so an unbounded n
+// against a grown table could exhaust branchd's memory; a larger request is
+// clamped, and the API rejects a larger ?data= with 400.
+const MaxSampleRows = 500
+
+// WithDataSample turns on bounded data sampling: for each table that grew
+// (TableDelta.Grew), DiffBranch returns up to n branch-only rows (matched by
+// primary key) in TableDelta.SampleRows. A non-positive n uses the default
+// cap (20); n above MaxSampleRows is clamped to it. Tables without a primary
+// key are skipped. Off by default.
 func WithDataSample(n int) DiffOption {
 	return func(o *diffOptions) {
 		if n <= 0 {
 			n = defaultSampleRows
 		}
-		o.sample = n
+		o.sample = min(n, MaxSampleRows)
 	}
 }
 
-// DiffBranch reports what changed in a ready branch relative to its base. It
-// provisions an internal throwaway branch ("diff-<6 hex>") from the target's
-// OWN base — the recorded source volume/generation and frozen-layer chain,
-// not the source's current generation — then runs pg_dump --schema-only and
-// a row-estimate query inside both instances over the local socket (no
-// credentials involved, so rotated branch passwords don't matter) and diffs
-// host-side. The throwaway is a normal registry row (TTL'd, so the reaper
-// cleans strays if branchd dies mid-diff) and is destroyed before returning,
-// success or not. Expect a few seconds of wall time: a full branch provision
-// plus two dumps.
+// WithParentQuiesce lets DiffBranch briefly stop a csi branch's parent. On
+// the csi backend a branch created from another branch has its parent's live
+// PVC as its base, and cloning an in-use PVC is not crash-safe, so the diff's
+// base clone stops the parent around it (CHECKPOINT, stop, clone, restart),
+// exactly like a reset of the child does, dropping the parent's connections.
+// Without this option DiffBranch refuses such a diff with ErrParentQuiesce.
+// The API passes it for the operator role and above only, the role a reset
+// needs. It changes nothing on other backends or for branches of a source.
+func WithParentQuiesce() DiffOption {
+	return func(o *diffOptions) { o.quiesceParent = true }
+}
+
+// ErrParentQuiesce is returned by DiffBranch for a csi branch created from
+// another branch when the caller did not pass WithParentQuiesce: the diff
+// would have to stop that parent briefly. The API maps it to 403.
+var ErrParentQuiesce = errors.New("diff would stop the parent branch")
+
+// DiffBranch reports what changed in a ready branch relative to its base —
+// the state a reset would return it to. It provisions an internal throwaway
+// branch ("diff-<6 hex>") from the target's OWN base — the recorded source
+// volume/generation and frozen-layer chain, not the source's current
+// generation — then runs pg_dump --schema-only and a row-estimate query
+// inside both instances over the local socket (no credentials involved, so
+// rotated branch passwords don't matter) and diffs host-side. The throwaway
+// is a normal registry row (TTL'd, so the reaper cleans strays if branchd dies
+// mid-diff) and is destroyed before returning, success or not. It counts
+// toward --max-branches, so at the cap DiffBranch returns ErrQuotaExceeded.
+// Expect a few seconds of wall time: a full branch provision plus two dumps.
+//
+// zfs and csi children base on their parent's live volume, so their diff
+// compares against the parent's CURRENT state (what a reset would re-clone).
+// A csi child's diff briefly stops the parent around the clone exactly like a
+// reset does, so it needs WithParentQuiesce (ErrParentQuiesce otherwise). A
+// csi child whose parent is gone cannot be diffed (ErrBaseGone).
 func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption) (_ *DiffResult, err error) {
 	defer e.observeOp("diff", &err)()
 	var o diffOptions
@@ -94,6 +189,21 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 	if b.State != registry.BranchReady {
 		return nil, fmt.Errorf("branch %q is %s, not ready", name, b.State)
 	}
+	if err := e.checkCSIChildBase(b); err != nil {
+		return nil, fmt.Errorf("diff %q: %w", name, err)
+	}
+	if e.csi() && b.ParentBranchName != "" && !o.quiesceParent {
+		// checkCSIChildBase confirmed the base is the parent's own PVC, so
+		// the clone below would stop the parent: refuse before touching it.
+		return nil, fmt.Errorf("diff %q: its base is the live volume of parent branch %q, which is stopped briefly around the clone (as for a reset of %q): %w",
+			name, b.ParentBranchName, name, ErrParentQuiesce)
+	}
+	// The throwaway is a real branch (row, volume, running instance) for the
+	// diff's lifetime and counts toward --max-branches, so it is refused at
+	// the cap like any other create, before anything is written.
+	if err := e.checkQuota(); err != nil {
+		return nil, fmt.Errorf("diff %q needs a temporary branch: %w", name, err)
+	}
 	src, err := e.reg.GetSourceByID(b.SourceID)
 	if err != nil {
 		return nil, err
@@ -106,7 +216,7 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 	// The throwaway copies the target's base coordinates: SourceVolume pins
 	// the source generation (zfs/csi children: the parent's dataset/PVC) and
 	// BaseLayerID the frozen overlay chain — exactly what reset re-provisions
-	// onto. ParentBranchName stays empty: lineage is the diff's business only.
+	// onto.
 	tw := &registry.Branch{
 		Name:         twName,
 		SourceID:     b.SourceID,
@@ -114,6 +224,13 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 		SourceVolume: b.SourceVolume,
 		BaseLayerID:  b.BaseLayerID,
 		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}
+	if e.csi() {
+		// A csi child's base is its parent's live PVC, and cloning an in-use
+		// PVC is not crash-safe: naming the parent makes provisionCSI quiesce
+		// it around the clone (CHECKPOINT, stop, clone, restart), the same as
+		// a child reset. (zfs snapshots are atomic and need no quiesce.)
+		tw.ParentBranchName = b.ParentBranchName
 	}
 	if err := e.reg.CreateBranchCtx(ctx, tw); err != nil {
 		return nil, fmt.Errorf("diff %q: %w", name, err)
@@ -142,130 +259,336 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 	if err != nil {
 		return nil, fmt.Errorf("diff %q: dump branch schema: %w", name, err)
 	}
-	baseRows, err := e.rowEstimates(ctx, twRow.ContainerID, src)
+	baseStats, err := e.tableStats(ctx, twRow.ContainerID, src)
 	if err != nil {
-		return nil, fmt.Errorf("diff %q: base row estimates: %w", name, err)
+		return nil, fmt.Errorf("diff %q: base table stats: %w", name, err)
 	}
-	branchRows, err := e.rowEstimates(ctx, b.ContainerID, src)
+	branchStats, err := e.tableStats(ctx, b.ContainerID, src)
 	if err != nil {
-		return nil, fmt.Errorf("diff %q: branch row estimates: %w", name, err)
+		return nil, fmt.Errorf("diff %q: branch table stats: %w", name, err)
+	}
+	if err := e.countUnestimated(ctx, twRow.ContainerID, b.ContainerID, src, baseStats, branchStats); err != nil {
+		return nil, fmt.Errorf("diff %q: count rows: %w", name, err)
 	}
 
 	res := &DiffResult{
 		SchemaDiff: diffutil.Unified(stripDumpNoise(baseDump), stripDumpNoise(branchDump)),
-		Tables:     tableDeltas(baseRows, branchRows),
+		Tables:     tableDeltas(baseStats, branchStats),
 	}
 	if o.sample > 0 {
-		if err := e.sampleNewRows(ctx, res, b.ContainerID, twRow.ContainerID, src, o.sample); err != nil {
+		if err := e.sampleNewRows(ctx, res, b.ContainerID, twRow.ContainerID, src, baseStats, o.sample); err != nil {
 			return nil, fmt.Errorf("diff %q: sample rows: %w", name, err)
 		}
 	}
 	return res, nil
 }
 
-// sampleNewRows fills TableDelta.SampleRows for every grown table (branch
-// estimate > base estimate). For each it reads the table's primary-key columns
-// from the branch, pulls up to capN rows ordered by PK as jsonb from BOTH
-// instances, and keeps the branch rows whose PK is absent on the base (capped
-// at capN), computed host-side because base and branch are separate instances.
-// No-PK tables are skipped.
-func (e *Engine) sampleNewRows(ctx context.Context, res *DiffResult, branchCID, baseCID string, src *registry.Source, capN int) error {
-	for i := range res.Tables {
-		td := &res.Tables[i]
-		if td.BranchRows <= td.BaseRows {
+// tableKey identifies a user table the same way on both instances.
+type tableKey struct{ schema, table string }
+
+// sql is the key as a schema-qualified, quoted SQL name.
+func (k tableKey) sql() string { return quoteIdent(k.schema) + "." + quoteIdent(k.table) }
+
+// tableStat is one table's row count on one instance.
+type tableStat struct {
+	rows  int64 // planner estimate, exact count, or UnknownRows
+	bytes int64 // heap size; bounds the exact-count fallback
+}
+
+// tableStats runs tableStatsSQL inside the instance. Negative reltuples
+// (never analyzed) come back as UnknownRows, not 0.
+func (e *Engine) tableStats(ctx context.Context, cid string, src *registry.Source) (map[tableKey]tableStat, error) {
+	out, err := e.psqlOutput(ctx, cid, src, tableStatsSQL)
+	if err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		Schema string `json:"schema"`
+		Table  string `json:"table"`
+		Rows   int64  `json:"rows"`
+		Bytes  *int64 `json:"bytes"` // NULL if the table vanished mid-query
+	}
+	if out = strings.TrimSpace(out); out != "" {
+		if err := json.Unmarshal([]byte(out), &rows); err != nil {
+			return nil, fmt.Errorf("unparseable table stats %q: %w", truncate(out, 200), err)
+		}
+	}
+	stats := make(map[tableKey]tableStat, len(rows))
+	for _, r := range rows {
+		s := tableStat{rows: r.Rows}
+		if s.rows < 0 {
+			s.rows = UnknownRows
+		}
+		if r.Bytes != nil {
+			s.bytes = *r.Bytes
+		}
+		stats[tableKey{r.Schema, r.Table}] = s
+	}
+	return stats, nil
+}
+
+// countUnestimated replaces missing planner estimates with exact counts. A
+// table with no estimate on EITHER side is counted on both sides (so its delta
+// compares like with like) wherever its heap is at most exactCountMaxBytes.
+// Whatever cannot be counted keeps its estimate, or stays UnknownRows. A
+// failed count only loses precision, so it is logged, not returned: the only
+// error is ctx's, once it is done (no further count runs then).
+func (e *Engine) countUnestimated(ctx context.Context, baseCID, branchCID string, src *registry.Source, base, branch map[tableKey]tableStat) error {
+	need := map[tableKey]bool{}
+	for _, stats := range []map[tableKey]tableStat{base, branch} {
+		for k, s := range stats {
+			if s.rows < 0 {
+				need[k] = true
+			}
+		}
+	}
+	if len(need) == 0 {
+		return nil
+	}
+	keys := make([]tableKey, 0, len(need))
+	for k := range need {
+		keys = append(keys, k)
+	}
+	sortKeys(keys)
+	if err := e.countExact(ctx, baseCID, src, base, keys); err != nil {
+		return err
+	}
+	return e.countExact(ctx, branchCID, src, branch, keys)
+}
+
+// countExact counts the rows of every listed table present in stats whose
+// heap is small enough, in statements of up to countChunk tables each, and
+// records the counts in stats. Once ctx is done it returns ctx's error
+// instead of running the remaining chunks.
+func (e *Engine) countExact(ctx context.Context, cid string, src *registry.Source, stats map[tableKey]tableStat, keys []tableKey) error {
+	var todo []tableKey
+	for _, k := range keys {
+		if s, ok := stats[k]; ok && s.bytes <= exactCountMaxBytes {
+			todo = append(todo, k)
+		}
+	}
+	for len(todo) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := todo[:min(countChunk, len(todo))]
+		todo = todo[len(chunk):]
+		subs := make([]string, len(chunk))
+		for i, k := range chunk {
+			subs[i] = "(SELECT count(*) FROM " + k.sql() + ")"
+		}
+		out, err := e.psqlOutput(ctx, cid, src, "SELECT to_json(ARRAY["+strings.Join(subs, ", ")+"])")
+		var counts []int64
+		if err == nil {
+			if err = json.Unmarshal([]byte(strings.TrimSpace(out)), &counts); err == nil && len(counts) != len(chunk) {
+				err = fmt.Errorf("got %d counts for %d tables", len(counts), len(chunk))
+			}
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			slog.Warn("diff: exact row count failed; keeping planner estimates", "container", cid, "tables", len(chunk), "err", err)
 			continue
 		}
-		pk, err := e.primaryKeyColumns(ctx, branchCID, src, td.Table)
-		if err != nil {
-			return err
+		for i, k := range chunk {
+			s := stats[k]
+			s.rows = counts[i]
+			stats[k] = s
 		}
-		if len(pk) == 0 {
-			continue // no PK: nothing stable to diff by, skip sampling
-		}
-		branchRows, err := e.sampleTableRows(ctx, branchCID, src, td.Table, pk, capN)
-		if err != nil {
-			return err
-		}
-		baseRows, err := e.sampleTableRows(ctx, baseCID, src, td.Table, pk, capN)
-		if err != nil {
-			return err
-		}
-		baseKeys := make(map[string]bool, len(baseRows))
-		for _, r := range baseRows {
-			baseKeys[rowKey(r, pk)] = true
-		}
-		var only []map[string]any
-		for _, r := range branchRows {
-			if len(only) >= capN {
-				break
-			}
-			if !baseKeys[rowKey(r, pk)] {
-				only = append(only, r)
-			}
-		}
-		td.SampleRows = only
 	}
 	return nil
 }
 
-// pkColumnsSQL lists a table's primary-key column names in key order, one per
-// line. It resolves the relation through the user schemas (excluding system
-// ones), matching the row-estimate query's table universe.
-const pkColumnsSQL = `SELECT a.attname FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=ANY(i.indkey) WHERE i.indisprimary AND c.relname=%s AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY array_position(i.indkey, a.attnum)`
+// sampleScanKeys is how many of a grown table's highest primary keys are
+// checked against the base when looking for branch-only rows.
+func sampleScanKeys(capN int) int { return max(10*capN, 1000) }
 
-// primaryKeyColumns returns the table's primary-key column names (empty when
-// the table has no primary key).
-func (e *Engine) primaryKeyColumns(ctx context.Context, cid string, src *registry.Source, table string) ([]string, error) {
-	sql := fmt.Sprintf(pkColumnsSQL, quoteLiteral(table))
-	out, err := e.psqlOutput(ctx, cid, src, sql)
+// keyChunkBytes bounds the JSON key list passed in one presence check.
+const keyChunkBytes = 32 << 10
+
+// sampleNewRows fills TableDelta.SampleRows for every table that grew. Per
+// table it reads the branch's primary key, takes the highest
+// sampleScanKeys(capN) keys on the branch (serial, identity and time-ordered
+// keys put new rows there), asks the base which of those keys it has, and
+// returns up to capN branch rows whose key the base lacks — every row, when
+// the table does not exist on the base at all. Base and branch are separate
+// instances, so the comparison happens host-side, key by key. A table whose
+// sampling fails (e.g. its key columns differ on the base) is logged and
+// left without samples rather than failing the diff.
+func (e *Engine) sampleNewRows(ctx context.Context, res *DiffResult, branchCID, baseCID string, src *registry.Source, base map[tableKey]tableStat, capN int) error {
+	for i := range res.Tables {
+		td := &res.Tables[i]
+		if !td.Grew() {
+			continue
+		}
+		k := tableKey{td.Schema, td.Table}
+		_, onBase := base[k]
+		rows, err := e.sampleTable(ctx, branchCID, baseCID, src, k, onBase, capN)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			slog.Warn("diff: skipping data sample for table", "table", k.sql(), "err", err)
+			continue
+		}
+		td.SampleRows = rows
+	}
+	return nil
+}
+
+// pkColumn is one primary-key column: its name and SQL type (format_type).
+type pkColumn struct{ name, typ string }
+
+// sampleTable returns up to capN rows of table k present on the branch but
+// not on the base (nil when there are none or the table has no primary key),
+// ordered by primary key.
+func (e *Engine) sampleTable(ctx context.Context, branchCID, baseCID string, src *registry.Source, k tableKey, onBase bool, capN int) ([]map[string]any, error) {
+	pk, err := e.primaryKey(ctx, branchCID, src, k)
+	if err != nil || len(pk) == 0 {
+		return nil, err // no PK: nothing stable to diff by
+	}
+	keys, err := e.highestKeys(ctx, branchCID, src, k, pk, sampleScanKeys(capN))
 	if err != nil {
 		return nil, err
 	}
-	var cols []string
-	for _, line := range strings.Split(out, "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			cols = append(cols, line)
+	var fresh []string
+	if !onBase {
+		fresh = keys[:min(capN, len(keys))]
+	} else {
+		for start := 0; start < len(keys) && len(fresh) < capN; {
+			end, size := start, 0
+			for end < len(keys) && (end == start || size+len(keys[end]) <= keyChunkBytes) {
+				size += len(keys[end]) + 1
+				end++
+			}
+			present, err := e.keysPresent(ctx, baseCID, src, k, pk, keys[start:end])
+			if err != nil {
+				return nil, err
+			}
+			for i, key := range keys[start:end] {
+				if !present[i] && len(fresh) < capN {
+					fresh = append(fresh, key)
+				}
+			}
+			start = end
 		}
+	}
+	if len(fresh) == 0 {
+		return nil, nil
+	}
+	return e.rowsByKey(ctx, branchCID, src, k, pk, fresh)
+}
+
+// primaryKeySQL lists a table's primary-key columns in key order with their
+// SQL types, as one JSON array of [name, type] pairs.
+const primaryKeySQL = `SELECT coalesce(json_agg(json_build_array(a.attname, format_type(a.atttypid, a.atttypmod)) ORDER BY array_position(i.indkey, a.attnum)), '[]') FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=ANY(i.indkey) WHERE i.indisprimary AND n.nspname=%s AND c.relname=%s`
+
+// primaryKey returns the table's primary-key columns (empty when it has
+// none).
+func (e *Engine) primaryKey(ctx context.Context, cid string, src *registry.Source, k tableKey) ([]pkColumn, error) {
+	out, err := e.psqlOutput(ctx, cid, src, fmt.Sprintf(primaryKeySQL, sqlLiteral(k.schema), sqlLiteral(k.table)))
+	if err != nil {
+		return nil, err
+	}
+	var pairs [][2]string
+	if out = strings.TrimSpace(out); out != "" {
+		if err := json.Unmarshal([]byte(out), &pairs); err != nil {
+			return nil, fmt.Errorf("unparseable primary key %q: %w", truncate(out, 200), err)
+		}
+	}
+	cols := make([]pkColumn, len(pairs))
+	for i, p := range pairs {
+		cols[i] = pkColumn{name: p[0], typ: p[1]}
 	}
 	return cols, nil
 }
 
-// sampleTableRows pulls up to capN rows of table ordered by its primary key,
-// each as a single-line jsonb object, and parses them into maps.
-func (e *Engine) sampleTableRows(ctx context.Context, cid string, src *registry.Source, table string, pk []string, capN int) ([]map[string]any, error) {
+// highestKeys returns up to n primary keys of the table, highest first, each
+// as a one-line JSON object {column: value}.
+func (e *Engine) highestKeys(ctx context.Context, cid string, src *registry.Source, k tableKey, pk []pkColumn, n int) ([]string, error) {
+	fields := make([]string, len(pk))
 	order := make([]string, len(pk))
 	for i, c := range pk {
-		order[i] = quoteIdent(c)
+		fields[i] = sqlLiteral(c.name) + ", t." + quoteIdent(c.name)
+		order[i] = "t." + quoteIdent(c.name) + " DESC"
 	}
-	sql := fmt.Sprintf("SELECT to_jsonb(t.*) FROM %s t ORDER BY %s LIMIT %d",
-		quoteIdent(table), strings.Join(order, ", "), capN)
+	sql := fmt.Sprintf("SELECT jsonb_build_object(%s) FROM %s AS t ORDER BY %s LIMIT %d",
+		strings.Join(fields, ", "), k.sql(), strings.Join(order, ", "), n)
+	out, err := e.psqlOutput(ctx, cid, src, sql)
+	if err != nil {
+		return nil, err
+	}
+	return nonEmptyLines(out), nil
+}
+
+// keyRecordSQL is a FROM clause expanding a JSON array of key objects into
+// typed rows p(<pk columns>) — jsonb_to_record reads back what jsonb wrote for
+// every type — numbered e.i (from 1) when ordinality is set. Passing keys as
+// JSON keeps the values exact and the SQL free of per-type literal quoting.
+func keyRecordSQL(keysJSON string, pk []pkColumn, ordinality bool) string {
+	cols := make([]string, len(pk))
+	for i, c := range pk {
+		cols[i] = quoteIdent(c.name) + " " + c.typ
+	}
+	elems := fmt.Sprintf("jsonb_array_elements(%s::jsonb) AS e(k)", sqlLiteral(keysJSON))
+	if ordinality {
+		elems = fmt.Sprintf("jsonb_array_elements(%s::jsonb) WITH ORDINALITY AS e(k, i)", sqlLiteral(keysJSON))
+	}
+	return elems + ", LATERAL jsonb_to_record(e.k) AS p(" + strings.Join(cols, ", ") + ")"
+}
+
+// pkMatch is the condition joining key rows p to table rows t by primary key.
+func pkMatch(pk []pkColumn) string {
+	conds := make([]string, len(pk))
+	for i, c := range pk {
+		conds[i] = "t." + quoteIdent(c.name) + " = p." + quoteIdent(c.name)
+	}
+	return strings.Join(conds, " AND ")
+}
+
+// keysPresent reports, per key, whether the table on this instance has a row
+// with that primary key.
+func (e *Engine) keysPresent(ctx context.Context, cid string, src *registry.Source, k tableKey, pk []pkColumn, keys []string) ([]bool, error) {
+	sql := fmt.Sprintf("SELECT e.i FROM %s WHERE EXISTS (SELECT 1 FROM %s AS t WHERE %s)",
+		keyRecordSQL("["+strings.Join(keys, ",")+"]", pk, true), k.sql(), pkMatch(pk))
+	out, err := e.psqlOutput(ctx, cid, src, sql)
+	if err != nil {
+		return nil, err
+	}
+	present := make([]bool, len(keys))
+	for _, line := range nonEmptyLines(out) {
+		i, err := strconv.Atoi(line)
+		if err != nil || i < 1 || i > len(keys) {
+			return nil, fmt.Errorf("unexpected key ordinal %q", line)
+		}
+		present[i-1] = true
+	}
+	return present, nil
+}
+
+// rowsByKey fetches the full rows for the given keys, ordered by primary key.
+func (e *Engine) rowsByKey(ctx context.Context, cid string, src *registry.Source, k tableKey, pk []pkColumn, keys []string) ([]map[string]any, error) {
+	order := make([]string, len(pk))
+	for i, c := range pk {
+		order[i] = "t." + quoteIdent(c.name)
+	}
+	// t.* (not bare t, which a column named "t" would shadow) is the whole row
+	sql := fmt.Sprintf("SELECT to_jsonb(t.*) FROM %s, %s AS t WHERE %s ORDER BY %s",
+		keyRecordSQL("["+strings.Join(keys, ",")+"]", pk, false), k.sql(), pkMatch(pk), strings.Join(order, ", "))
 	out, err := e.psqlOutput(ctx, cid, src, sql)
 	if err != nil {
 		return nil, err
 	}
 	var rows []map[string]any
-	for _, line := range strings.Split(out, "\n") {
-		if line = strings.TrimSpace(line); line == "" {
-			continue
-		}
+	for _, line := range nonEmptyLines(out) {
 		var m map[string]any
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
-			return nil, fmt.Errorf("decode sample row %q: %w", line, err)
+			return nil, fmt.Errorf("decode sample row %q: %w", truncate(line, 200), err)
 		}
 		rows = append(rows, m)
 	}
 	return rows, nil
-}
-
-// rowKey is the host-side join key for a sampled row: its primary-key values,
-// JSON-encoded so heterogeneous types compare structurally.
-func rowKey(row map[string]any, pk []string) string {
-	parts := make([]string, len(pk))
-	for i, c := range pk {
-		b, _ := json.Marshal(row[c])
-		parts[i] = string(b)
-	}
-	return strings.Join(parts, "\x00")
 }
 
 // psqlOutput runs a single SQL statement in the instance over the local socket
@@ -282,14 +605,32 @@ func (e *Engine) psqlOutput(ctx context.Context, cid string, src *registry.Sourc
 	return e.drv.ExecOutput(ctx, cid, cmd)
 }
 
-// quoteLiteral wraps s as a SQL string literal (single quotes doubled).
-func quoteLiteral(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+// sqlLiteral quotes s as an escape-string literal (E'...'), which reads the
+// same whatever standard_conforming_strings is set to.
+func sqlLiteral(s string) string {
+	return "E'" + strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(s) + "'"
 }
 
 // quoteIdent wraps s as a SQL identifier (double quotes doubled).
 func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+func nonEmptyLines(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // stripDumpNoise removes pg_dump lines that differ between two dumps of the
@@ -323,61 +664,42 @@ func pgDumpSchemaCmd(src *registry.Source) []string {
 	return []string{"pg_dump", "-U", user, "-h", "/var/run/postgresql", "--schema-only", "--no-owner", "--no-acl", db}
 }
 
-// rowEstimates runs the row-estimate query inside the given instance and
-// parses its relname|reltuples lines. Negative reltuples (never analyzed)
-// clamp to 0.
-func (e *Engine) rowEstimates(ctx context.Context, cid string, src *registry.Source) (map[string]int64, error) {
-	user, db := src.ConnUser, src.ConnDB
-	if user == "" {
-		user = "postgres"
-	}
-	if db == "" {
-		db = "postgres"
-	}
-	cmd := []string{"psql", "-tA", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", db, "-h", "/var/run/postgresql", "-c", rowEstimateSQL}
-	out, err := e.drv.ExecOutput(ctx, cid, cmd)
-	if err != nil {
-		return nil, err
-	}
-	rows := map[string]int64{}
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+func sortKeys(keys []tableKey) {
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].schema != keys[j].schema {
+			return keys[i].schema < keys[j].schema
 		}
-		name, count, ok := strings.Cut(line, "|")
-		if !ok {
-			return nil, fmt.Errorf("unparseable row estimate line %q", line)
-		}
-		n, err := strconv.ParseInt(count, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("unparseable row estimate line %q: %w", line, err)
-		}
-		rows[name] = max(n, 0)
-	}
-	return rows, nil
+		return keys[i].table < keys[j].table
+	})
 }
 
-// tableDeltas joins both sides' estimates into a sorted union; tables present
-// on one side only count 0 on the other.
-func tableDeltas(base, branch map[string]int64) []TableDelta {
-	names := map[string]bool{}
-	for n := range base {
-		names[n] = true
+// tableDeltas joins both sides into a union sorted by schema and name. A
+// table present on one side only counts 0 on the other; an unknown side
+// keeps UnknownRows and marks the delta unknown.
+func tableDeltas(base, branch map[tableKey]tableStat) []TableDelta {
+	names := map[tableKey]bool{}
+	for k := range base {
+		names[k] = true
 	}
-	for n := range branch {
-		names[n] = true
+	for k := range branch {
+		names[k] = true
 	}
-	sorted := make([]string, 0, len(names))
-	for n := range names {
-		sorted = append(sorted, n)
+	keys := make([]tableKey, 0, len(names))
+	for k := range names {
+		keys = append(keys, k)
 	}
-	sort.Strings(sorted)
-	out := make([]TableDelta, 0, len(sorted))
-	for _, n := range sorted {
-		out = append(out, TableDelta{
-			Table: n, BaseRows: base[n], BranchRows: branch[n], Delta: branch[n] - base[n],
-		})
+	sortKeys(keys)
+	out := make([]TableDelta, 0, len(keys))
+	for _, k := range keys {
+		// absent = 0 rows (the zero tableStat)
+		b, r := base[k].rows, branch[k].rows
+		td := TableDelta{Schema: k.schema, Table: k.table, BaseRows: b, BranchRows: r}
+		if b < 0 || r < 0 {
+			td.RowsUnknown = true
+		} else {
+			td.Delta = r - b
+		}
+		out = append(out, td)
 	}
 	return out
 }

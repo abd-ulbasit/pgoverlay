@@ -1,19 +1,21 @@
 // HA leader-election integration test against the pgoverlay-test kind cluster
 // (hack/kind-up.sh), gated by PGOVERLAY_K8S_IT=1. It installs the chart with
 // replicaCount=2 (which turns on --leader-elect + the leases RBAC), asserts
-// exactly one replica holds the pgoverlay-branchd Lease and serves mutations,
-// kills the leader pod, and asserts the surviving replica acquires the Lease
-// and a branch create succeeds within the renew deadline.
+// exactly one replica holds the pgoverlay-branchd Lease, carries the
+// pgoverlay.leader label and is the only endpoint of the API Service, and that
+// mutations through the Service succeed. It then kills the leader pod and
+// asserts the surviving replica acquires the Lease, takes over the label and
+// the Service, and a branch create through the Service succeeds.
 //
-// NOT RUN in this change's sandbox (no kind/Docker) and NOT in default CI
-// (CI runs PGOVERLAY_IT only, not PGOVERLAY_K8S_IT). Written to compile and be
-// correct; reuses the helm/port-forward/source-pod helpers in helm_it_test.go.
+// Runs in CI's kube job (PGOVERLAY_K8S_IT=1 go test ./internal/deploy/) and
+// reuses the helm/port-forward/source-pod helpers in helm_it_test.go.
 package deploy
 
 import (
 	"context"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +27,7 @@ import (
 const (
 	haNS      = "pgoverlay-ha"
 	haRelease = "pgoverlay"
-	haToken   = "ha-it-token"
+	haToken   = "ha-it-token-0123456789"
 	haSrcPod  = "pgoverlay-ha-source"
 	leaseName = "pgoverlay-branchd"
 	// failover budget: the lease duration is 15s, so a survivor can acquire
@@ -104,22 +106,27 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 		t.Fatalf("Lease holder %q is not one of the branchd pods %v", holder, pods)
 	}
 
-	// Forward to the leader POD, not to the Service. /readyz is deliberately
-	// NOT leader-gated (a follower stays ready to serve reads and probes), so
-	// both replicas are Service endpoints and `port-forward svc/...` would pin
-	// one at random — half the time a follower, which 503s every mutation for
-	// as long as the forward lives. Naming the pod makes the test deterministic
-	// and is what lets the post-failover step below prove the *new* leader
-	// accepts writes.
-	base := portForward(t, kc, haNS, "pod/"+holder)
+	// The leader labels its pod and the API Service selects only that label,
+	// so the Service (what ghook, the CLI and `port-forward svc/...` use) has
+	// exactly the leader as its endpoint and mutations through it never land
+	// on a follower. Both pods stay Ready (helm --wait above needed that).
+	// The leader must be Running and Ready first: a replacement pod can win
+	// the Lease while still ContainerCreating (#14, CI 30340851419).
+	waitPodReady(t, kc, haNS, holder, 2*time.Minute)
+	waitServiceIsLeaderOnly(t, kc, holder)
+	base := portForward(t, kc, haNS, "svc/"+haAPIService)
 	client := apiclient.New(base, haToken)
 	srcIP := startHASourcePod(t, kc)
 
 	if _, err := createSourceWithRetry(ctx, client, srcIP, renewBound); err != nil {
-		t.Fatalf("create source against leader: %v", err)
+		t.Fatalf("create source through the API Service: %v", err)
 	}
-	if _, err := createBranchWithRetry(ctx, client, "ha-pr-1", renewBound); err != nil {
-		t.Fatalf("create branch against leader: %v", err)
+	// Every mutation through the Service lands on the leader: no 503s.
+	for i := 1; i <= 4; i++ {
+		name := "ha-pr-" + strconv.Itoa(i)
+		if _, err := client.CreateBranch(ctx, api.CreateBranchRequest{Name: name, Source: "ha-main"}); err != nil {
+			t.Fatalf("create %s through the API Service: %v", name, err)
+		}
 	}
 
 	// Kill the leader pod; the survivor must acquire the Lease and accept a
@@ -139,21 +146,59 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 	}
 	t.Logf("failed over: new Lease holder %s", newHolder)
 
-	// The old forward went down with the pod we just deleted ("lost connection
-	// to pod"), so every later request would get connection-refused on a dead
-	// local port and look like a failover failure. Re-establish against the
-	// survivor before asserting it accepts writes.
-	client = apiclient.New(portForward(t, kc, haNS, "pod/"+newHolder), haToken)
+	// The new leader takes over the label, so the Service follows it. The old
+	// forward went down with the pod we just deleted (a Service port-forward
+	// pins one pod), so re-establish it before asserting writes.
+	//
+	// The new leader is not necessarily the surviving replica: the Deployment
+	// replaces the killed pod at once, and that replacement can win the Lease
+	// within a second of starting, before the API server shows it Running.
+	// Forwarding then fails with "pod is not running. Current
+	// status=Pending" (CI 30340851419), so wait for it to be Ready first.
+	waitPodReady(t, kc, haNS, newHolder, 2*time.Minute)
+	waitServiceIsLeaderOnly(t, kc, newHolder)
+	client = apiclient.New(portForward(t, kc, haNS, "svc/"+haAPIService), haToken)
 
 	// A create now succeeds against the new leader within the budget.
-	if _, err := createBranchWithRetry(ctx, client, "ha-pr-2", renewBound); err != nil {
+	if _, err := createBranchWithRetry(ctx, client, "ha-pr-5", renewBound); err != nil {
 		t.Fatalf("create branch after failover: %v", err)
 	}
 
 	// Cleanup branches/source so the namespace teardown is clean.
-	_ = client.DestroyBranch(ctx, "ha-pr-1")
-	_ = client.DestroyBranch(ctx, "ha-pr-2")
+	for i := 1; i <= 5; i++ {
+		_ = client.DestroyBranch(ctx, "ha-pr-"+strconv.Itoa(i))
+	}
 	_ = client.RemoveSource(ctx, "ha-main")
+}
+
+// haAPIService is the chart's API Service for release haRelease (the release
+// name contains "pgoverlay", so the fullname is the release name).
+const haAPIService = haRelease + "-api"
+
+// waitServiceIsLeaderOnly polls until leader carries the pgoverlay.leader
+// label, no other branchd pod does, and the API Service's only endpoint is
+// leader.
+func waitServiceIsLeaderOnly(t *testing.T, kc, leader string) {
+	t.Helper()
+	kubectl := func(args ...string) (string, error) {
+		out, err := exec.Command("kubectl", append([]string{"--kubeconfig", kc, "-n", haNS}, args...)...).CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	var labelled, endpoints string
+	deadline := time.Now().Add(renewBound)
+	for time.Now().Before(deadline) {
+		var err1, err2 error
+		labelled, err1 = kubectl("get", "pods", "-l", "app.kubernetes.io/name=pgoverlay,pgoverlay.leader=true",
+			"-o", "jsonpath={.items[*].metadata.name}")
+		endpoints, err2 = kubectl("get", "endpointslices", "-l", "kubernetes.io/service-name="+haAPIService,
+			"-o", "jsonpath={.items[*].endpoints[*].targetRef.name}")
+		if err1 == nil && err2 == nil && labelled == leader && endpoints == leader {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("API Service never routed to the leader %s alone within %s: labelled pods %q, endpoints %q",
+		leader, renewBound, labelled, endpoints)
 }
 
 // startHASourcePod runs the seed postgres pod in the HA namespace.

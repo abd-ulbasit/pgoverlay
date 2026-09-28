@@ -4,26 +4,50 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, with no commit needed: new advisories reach the vuln DB and new
+  # postgres images are published whether or not anyone pushes. The scheduled
+  # run is the vuln gate plus the Postgres version matrix.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  # release.yml calls this workflow for every v* tag, so a release is gated on
+  # the whole suite, vuln gate included, at the tagged commit.
+  workflow_call:
+
+# Least privilege: nothing here writes to the repository.
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
-# unit/integration/helm are fast. The `kube` job stands up a kind cluster and
-# runs the Kubernetes + HA-failover suites (CSI best-effort). The Postgres
-# version matrix still runs locally via the Makefile.
+# Third-party actions are pinned to commit SHAs (Dependabot keeps the pins
+# and their version comments current). Downloaded tools are pinned to a
+# version and, where they are not installed by a pinned action, a sha256.
+#
+# unit/vuln/js/images/integration/helm are fast. The `kube` job stands up a
+# kind cluster and runs the Kubernetes + HA-failover suites (CSI best-effort).
+# `pg-matrix` runs the Postgres 14-18 version matrix on the weekly schedule
+# (and on demand).
 jobs:
   unit:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - run: go vet ./...
       # The golang base image pins GOTOOLCHAIN=local, so a Dockerfile trailing
       # go.mod's `go` directive fails at `RUN go mod download` — which is how
-      # `make docker-build` and the helm ITs silently broke once already.
+      # `make docker-build` and the helm ITs silently broke once already. It
+      # also keeps the goreleaser pin buildable with go.mod's Go (make
+      # release-check runs it with go run) and equal in the Makefile and
+      # release.yml.
       - run: make check-toolchain
       - name: gofmt
         run: |
@@ -41,22 +65,67 @@ jobs:
   vuln:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       # The gate itself lives in hack/vulncheck.sh so `make vuln` reproduces it
-      # byte for byte on a laptop. Rationale for the module-scoped allowlist is
-      # in that script and in SECURITY.md.
-      - name: govulncheck (binary mode + module-scoped allowlist)
+      # byte for byte on a laptop. It pins govulncheck and fails closed; the
+      # accepted advisories are in hack/vuln-allowlist.txt (see SECURITY.md).
+      - name: vuln gate self-test (stub scanner, offline)
+        run: make vuln-test
+      - name: govulncheck (binary mode, per-advisory allowlist)
         run: make vuln
 
+  js:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines: node >= 18; the oldest supported and the current LTS lines
+        node: ["18", "22", "24"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+      # Both SDKs, sdk/js (pgoverlay-test) and sdk/js-connect
+      # (pgoverlay-connect): node --test plus an `npm pack --dry-run`.
+      - run: make js-sdk-test
+
+  images:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: [Dockerfile, Dockerfile.ghook]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Both architectures the release publishes. The build stage
+      # cross-compiles from the runner's platform, so no emulation is needed.
+      - name: build ${{ matrix.dockerfile }} (linux/amd64, linux/arm64)
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: docker buildx build --platform linux/amd64,linux/arm64 -f "$DOCKERFILE" .
+
   integration:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest # Docker preinstalled; overlay tests use --cap-add SYS_ADMIN
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: pre-pull images
@@ -66,43 +135,83 @@ jobs:
       # -p 1: serialize packages. The IT suites each spin Postgres containers
       # with published ephemeral ports; running packages in parallel on one
       # daemon races those ports ("address already in use"). Serializing trades
-      # a little speed for determinism.
-      - run: PGOVERLAY_IT=1 go test ./... -count=1 -p 1 -timeout 25m
+      # a little speed for determinism. `make it` runs the same command.
+      - run: make it
+
+  pg-matrix:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The supported range (README "Supported Postgres versions"): 14 is the
+        # floor because branch startup passes recovery_init_sync_method.
+        pg: ["14", "15", "16", "17", "18"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: seed -> branch -> verify -> destroy on postgres ${{ matrix.pg }}
+        env:
+          PGOVERLAY_MATRIX_VERSIONS: ${{ matrix.pg }}
+        run: |
+          docker pull -q "postgres:${PGOVERLAY_MATRIX_VERSIONS}"
+          docker pull -q alpine:3.21
+          make matrix
 
   helm:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.4
       - run: make helm-test
 
   kube:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest # Docker preinstalled; the ITs create their own kind cluster
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.4
+      # Checksums are the upstream-published sha256 of these exact releases,
+      # written down here so a tampered download fails instead of running as
+      # root. Bump version and checksum together.
       - name: Install kind + kubectl
+        env:
+          KIND_VERSION: v0.27.0
+          KIND_SHA256: a6875aaea358acf0ac07786b1a6755d08fd640f4c79b7a2e46681cc13f49a04b
+          KUBECTL_VERSION: v1.31.0
+          KUBECTL_SHA256: 7c27adc64a84d1c0cc3dcf7bf4b6e916cc00f3f576a2dbac51b318d926032437
         run: |
-          curl -fsSL -o kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
-          curl -fsSL -o kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          curl -fsSL -o kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          printf '%s  kind\n%s  kubectl\n' "$KIND_SHA256" "$KUBECTL_SHA256" | sha256sum --check --strict
           chmod +x kind kubectl && sudo mv kind kubectl /usr/local/bin/
       # Gate: the Kubernetes runtime-driver suite (hostPath volumes, helper
       # pods, branch pods, overlay-in-pod). It bootstraps the kind cluster
       # (hack/kind-up.sh) and loads its images itself.
       - name: Kubernetes runtime ITs (kind, hostPath)
         run: PGOVERLAY_K8S_IT=1 go test ./internal/runtime/ -count=1 -timeout 25m
-      # Gate: the end-to-end helm-deploy and HA-failover suites. These were
-      # `continue-on-error: true` while their timing was "still being hardened
-      # for hosted runners" — but what they were actually reporting was two
-      # real defects (a Dockerfile toolchain mismatch, and a port-forward
-      # pinned to the wrong namespace and then to the pod the test kills). The
-      # badge stayed green over "--- FAIL: TestHelmDeployEndToEnd" for weeks,
-      # which is worse than having no badge. Fixed and green on two
-      # consecutive runs, so it gates again.
+      # Gate: the end-to-end helm-deploy and HA-failover suites. Every
+      # port-forward in them waits for its pod to be Running and Ready first
+      # (waitPodReady): the HA suite once forwarded to a replacement pod that
+      # had already won the Lease but was still ContainerCreating.
       - name: Helm deploy + HA-failover ITs (kind)
         run: PGOVERLAY_K8S_IT=1 go test ./internal/deploy/ -count=1 -timeout 25m
       # Still best-effort, and for a reason that is not pgoverlay's code: the

@@ -1,10 +1,16 @@
 # pgoverlay has two storage modes (docs/kubernetes.md): csi — branches as PVC
 # clones, schedulable on any node, the recommended production-ish deployment
 # — and hostpath (default), which keeps all CoW data on ONE designated
-# storage node (single-node/dev scope). branchd itself is always pinned to
-# `node`; in hostpath mode every branch/helper pod is pinned there too.
+# storage node (single-node/dev scope). In hostpath mode branchd and every
+# branch/helper pod are pinned to `node`; in csi mode (with the default
+# persistence) nothing is pinned and branchd follows its state PVC.
 
-# REQUIRED: name of the storage node (kubectl get nodes).
+# Name of the storage node (kubectl get nodes). REQUIRED in hostpath mode, and
+# whenever branchd's state is a hostPath (persistence off): branchd is pinned
+# to it with nodeName. Ignored in csi mode with persistence on (the default):
+# branchd then needs nothing from any particular node, and pinning it would
+# strand it Pending once that node is replaced. Use nodeSelector/affinity
+# below if you still want to steer it.
 node: ""
 
 # Host directory on the storage node holding all CoW volumes. branchd's own
@@ -24,7 +30,8 @@ dataRoot: /var/lib/pgoverlay
 #    pods schedule on ANY node with no extra capabilities. Requires a
 #    StorageClass whose CSI driver supports PVC cloning (e.g. EBS, Ceph RBD,
 #    zfs-localpv, LINSTOR) — or VolumeSnapshots when snapshotClass is set.
-#    `node` is still required: branchd itself keeps its sqlite state on it.
+#    branchd's sqlite state goes on a PVC too (persistence, auto-on), so
+#    `node` is not needed.
 storage:
   mode: hostpath
   # REQUIRED when mode=csi: StorageClass for all pgoverlay PVCs.
@@ -59,10 +66,19 @@ persistence:
 # replicaCount > 1 (or leaderElection.enabled) the chart turns on leader
 # election automatically — see leaderElection below and docs/ha.md.
 #
-# Co-scheduling caveat: an RWO PVC binds to one node, so all replicas must
-# schedule there (the chart already pins branchd to `node`). For replicas on
-# different nodes use an RWX volume / a CSI driver that supports it.
+# Co-scheduling caveat: an RWO volume attaches to one node, so all replicas
+# must run there. When branchd is pinned to `node` they are; when it is not
+# (csi mode with persistence) the chart adds a required podAffinity so the
+# replicas follow each other (unless you set `affinity` yourself). For
+# replicas on different nodes use an RWX volume / a CSI driver that supports it.
 replicaCount: 1
+
+# Scheduling knobs for the branchd pod (standard Kubernetes shapes). They add
+# to the `node` pin where there is one. `affinity`, when set, replaces the
+# HA co-location default described above.
+nodeSelector: {}
+tolerations: []
+affinity: {}
 
 # HA leader election (branchd --leader-elect). When on (or replicaCount > 1),
 # replicas contend for a coordination.k8s.io Lease (pgoverlay-branchd) in the
@@ -86,6 +102,16 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# Image for the file-level helper pods branchd starts at runtime (seed-volume
+# prep, entrypoint installs, disk usage, hostPath volume copies; branchd
+# --kube-helper-image). Empty = the built-in default, alpine pinned by digest
+# to the same base the pgoverlay images use. Set it to a mirror when the
+# cluster cannot pull from Docker Hub (private or air-gapped registries), and
+# pin it by digest (repo@sha256:...): in hostpath mode this image runs as root
+# with the whole data root mounted. The postgres images for branches and
+# seeding still follow the source's pg_version (postgres:<major>).
+helperImage: ""
+
 # Bearer token for the REST API. Exactly one of these is required:
 #  - token: the chart renders a Secret holding it. WARNING: a value passed via
 #    --set token= (or a values file committed to git) is persisted IN CLEARTEXT
@@ -104,11 +130,21 @@ api:
 
 # Postgres wire-protocol router (connect with dbname@branch). Expose as
 # NodePort to reach branches from outside the cluster without port-forward.
+# Before exposing it beyond a trusted network, set tls.certSecret below, turn
+# on rotateBranchCredentials, and (LoadBalancer) restrict
+# loadBalancerSourceRanges: branches are copies of production.
 proxy:
   port: 6432
   service:
     type: ClusterIP
     nodePort: "" # set when type is NodePort, e.g. 30432
+    # Service annotations, e.g. to make a cloud load balancer internal:
+    #   service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    annotations: {}
+    # type LoadBalancer only: client CIDRs allowed through the load balancer
+    # (e.g. your CI runners' egress). Empty = the provider default, which on
+    # most clouds (EKS Classic ELB included) is 0.0.0.0/0.
+    loadBalancerSourceRanges: []
   # Wire-protocol TLS for the Postgres router. Point certSecret at a Secret
   # with tls.crt and tls.key (e.g. a cert-manager Certificate's secret); it is
   # mounted into branchd and passed to --pg-tls-cert/--pg-tls-key, so the proxy
@@ -125,6 +161,12 @@ reconcileInterval: 60s
 # Age past which a creating/resetting branch row is considered stuck and failed
 # by reconcile (branchd --stuck-timeout).
 stuckTimeout: 10m
+
+# Seconds branchd gives in-flight branch/source operations to finish on
+# SIGTERM (rollout, pod delete) before it cancels and rolls them back
+# (branchd --shutdown-timeout). The pod's terminationGracePeriodSeconds is
+# set to this plus 30s so the kubelet does not kill branchd mid-drain.
+shutdownTimeout: 60
 
 # Per-branch credential rotation (branchd --rotate-branch-credentials): every
 # branch gets its own generated password instead of inheriting the source's.
@@ -144,11 +186,16 @@ rotateBranchCredentials: false
 #  - hostpath/overlay mode (default): the branch pods branchd creates at
 #    runtime (NOT this chart) need CAP_SYS_ADMIN + an UNCONFINED seccomp
 #    profile to perform the in-container overlay mount (a privileged kernel
-#    op). That is a single-node / trusted-workload posture only.
+#    op), and every pod uses hostPath volumes. That is a single-node /
+#    trusted-workload posture only, and the namespace must allow Pod Security
+#    "privileged".
 #  - csi mode (storage.mode=csi) is the RECOMMENDED PRODUCTION DEFAULT:
-#    branches are PVC clones, branch pods need NO added capabilities and run
-#    under the cluster's default (RuntimeDefault) seccomp, schedulable on any
-#    node. Prefer csi whenever the cluster is shared/untrusted.
+#    branches are PVC clones, branch and helper pods need NO added
+#    capabilities and run with RuntimeDefault seccomp and no privilege
+#    escalation, schedulable on any node. With persistence on (the default)
+#    everything fits Pod Security "baseline". Prefer csi whenever the cluster
+#    is shared/untrusted. "restricted" fits neither mode: branchd and the
+#    postgres entrypoint start as root. NOTES.txt prints the level needed.
 runAsUser: 0
 
 resources: {}
@@ -157,9 +204,10 @@ resources: {}
 # installs don't lose connectivity, but RECOMMENDED on any shared cluster.
 # Needs a CNI that enforces NetworkPolicy (Calico, Cilium, ...). When enabled
 # the chart locks down: (a) ingress to branchd API/proxy to ghook + the
-# selectors below + the metrics source; (b) ingress to branch pods to branchd
-# only; (c) egress from branch pods to cluster DNS + the configured Postgres
-# source(s) only.
+# selectors below + the metrics source; (b) branch pods: ingress from branchd
+# only, egress to cluster DNS only (branches never talk to the source); (c)
+# helper pods: no ingress, and — once sourceEgress is set — egress to cluster
+# DNS + the configured Postgres source(s) only.
 networkPolicy:
   enabled: false
   # Who may reach branchd's API (7070) and proxy (6432). A list of raw
@@ -177,14 +225,17 @@ networkPolicy:
   #     - namespaceSelector:
   #         matchLabels: { kubernetes.io/metadata.name: monitoring }
   metricsFrom: []
-  # Cluster DNS peer(s) for branch-pod egress. Defaults to the kube-dns pods in
-  # any namespace (k8s-app=kube-dns, the CoreDNS convention). Override if your
-  # DNS uses different labels/namespace.
+  # Cluster DNS peer(s) for branch- and helper-pod egress. Defaults to the
+  # kube-dns pods in any namespace (k8s-app=kube-dns, the CoreDNS convention).
+  # Override if your DNS uses different labels/namespace.
   dnsFrom: []
-  # The Postgres source(s) branch pods hydrate from — a list of
-  # NetworkPolicyPeer (podSelector/namespaceSelector and/or ipBlock). Empty =
-  # no source egress opened (CSI-clone branches that carry their own data need
-  # none; overlay branches reading a remote source do). Example:
+  # The Postgres source(s) seeding reads from — a list of NetworkPolicyPeer
+  # (podSelector/namespaceSelector and/or ipBlock). Only the seed HELPER pods
+  # (pgoverlay.role=helper: pg_basebackup / pg_dump) connect to a source;
+  # branch pods never do, in any storage mode, and get no source egress.
+  # When set, helper pods may reach only these (plus DNS). Empty = helper
+  # egress is left unrestricted, since seeding has to reach the source.
+  # Example:
   #   sourceEgress:
   #     - ipBlock: { cidr: 10.0.5.10/32 }
   sourceEgress: []
@@ -215,6 +266,17 @@ ghook:
   #    production — keeps all ghook secrets out of Helm values/history.
   webhookSecret: ""
   existingSecret: ""
+  # Token ghook uses against branchd's REST API. ghook only creates, resets
+  # and destroys branches, so give it an operator-role token rather than the
+  # admin one (which also manages sources, credentials and tokens):
+  #   pgb token create ghook --role operator          # prints the token once
+  #   kubectl -n <ns> create secret generic pgoverlay-ghook-api --from-literal=token=<it>
+  #   helm upgrade ... --set ghook.apiTokenSecret=pgoverlay-ghook-api
+  # Empty = fall back to branchd's admin token (token/existingSecret above);
+  # NOTES.txt warns when that happens.
+  apiTokenSecret: ""
+  # Key holding the token in apiTokenSecret.
+  apiTokenKey: token
   # GitHub credentials enable the live connect-info PR comment and the
   # pgoverlay/branch commit status. Two auth modes, mutually exclusive:
   #
@@ -246,10 +308,13 @@ ghook:
   # Comma-separated "owner/name" allow-list; empty accepts any repository
   # that signs with the webhook secret (logged as a warning).
   repos: ""
-  # Branch naming: "pr-number" (default, pr-<N>) or "git-branch" (the PR's
-  # head ref, sanitized — lets preview platforms derive the branch from the
-  # git ref they already know, e.g. Vercel's VERCEL_GIT_COMMIT_REF, which is
-  # present from the first build before any PR association exists).
+  # Branch naming: "pr-number" (default, gh-<repo-key>-pr-<N>) or
+  # "git-branch" (gh-<repo-key>-<the PR's head ref, sanitized> — lets preview
+  # platforms derive the branch from the git ref they already know, e.g.
+  # Vercel's VERCEL_GIT_COMMIT_REF, which is present from the first build
+  # before any PR association exists; fork PRs are named by number). The
+  # repo key keeps PRs of different repositories apart; see
+  # docs/github-app.md.
   branchNaming: ""
   # host[:port] of the pgoverlay proxy as reachable by developers (shown in
   # PR comments), e.g. a NodePort or LB address for proxy.service.
@@ -259,4 +324,10 @@ ghook:
   port: 8080
   service:
     type: ClusterIP
+    annotations: {}
+    # type LoadBalancer only: CIDRs allowed to reach the webhook, e.g.
+    # GitHub's hook ranges (curl -s https://api.github.com/meta | jq .hooks).
+    # Deliveries are HMAC-verified either way; this also keeps everyone else
+    # off the endpoint.
+    loadBalancerSourceRanges: []
   resources: {}

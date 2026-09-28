@@ -20,7 +20,7 @@ import (
 // helper installs the zfs package at run time — it must be reachable (apk
 // network access) and version-compatible with the host's zfs kernel module.
 // Documented in docs/zfs.md.
-const zfsHelperImage = "alpine:3.21"
+const zfsHelperImage = runtime.UtilityImage
 
 // shellSafeRe matches argv words that need no quoting (dataset names,
 // snapshot names, flags). Anything else is single-quoted.

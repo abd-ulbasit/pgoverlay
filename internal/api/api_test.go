@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,16 @@ type fakeDriver struct {
 	starts     int
 	execs      [][]string // every Exec call, in order
 	execOutErr error      // returned by every ExecOutput call when set
+	seedErr    error      // returned by the pg_basebackup helper when set
+	execErr    error      // returned by every in-branch psql Exec when set
+	rmVolErr   error      // returned by every RemoveVolume when set
+
+	// startBlock, when set, parks every StartBranch until it is closed or the
+	// saga's context is cancelled; startEntered receives once per parked call
+	// and startErr records the context error a cancelled call returned.
+	startBlock   chan struct{}
+	startEntered chan struct{}
+	startErr     chan error
 }
 
 func newFake() *fakeDriver {
@@ -40,6 +51,9 @@ func (f *fakeDriver) CreateVolume(ctx context.Context, name string, l map[string
 	return nil
 }
 func (f *fakeDriver) RemoveVolume(ctx context.Context, name string) error {
+	if f.rmVolErr != nil {
+		return f.rmVolErr
+	}
 	delete(f.volumes, name)
 	return nil
 }
@@ -50,11 +64,23 @@ func (f *fakeDriver) CloneVolume(ctx context.Context, src, dst string, l map[str
 
 // RunHelper returns canned du output so the usage endpoint has something to parse.
 func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
+	if f.seedErr != nil && len(s.Cmd) > 0 && s.Cmd[0] == "pg_basebackup" {
+		return "", f.seedErr
+	}
 	return "4096\t/pgoverlay/rw", nil
 }
 func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
 	if f.failStart {
 		return "", errors.New("boom")
+	}
+	if f.startBlock != nil {
+		f.startEntered <- struct{}{}
+		select {
+		case <-f.startBlock:
+		case <-ctx.Done():
+			f.startErr <- ctx.Err()
+			return "", ctx.Err()
+		}
 	}
 	f.starts++
 	f.containers["cid-"+s.Name] = true
@@ -62,6 +88,9 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 }
 func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error {
 	f.execs = append(f.execs, cmd)
+	if len(cmd) > 0 && cmd[0] == "psql" {
+		return f.execErr
+	}
 	return nil
 }
 
@@ -84,24 +113,28 @@ func (f *fakeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (s
 	switch {
 	case strings.Contains(joined, "reltuples"):
 		if isBase {
-			return "users|100\n", nil
+			return `[{"schema":"public","table":"users","rows":100,"bytes":8192}]`, nil
 		}
-		return "added|7\nusers|100\n", nil
+		return `[{"schema":"public","table":"added","rows":7,"bytes":8192},{"schema":"public","table":"users","rows":100,"bytes":8192}]`, nil
 	case strings.Contains(joined, "indisprimary"):
 		if strings.Contains(joined, "'added'") {
-			return "x\n", nil // added has PK x
+			return `[["x","integer"]]`, nil // added has PK x
 		}
-		return "", nil
+		return "[]", nil
+	case strings.Contains(joined, "jsonb_build_object"):
+		// the new table's keys, highest first (it is absent on the base, so
+		// every row is branch-only)
+		return `{"x": 2}` + "\n" + `{"x": 1}` + "\n", nil
 	case strings.Contains(joined, "to_jsonb"):
-		if isBase {
-			return "", nil // base has no rows in the new table
-		}
 		return `{"x": 1}` + "\n" + `{"x": 2}` + "\n", nil
 	}
 	return "", nil
 }
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
-	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
+	if !f.containers[id] {
+		return runtime.ContainerInfo{}, fmt.Errorf("container %s: %w", id, runtime.ErrNotFound)
+	}
+	return runtime.ContainerInfo{ID: id, Running: true, Host: "127.0.0.1", Port: 54321}, nil
 }
 func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 	delete(f.containers, id)
@@ -110,14 +143,17 @@ func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, error) {
 	var out []runtime.ContainerInfo
 	for id := range f.containers {
-		out = append(out, runtime.ContainerInfo{ID: id, Running: true})
+		out = append(out, runtime.ContainerInfo{ID: id, Running: true, Host: "127.0.0.1", Port: 54321})
 	}
 	return out, nil
 }
-func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
-	var out []string
+func (f *fakeDriver) ListHelpers(ctx context.Context) ([]runtime.ContainerInfo, error) {
+	return nil, nil
+}
+func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]runtime.VolumeInfo, error) {
+	var out []runtime.VolumeInfo
 	for name := range f.volumes {
-		out = append(out, name)
+		out = append(out, runtime.VolumeInfo{Name: name})
 	}
 	return out, nil
 }
@@ -126,30 +162,28 @@ const testToken = "sekrit"
 
 func newTestServer(t *testing.T, opts ...engine.Option) (*httptest.Server, *fakeDriver) {
 	t.Helper()
-	d := newFake()
-	reg, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { reg.Close() })
-	eng := engine.New(reg, d, "postgres:17", opts...)
-	m := metrics.New()
-	m.SetStateCounter(reg)
-	ready := func(ctx context.Context) error {
-		if err := reg.Ping(ctx); err != nil {
-			return err
-		}
-		_, err := d.ListManaged(ctx)
-		return err
-	}
-	ts := httptest.NewServer(New(eng, reg, testToken, m.Handler(), ready, 0).Handler())
-	t.Cleanup(ts.Close)
+	ts, _, d := newTestServerParts(t, opts...)
 	return ts, d
 }
 
 // newTestServerWithLeader builds the API like newTestServer but returns the
 // *Server too, so leader-gate tests can flip its gate.
 func newTestServerWithLeader(t *testing.T, opts ...engine.Option) (*httptest.Server, *Server) {
+	t.Helper()
+	ts, srv, _ := newTestServerParts(t, opts...)
+	return ts, srv
+}
+
+// newTestServerParts builds the API over a fresh registry and fake driver and
+// returns all three handles.
+func newTestServerParts(t *testing.T, opts ...engine.Option) (*httptest.Server, *Server, *fakeDriver) {
+	t.Helper()
+	return newTestServerCfg(t, 0, opts...)
+}
+
+// newTestServerCfg is newTestServerParts with an explicit stuck timeout (0 =
+// the default).
+func newTestServerCfg(t *testing.T, stuckTimeout time.Duration, opts ...engine.Option) (*httptest.Server, *Server, *fakeDriver) {
 	t.Helper()
 	d := newFake()
 	reg, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -167,10 +201,10 @@ func newTestServerWithLeader(t *testing.T, opts ...engine.Option) (*httptest.Ser
 		_, err := d.ListManaged(ctx)
 		return err
 	}
-	srv := New(eng, reg, testToken, m.Handler(), ready, 0)
+	srv := New(eng, reg, testToken, m.Handler(), ready, stuckTimeout)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return ts, srv
+	return ts, srv, d
 }
 
 // do sends an authenticated JSON request; token "" sends no Authorization.
@@ -443,6 +477,25 @@ func TestCreateBranchQuotaReturns403(t *testing.T) {
 		CreateBranchRequest{Name: "pr-2", Source: "main"})
 	if code != http.StatusForbidden {
 		t.Fatalf("over-cap create: code=%d body=%s, want 403", code, body)
+	}
+}
+
+// TestDiffQuotaReturns403: a diff provisions a throwaway branch, so at the
+// --max-branches cap it is refused with 403 like a create, and starts nothing.
+func TestDiffQuotaReturns403(t *testing.T) {
+	ts, d := newTestServer(t, engine.WithMaxBranches(1))
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches",
+		CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create: code=%d body=%s", code, body)
+	}
+	starts := d.starts
+	code, body := do(t, ts, testToken, "GET", "/v1/branches/pr-1/diff", nil)
+	if code != http.StatusForbidden || !strings.Contains(string(body), "quota") {
+		t.Fatalf("diff at the cap: code=%d body=%s, want 403 naming the quota", code, body)
+	}
+	if d.starts != starts {
+		t.Fatalf("diff at the cap started %d instance(s)", d.starts-starts)
 	}
 }
 

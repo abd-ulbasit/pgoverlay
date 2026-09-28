@@ -23,7 +23,7 @@ const roleKey ctxKey = iota
 
 // envTokenActor is the audit name recorded for mutations made with the built-in
 // PGOVERLAY_TOKEN env value, which carries admin but has no stored token name.
-const envTokenActor = "root"
+const envTokenActor = registry.EnvTokenActor
 
 // resolveActor maps a presented bearer token to the actor behind it: the
 // resolved role plus the identity recorded in the audit log. The built-in

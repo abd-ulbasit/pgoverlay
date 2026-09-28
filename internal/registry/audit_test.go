@@ -2,6 +2,8 @@ package registry
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -157,8 +159,14 @@ func TestBranchHistory(t *testing.T) {
 
 func TestBranchHistoryUnknownName(t *testing.T) {
 	r := openTest(t)
-	if _, err := r.BranchHistory("nope"); err != ErrNotFound {
+	if _, err := r.BranchHistory("nope"); !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), `"nope"`) {
 		t.Fatalf("err=%v want ErrNotFound", err)
+	}
+	// rows whose entity still exists carry an empty entity_name; the empty
+	// name must not match them all
+	seedReadyBranch(t, r, "pr-x")
+	if _, err := r.BranchHistory(""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("BranchHistory(\"\") err=%v want ErrNotFound", err)
 	}
 }
 
@@ -177,5 +185,116 @@ func TestLookupAPITokenActor(t *testing.T) {
 	}
 	if _, _, ok := r.LookupAPITokenActor(""); ok {
 		t.Fatal("empty token resolved")
+	}
+}
+
+// sourceJournal returns a source's transitions (to_state, actor, entity_name),
+// oldest first, read straight from the table (sources have no history API).
+func sourceJournal(t *testing.T, r *Registry, id string) [][3]string {
+	t.Helper()
+	rows, err := r.db.Query(`SELECT to_state, actor, entity_name FROM transitions
+		WHERE entity='source' AND entity_id=? ORDER BY id`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out [][3]string
+	for rows.Next() {
+		var e [3]string
+		if err := rows.Scan(&e[0], &e[1], &e[2]); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// SECRETS-03/06: source create, state changes, refresh and delete record the
+// request actor, and a delete leaves a row saying who removed the source.
+func TestSourceMutationsRecordActor(t *testing.T) {
+	r := openTest(t)
+	alice := WithActor(context.Background(), Actor{Name: "alice", Role: RoleAdmin})
+	s := &Source{Name: "prod", PGVersion: "17", Volume: "v1"}
+	if err := r.CreateSourceCtx(alice, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetSourceStateCtx(alice, s.ID, SourceReady, "seed complete"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.BumpSourceGenerationCtx(alice, s.ID, "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := r.GetSourceByID(s.ID); err != nil || got.Generation != 2 || got.Volume != "v2" {
+		t.Fatalf("after refresh: %+v err=%v", got, err)
+	}
+	if err := r.DeleteSourceCtx(alice, s.ID); err != nil {
+		t.Fatal(err)
+	}
+	j := sourceJournal(t, r, s.ID)
+	want := []string{string(SourceSeeding), string(SourceReady), string(SourceReady), "deleted"}
+	if len(j) != len(want) {
+		t.Fatalf("source journal %v, want to_states %v", j, want)
+	}
+	for i, e := range j {
+		if e[0] != want[i] || e[1] != "alice (admin)" {
+			t.Errorf("entry %d = %v, want to_state %q by alice (admin)", i, e, want[i])
+		}
+		if e[2] != "prod" {
+			t.Errorf("entry %d entity_name=%q, want prod (source row is gone)", i, e[2])
+		}
+	}
+	// the ctx-less wrappers still record the system actor
+	s2 := &Source{Name: "other", PGVersion: "17", Volume: "o1"}
+	if err := r.CreateSource(s2); err != nil {
+		t.Fatal(err)
+	}
+	if j := sourceJournal(t, r, s2.ID); len(j) != 1 || j[0][1] != SystemActor {
+		t.Fatalf("CreateSource journal %v, want the system actor", j)
+	}
+	if err := r.DeleteSourceCtx(alice, "no-such-id"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DeleteSourceCtx(unknown) err=%v want ErrNotFound", err)
+	}
+}
+
+// SECRETS-03: removing a source deletes its destroyed branch rows (the
+// source_id foreign key requires it), but their history stays reachable by
+// name.
+func TestBranchHistorySurvivesSourceDelete(t *testing.T) {
+	r := openTest(t)
+	b := seedReadyBranch(t, r, "pr-42")
+	ctx := WithActor(context.Background(), Actor{Name: "ci", Role: RoleOperator})
+	for _, to := range []BranchState{BranchDestroying, BranchDestroyed} {
+		if err := r.TransitionBranchCtx(ctx, b.ID, to, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := r.BranchHistory("pr-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DeleteSource(b.SourceID); err != nil {
+		t.Fatal(err)
+	}
+	after, err := r.BranchHistory("pr-42")
+	if err != nil {
+		t.Fatalf("history lost with the source: %v", err)
+	}
+	if len(after) != len(before) || after[len(after)-1].Actor != "ci (operator)" {
+		t.Fatalf("history after delete %+v, want %+v", after, before)
+	}
+	// a recreated name gets the old trail plus its own
+	seedReadyBranch(t, r, "pr-42")
+	hist, err := r.BranchHistory("pr-42")
+	if err != nil || len(hist) != len(before)+2 {
+		t.Fatalf("history of recreated name: %d rows err=%v, want %d", len(hist), err, len(before)+2)
+	}
+}
+
+func TestLocalActor(t *testing.T) {
+	if got := LocalActor("basit").String(); got != "local:basit" {
+		t.Fatalf("LocalActor=%q", got)
+	}
+	if got := LocalActor("").String(); got != "local:unknown" {
+		t.Fatalf("LocalActor(\"\")=%q", got)
 	}
 }

@@ -30,7 +30,7 @@ expect a few seconds.
 With --data, up to --sample (default 20) branch-only rows are shown per
 grown table — rows present on the branch but not the base, matched by
 primary key. Tables without a primary key are skipped (noted in a footer).`,
-		Args: cobra.ExactArgs(1),
+		Args: nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			n := 0
 			if data {
@@ -81,31 +81,41 @@ func renderDiff(w io.Writer, res *engine.DiffResult, all, data bool) error {
 		fmt.Fprint(w, res.SchemaDiff)
 	}
 	rows := res.Tables
+	hidden := 0 // unknown-count tables left out of the changed-only view
 	if !all {
 		rows = nil
 		for _, t := range res.Tables {
 			if t.Delta != 0 {
 				rows = append(rows, t)
+			} else if t.RowsUnknown {
+				hidden++
 			}
 		}
 	}
 	if len(rows) == 0 {
-		fmt.Fprintln(w, "tables: no row-count changes")
+		if hidden > 0 {
+			fmt.Fprintln(w, "tables: no known row-count changes")
+		} else {
+			fmt.Fprintln(w, "tables: no row-count changes")
+		}
 	} else {
 		fmt.Fprintln(w)
 		tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
 		fmt.Fprintln(tw, "TABLE\tBASE\tBRANCH\tDELTA")
 		for _, t := range rows {
-			delta := fmt.Sprintf("%+d", t.Delta)
-			if t.Delta == 0 {
-				delta = "0"
-			}
-			fmt.Fprintf(tw, "%s\t%d\t%d\t%s\n", t.Table, t.BaseRows, t.BranchRows, delta)
+			base, branch, delta := t.Cells() // "?" = unknown (never analyzed, too big to count)
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", t.Name(), base, branch, delta)
 		}
 		if err := tw.Flush(); err != nil {
 			return err
 		}
 		fmt.Fprintln(w, "(row counts are planner estimates)")
+	}
+	switch {
+	case hidden == 1:
+		fmt.Fprintln(w, "(1 table with an unknown row count not shown: never analyzed and too large to count exactly; --all lists it)")
+	case hidden > 1:
+		fmt.Fprintf(w, "(%d tables with an unknown row count not shown: never analyzed and too large to count exactly; --all lists them)\n", hidden)
 	}
 	if data {
 		if err := renderSamples(w, res); err != nil {
@@ -122,17 +132,16 @@ func renderSamples(w io.Writer, res *engine.DiffResult) error {
 	var skipped []string
 	printedAny := false
 	for _, t := range res.Tables {
-		grew := t.BranchRows > t.BaseRows
-		if !grew {
+		if !t.Grew() {
 			continue
 		}
 		if len(t.SampleRows) == 0 {
 			// grew but no samples: either no PK (skipped) or no new-by-PK rows
-			skipped = append(skipped, t.Table)
+			skipped = append(skipped, t.Name())
 			continue
 		}
 		printedAny = true
-		fmt.Fprintf(w, "\nnew rows in %s (up to %d):\n", t.Table, len(t.SampleRows))
+		fmt.Fprintf(w, "\nnew rows in %s (up to %d):\n", t.Name(), len(t.SampleRows))
 		for _, row := range t.SampleRows {
 			b, err := json.Marshal(compactRow(row))
 			if err != nil {

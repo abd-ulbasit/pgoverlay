@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -23,7 +23,7 @@ func TestDumpSeededBranching(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePGVersion(t, ctx, "16")
+	host, port, network, hostConn := pgctltest.StartSourcePGVersion(t, ctx, "16")
 	mustExec(t, ctx, hostConn, `CREATE TABLE items(id int primary key, name text);
 		INSERT INTO items SELECT i, 'item-' || i FROM generate_series(1,5000) i;
 		CREATE SCHEMA internal;

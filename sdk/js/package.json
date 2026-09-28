@@ -14,7 +14,8 @@
   },
   "files": [
     "index.mjs",
-    "index.d.ts"
+    "index.d.ts",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18"

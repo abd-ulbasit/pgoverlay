@@ -15,25 +15,29 @@ see the [design decisions](DESIGN-DECISIONS.md).
             │                ┌─ branchd ────────────────────────────────┐
             │                │  REST API :7070   (+ embedded web UI)    │
             │                │  pgproxy :6432    (wire-protocol router) │
-            │                │  TTL reaper       (background loop)      │
+            │                │  reconcile loop   (reap, repair, GC)     │
             │                └──────────────┬────────────────────────────┘
             ▼                               ▼
         ┌─ engine ──────────────────────────────────┐
-        │  sagas: create/from-branch/reset/destroy    │
+        │  sagas: create/from-branch/reset/recover/   │
+        │  destroy; diff; masking                     │
         │  cow.Planner: overlay | zfs | csi (names,    │
         │  entrypoints, zfs argv, clone plans)        │
         └───────┬──────────────────────┬────────────┘
                 ▼                      ▼
         registry (SQLite)      runtime.Driver
         states + journal       ├─ DockerDriver (containers, volumes)
-        sources, branches,     └─ KubeDriver   (pods on one storage node,
-        mask scripts                            hostPath "volumes")
+        sources, branches,     └─ KubeDriver   (pods; hostPath dirs on one
+        layers, mask scripts,                   storage node, or CSI PVCs)
+        tokens
 ```
 
 One engine, two frontends: the CLI embeds it directly (local mode), branchd
 serves it over REST and the CLI becomes a thin API client (server mode). The
-registry is SQLite — single writer, which is why branchd is single-replica
-and local mode must not run concurrently with it.
+registry is SQLite — a single writer. branchd runs as one replica by default;
+with leader election ([High availability](ha.md)) extra replicas stand by and
+only the leader writes. Local mode must not run against a registry a branchd
+is using.
 
 ## The CoW mechanism (overlay backend, default)
 
@@ -68,6 +72,19 @@ the branch's rw layer. `syncfs` replaces that per-file pass with one syscall
 and copies nothing up; it's what makes branch creation O(1) in data size
 (measured in [Benchmarks](benchmarks.md)).
 
+The same rule still applies after startup. Postgres opens every relation
+segment read-write, for reads too (`md.c`), so the first query that touches a
+table copies each of its segment files (up to 1 GiB) whole into the branch's
+rw layer. A branch's disk therefore grows toward the size of the tables it
+touches, read or write ([Reads copy up too](benchmarks.md#reads-copy-up-too));
+the zfs and csi backends copy blocks instead.
+
+Every branch container gets `CAP_SYS_ADMIN` and `apparmor=unconfined` for the
+mount, on Docker whatever the backend. Branch ports are published on the
+Docker host's `127.0.0.1`: branchd picks a free loopback port and pins it, and
+containers restart with the daemon (`unless-stopped`), so the address survives
+Docker and host restarts.
+
 ### Seeding: basebackup vs dump
 
 The seed itself has two methods. `pg_basebackup` (default) is a physical,
@@ -83,6 +100,15 @@ cluster, so branches skip crash recovery entirely. Either way the seed is
 just a data dir in the source layer — everything downstream (overlay/zfs/csi
 branching, refresh generations, masking) is identical.
 
+A basebackup of a standby is made safe to boot: the seed deletes the standby
+and recovery signal files and strips the recovery settings, and the branch
+entrypoints override the settings that would tie a branch to the source host
+(port, listen and socket addresses, `hba_file`, archiving, synchronous
+standbys). The seed helper also checks the data directory's major version
+against the image and fails a mismatched seed. Each source can name its own
+image (`--image`) for extensions, locales or libc the stock
+`postgres:<major>` image lacks.
+
 ## The zfs backend (experimental)
 
 `branchd --cow zfs --zfs-dataset tank/pgoverlay` swaps the layer mechanics:
@@ -95,24 +121,58 @@ Details and verification walkthrough: [ZFS backend](zfs.md).
 
 ## Sagas and states
 
-Branch rows move through a journaled state machine:
+Branch rows move through a journaled state machine (`legalBranch` in
+`internal/registry/registry.go`); every transition is a compare-and-swap
+written together with its journal row, and records the actor:
 
+```mermaid
+stateDiagram-v2
+    [*] --> creating
+    creating --> ready
+    creating --> failed
+    ready --> resetting: reset, freeze or csi quiesce, reconcile restart
+    ready --> destroying
+    resetting --> ready
+    resetting --> failed
+    failed --> resetting: reset, or recover onto the existing data
+    failed --> destroying
+    destroying --> destroying: failed attempt (journaled note), retried
+    destroying --> destroyed
+    destroyed --> [*]
 ```
- creating ──► ready ──► resetting ──► ready
-     │          │           │
-     ▼          ▼           ▼
-   failed   destroying ──► destroyed        (every transition journaled)
-```
+
+`failed` is not terminal: `pgb branch reset` re-clones a failed branch (for a
+failed create, a retry), and `pgb branch recover` restarts it on its recorded
+volumes with no re-clone — the way back for a branch that failed with its data
+intact, such as a freeze parent interrupted by a crash. A destroy that fails
+part-way leaves the row in `destroying` with a journaled note, and running the
+destroy again (by hand, or reconcile's `retry_destroy`) re-runs the idempotent
+teardown. A resetting branch that is destroyed is first moved to `failed`.
+Sources have a smaller machine: `seeding → ready | failed`; a failed seed is
+replaced by the next `source add` of the same name.
 
 Provisioning is a **saga**: each step (layer create, entrypoint install,
 container start, readiness wait, masking) registers a compensation, and any
 failure unwinds them in reverse — no orphaned containers, volumes, or
-datasets. Masking scripts (per-source ordered SQL, stored in the registry)
-run inside the fresh branch via `psql` over the local socket *after*
-readiness and *before* the branch is marked ready, so a branch never serves
-unmasked data; a failing script fails the branch. On startup, `Reconcile`
-repairs interrupted work: stuck `creating` rows are failed and their
-resources cleaned, and managed containers with no registry row are removed.
+datasets. While a saga runs it heartbeats its rows (every
+`min(--stuck-timeout/4, 30s)`), so reconcile can tell a slow operation from
+an abandoned one. Masking scripts (per-source ordered SQL, stored in the
+registry) run inside the fresh branch via `psql` over the local socket
+*after* readiness and *before* the branch is marked ready, so a branch never
+serves unmasked data; a failing script fails the branch. Failure reasons are
+stored without Postgres `DETAIL`/`CONTEXT` lines (which can quote row data)
+and capped at 1 KiB.
+
+The **reconcile loop** runs one pass at startup and then every
+`--reconcile-interval`. It reaps expired branches; fails `creating`/`resetting`
+branches and `seeding` sources that have made no progress for
+`--stuck-timeout` (so a crash less than that ago is repaired by a later pass,
+not the startup one); retries destroys stuck in `destroying`; restarts ready
+branches whose container or pod is gone and records moved addresses; removes
+orphaned containers and finished helpers; and garbage-collects unreferenced
+layers and volumes older than `--stuck-timeout`. Every destructive step is
+re-checked against the registry just before it runs. The action list is in
+[Troubleshooting](troubleshooting.md#what-reconcile-does).
 
 ## Source generations
 
@@ -131,12 +191,17 @@ switches to per-branch passwords: on every branch create and reset the
 engine generates a 32-hex `crypto/rand` secret and applies it inside the
 branch — `ALTER ROLE … WITH PASSWORD` over the same local-socket psql path
 masking uses, after masking and before the branch is marked ready — then
-stores it on the branch row (registry v7). The API returns it as `password`
-(omitted in inherit mode), `pgb connect` embeds it in the printed DSNs, and
-`pgb branch ls` never shows it. Branch-from-branch children get their own
-password; the parent's freeze/quiesce restart deliberately does not
-re-rotate (its data already carries its password). A reset rotates again —
-the old branch password stops working.
+stores it on the branch row (registry v7), encrypted with AES-256-GCM under a
+dedicated at-rest key (`secret.key` in the state directory, or
+`PGOVERLAY_SECRET_KEY`; see [Security](security.md#the-registry-and-the-at-rest-key)).
+The API returns it as `password` (omitted in inherit mode), `pgb connect`
+embeds it in the printed DSNs, and `pgb branch ls` never shows it. A password
+the configured key cannot decrypt is reported as `password_unavailable`
+instead of failing the row; a reset mints a new one. Branch-from-branch
+children get their own password; the parent's freeze/quiesce restart
+deliberately does not re-rotate (its data already carries its password), and
+neither does a recover. A reset rotates again — the old branch password stops
+working. A destroyed branch's row keeps no password.
 
 The trade-off: with rotation a leaked branch DSN exposes only that branch,
 never the production-shaped source. But static-credential preview flows
@@ -148,19 +213,32 @@ same source password, so those flows need inherit mode (the default).
 
 `DiffBranch` answers "what changed in this branch?" without ever touching
 the source: it provisions an internal **throwaway branch** (`diff-<6 hex>`)
-from the target's *own* recorded base — the same pinned source-generation
-volume and frozen-layer chain reset re-provisions onto, never the source's
-current generation — so the comparison baseline is exactly what the branch
-started from. Both instances are then dumped in-container over the local
-socket (`pg_dump --schema-only --no-owner --no-acl`, plus a
-`pg_class.reltuples` row-estimate query), the unified diff is computed
-host-side, and the throwaway is destroyed through the normal branch-destroy
-path. The throwaway is a regular registry row with a one-hour TTL, so if
-branchd dies mid-diff the reaper (or reconcile) cleans the stray. All cow
-backends work identically — the throwaway is just a branch. Caveat: row
-counts are planner estimates; a fresh clone reports the base's last ANALYZE
-and the target's stats may be stale, so deltas show direction and magnitude,
-not exact counts.
+from the target's *own* recorded base — whatever a reset of the target would
+re-provision onto, never the source's current generation. Both instances are
+then dumped in-container over the local socket
+(`pg_dump --schema-only --no-owner --no-acl`, plus a table-statistics query),
+the unified diff is computed host-side (a linear-space Myers diff), and the
+throwaway is destroyed through the normal branch-destroy path. The throwaway
+is a regular registry row with a one-hour TTL, so if branchd dies mid-diff
+the reaper (or reconcile) cleans the stray.
+
+What "the base" is depends on the backend:
+
+- **overlay**: the pinned source-generation volume and frozen-layer chain,
+  so the baseline is exactly what the branch started from;
+- **zfs and csi, for a branch created from another branch**: the parent's
+  live dataset or PVC. The diff (like a reset) therefore compares against the
+  parent's **current** state, and changes the parent made after the fork show
+  up reversed. On csi the parent is quiesced around the clone (CHECKPOINT,
+  stop, clone, restart) because cloning an in-use PVC is not crash-safe, and a
+  child whose parent was destroyed can no longer be diffed or reset.
+
+Row counts are planner estimates (`pg_class.reltuples`); a table never
+analyzed is counted exactly when its heap is 64 MiB or less, and otherwise
+reported as unknown. Deltas show direction and magnitude, not an audit.
+Tables are keyed by schema and name. Optional sampling
+(`?data=N`, at most 500 rows per table) returns branch-only rows of grown
+tables by primary key.
 
 ## Proxy routing
 
@@ -180,6 +258,18 @@ relayed untouched between client and branch. With `--pg-tls-cert/--pg-tls-key`
 the router answers `SSLRequest` with `'S'` and terminates TLS before reading
 the startup message (`sslmode=require` works); without certs it answers `'N'`
 as before. The REST API gets the same treatment via `--api-tls-*`.
+
+While relaying the backend's startup response the router records its
+`BackendKeyData`, so a `CancelRequest` (psql's `Ctrl-C`, a driver's cancel)
+is forwarded to the backend of the one live session holding that key;
+unknown or ambiguous keys are dropped. The map is per branchd process, so with
+several replicas a cancel must reach the replica carrying the session. The
+router is also an unauthenticated surface, so it bounds each connection's
+startup (first byte in 2 s, startup in 10 s, backend `ReadyForQuery` in
+30 s), caps connections (256) and per-IP startups (64), closes sessions idle
+in both directions for 15 minutes, and refuses every routing failure with the
+same message. After a failed dial it re-reads the branch's address once
+(rate-limited) in case the branch moved. Details in [Security](security.md).
 
 ## Branch-from-branch: the layer DAG
 
@@ -202,22 +292,34 @@ their `/upper` subdir, the source its `/data`. Layers are garbage-collected
 when the last branch whose chain references them is destroyed — destroying
 the parent first leaves the child (and the layer) intact. ZFS and CSI modes
 skip the freeze machinery entirely: they snapshot/clone at the block or
-volume level (ZFS: `zfs snapshot` + `clone`; CSI: PVC clone after a brief
-parent quiesce).
+volume level (ZFS: `zfs snapshot` + `clone`, with no parent interruption;
+CSI: PVC clone after a brief parent CHECKPOINT and stop, then the parent
+restarts).
+
+Overlay chains only grow: each fork of a parent adds a layer, a reset keeps
+the chain, and there is no compaction yet. Branch-from-branch is refused
+(`403`) once the parent's chain reaches `--max-layer-depth` (default 100).
 
 ## Kubernetes: storage-node and CSI models
 
 The kube driver has two storage strategies. **hostPath** (default) maps
 "volumes" to subdirectories of a data root (default `/var/lib/pgoverlay`) on
 one designated **storage node**; helpers are one-shot pods and branches are
-plain pods, all pinned with `nodeName`, branch pods carrying `SYS_ADMIN` for
-the overlay mount. **csi** (`--kube-storage csi`) makes every volume a PVC
-and every branch a PVC *clone* (`dataSource`, or VolumeSnapshot+restore when
-a snapshot class is configured): branch pods need no `SYS_ADMIN`, no node
-pin — they schedule anywhere, which is the multi-node payoff. The trade-off:
-clone CoW economics belong to the CSI driver (instant on EBS/Ceph/zfs-localpv,
-full copy on naive drivers). Either way: no CRDs, no operator — branchd is a
-normal Deployment with a namespace-scoped Role.
+plain pods, all pinned with `nodeName`, branch pods carrying `SYS_ADMIN` (and
+unconfined seccomp and AppArmor) for the overlay mount. **csi**
+(`--kube-storage csi`) makes every volume a PVC and every branch a PVC
+*clone* (`dataSource`, or VolumeSnapshot+restore when a snapshot class is
+configured): branch pods need no `SYS_ADMIN`, no node pin — they schedule
+anywhere, which is the multi-node payoff. The trade-off: clone CoW economics
+belong to the CSI driver (instant on EBS/Ceph/zfs-localpv, full copy on naive
+drivers). Either way: no CRDs, no operator — branchd is a normal Deployment
+with a namespace-scoped Role: pods create/delete/get/list/watch,
+`pods/exec`, `pods/log`, and Secrets create/delete (helper pods read their
+environment, including a seed's source password, from a short-lived Secret
+instead of the pod spec), plus PVCs and VolumeSnapshots in csi mode and
+Leases and pod `patch` with leader election. Helper pods carry the
+`pgoverlay.instance` label and an ownerReference to branchd's own pod, so
+Kubernetes garbage-collects them if branchd dies mid-seed.
 
 ## What runs where
 
@@ -225,7 +327,8 @@ normal Deployment with a namespace-scoped Role.
 |---|---|
 | data files | only ever touched **inside containers** (helpers/entrypoints) |
 | host Go code | pure control plane: registry, sagas, driver API calls |
-| seeding | `pg_basebackup` helper, runs as uid 999 (postgres) |
+| seeding | `pg_basebackup` or `pg_dump` helper, runs as uid 999 (postgres) |
+| masking, credential rotation, diff dumps | exec into the branch (as `postgres` on Docker, as root on Kubernetes) |
 | disk usage | `du -sb` helper on the rw layer (zfs: `zfs list -o used`) |
 | web UI | single static page, `go:embed`, no build toolchain |
 | GitHub App | separate `pgoverlay-github` service driving the REST API |

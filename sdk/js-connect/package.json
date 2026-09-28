@@ -1,6 +1,6 @@
 {
   "name": "pgoverlay-connect",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Resolve a Postgres connection string for a pgoverlay branch — fetches per-branch credentials so apps keep static config with credential rotation on",
   "license": "Apache-2.0",
   "type": "module",

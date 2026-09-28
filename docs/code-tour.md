@@ -83,19 +83,25 @@ One sentence per box, then a short subsection each.
 
 ### `cmd/pgb` → `internal/cli` — the CLI
 
-`cmd/pgb/main.go` is a 13-line shim that calls
-`cli.NewRootCmd().Execute()`. The real CLI lives in `internal/cli/root.go`
-(cobra commands: `source`, `branch`, `connect`, `diff`, `history`, `doctor`,
-`gc`, `token`). It has **two modes**, chosen by the `--server` flag /
-`PGOVERLAY_SERVER` env:
+`cmd/pgb/main.go` is a short shim that runs `cli.NewRootCmd()` with
+`ExecuteC` and maps the error to an exit code (`cli.ExitCode`: `pgb doctor`
+exits 2 when it cannot compute a plan). The real CLI lives in
+`internal/cli/root.go` (cobra commands: `source`, `branch` — including
+`recover` — `connect`, `diff`, `history`, `doctor`, `gc`, `token`, `version`).
+It has **two modes**, chosen by the `--server` flag / `PGOVERLAY_SERVER` env:
 
 - **Local mode** (`--server` unset): `open()` in `root.go` builds an `engine`
   directly over a Docker driver and the local SQLite registry — the CLI *is*
   the engine. Construction is lazy (inside each command's `RunE`) so `--help`
-  and tests never touch Docker.
+  and tests never touch Docker; metadata-only commands (`connect`, `history`)
+  use `openRegistry()` and never touch Docker at all. The registry is opened
+  with the same at-rest keys branchd uses (`openRegistryAt`), and the command
+  context carries the `local:<os user>` audit actor.
 - **Server mode** (`--server http://branchd:7070`): `serverClient()` returns an
   `apiclient.Client` and the CLI becomes a thin REST caller; the token comes
-  from `PGOVERLAY_TOKEN`.
+  from `PGOVERLAY_TOKEN`. The URL is validated up front
+  (`apiclient.ValidateBaseURL`), and the client retries `503`s and, for
+  idempotent requests, `502`/`504` and connection resets.
 
 Depends on: `internal/engine`, `internal/registry`, `internal/runtime`
 (local) or `internal/apiclient` (server).
@@ -113,12 +119,20 @@ Depends on: `internal/engine`, `internal/registry`, `internal/runtime`
    default 60s).
 4. Optionally **leader election** (`--leader-elect`, kube only) — `internal/ha`.
 
-It wires `internal/metrics` into the engine and serves `/metrics`, and it
-encrypts branch passwords at rest with a key derived from `PGOVERLAY_TOKEN`
-(`reg.SetSecretKey(registry.DeriveSecretKey(token))`). Storage backend selection
+It wires `internal/metrics` into the engine and serves `/metrics`. At startup
+`configureSecrets` sets up at-rest encryption of rotated branch passwords
+under a dedicated key, independent of `PGOVERLAY_TOKEN` (which must be at
+least 16 characters, `config.ValidateAdminToken`): `$PGOVERLAY_SECRET_KEY`,
+else `--secret-key-file`, else `<state dir>/secret.key`, generated on first
+start. Retired keys (`$PGOVERLAY_SECRET_KEY_PREVIOUS`) and the legacy
+token-derived key stay decrypt-only, and `ReencryptSecrets` moves every row
+under the primary key before serving. Storage backend selection
 (`--runtime` docker|kube, `--cow` overlay|zfs|csi, `--kube-storage`
-hostpath|csi) is validated in `resolveStorage`. Graceful shutdown closes the
-listeners but **leaves branch containers running** — they are durable state.
+hostpath|csi) is validated in `resolveStorage`. Graceful shutdown
+(`drainAPI`) stops admitting mutations, gives in-flight requests
+`--shutdown-timeout`, cancels (and so rolls back) what is left, and only then
+releases the HA Lease; it **leaves branch containers running** — they are
+durable state.
 
 ### `cmd/pgoverlay-github` → `internal/ghook` — the GitHub App webhook receiver
 
@@ -132,17 +146,29 @@ listeners but **leaves branch containers running** — they are durable state.
   → `ensureBranch`); `synchronize` optionally resets it (`ResetOnPush`).
 - `closed` → destroy the branch (`handleClosed`).
 
-Branch names are namespaced under a reserved `gh-` prefix
-(`gh-pr-<n>` or `gh-<sanitized-ref>`) so a webhook can never collide with a
-human-created branch. When GitHub App / PAT creds are configured it posts a
-`pgoverlay/branch` commit status and keeps a live PR comment with the connect
-string (and, with `DiffOnPush`, a schema/data diff). Webhook deliveries are
-acked immediately and the branch op runs **detached** (a 5-minute background
+Branch names are `gh-<repo-key>-pr-<n>` or `gh-<repo-key>-<sanitized-ref>`,
+where the repo key is six hex characters of the SHA-256 of the lowercased
+`owner/name`. The rule lives in the public `pgoverlayconnect/names.go`
+(`RepoKey`, `PRBranchName`, `RefBranchName`) so the service and the connect
+helpers derive the same names, and a golden table
+(`pgoverlayconnect/testdata/branch_names.json`) is shared by the Go, ghook and
+JS tests. The prefix keeps webhook branches apart from hand-made ones by
+convention (the engine does not reserve it), the repo key keeps repositories
+apart, fork PRs are always named by number, and long refs are cut and
+suffixed with a hash so they stay distinct. When GitHub App / PAT creds are
+configured it posts a `pgoverlay/branch` commit status (success only once the
+branch is ready) and keeps a live PR comment with the connect string (and,
+with `DiffOnPush`, a schema/data diff). Webhook deliveries are acked
+immediately and the branch op runs **detached** (a 5-minute background
 context) because GitHub abandons deliveries after ~10s but provisioning at pod
-speed can take longer (`dispatch`).
+speed can take longer (`dispatch`). Deliveries for one branch run one at a
+time in arrival order (a per-branch queue), a repeated `X-GitHub-Delivery`
+id is ignored, and with GitHub credentials a `closed` delivery for a PR that
+GitHub reports open is ignored.
 
 Depends on: `internal/apiclient`, `internal/api` (wire types),
-`internal/ghook/githubapp.go` (App auth: per-installation tokens).
+`pgoverlayconnect` (naming), `internal/ghook/githubapp.go` (App auth:
+per-installation tokens).
 
 ### `internal/engine` — the brains
 
@@ -153,6 +179,8 @@ branch is a **saga** with compensations:
 
 - `saga.go` — `CreateBranch`, `ResetBranch`, `DestroyBranch`, and the shared
   `provision` step that fans out to overlay / `provisionZFS` / `provisionCSI`.
+- `recover.go` — `RecoverBranch`: restart a failed branch on its recorded
+  volumes with no re-clone.
 - `freeze.go` — `CreateBranchFrom` (branch-from-branch): the frozen-layer DAG.
 - `diff.go` — `DiffBranch` (throwaway branch from the same recorded base, dump
   both, diff host-side).
@@ -166,24 +194,28 @@ Depends on: `internal/registry`, `internal/runtime`, `internal/cow`,
 
 Pure-Go SQLite (`modernc.org/sqlite`, no cgo). It owns the **state machine**
 (branches move `creating → ready → resetting → ready`, plus `destroying →
-destroyed` and `failed`), the **transitions/audit journal** (who did what —
-`actor` column), **sources** and their generations, **frozen layers**, **mask
-scripts**, and **hashed API tokens**. Schema is versioned via
-`PRAGMA user_version`; `schema.go` holds the migration list — currently **v11**
+destroyed`, and `failed`, which reset or recover can leave; sources move
+`seeding → ready | failed`), the **transitions/audit journal** (who did
+what — `actor` column), **sources** and their generations, **frozen layers**,
+**mask scripts**, **hashed API tokens**, and rotated branch passwords
+encrypted at rest (`crypto.go`). Schema is versioned via `PRAGMA
+user_version`; `schema.go` holds the migration list — currently **v15**
 (see `migrations` in `internal/registry/schema.go`). Crucially SQLite is a
-**single writer**, which is why branchd is single-replica for writes (HA elects
-one leader) and you must not run local-mode `pgb` against a registry a `branchd`
-is using.
+**single writer**: one branchd writes (with HA, the elected leader), and you
+must not run local-mode `pgb` against a registry a `branchd` is using.
 
 ### `internal/runtime` — the `Driver` interface
 
-`runtime.go` defines `Driver`: `CreateVolume`, `RemoveVolume`, `CloneVolume`,
-`RunHelper` (one-shot data containers), `StartBranch` (the long-lived branch
-Postgres), `Exec`/`ExecOutput`, `Inspect`, `StopRemove`, `ListManaged`,
-`ListManagedVolumes`. Two implementations:
+`runtime.go` defines `Driver`: `EnsureImage`, `CreateVolume`, `RemoveVolume`,
+`CloneVolume`, `RunHelper` (one-shot data containers), `StartBranch` (the
+long-lived branch Postgres), `Exec`/`ExecOutput`, `Inspect`, `StopRemove`,
+`ListManaged`, `ListHelpers`, and `ListManagedVolumes` (with creation times,
+so GC can spare young volumes). Two implementations:
 
 - **`docker.go`** — `DockerDriver`: named volumes + containers, branches
-  published on `127.0.0.1`.
+  published on a pinned `127.0.0.1` port with the `unless-stopped` restart
+  policy; the Docker endpoint is resolved like the `docker` CLI does
+  (`dockercontext.go`; `ssh://` endpoints are refused).
 - **`kube.go` / `kube_podspec.go` / `kube_csi.go`** — `KubeDriver`: branches as
   pods, two storage strategies (hostPath on one node, or CSI PVC clones).
 
@@ -215,8 +247,11 @@ server mode and by ghook. Speaks the wire types defined in `internal/api`.
 
 ### SDKs and the GitHub Action
 
-- `pgoverlaytest/` (Go) — spin up an ephemeral branch in a test, get a DSN, tear
-  it down. `pgoverlayconnect/` (Go) — resolve a connect string at runtime.
+- `pgoverlaytest/` (Go) — spin up an ephemeral branch in a test, get a
+  `ProxyDSN` through the router (`WithProxyHost` / `PGOVERLAY_PROXY_HOST` when
+  the router has its own address) and a direct `DSN`, tear it down.
+  `pgoverlayconnect/` (Go) — resolve a connect string at runtime, and the
+  branch-naming rule shared with the GitHub App service.
 - `sdk/js` and `sdk/js-connect` — JS equivalents (`index.mjs` + `.d.ts`).
 - `action/` — a composite GitHub Action (`action.yml` + `entrypoint.sh`, plus a
   separate `action/destroy`) for CI pipelines.
@@ -307,8 +342,11 @@ Walking each step with the file that does it:
 3. **Resolve source** — `reg.GetSourceByName`; the source must be in state
    `ready` (`registry`).
 4. **Insert the row** — `reg.CreateBranchCtx` writes a branch row in state
-   `creating`, pinning `SourceVolume` (the source's *current* generation
-   volume) and naming the rw volume via `planner.BranchLayerName`.
+   `creating` (and its journal row, in one transaction), pinning
+   `SourceVolume` (the source's *current* generation volume) and naming the rw
+   volume via `freshBranchLayer`: the lowest generation of the name that no
+   registry row has ever used, so a reused branch name never lands on a
+   volume another branch still depends on.
 5. **Provision (the saga body)** — `provision` in `saga.go`. For the overlay
    backend it builds a `cow.Plan` from the layer chain, then runs steps that
    each push a compensation onto an `undo` stack:
@@ -328,9 +366,12 @@ Walking each step with the file that does it:
    `SetBranchContainer` first (so a concurrent reconcile treats the in-flight
    container as owned, not an orphan), then `waitReady` (`pg_isready` loop,
    90s budget — this is where WAL crash recovery happens for basebackup
-   seeds), then `applyMasking` (per-source SQL via in-container `psql` over the
-   local socket, so the branch never serves unmasked data), then optional
-   `rotateBranchCredentials`.
+   seeds; on Kubernetes a fatal pod state such as `ImagePullBackOff` fails it
+   early, with the reason), then `applyMasking` (per-source SQL via
+   in-container `psql` over the local socket, so the branch never serves
+   unmasked data), then optional `rotateBranchCredentials`. Throughout, the
+   saga's `keepAlive` heartbeat bumps the row's `updated_at`, so reconcile's
+   stuck detector never fails a slow but live create.
 7. **Address + mark ready** — `inspectAddr` polls `drv.Inspect` until a routable
    host:port appears (k8s pod IPs lag exec-readiness), then
    `reg.MarkBranchReadyCtx` flips the row to `ready` and records host/port.
@@ -384,22 +425,34 @@ Step by step (all in `internal/pgproxy`):
 
 - **Accept & startup phase** — `handleConn` answers `SSLRequest` with `'S'` and
   a TLS upgrade when `TLSConfig` is set (`--pg-tls-cert/--pg-tls-key`), else
-  `'N'`. `GSSEncRequest` is answered `'N'`; `CancelRequest` is dropped silently.
-  A `StartupTimeout` (10s) bounds the whole phase so a client that connects and
-  dribbles can't pin a goroutine forever.
+  `'N'`. `GSSEncRequest` is answered `'N'`. A `CancelRequest` (plaintext, or
+  inside TLS) is forwarded byte for byte to the backend of the one live
+  session holding its key (`cancel.go`); unknown or ambiguous keys are dropped.
+  The client must send its first byte within `FirstByteTimeout` (2s) and
+  finish the startup packets within `StartupTimeout` (10s from accept), so a
+  client that connects and dribbles can't pin a goroutine; `MaxStartupsPerIP`
+  (64) caps one address's connections still in startup, and `MaxConns` (256)
+  caps them all.
 - **Parse the StartupMessage** — `route` reads `startup.Parameters["database"]`
   and `splitDatabase` (`startup.go`) splits on the **last** `@` into
   `dbname` and `branch`. No `@` → `3D000 invalid_catalog_name` refusal.
 - **Resolve** — `RegistryResolver.ResolveBranch` looks the branch up in the
   registry and returns `host:port` **only if the branch is `ready`**. Unknown
   name, not-ready, dial failure — all collapse to the same generic refusal
-  (`genericRouteRefusal`) so an unauthenticated client can't enumerate branch
-  names or probe state. The real reason is logged server-side.
+  (`genericRouteRefusal`), so an unauthenticated client cannot tell them
+  apart. It can still confirm that a *ready* branch exists, because the
+  branch's auth challenge is relayed before any credentials; a full fix needs
+  the proxy to take part in auth. The real reason is logged server-side.
+  After a failed dial the resolver's `Refresh` hook re-reads the branch's
+  address from the runtime once (rate-limited per branch), in case it moved.
 - **Rewrite & relay** — the proxy sets `database` back to the real `dbname`,
   re-encodes the startup message, dials the backend, writes the rewritten
-  startup, then `relay()` copies bytes in both directions with an
-  `IdleTimeout` (15m). Everything after the startup message — including the
-  SCRAM challenge/response — is opaque to the proxy.
+  startup, and relays the backend's startup response frame by frame until
+  the first `ReadyForQuery` (recording `BackendKeyData` for cancels), which
+  must arrive within `AuthTimeout` (30s). Then `relay()` copies bytes in both
+  directions with an `IdleTimeout` (15m, on reads and writes); once one
+  direction ends, the other gets a 5s grace. Everything after the startup
+  message — including the SCRAM challenge/response — is opaque to the proxy.
 
 Backend dials are always plaintext (branches are local/cluster-internal);
 client-facing TLS is the security boundary.
@@ -462,7 +515,9 @@ graph TB
 - **HA** — `--leader-elect` makes replicas contend for a Lease
   (`internal/ha/leader.go`); only the leader runs reconcile and accepts mutating
   `/v1` writes (the `LeaderGate` in `internal/api/leader.go` returns 503 on
-  non-leaders), which keeps the single-writer SQLite registry safe.
+  non-leaders), which keeps the single-writer SQLite registry safe. The leader
+  labels its pod `pgoverlay.leader=true` and the chart's API Service selects
+  that label, so API traffic reaches the leader.
 - Helm chart and manifests live under `deploy/helm/pgoverlay/` (deployment,
   services for API and proxy, RBAC, PVC, NetworkPolicy, the ghook Deployment).
 

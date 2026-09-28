@@ -10,6 +10,26 @@
 #   kubectl apply -f deploy/preview-deployer-rbac.yaml
 #   kubectl -n pgoverlay-preview create token preview-deployer --duration=24h
 # Hand that short-lived token (not a kubeconfig with cluster-admin) to CI.
+#
+# Why each rule is here (internal/deploy's TestPreviewDeployerCanInstallChart
+# renders the chart in every mode and fails if this Role stops covering it):
+#
+#  - The chart creates a Role for branchd. Kubernetes' RBAC escalation
+#    prevention only lets a subject create a Role granting permissions it
+#    holds itself, so every rule of templates/rbac.yaml — in every mode you
+#    install (csi adds PVCs and VolumeSnapshots, HA adds Leases and pod
+#    patch) — is repeated below. The alternative, `escalate` on roles, lets
+#    the deployer grant itself anything in the namespace.
+#  - Helm stores release state in Secrets (HELM_DRIVER=secret, the default)
+#    and LISTs them by label on every install/upgrade. resourceNames cannot
+#    scope a list, and a list returns every Secret's data. So THIS SERVICE
+#    ACCOUNT CAN READ EVERY SECRET IN pgoverlay-preview: keep the namespace
+#    dedicated to pgoverlay (don't put other tenants' credentials here).
+#    Running Helm with HELM_DRIVER=configmap moves release state into
+#    ConfigMaps; you can then drop get/list/patch/update below, keeping
+#    create/delete (branchd's Role needs them, see templates/rbac.yaml) as
+#    long as you also use existingSecret / ghook.existingSecret, so the chart
+#    renders no Secrets of its own.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -28,49 +48,47 @@ metadata:
   namespace: pgoverlay-preview
 rules:
   # Core workload + config objects a Helm release of pgoverlay (and the preview
-  # app) creates in this namespace. NOTE: secrets are deliberately NOT in this
-  # broad rule — see the scoped secrets rule below.
+  # app) creates in this namespace. Also covers branchd's pods rules (create,
+  # delete, get, list, watch; patch in HA mode for the leader label).
   - apiGroups: [""]
     resources: ["pods", "services", "configmaps", "serviceaccounts", "persistentvolumeclaims"]
     verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
-  # Secrets are scoped tighter than the rest: a broad secrets/get+list+watch
-  # would let a leaked CI token read EVERY secret in the namespace (other
-  # tenants' DB creds, TLS keys, ...). Helm's release-state secrets are named
-  # sh.helm.release.v1.<release>.v<n>; the chart's own token Secret is
-  # <release>-pgoverlay-token (and -ghook). We allow create (Helm needs it for
-  # release state + the chart Secret) but restrict get/delete/patch/update to
-  # those known names via resourceNames, and grant NO list/watch (no
-  # namespace-wide enumeration). Best practice: pass token/webhookSecret via a
-  # pre-created Secret (existingSecret) so this deployer never creates secrets
-  # at all and you can drop `create` here too.
+  # Held only so the chart's branchd Role may grant them (escalation check):
+  # branchd execs into branch pods and reads helper pod logs.
   - apiGroups: [""]
-    resources: ["secrets"]
+    resources: ["pods/exec"]
     verbs: ["create"]
   - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Secrets: Helm release state (list + get/create/update/delete of
+  # sh.helm.release.v1.<release>.v<N>), the chart's own token Secrets (watch
+  # too, for `helm --wait`), and branchd's short-lived helper env Secrets
+  # (create/delete). See the header: list exposes every Secret in the
+  # namespace to this ServiceAccount.
+  - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "delete", "patch", "update"]
-    resourceNames:
-      # Helm release state (covers v1..v9; extend if a release exceeds 9 revs).
-      - sh.helm.release.v1.pgoverlay.v1
-      - sh.helm.release.v1.pgoverlay.v2
-      - sh.helm.release.v1.pgoverlay.v3
-      - sh.helm.release.v1.pgoverlay.v4
-      - sh.helm.release.v1.pgoverlay.v5
-      - sh.helm.release.v1.pgoverlay.v6
-      - sh.helm.release.v1.pgoverlay.v7
-      - sh.helm.release.v1.pgoverlay.v8
-      - sh.helm.release.v1.pgoverlay.v9
-      # Chart-managed Secrets (when not using existingSecret).
-      - pgoverlay-token
-      - pgoverlay-ghook
+    verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
+  # networkPolicy.enabled renders NetworkPolicies.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
     verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
   # The chart ships a namespaced Role + RoleBinding for branchd itself; the
   # deployer must be able to create them (but only Roles, never ClusterRoles).
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
     verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]
+  # storage.mode=csi: branchd's Role grants these (VolumeSnapshot clones).
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["create", "delete", "get", "list"]
+  # replicaCount > 1 / leaderElection.enabled: branchd's Role grants these.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "watch", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

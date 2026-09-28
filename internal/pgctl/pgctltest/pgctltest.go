@@ -1,4 +1,9 @@
-package pgctl
+// Package pgctltest starts throwaway source Postgres containers for the
+// integration tests (testcontainers-go). It is imported only from _test.go
+// files, which keeps testcontainers, its Moby dependencies and the testing
+// package out of the shipped binaries; internal/pgctl's deps test enforces
+// that.
+package pgctltest
 
 import (
 	"context"
@@ -17,8 +22,7 @@ import (
 
 // StartSourcePG starts a "production" postgres:17 on a dedicated docker
 // network and returns its in-network host, port, network name, and a host
-// connection string. It is a shared integration-test helper (lives in a
-// non-test file so other packages' tests can import it).
+// connection string.
 func StartSourcePG(t *testing.T, ctx context.Context) (host string, port int, networkName string, hostConn string) {
 	t.Helper()
 	return StartSourcePGVersion(t, ctx, "17")
@@ -75,4 +79,44 @@ func StartSourcePGVersion(t *testing.T, ctx context.Context, major string) (host
 		t.Fatal(err)
 	}
 	return "sourcedb", 5432, net.Name, fmt.Sprintf("postgres://postgres:secret@localhost:%d/postgres", mp.Num())
+}
+
+// StandbySlot is the physical replication slot StartStandbyPG's replica
+// streams through on the primary.
+const StandbySlot = "pgoverlay_it_standby"
+
+// StartStandbyPG starts a hot standby of the StartSourcePG primary reachable
+// as primaryHost on networkName, the way operators build read replicas:
+// pg_basebackup -R (standby.signal plus primary_conninfo with the password)
+// through a physical slot (primary_slot_name). It returns the standby's
+// in-network host and port and a host connection string.
+func StartStandbyPG(t *testing.T, ctx context.Context, networkName, primaryHost string) (host string, port int, hostConn string) {
+	t.Helper()
+	script := fmt.Sprintf(`set -e
+pg_basebackup -h %s -U postgres -D /tmp/standby -R -X stream -C -S %s --checkpoint=fast
+exec postgres -D /tmp/standby`, primaryHost, StandbySlot)
+	req := tc.ContainerRequest{
+		Image: "postgres:17",
+		// the stock image runs its entrypoint as root; postgres refuses to
+		// run as root, so drop to the postgres user as that entrypoint does
+		Entrypoint:     []string{"gosu", "postgres", "sh", "-c", script},
+		Env:            map[string]string{"PGPASSWORD": "secret"},
+		Networks:       []string{networkName},
+		NetworkAliases: map[string][]string{networkName: {"standbydb"}},
+		ExposedPorts:   []string{"5432/tcp"},
+		WaitingFor: wait.ForAll(
+			wait.ForLog("database system is ready to accept read-only connections"),
+			wait.ForListeningPort("5432/tcp"),
+		).WithStartupTimeoutDefault(90 * time.Second),
+	}
+	c, err := tc.GenericContainer(ctx, tc.GenericContainerRequest{ContainerRequest: req, Started: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Terminate(context.Background()) })
+	mp, err := c.MappedPort(ctx, "5432")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "standbydb", 5432, fmt.Sprintf("postgres://postgres:secret@localhost:%d/postgres", mp.Num())
 }

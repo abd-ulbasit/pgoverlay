@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/abd-ulbasit/pgoverlay/internal/api"
 	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
 )
@@ -31,7 +34,7 @@ const (
 	storageNode = "pgoverlay-test-control-plane"
 	helmNS      = "pgoverlay-system"
 	release     = "pgoverlay" // fullname collapses to "pgoverlay" -> svc pgoverlay-api
-	apiToken    = "helm-it-token"
+	apiToken    = "helm-it-token-0123456789"
 	sourcePod   = "pgoverlay-it-helm-source"
 	// chartPath is spelled once: both suites install from it and chartImage
 	// renders it to learn which image to build.
@@ -140,9 +143,96 @@ func loadBranchdImage(t *testing.T) {
 	run(t, "kind", "load", "image-archive", tar, "--name", kindCluster)
 }
 
+// podReadiness reports whether a pod (the JSON of `kubectl get pod -o json`)
+// can take a port-forward and serve through it: phase Running, the Ready
+// condition true, and not being deleted. When it cannot, why says what it is
+// still waiting for, for the timeout message.
+//
+// Each half is load-bearing. `kubectl port-forward` refuses anything that is
+// not Running ("unable to forward port because pod is not running. Current
+// status=Pending"), and Running alone only means the container started:
+// branchd's port answers once Ready (its readinessProbe is /readyz). A pod
+// with a deletionTimestamp is on its way out and will drop the forward.
+func podReadiness(podJSON []byte) (ready bool, why string, err error) {
+	var pod corev1.Pod
+	if err := json.Unmarshal(podJSON, &pod); err != nil {
+		return false, "", fmt.Errorf("decode pod: %w", err)
+	}
+	if pod.DeletionTimestamp != nil {
+		return false, "pod is terminating", nil
+	}
+	if pod.Status.Phase != corev1.PodRunning {
+		return false, fmt.Sprintf("phase %s", pod.Status.Phase), nil
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			if c.Status == corev1.ConditionTrue {
+				return true, "", nil
+			}
+			return false, fmt.Sprintf("Ready=%s (%s)", c.Status, c.Reason), nil
+		}
+	}
+	return false, "no Ready condition yet", nil
+}
+
+// waitPodReady blocks until pod in ns is Running and Ready (podReadiness),
+// failing the test after timeout.
+//
+// Call it before every port-forward to a pod. A Lease holder or a freshly
+// scheduled replica can be named before the API server shows it Running:
+// CI 30340851419 failed exactly so, when the replacement pod the Deployment
+// created for the killed leader won the Lease within a second of starting,
+// while its status still read Pending/ContainerCreating, and the forward to
+// it was refused.
+func waitPodReady(t *testing.T, kc, ns, pod string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		out, err := exec.Command("kubectl", "--kubeconfig", kc, "-n", ns,
+			"get", "pod", pod, "-o", "json").Output()
+		var why string
+		if err != nil {
+			why = fmt.Sprintf("kubectl get pod: %v", err)
+		} else {
+			ready, reason, derr := podReadiness(out)
+			if derr != nil {
+				t.Fatalf("pod %s/%s: %v", ns, pod, derr)
+			}
+			if ready {
+				return
+			}
+			why = reason
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pod %s/%s not Running and Ready within %s: %s", ns, pod, timeout, why)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// waitReleasePodsReady waits for every branchd pod of the release in ns (the
+// chart's app.kubernetes.io/name=pgoverlay selector) to be Running and Ready.
+// It is what makes a port-forward to the API Service deterministic:
+// `port-forward svc/...` binds one pod behind the Service, and fails when the
+// pod it picks is not running yet, so `helm install --wait` finishing is not
+// taken as proof of that on its own.
+func waitReleasePodsReady(t *testing.T, kc, ns string, timeout time.Duration) {
+	t.Helper()
+	names := strings.Fields(run(t, "kubectl", "--kubeconfig", kc, "-n", ns, "get", "pods",
+		"-l", "app.kubernetes.io/name=pgoverlay", "-o", "jsonpath={.items[*].metadata.name}"))
+	if len(names) == 0 {
+		t.Fatalf("no branchd pods (app.kubernetes.io/name=pgoverlay) in namespace %s", ns)
+	}
+	for _, name := range names {
+		waitPodReady(t, kc, ns, name, timeout)
+	}
+}
+
 // portForward starts kubectl port-forward to target ("svc/pgoverlay-api", or
 // "pod/<name>") on a random local port and returns the base URL once the
-// forward is listening.
+// forward is listening. Wait for the pod behind target to be Ready first
+// (waitPodReady, waitReleasePodsReady): kubectl refuses to forward to a pod
+// that is not Running.
 //
 // ns and target are both explicit. ns because the HA suite installs its own
 // release into its own namespace, and a helper that assumed helmNS forwarded
@@ -318,6 +408,7 @@ func TestHelmDeployEndToEnd(t *testing.T) {
 		"--wait", "--timeout", "3m")
 	t.Logf("helm release ready in %s", time.Since(start))
 
+	waitReleasePodsReady(t, kc, helmNS, 2*time.Minute)
 	base := portForward(t, kc, helmNS, "svc/pgoverlay-api")
 	resp, err := http.Get(base + "/healthz")
 	if err != nil {

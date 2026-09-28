@@ -42,18 +42,32 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	}
 	parent, err := e.reg.GetBranchByName(parentName)
 	if err != nil {
-		return nil, fmt.Errorf("parent branch %q: %w", parentName, err)
+		return nil, fmt.Errorf("parent %w", err) // `parent branch "x" not found`
 	}
 	if parent.State != registry.BranchReady {
 		return nil, fmt.Errorf("parent branch %q is %s, not ready", parentName, parent.State)
+	}
+	if !e.zfs() && !e.csi() {
+		// the freeze adds one layer to the parent's chain (and the child's)
+		chain, err := e.reg.LayerChain(parent.ID)
+		if err != nil {
+			return nil, err
+		}
+		if err := e.checkLayerDepth(parent, chain); err != nil {
+			return nil, err
+		}
 	}
 	src, err := e.reg.GetSourceByID(parent.SourceID)
 	if err != nil {
 		return nil, err
 	}
+	rw, err := e.freshBranchLayer(name, 1)
+	if err != nil {
+		return nil, err
+	}
 	expiresAt := e.expiresAtFor(ttl)
 	child := &registry.Branch{
-		Name: name, SourceID: parent.SourceID, RWVolume: e.planner.BranchLayerName(name),
+		Name: name, SourceID: parent.SourceID, RWVolume: rw,
 		SourceVolume: parent.SourceVolume, ExpiresAt: expiresAt, ParentBranchName: parentName,
 	}
 	if e.zfs() || e.csi() {
@@ -66,6 +80,8 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	if err := e.reg.CreateBranchCtx(ctx, child); err != nil {
 		return nil, err
 	}
+	// the parent sits in resetting for most of a freeze or csi clone
+	defer e.keepAlive(child.ID, parent.ID)()
 	provision := func() error { return e.freezeAndProvision(ctx, child, parent, src) }
 	if e.zfs() {
 		provision = func() error { return e.provisionZFS(ctx, child, src) }
@@ -75,7 +91,7 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	}
 	if err := provision(); err != nil {
 		e.logCompensationErr("transition", "from_branch: mark child failed after provision failed",
-			e.reg.TransitionBranchCtx(ctx, child.ID, registry.BranchFailed, err.Error()), "branch", child.Name, "branch_id", child.ID)
+			e.reg.TransitionBranchCtx(ctx, child.ID, registry.BranchFailed, failureReason(err)), "branch", child.Name, "branch_id", child.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)
@@ -91,13 +107,17 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err != nil {
 		return err
 	}
-	origPlan := cow.PlanBranch(parent.RWVolume, parent.SourceVolume, layerVolumes(chain))
 	// the parent's current rw volume becomes the newest frozen layer
 	frozen := append([]string{parent.RWVolume}, layerVolumes(chain)...)
-	newRW := cow.BranchRWVolumeNameGen(parent.Name, len(chain)+2)
+	// a generation no row has used: a recreated parent may already sit on a
+	// later generation of its name (see freshBranchLayer)
+	newRW, err := e.freshBranchLayer(parent.Name, len(chain)+2)
+	if err != nil {
+		return err
+	}
 	parentPlan := cow.PlanBranch(newRW, parent.SourceVolume, frozen)
 	childPlan := cow.PlanBranch(child.RWVolume, child.SourceVolume, frozen)
-	image := e.image(src.PGVersion)
+	image := e.image(src)
 
 	if err := e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchResetting, "freeze for child "+child.Name); err != nil {
 		return err
@@ -115,9 +135,16 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 
 	// 2. stop the parent: its rw volume must not change while it becomes a
 	// layer. The parent container is untouched up to here, so a checkpoint
-	// failure above leaves it ready and running.
-	if err := e.drv.StopRemove(ctx, parent.ContainerID); err != nil {
-		// container state unknown — don't guess; reconcile/destroy can clean
+	// failure above leaves it ready and running. From here on every step
+	// that affects the parent runs detached from the request (bounded by
+	// parentStepTimeout): cancelling the child's create must abort the
+	// child, not leave the parent half-stopped and failed.
+	stopCtx, cancelStop := context.WithTimeout(bg, parentStepTimeout)
+	err = e.drv.StopRemove(stopCtx, parent.ContainerID)
+	cancelStop()
+	if err != nil {
+		// container state unknown — don't guess; the parent is marked failed
+		// with its data intact (RecoverBranch restarts it)
 		e.logCompensationErr("transition", "freeze: mark parent failed after stop parent failed",
 			e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed, "freeze for child "+child.Name+": stop parent failed: "+err.Error()),
 			"branch", parent.Name, "branch_id", parent.ID)
@@ -129,11 +156,21 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 		for i := len(undo) - 1; i >= 0; i-- {
 			undo[i]()
 		}
-		e.restoreParent(bg, parent, src, origPlan, stepErr)
+		e.restoreParent(bg, parent, src, chain, stepErr)
 		return stepErr
 	}
 
-	// 3. fresh rw volume for the parent (the swap), with the entrypoint
+	// 3. fresh rw volume for the parent (the swap), with the entrypoint.
+	// Claimed on the parent row first: no column names it until
+	// CommitFreeze, and reconcile's volume GC (in this process or another)
+	// must not take it meanwhile.
+	if err := e.reg.SetBranchPendingVolume(parent.ID, newRW); err != nil {
+		return fail(fmt.Errorf("claim parent rw volume: %w", err))
+	}
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "freeze: release parent rw volume claim", e.reg.SetBranchPendingVolume(parent.ID, ""),
+			"branch", parent.Name, "volume", newRW)
+	})
 	if err := e.drv.CreateVolume(ctx, newRW, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.branch.id": parent.ID})); err != nil {
 		return fail(fmt.Errorf("create parent rw volume: %w", err))
 	}
@@ -228,34 +265,13 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 // restoreParent puts a parent back on its original rw volume and chain after
 // a failed freeze (the compensations already removed the fresh rw volume and
 // any new containers). If the restoration restart itself fails the parent is
-// marked failed — its data (the original rw volume) is always preserved.
-func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src *registry.Source, origPlan cow.Plan, cause error) {
-	failed := func(err error) {
+// marked failed — its data (the original rw volume) is always preserved, and
+// RecoverBranch can restart it later.
+func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src *registry.Source, chain []registry.Layer, cause error) {
+	if err := e.restartAndMarkReady(ctx, parent, src, chain); err != nil {
 		e.logCompensationErr("transition", "restoreParent: mark parent failed after restore failed",
 			e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed,
 				fmt.Sprintf("freeze failed (%v); parent restore failed: %v", cause, err)),
 			"branch", parent.Name, "branch_id", parent.ID)
 	}
-	cid, err := e.startOverlayBranch(ctx, parent.Name, origPlan, e.image(src.PGVersion), e.branchLabels(parent))
-	if err == nil {
-		e.logCompensationErr("transition", "restoreParent: own restored parent container before readiness wait",
-			e.reg.SetBranchContainer(parent.ID, cid), "branch", parent.Name, "container", cid) // own the in-flight container before the readiness wait
-	}
-	if err != nil {
-		failed(err)
-		return
-	}
-	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
-		e.logCompensationErr("undo", "restoreParent: stop/remove parent container after readiness wait failed",
-			e.drv.StopRemove(ctx, cid), "branch", parent.Name, "container", cid)
-		failed(err)
-		return
-	}
-	info, err := e.inspectAddr(ctx, cid)
-	if err != nil {
-		failed(err)
-		return
-	}
-	e.logCompensationErr("transition", "restoreParent: mark parent ready after restore",
-		e.reg.MarkBranchReadyCtx(ctx, parent.ID, cid, info.Host, info.Port), "branch", parent.Name, "branch_id", parent.ID)
 }

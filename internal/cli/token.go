@@ -20,7 +20,7 @@ func newTokenCreateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create NAME",
 		Short: "Mint an API token (the token is printed once and never recoverable)",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !registry.ValidRole(role) {
 				return fmt.Errorf("invalid --role %q: want admin, operator or viewer", role)
@@ -91,7 +91,7 @@ func newTokenRevokeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "revoke NAME",
 		Short: "Revoke an API token by name",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if c := serverClient(cmd); c != nil {
 				if err := c.RevokeToken(cmd.Context(), args[0]); err != nil {

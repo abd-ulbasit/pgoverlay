@@ -12,16 +12,45 @@ import (
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
-// ErrInvalidName rejects branch names that cannot be used across runtimes
-// (docker container names, k8s pod names — RFC 1123 after the pgoverlay-br-
-// prefix). The API maps it to 400.
-var ErrInvalidName = errors.New("invalid branch name")
+// ErrInvalidName rejects branch and source names that cannot be used across
+// runtimes (docker container names, k8s pod names — RFC 1123 after the
+// pgoverlay-br- prefix). The error text names the kind ("invalid branch
+// name", "invalid source name"). The API maps it to 400.
+var ErrInvalidName = errors.New("invalid name")
+
+// ErrMaskingFailed marks a branch provision that failed because one of the
+// source's masking scripts failed inside the branch (bad SQL, a missing
+// table): a problem with operator-supplied configuration, not with pgoverlay.
+// The error message names the script and carries psql's output. Test with
+// errors.Is; the API maps it to 422.
+var ErrMaskingFailed = errors.New("masking script failed")
+
+// ErrSeedFailed marks a source add/refresh whose seed command (pg_basebackup
+// or pg_dump) failed against the source; see pgctl.ErrSeedFailed. The API
+// maps it to 422 with the tool's message.
+var ErrSeedFailed = pgctl.ErrSeedFailed
+
+// markedError tags err with a sentinel for errors.Is without changing its
+// message.
+type markedError struct{ kind, err error }
+
+func (m markedError) Error() string   { return m.err.Error() }
+func (m markedError) Unwrap() []error { return []error{m.kind, m.err} }
 
 var branchNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
+
+type invalidNameError struct{ kind, name string }
+
+func (e *invalidNameError) Error() string {
+	return fmt.Sprintf("invalid %s name %q: %s name must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", e.kind, e.name, e.kind)
+}
+
+func (e *invalidNameError) Is(target error) bool { return target == ErrInvalidName }
 
 // validateName enforces the cross-runtime naming rule shared by branch and
 // source names: lowercase letters/digits/hyphens, starting with a letter or
@@ -30,7 +59,7 @@ var branchNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 // names flow into container/dataset/volume names, so this is the one gate.
 func validateName(kind, name string) error {
 	if !branchNameRe.MatchString(name) {
-		return fmt.Errorf("%w %q: %s name must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", ErrInvalidName, name, kind)
+		return &invalidNameError{kind: kind, name: name}
 	}
 	return nil
 }
@@ -80,22 +109,27 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	}
 	src, err := e.reg.GetSourceByName(sourceName)
 	if err != nil {
-		return nil, fmt.Errorf("source %q: %w", sourceName, err)
+		return nil, err
 	}
 	if src.State != registry.SourceReady {
 		return nil, fmt.Errorf("source %q is %s, not ready", sourceName, src.State)
 	}
+	rw, err := e.freshBranchLayer(name, 1)
+	if err != nil {
+		return nil, err
+	}
 	expiresAt := e.expiresAtFor(ttl)
 	b := &registry.Branch{
-		Name: name, SourceID: src.ID, RWVolume: e.planner.BranchLayerName(name),
+		Name: name, SourceID: src.ID, RWVolume: rw,
 		SourceVolume: src.Volume, ExpiresAt: expiresAt,
 	}
 	if err := e.reg.CreateBranchCtx(ctx, b); err != nil {
 		return nil, err
 	}
+	defer e.keepAlive(b.ID)()
 	if err := e.provision(ctx, b, src); err != nil {
 		e.logCompensationErr("transition", "create: mark branch failed after provision failed",
-			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, err.Error()), "branch", b.Name, "branch_id", b.ID)
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, failureReason(err)), "branch", b.Name, "branch_id", b.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)
@@ -147,7 +181,7 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	}
 
 	// 3. branch container
-	cid, err := e.startOverlayBranch(ctx, b.Name, plan, e.image(src.PGVersion), e.branchLabels(b))
+	cid, err := e.startOverlayBranch(ctx, b.Name, plan, e.image(src), e.branchLabels(b))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -161,6 +195,41 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 		return fail(err)
 	}
 	return nil
+}
+
+// maxLayerGenerations bounds freshBranchLayer's search. Each recreation of a
+// name whose old volumes are still known uses one more generation; reaching
+// this many means something else is wrong.
+const maxLayerGenerations = 10000
+
+// freshBranchLayer names the writable layer for a new branch row, or for a
+// freeze parent's swap volume: the lowest generation, from minGen up, that no
+// registry row has ever used (see Registry.VolumeNameUsed). Volume names used
+// to depend on the branch name alone, so a name destroyed and created again
+// silently adopted its predecessor's volume — docker VolumeCreate and the
+// hostPath mkdir -p are both idempotent — including a frozen layer that live
+// children still mount read-only: the "fresh" branch came up on the old
+// branch's writes and wrote into a mounted lower layer. The common case (a
+// name used for the first time) still gets the legacy name, and existing rows
+// keep the volume their row records.
+//
+// zfs clones are named by branch and removed with it, and a zfs parent cannot
+// be destroyed while clones of it live, so zfs keeps the plain name.
+func (e *Engine) freshBranchLayer(name string, minGen int) (string, error) {
+	if e.zfs() {
+		return e.planner.BranchLayerName(name), nil
+	}
+	for gen := max(minGen, 1); gen < minGen+maxLayerGenerations; gen++ {
+		v := cow.BranchRWVolumeNameGen(name, gen)
+		used, err := e.reg.VolumeNameUsed(v)
+		if err != nil {
+			return "", fmt.Errorf("pick writable volume for branch %q: %w", name, err)
+		}
+		if !used {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("pick writable volume for branch %q: no unused name in %d generations", name, maxLayerGenerations)
 }
 
 // layerVolumes projects a layer chain (topmost first) onto its volume names.
@@ -179,7 +248,7 @@ func layerVolumes(chain []registry.Layer) []string {
 // volume and prepares its upper/work dirs.
 func (e *Engine) installOverlayEntrypoint(ctx context.Context, rwVolume string) error {
 	_, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
-		Image:  "alpine:3.21",
+		Image:  runtime.UtilityImage,
 		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh && mkdir -p /pgoverlay/rw/upper /pgoverlay/rw/work`},
 		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScript},
 		Mounts: []runtime.Mount{{Volume: rwVolume, Target: cow.RWPath}},
@@ -249,7 +318,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	// (plain unprivileged helper: it only writes a file)
 	cloneMount := runtime.Mount{Kind: runtime.MountHostPath, Volume: e.planner.Mountpoint(b.RWVolume), Target: cow.RWPath}
 	if _, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
-		Image:  "alpine:3.21",
+		Image:  runtime.UtilityImage,
 		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh`},
 		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScriptDirect},
 		Mounts: []runtime.Mount{cloneMount},
@@ -258,14 +327,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	}
 
 	// 4. branch container on the clone mountpoint
-	cid, err := e.drv.StartBranch(ctx, runtime.BranchSpec{
-		Name:       "pgoverlay-br-" + b.Name,
-		Image:      e.image(src.PGVersion),
-		Env:        []string{"PGDATA=" + cow.DirectDataPath},
-		Mounts:     []runtime.Mount{cloneMount},
-		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
-		Labels:     e.branchLabels(b),
-	})
+	cid, err := e.startZFSBranch(ctx, b, e.image(src))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -278,6 +340,19 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 		return fail(err)
 	}
 	return nil
+}
+
+// startZFSBranch starts a zfs branch's container straight on its clone's
+// mountpoint, where provisionZFS installed the direct entrypoint.
+func (e *Engine) startZFSBranch(ctx context.Context, b *registry.Branch, image string) (string, error) {
+	return e.drv.StartBranch(ctx, runtime.BranchSpec{
+		Name:       "pgoverlay-br-" + b.Name,
+		Image:      image,
+		Env:        []string{"PGDATA=" + cow.DirectDataPath},
+		Mounts:     []runtime.Mount{{Kind: runtime.MountHostPath, Volume: e.planner.Mountpoint(b.RWVolume), Target: cow.RWPath}},
+		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
+		Labels:     e.branchLabels(b),
+	})
 }
 
 func (e *Engine) branchLabels(b *registry.Branch) map[string]string {
@@ -336,6 +411,14 @@ func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *regi
 // keeps its existing password.
 func (e *Engine) rotateBranchCredentials(ctx context.Context, cid string, b *registry.Branch, src *registry.Source) error {
 	if !e.rotateCredentials {
+		// Inherit mode: the fresh clone carries the source's credentials, so
+		// a password left on the row by an earlier rotating run (readable or
+		// not) is stale. Clear it rather than hand it out.
+		if b.Password != "" || b.PasswordUnavailable {
+			if err := e.reg.SetBranchPassword(b.ID, ""); err != nil {
+				return fmt.Errorf("clear stale password for branch %q: %w", b.Name, err)
+			}
+		}
 		return nil
 	}
 	buf := make([]byte, 16)
@@ -358,13 +441,39 @@ func (e *Engine) rotateBranchCredentials(ctx context.Context, cid string, b *reg
 	// a bounded leak. The exposure is bounded: this same password is also stored
 	// (now encrypted at rest), is re-rotated on every reset, and belongs to an
 	// ephemeral branch. Left as-is deliberately; revisit if a stdin exec lands.
+	//
+	// Both drivers format the argv into their exec errors, so a failed ALTER
+	// ROLE error carries the new password. That error becomes the failed
+	// transition's reason (stored in plaintext, returned by the history
+	// endpoint) and is logged, so the password is redacted from it here.
 	if err := e.drv.Exec(ctx, cid, psqlCmd(src, stmt)); err != nil {
-		return fmt.Errorf("rotate credentials for branch %q: %w", b.Name, err)
+		return fmt.Errorf("rotate credentials for branch %q: %w", b.Name, redactSecret(err, pw))
 	}
 	if err := e.reg.SetBranchPassword(b.ID, pw); err != nil {
 		return fmt.Errorf("persist rotated password for branch %q: %w", b.Name, err)
 	}
 	return nil
+}
+
+// redactedError is an error whose text has a secret masked out. It
+// deliberately does not unwrap to the original (whose text still holds the
+// secret), but still matches it under errors.Is, so callers can test for
+// context.Canceled and the like.
+type redactedError struct {
+	msg   string
+	cause error
+}
+
+func (e *redactedError) Error() string        { return e.msg }
+func (e *redactedError) Is(target error) bool { return errors.Is(e.cause, target) }
+
+// redactSecret returns err with every occurrence of secret in its text
+// replaced by "[REDACTED]" (err unchanged when the secret does not appear).
+func redactSecret(err error, secret string) error {
+	if err == nil || secret == "" || !strings.Contains(err.Error(), secret) {
+		return err
+	}
+	return &redactedError{msg: strings.ReplaceAll(err.Error(), secret, "[REDACTED]"), cause: err}
 }
 
 // inspectAddr inspects cid until the runtime reports a routable address.
@@ -393,25 +502,42 @@ func (e *Engine) inspectAddr(ctx context.Context, cid string) (runtime.Container
 	}
 }
 
-// ResetBranch throws away a ready branch's writes and reprovisions it from
-// its recorded source volume on the same registry row (ready -> resetting ->
-// ready; new container id and host port).
+// ResetBranch throws away a branch's writes and reprovisions it from its
+// recorded base (source volume plus frozen layer chain) on the same registry
+// row (ready|failed -> resetting -> ready; new container id and host port).
+// Resetting a failed branch is how a failed create is retried, and how a
+// branch whose data is gone is brought back; RecoverBranch instead restarts a
+// failed branch on the data it still has.
 func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Branch, err error) {
 	defer e.observeOp("reset", &err)()
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
 		return nil, err
 	}
+	if err := e.checkCSIChildBase(b); err != nil {
+		return nil, fmt.Errorf("reset %q: %w", name, err)
+	}
+	if err := e.checkChildCommitted(b); err != nil {
+		return nil, err
+	}
 	src, err := e.reg.GetSourceByID(b.SourceID)
 	if err != nil {
 		return nil, err
 	}
-	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchResetting, "reset requested"); err != nil {
+	if err := e.checkChildrenAllowReprovision(b); err != nil {
 		return nil, err
 	}
+	reason := "reset requested"
+	if b.State == registry.BranchFailed {
+		reason = "reset requested (from failed)"
+	}
+	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchResetting, reason); err != nil {
+		return nil, err
+	}
+	defer e.keepAlive(b.ID)()
 	fail := func(stepErr error) (*registry.Branch, error) {
 		e.logCompensationErr("transition", "reset: mark branch failed after reset step failed",
-			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, stepErr.Error()), "branch", b.Name, "branch_id", b.ID)
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, failureReason(stepErr)), "branch", b.Name, "branch_id", b.ID)
 		return nil, stepErr
 	}
 	if b.ContainerID != "" {
@@ -426,6 +552,33 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 		return fail(fmt.Errorf("reset %q: %w", name, err))
 	}
 	return e.reg.GetBranchByName(name)
+}
+
+// checkChildrenAllowReprovision refuses to stop and rebuild b while branches
+// created from it still depend on its live volumes. It runs before any state
+// change, so a refusal leaves b exactly as it was.
+//
+//   - zfs children are clones of snapshots of b's dataset: `zfs destroy -r`
+//     of the parent fails once the container is gone, which used to leave a
+//     healthy parent failed. DestroyBranch refuses the same way.
+//   - a child still being created may be mid-freeze or mid-clone on b's
+//     volume.
+func (e *Engine) checkChildrenAllowReprovision(b *registry.Branch) error {
+	if e.zfs() {
+		if n, err := e.reg.CountLiveBranchesByVolume(b.RWVolume); err != nil {
+			return err
+		} else if n > 0 {
+			return fmt.Errorf("branch %q has %d child branch(es) cloned from it; destroy them first", b.Name, n)
+		}
+	}
+	kids, err := e.reg.InFlightChildren(b.Name)
+	if err != nil {
+		return err
+	}
+	if len(kids) > 0 {
+		return fmt.Errorf("branch %q has an in-flight child branch %q being created from it; wait for it to finish or destroy it first", b.Name, kids[0])
+	}
+	return nil
 }
 
 // applyMasking runs the source's masking scripts (registry order) inside the
@@ -445,14 +598,18 @@ func (e *Engine) applyMasking(ctx context.Context, cid string, src *registry.Sou
 	defer func() { e.metrics.ObserveMasking(time.Since(start).Seconds()) }()
 	for _, sc := range scripts {
 		if err := e.drv.Exec(ctx, cid, psqlCmd(src, sc.SQL)); err != nil {
-			return fmt.Errorf("masking script %q: %w", sc.Name, err)
+			return markedError{ErrMaskingFailed, fmt.Errorf("masking script %q: %w", sc.Name, err)}
 		}
 	}
 	return nil
 }
 
-// psqlCmd builds an in-container psql invocation over the local socket
-// (peer/local auth — no password needed) with the source's user/database.
+// psqlCmd builds an in-container psql invocation over the local socket with
+// the source's user/database. No password is sent, so the branch's pg_hba.conf
+// (copied from the source) must allow local connections for that role without
+// one: `trust`, or `peer` when the role is postgres (the docker driver execs as
+// the postgres OS user; kube exec runs as the container's user, so peer only
+// works there if that user is postgres).
 func psqlCmd(src *registry.Source, sql string) []string {
 	user, db := src.ConnUser, src.ConnDB
 	if user == "" {
@@ -464,7 +621,21 @@ func psqlCmd(src *registry.Source, sql string) []string {
 	return []string{"psql", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", db, "-c", sql}
 }
 
+// containerDiagnoser is an optional runtime driver capability: explain why a
+// container is not serving yet (image pull back-off, unschedulable pod, crash
+// loop), and whether waiting can still help. The kube driver implements it;
+// readiness is otherwise only visible as exec errors.
+type containerDiagnoser interface {
+	DiagnoseContainer(ctx context.Context, id string) (reason string, fatal bool)
+}
+
+// waitReady polls pg_isready in the container until it answers or timeout
+// passes. With a diagnosing driver it stops early on a state waiting cannot
+// fix, and the returned error carries the driver's explanation — captured
+// before the caller's compensation removes the container and with it the
+// evidence (kubectl describe on a deleted pod shows nothing).
 func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duration) error {
+	diag, _ := e.drv.(containerDiagnoser)
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -472,15 +643,64 @@ func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duratio
 		if lastErr == nil {
 			return nil
 		}
+		if diag != nil {
+			if reason, fatal := diag.DiagnoseContainer(ctx, cid); fatal {
+				return fmt.Errorf("%s (last readiness probe: %w)", reason, lastErr)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
+	if diag != nil {
+		if reason, _ := diag.DiagnoseContainer(ctx, cid); reason != "" {
+			return fmt.Errorf("%w; %s", lastErr, reason)
+		}
+	}
 	return lastErr
 }
 
+// DestroyError is what DestroyBranch returns when the teardown itself failed.
+// The branch stays in destroying with Reason journaled (`pgb history`), and
+// destroying it again, or reconcile's retry_destroy, retries the teardown.
+// Reason is the journaled text; InUse and RuntimeUnavailable classify the
+// cause so the API can answer with a status the caller can act on. Error()
+// is the underlying error's text.
+type DestroyError struct {
+	Branch string
+	Reason string
+	// InUse: the runtime refused to remove something another user still
+	// holds (a volume another container mounts, a busy zfs dataset); the
+	// retry succeeds once it is released.
+	InUse bool
+	// RuntimeUnavailable: the container runtime could not be reached or did
+	// not answer in time; the retry succeeds once it is back.
+	RuntimeUnavailable bool
+	Err                error
+}
+
+func (e *DestroyError) Error() string { return e.Err.Error() }
+func (e *DestroyError) Unwrap() error { return e.Err }
+
+// destroyTimeout bounds a destroy's teardown. The teardown runs detached from
+// the caller's context — a client that disconnects, a ghook deadline or a
+// shutdown must not abandon it halfway — so it needs a bound of its own.
+const destroyTimeout = 5 * time.Minute
+
+// DestroyBranch tears a branch down: its container, its writable layer, the
+// destroyed tombstone, then GC of any frozen layers and old source
+// generations it was the last reference to.
+//
+// It is idempotent and retryable. A branch wedged in creating/resetting is
+// forced to failed first (fast-pathing reconcile's stuck handling); ready and
+// failed branches move to destroying; a row already in destroying — an
+// earlier destroy that failed or was interrupted — re-runs the teardown, every
+// step of which tolerates already-gone resources. A teardown failure leaves
+// the row in destroying with the cause journaled (pgb history) for the next
+// attempt: another destroy call, or reconcile's retry_destroy
+// (Registry.ListStuckDestroyingBranches); the error is then a *DestroyError.
 func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	defer e.observeOp("destroy", &err)()
 	b, err := e.reg.GetBranchByName(name)
@@ -501,56 +721,89 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	if err != nil {
 		return err
 	}
-	// Force a branch wedged in a transient state (creating/resetting) to failed
-	// first, so it can be destroyed now instead of waiting out the 10m
-	// stuck-timeout reconcile. creating->failed and resetting->failed are both
-	// legal (the same edges reconcile's fail-stuck path uses), so this just
-	// fast-paths what reconcile would eventually do.
-	forcedFromTransient := b.State == registry.BranchCreating || b.State == registry.BranchResetting
-	if forcedFromTransient {
+	// guarded: keep the rw volume if another live branch still needs it (see
+	// teardownBranch). A retry cannot tell whether the first attempt was a
+	// forced one, so it errs on the side of keeping.
+	guarded := b.State != registry.BranchReady && b.State != registry.BranchFailed
+	switch b.State {
+	case registry.BranchCreating, registry.BranchResetting:
+		// Force a branch wedged in a transient state (creating/resetting) to
+		// failed first, so it can be destroyed now instead of waiting out the
+		// stuck-timeout reconcile. creating->failed and resetting->failed are
+		// the same edges reconcile's fail-stuck path uses.
 		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, "destroy requested: forcing stuck "+string(b.State)); err != nil {
 			return err
 		}
+		fallthrough
+	case registry.BranchReady, registry.BranchFailed:
+		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
+			return err
+		}
+	case registry.BranchDestroying:
+		e.logCompensationErr("transition", "destroy: journal retry", e.reg.NoteBranchCtx(ctx, b.ID, "destroy retried"),
+			"branch", b.Name, "branch_id", b.ID)
 	}
-	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
+
+	td, cancel := context.WithTimeout(context.WithoutCancel(ctx), destroyTimeout)
+	defer cancel()
+	if err := e.teardownBranch(td, b, guarded); err != nil {
+		reason := failureReason(err)
+		e.logCompensationErr("transition", "destroy: journal failed teardown",
+			e.reg.NoteBranchCtx(td, b.ID, "destroy failed, destroy again to retry: "+reason),
+			"branch", b.Name, "branch_id", b.ID)
+		return &DestroyError{Branch: b.Name, Reason: reason,
+			InUse: runtime.IsInUse(err), RuntimeUnavailable: runtime.IsUnavailable(err), Err: err}
+	}
+	if err := e.reg.TransitionBranchCtx(td, b.ID, registry.BranchDestroyed, ""); err != nil {
+		// a concurrent destroy of the same row (a retry racing reconcile)
+		// finished first: the branch is gone, which is what was asked
+		if errors.Is(err, registry.ErrIllegalTransition) {
+			if cur, gerr := e.reg.GetBranchByID(b.ID); gerr == nil && cur.State == registry.BranchDestroyed {
+				return nil
+			}
+		}
 		return err
 	}
+	// the destroyed branch may have been the last reference to its frozen
+	// layer chain and/or an old-generation source volume
+	e.gcLayers(td, chain)
+	e.gcSourceVolume(td, b.SourceID, b.SourceVolume)
+	return nil
+}
+
+// teardownBranch removes a destroying branch's container and writable layer.
+// Every step is idempotent (StopRemove and RemoveVolume treat gone as done),
+// so a retried destroy simply runs it again.
+//
+// When guarded, the writable layer is kept if it is still another live
+// branch's data. That is the case for a branch forced out of a transient
+// state: a freeze parent keeps its live data in its rw volume until
+// CommitFreeze while an in-flight child mounts it, and a csi/zfs clone parent
+// is quiesced while its child clones the volume — removing it would lose the
+// parent's data (the same guard as reconcile's fail-stuck path). A normally
+// destroyed ready/failed branch is not guarded: its rw volume is its own
+// (csi clones are independent PVCs). A kept volume is freed later by
+// gcSourceVolume (clone children) or reconcile's volume GC.
+func (e *Engine) teardownBranch(ctx context.Context, b *registry.Branch, guarded bool) error {
 	if b.ContainerID != "" {
 		if err := e.drv.StopRemove(ctx, b.ContainerID); err != nil {
 			return fmt.Errorf("remove container: %w", err)
 		}
 	}
-	// When we forced a branch out of a transient state, its rw volume may still
-	// be another live branch's data. A freeze parent forced out of 'resetting'
-	// keeps its live data in its rw volume until CommitFreeze; an in-flight child
-	// references that volume (as its source_volume, or by naming the parent).
-	// Removing it would be the A1 data-loss bug, so guard exactly like
-	// reconcile's ActionFailStuck. A normally-destroyed ready/failed branch is
-	// NOT guarded: a post-CommitFreeze parent has already swapped to a fresh rw
-	// volume (its old one is now a layer GC'd separately), and the
-	// parent_branch_name link would otherwise false-positive against that fresh
-	// volume.
-	if forcedFromTransient {
+	if guarded {
 		referenced, err := e.reg.CountLiveBranchesReferencingRW(b.Name, b.RWVolume)
 		if err != nil {
 			return err
 		}
 		if referenced > 0 {
-			slog.Warn("destroy: forced-stuck branch rw volume is live data for another branch; keeping the volume",
+			slog.Warn("destroy: branch rw volume is live data for another branch; keeping the volume",
 				"branch", b.Name, "rw_volume", b.RWVolume, "referencing_branches", referenced)
-		} else if err := e.removeBranchLayer(ctx, b); err != nil {
-			return fmt.Errorf("remove branch layer: %w", err)
+			return nil
 		}
-	} else if err := e.removeBranchLayer(ctx, b); err != nil {
+	}
+	if err := e.removeBranchLayer(ctx, b); err != nil {
 		return fmt.Errorf("remove branch layer: %w", err)
 	}
-	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroyed, ""); err != nil {
-		return err
-	}
-	// the destroyed branch may have been the last reference to its frozen
-	// layer chain and/or an old-generation source volume
-	e.gcLayers(ctx, chain)
-	e.gcSourceVolume(ctx, b.SourceID, b.SourceVolume)
 	return nil
 }
 

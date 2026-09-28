@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -41,15 +42,44 @@ type fakeDriver struct {
 	// report no Host (pod exec-ready before status.podIP is published).
 	emptyHostInspects int
 	inspects          int
+
+	// runtime-state overrides for reconcile tests: containerState replaces
+	// the default "running on 127.0.0.1:54321" report for a container id;
+	// volumeCreated is what ListManagedVolumes reports as a volume's creation
+	// time (unset = unknown); helperList is what ListHelpers returns.
+	containerState map[string]runtime.ContainerInfo
+	volumeCreated  map[string]time.Time
+	helperList     []runtime.ContainerInfo
+
+	// hooks run inside the corresponding driver call, before it takes effect
+	// (used to run reconcile in the middle of a saga).
+	onCreateVolume func(name string)
+	onStartBranch  func(spec runtime.BranchSpec)
+	onRunHelper    func(spec runtime.HelperSpec)
 }
 
 func newFake() *fakeDriver {
 	return &fakeDriver{
-		volumes:       map[string]bool{},
-		volumeLabels:  map[string]map[string]string{},
-		containerLbls: map[string]map[string]string{},
-		containers:    map[string]bool{},
+		volumes:        map[string]bool{},
+		volumeLabels:   map[string]map[string]string{},
+		containerLbls:  map[string]map[string]string{},
+		containers:     map[string]bool{},
+		containerState: map[string]runtime.ContainerInfo{},
+		volumeCreated:  map[string]time.Time{},
 	}
+}
+
+// info is what the fake runtime reports for an existing container: running on
+// 127.0.0.1:54321 unless a test overrode it via containerState.
+func (f *fakeDriver) info(id string) runtime.ContainerInfo {
+	if st, ok := f.containerState[id]; ok {
+		st.ID = id
+		if st.Labels == nil {
+			st.Labels = f.containerLbls[id]
+		}
+		return st
+	}
+	return runtime.ContainerInfo{ID: id, Running: true, Host: "127.0.0.1", Port: 54321, Labels: f.containerLbls[id]}
 }
 
 // addOrphanContainer registers a managed container tagged with instanceID and
@@ -67,6 +97,9 @@ func (f *fakeDriver) addOrphanVolume(name, instanceID string) {
 }
 func (f *fakeDriver) EnsureImage(ctx context.Context, image string) error { return nil }
 func (f *fakeDriver) CreateVolume(ctx context.Context, name string, l map[string]string) error {
+	if f.onCreateVolume != nil {
+		f.onCreateVolume(name)
+	}
 	f.volumes[name] = true
 	f.volumeLabels[name] = l
 	f.log = append(f.log, "volume:"+name)
@@ -88,10 +121,16 @@ func (f *fakeDriver) CloneVolume(ctx context.Context, src, dst string, l map[str
 	return nil
 }
 func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
+	if f.onRunHelper != nil {
+		f.onRunHelper(s)
+	}
 	f.helpers = append(f.helpers, s)
 	return f.helperOut, f.helperErr
 }
 func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
+	if f.onStartBranch != nil {
+		f.onStartBranch(s)
+	}
 	f.startAttempts++
 	if f.failStart || f.failStartAt[f.startAttempts] {
 		return "", errors.New("boom")
@@ -148,33 +187,41 @@ func (f *fakeDriver) psqlExecs() [][]string {
 }
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
 	f.inspects++
-	if f.inspects <= f.emptyHostInspects {
-		return runtime.ContainerInfo{ID: id, Running: f.containers[id], Port: 54321}, nil
+	if !f.containers[id] {
+		return runtime.ContainerInfo{}, fmt.Errorf("container %s: %w", id, runtime.ErrNotFound)
 	}
-	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
+	info := f.info(id)
+	if f.inspects <= f.emptyHostInspects {
+		info.Host = ""
+	}
+	return info, nil
 }
 func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 	delete(f.containers, id)
+	delete(f.containerState, id)
 	f.log = append(f.log, "stop:"+id)
 	return nil
 }
 func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, error) {
 	var out []runtime.ContainerInfo
 	for id := range f.containers {
-		out = append(out, runtime.ContainerInfo{ID: id, Running: true, Labels: f.containerLbls[id]})
+		out = append(out, f.info(id))
 	}
 	return out, nil
+}
+func (f *fakeDriver) ListHelpers(ctx context.Context) ([]runtime.ContainerInfo, error) {
+	return f.helperList, nil
 }
 
 // ListManagedVolumes returns only volumes whose recorded labels carry
 // pgoverlay.instance=instanceID — mirroring the real drivers' instance-scoped
 // filter. A volume created without labels (set directly in a test) is treated
 // as belonging to no instance and is never returned.
-func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
-	var out []string
+func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]runtime.VolumeInfo, error) {
+	var out []runtime.VolumeInfo
 	for name := range f.volumes {
 		if f.volumeLabels[name][runtime.LabelInstance] == instanceID {
-			out = append(out, name)
+			out = append(out, runtime.VolumeInfo{Name: name, Created: f.volumeCreated[name]})
 		}
 	}
 	return out, nil
@@ -192,7 +239,8 @@ func testEngine(t *testing.T, d runtime.Driver, opts ...Option) (*Engine, *regis
 
 func readySource(t *testing.T, r *registry.Registry) *registry.Source {
 	t.Helper()
-	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main",
+		ConnHost: "db", ConnPort: 5432, ConnUser: "postgres"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}
@@ -537,18 +585,25 @@ func TestResetBranchFailsToFailedAndUnwinds(t *testing.T) {
 	}
 }
 
-func TestResetBranchRequiresReady(t *testing.T) {
+// Resetting a failed branch re-provisions it from its base (failed ->
+// resetting); if provisioning fails again it is failed again, and once the
+// cause is gone a reset brings it back to ready.
+func TestResetBranchFromFailedReprovisions(t *testing.T) {
 	d := newFake()
 	d.failStart = true
 	e, r := testEngine(t, d)
 	readySource(t, r)
 	e.CreateBranch(context.Background(), "pr-1", "main", 0) // fails -> failed state
 	if _, err := e.ResetBranch(context.Background(), "pr-1"); err == nil {
-		t.Fatal("want error resetting a failed branch")
+		t.Fatal("want error: provisioning still fails")
 	}
 	b, _ := r.GetBranchByName("pr-1")
 	if b.State != registry.BranchFailed {
 		t.Fatalf("state=%q", b.State)
+	}
+	d.failStart = false
+	if b, err := e.ResetBranch(context.Background(), "pr-1"); err != nil || b.State != registry.BranchReady {
+		t.Fatalf("reset from failed: %+v err=%v", b, err)
 	}
 }
 

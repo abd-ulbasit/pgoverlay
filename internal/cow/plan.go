@@ -130,10 +130,13 @@ func SourceVolumeName(source string, gen int) string {
 }
 func BranchRWVolumeName(branch string) string { return "pgoverlay-br-" + branch + "-rw" }
 
-// BranchRWVolumeNameGen names a branch's writable volume after gen-1 freezes:
-// every freeze turns the current rw volume into an immutable layer (keeping
-// its name) and moves the branch onto a fresh volume. Gen 1 is the original
-// (legacy) name.
+// BranchRWVolumeNameGen names generation gen of a branch's writable volume.
+// Every freeze turns the current rw volume into an immutable layer (keeping
+// its name) and moves the branch onto a fresh volume, and a branch name that
+// is destroyed and created again must not reuse any earlier volume of that
+// name (a frozen one may still be mounted by live children). The engine
+// therefore picks the lowest generation no registry row has used; gen 1 is
+// the original (legacy) name.
 func BranchRWVolumeNameGen(branch string, gen int) string {
 	if gen <= 1 {
 		return BranchRWVolumeName(branch)

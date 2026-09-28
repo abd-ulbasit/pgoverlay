@@ -10,6 +10,7 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -36,6 +37,12 @@ type Metrics struct {
 	reconcileActs *prometheus.CounterVec   // pgoverlay_reconcile_actions_total{action}
 	inflight      prometheus.Gauge         // pgoverlay_inflight_ops
 	compFailures  *prometheus.CounterVec   // pgoverlay_compensation_failures_total{kind}
+	leader        prometheus.Gauge         // pgoverlay_leader
+	leaderChanges prometheus.Counter       // pgoverlay_leader_transitions_total
+
+	leaderMu    sync.Mutex
+	leaderKnown bool // a first SetLeader has happened
+	isLeader    bool
 }
 
 // New builds a Metrics over its own registry. The branch/source gauges are
@@ -71,7 +78,7 @@ func New() *Metrics {
 		}),
 		reconcileActs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgoverlay_reconcile_actions_total",
-			Help: "Reconcile actions taken by action (fail_stuck|remove_orphan_container|gc_layer|gc_volume).",
+			Help: "Reconcile actions taken by action (fail_stuck|fail_stuck_source|retry_destroy|restart_branch|update_endpoint|remove_orphan_container|remove_orphan_helper|gc_layer|gc_volume).",
 		}, []string{"action"}),
 		inflight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgoverlay_inflight_ops",
@@ -81,13 +88,43 @@ func New() *Metrics {
 			Name: "pgoverlay_compensation_failures_total",
 			Help: "Best-effort saga compensation/failure-transition errors by kind (transition|undo|cleanup).",
 		}, []string{"kind"}),
+		leader: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "pgoverlay_leader",
+			Help: "1 when this branchd replica is the leader (accepts mutations, runs reconcile), else 0. Always 1 without --leader-elect.",
+		}),
+		leaderChanges: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "pgoverlay_leader_transitions_total",
+			Help: "Number of times this replica gained or lost leadership.",
+		}),
 	}
 	m.reg.MustRegister(
 		m.opDuration, m.opErrors, m.maskingDur,
 		m.reaperRuns, m.reaperReaped, m.reconcileRuns, m.reconcileActs, m.inflight,
-		m.compFailures,
+		m.compFailures, m.leader, m.leaderChanges,
 	)
 	return m
+}
+
+// SetLeader records this replica's leadership: pgoverlay_leader follows it
+// and every change after the first observation counts one
+// pgoverlay_leader_transitions_total. branchd feeds it from the API leader
+// gate, so "no replica is leader" (max(pgoverlay_leader) == 0) and leadership
+// flapping are alertable. No-op on a nil receiver.
+func (m *Metrics) SetLeader(leader bool) {
+	if m == nil {
+		return
+	}
+	m.leaderMu.Lock()
+	defer m.leaderMu.Unlock()
+	if m.leaderKnown && m.isLeader != leader {
+		m.leaderChanges.Inc()
+	}
+	m.leaderKnown, m.isLeader = true, leader
+	if leader {
+		m.leader.Set(1)
+	} else {
+		m.leader.Set(0)
+	}
 }
 
 // SetStateCounter registers the branches/sources state-count collector backed

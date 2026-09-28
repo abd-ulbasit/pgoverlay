@@ -29,6 +29,7 @@ type ghComment struct {
 // then PATCH.
 type fakeGitHub struct {
 	t        *testing.T
+	prState  string      // state served for GET /repos/acme/widgets/pulls/7 ("" = closed)
 	comments []ghComment // current comments (list endpoint state)
 	posted   []string    // bodies received by the create endpoint
 	patched  []string    // bodies received by the edit endpoint, in order
@@ -81,6 +82,14 @@ func newFakeGitHub(t *testing.T, existing ...string) *fakeGitHub {
 		t.Errorf("PATCH of unknown comment id %s", r.PathValue("id"))
 		w.WriteHeader(http.StatusNotFound)
 	})
+	mux.HandleFunc("GET /repos/acme/widgets/pulls/7", func(w http.ResponseWriter, r *http.Request) {
+		f.lastReq = r
+		state := f.prState
+		if state == "" {
+			state = "closed"
+		}
+		json.NewEncoder(w).Encode(map[string]any{"number": 7, "state": state})
+	})
 	mux.HandleFunc("POST /repos/acme/widgets/statuses/{sha}", func(w http.ResponseWriter, r *http.Request) {
 		f.lastReq = r
 		var s struct {
@@ -121,7 +130,7 @@ func TestOpenedPostsThenPatchesLiveComment(t *testing.T) {
 	if len(gh.posted) != 1 {
 		t.Fatalf("posted comments = %v, want exactly one", gh.posted)
 	}
-	for _, want := range []string{commentMarker, "`gh-pr-7`", "creating"} {
+	for _, want := range []string{commentMarker, "`" + pr7Branch + "`", "creating"} {
 		if !strings.Contains(gh.posted[0], want) {
 			t.Errorf("creating comment missing %q:\n%s", want, gh.posted[0])
 		}
@@ -130,7 +139,7 @@ func TestOpenedPostsThenPatchesLiveComment(t *testing.T) {
 		t.Fatalf("patched comments = %v, want exactly one (the ready update)", gh.patched)
 	}
 	final := gh.patched[0]
-	for _, want := range []string{commentMarker, "`gh-pr-7`", "ready", "-h pg.example.com", "-p 30432", "appdb@pr-7"} {
+	for _, want := range []string{commentMarker, "`" + pr7Branch + "`", "ready", "-h pg.example.com", "-p 30432", pr7ProxyDB} {
 		if !strings.Contains(final, want) {
 			t.Errorf("ready comment missing %q:\n%s", want, final)
 		}
@@ -173,7 +182,7 @@ func TestResetCommentShowsShortSHA(t *testing.T) {
 	if !strings.Contains(final, "reset @ 9f8e7d6") {
 		t.Fatalf("reset comment missing short sha:\n%s", final)
 	}
-	if !strings.Contains(final, "appdb@pr-7") {
+	if !strings.Contains(final, pr7ProxyDB) {
 		t.Fatalf("reset comment lost the connect string:\n%s", final)
 	}
 }
@@ -182,10 +191,10 @@ func TestResetCommentShowsShortSHA(t *testing.T) {
 // (the branch it pointed at no longer exists) — and posts no status.
 func TestClosedUpdatesCommentToDestroyed(t *testing.T) {
 	pg := newFakePG(t, true)
-	gh := newFakeGitHub(t, commentMarker+" branch gh-pr-7 ready, psql -h pg.example.com")
+	gh := newFakeGitHub(t, commentMarker+" branch "+pr7Branch+" ready, psql -h pg.example.com")
 	deliver(t, newService(Config{ProxyHost: "pg.example.com"}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
 
-	pg.assertCalls("DELETE /v1/branches/gh-pr-7")
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "DELETE /v1/branches/"+pr7Branch)
 	if len(gh.patched) != 1 {
 		t.Fatalf("patched = %v, want exactly one destroyed update", gh.patched)
 	}
@@ -228,7 +237,7 @@ func TestGitHubFailureDoesNotFailWebhook(t *testing.T) {
 	gh := &GitHub{BaseURL: down.URL, Token: StaticToken("gh-token"), HTTP: down.Client()}
 	// comment failure is non-fatal: the branch operation still completes
 	deliver(t, newService(Config{}, pg.srv.URL, gh), fixture(t, "pr_opened.json"))
-	pg.assertCalls("GET /v1/branches/gh-pr-7", "POST /v1/branches")
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "POST /v1/branches")
 }
 
 func TestSetStatusRequestShape(t *testing.T) {
@@ -271,11 +280,11 @@ func TestEnsureSetsPendingThenSuccessStatus(t *testing.T) {
 	}
 	pending, success := gh.statuses[0], gh.statuses[1]
 	if pending.State != "pending" || pending.SHA != "0d1e2f3a4b5c6d7e" ||
-		pending.Context != "pgoverlay/branch" || !strings.Contains(pending.Description, "creating branch gh-pr-7") {
+		pending.Context != "pgoverlay/branch" || !strings.Contains(pending.Description, "creating branch "+pr7Branch) {
 		t.Errorf("pending status = %+v", pending)
 	}
 	if success.State != "success" || success.SHA != "0d1e2f3a4b5c6d7e" ||
-		!strings.Contains(success.Description, "branch gh-pr-7 ready") ||
+		!strings.Contains(success.Description, "branch "+pr7Branch+" ready") ||
 		!strings.Contains(success.Description, "pg.example.com:30432") {
 		t.Errorf("success status = %+v", success)
 	}
@@ -285,8 +294,8 @@ func TestSynchronizeWithResetPostsResettingPending(t *testing.T) {
 	pg := newFakePG(t, true)
 	gh := newFakeGitHub(t)
 	deliver(t, newService(Config{ResetOnPush: true}, pg.srv.URL, gh.client()), fixture(t, "pr_synchronize.json"))
-	if len(gh.statuses) < 1 || !strings.Contains(gh.statuses[0].Description, "resetting branch gh-pr-7") {
-		t.Fatalf("statuses = %+v, want pending 'resetting branch gh-pr-7' first", gh.statuses)
+	if len(gh.statuses) < 1 || !strings.Contains(gh.statuses[0].Description, "resetting branch "+pr7Branch) {
+		t.Fatalf("statuses = %+v, want pending 'resetting branch %s' first", gh.statuses, pr7Branch)
 	}
 }
 
@@ -419,7 +428,7 @@ func TestDiffCommentFailureIsNonFatal(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
 		default: // POST create
 			w.WriteHeader(http.StatusCreated)
-			json.NewEncoder(w).Encode(api.Branch{Name: "pr-7", State: "ready", ProxyDatabase: "appdb@pr-7"})
+			json.NewEncoder(w).Encode(api.Branch{Name: "pr-7", State: "ready", ProxyDatabase: pr7ProxyDB})
 		}
 	}))
 	defer pg.Close()
@@ -444,9 +453,134 @@ func TestClosedWithoutMarkerCommentCreatesNothing(t *testing.T) {
 	pg := newFakePG(t, true)
 	gh := newFakeGitHub(t, "unrelated comment")
 	deliver(t, newService(Config{}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
-	pg.assertCalls("DELETE /v1/branches/gh-pr-7")
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "DELETE /v1/branches/"+pr7Branch)
 	if len(gh.posted) != 0 || len(gh.patched) != 0 || len(gh.statuses) != 0 {
 		t.Fatalf("posted=%v patched=%v statuses=%+v, want no GitHub writes on closed without a marker comment",
 			gh.posted, gh.patched, gh.statuses)
+	}
+}
+
+// A closed delivery for a pull request GitHub reports open again (a
+// redelivery, a replayed request, or one queued behind the reopen) must not
+// destroy the branch the open pull request uses.
+func TestClosedIgnoredWhenPullRequestIsOpenAgain(t *testing.T) {
+	pg := newFakePG(t, true)
+	gh := newFakeGitHub(t, commentMarker+" ready")
+	gh.prState = "open"
+	deliver(t, newService(Config{}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
+	pg.assertCalls() // no destroy, not even a lookup
+	if len(gh.patched) != 0 {
+		t.Errorf("patched = %v, want the comment left alone", gh.patched)
+	}
+	if got := gh.lastReq.URL.Path; got != "/repos/acme/widgets/pulls/7" {
+		t.Errorf("last GitHub call = %s, want the pull request lookup", got)
+	}
+}
+
+// Commit statuses are public on public repositories: a transport error
+// (which names branchd's in-cluster address) stays in the log, and the
+// status points there by delivery id. branchd's own 4xx answers are
+// deliberate and pass through.
+func TestFailureStatusDoesNotLeakTransportErrors(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close() // connection refused from now on
+
+	gh := newFakeGitHub(t)
+	svc := newService(Config{}, deadURL, gh.client())
+	body := fixture(t, "pr_opened.json")
+	req := httptest.NewRequest("POST", "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-Hub-Signature-256", sign(testSecret, body))
+	req.Header.Set("X-GitHub-Delivery", "d-123")
+	svc.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	svc.Wait()
+
+	if len(gh.statuses) != 2 {
+		t.Fatalf("statuses = %+v, want pending then failure", gh.statuses)
+	}
+	desc := gh.statuses[1].Description
+	host := strings.TrimPrefix(deadURL, "http://")
+	if strings.Contains(desc, host) || strings.Contains(desc, "127.0.0.1") || strings.Contains(desc, "dial") {
+		t.Errorf("failure status leaks the transport error: %q", desc)
+	}
+	if want := "get branch " + pr7Branch + " failed; see the pgoverlay-github logs (delivery d-123)"; desc != want {
+		t.Errorf("failure status = %q, want %q", desc, want)
+	}
+
+	pg := newFakePG(t, false)
+	pg.createErr, pg.createErrMsg = http.StatusForbidden, "quota exceeded: 10 live branches"
+	gh2 := newFakeGitHub(t)
+	deliver(t, newService(Config{}, pg.srv.URL, gh2.client()), fixture(t, "pr_opened.json"))
+	if desc := gh2.statuses[len(gh2.statuses)-1].Description; !strings.Contains(desc, "quota exceeded") {
+		t.Errorf("4xx failure status = %q, want branchd's message", desc)
+	}
+}
+
+// Without GHOOK_PROXY_HOST there is no host to put after -h: the comment
+// names the proxy database and says why there is no command.
+func TestCommentBodyWithoutProxyHost(t *testing.T) {
+	b := &api.Branch{Name: pr7Branch, User: "app", ProxyDatabase: pr7ProxyDB}
+	body := commentBody("", pr7Branch, "ready", b)
+	if strings.Contains(body, "psql") || strings.Contains(body, "-h") {
+		t.Errorf("comment prints a connect command without a host:\n%s", body)
+	}
+	for _, want := range []string{"`" + pr7ProxyDB + "`", "`app`", "GHOOK_PROXY_HOST"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("comment missing %q:\n%s", want, body)
+		}
+	}
+	// With a host, the command is there and the note is not.
+	if body := commentBody("pg.example.com", pr7Branch, "ready", b); !strings.Contains(body, "psql -h pg.example.com") || strings.Contains(body, "GHOOK_PROXY_HOST") {
+		t.Errorf("comment with a proxy host:\n%s", body)
+	}
+}
+
+// Schema text and table names come from the branch, so they cannot break
+// out of the diff comment's code fence or table: a fence in the schema is
+// out-fenced, and pipes, backticks and newlines in table names stay inside
+// one cell. The table list is capped.
+func TestDiffCommentEscapesBranchContent(t *testing.T) {
+	res := &engine.DiffResult{
+		SchemaDiff: "+COMMENT ON TABLE t IS '```\n@acme/oncall please approve\n```';\n+x ```` y\n",
+		Tables: []engine.TableDelta{
+			{Table: "a|b", BaseRows: 1, BranchRows: 2, Delta: 1},
+			{Table: "x`y", BaseRows: 1, BranchRows: 3, Delta: 2},
+			{Table: "`edge", BaseRows: 1, BranchRows: 4, Delta: 3},
+			{Table: "multi\nline", BaseRows: 1, BranchRows: 5, Delta: 4},
+		},
+	}
+	body := diffCommentBody(pr7Branch, res)
+	// The schema's longest backtick run is 4, so the fence is 5 long, and
+	// the only 5-backtick lines are the opening and the closing fence.
+	if !strings.Contains(body, "\n`````diff\n") || !strings.Contains(body, "\n`````\n") {
+		t.Errorf("fence is not longer than the schema's longest backtick run:\n%s", body)
+	}
+	open := strings.Index(body, "`````diff")
+	closing := strings.LastIndex(body, "\n`````\n")
+	if mention := strings.Index(body, "@acme/oncall"); mention < open || mention > closing {
+		t.Errorf("mention is outside the code fence:\n%s", body)
+	}
+	for _, want := range []string{
+		"| `a\\|b` | 1 | 2 | +1 |",
+		"| ``x`y`` | 1 | 3 | +2 |",
+		"| `` `edge `` | 1 | 4 | +3 |",
+		"| `multi line` | 1 | 5 | +4 |",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("diff comment missing row %q:\n%s", want, body)
+		}
+	}
+
+	many := &engine.DiffResult{}
+	for i := range diffTableLimit + 25 {
+		many.Tables = append(many.Tables, engine.TableDelta{Table: fmt.Sprintf("t%d", i), BranchRows: 1, Delta: 1})
+	}
+	body = diffCommentBody(pr7Branch, many)
+	if rows := strings.Count(body, "| `t"); rows != diffTableLimit {
+		t.Errorf("table rows = %d, want %d", rows, diffTableLimit)
+	}
+	if !strings.Contains(body, "and 25 more changed tables") {
+		t.Errorf("capped table does not say how many were left out:\n%s", body)
 	}
 }

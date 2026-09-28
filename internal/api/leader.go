@@ -1,51 +1,252 @@
 package api
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
-	"sync/atomic"
+	"sync"
+	"time"
 )
 
-// LeaderGate is the HA mutating-route gate: an atomic leadership flag the
+// LeaderGate is the HA mutating-route gate: the leadership flag the
 // leader-election orchestration flips. It defaults to leader=true so that with
 // leader election OFF (docker/local, single instance) every instance is always
 // the leader and mutating routes behave normally. When false, mutating /v1
 // routes return 503 "not leader" while reads, /healthz, /readyz and /metrics
-// keep serving (a non-leader backs read traffic and probes off its own
-// read-only registry handle).
+// keep serving.
+//
+// Each stretch of leadership is a term with its own context. Mutations admitted
+// during a term run on a context derived from it, so losing leadership cancels
+// every saga the deposed leader still has in flight (their compensations run on
+// a detached context) instead of letting it keep writing next to the new leader.
 type LeaderGate struct {
-	leader atomic.Bool
+	mu        sync.Mutex
+	leader    bool
+	term      context.Context
+	endTerm   context.CancelFunc
+	observers []func(leader bool)
 }
 
 // newLeaderGate returns a gate that starts as the leader (single-instance
 // default).
 func newLeaderGate() *LeaderGate {
 	g := &LeaderGate{}
-	g.leader.Store(true)
+	g.Set(true)
 	return g
 }
 
 // IsLeader reports whether this instance currently holds leadership.
-func (g *LeaderGate) IsLeader() bool { return g.leader.Load() }
+func (g *LeaderGate) IsLeader() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.leader
+}
 
-// Set flips the leadership flag (called from the election callbacks).
-func (g *LeaderGate) Set(leader bool) { g.leader.Store(leader) }
+// Set flips the leadership flag (called from the election callbacks). Opening
+// the gate starts a new term; closing it ends the current term, cancelling the
+// mutations admitted during it. Setting the current value is a no-op.
+func (g *LeaderGate) Set(leader bool) {
+	g.mu.Lock()
+	if leader == g.leader && g.term != nil {
+		g.mu.Unlock()
+		return
+	}
+	if leader {
+		g.term, g.endTerm = context.WithCancel(context.Background())
+	} else if g.endTerm != nil {
+		g.endTerm()
+	}
+	g.leader = leader
+	for _, fn := range g.observers {
+		fn(leader)
+	}
+	g.mu.Unlock()
+}
 
-// requireLeader wraps a mutating handler so it returns 503 when this instance
-// is not the leader. It is composed with requireRole on the same mutating
-// routes; reads/probes never get this wrapper.
-func (s *Server) requireLeader(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.leader.IsLeader() {
-			writeError(w, http.StatusServiceUnavailable, "not leader")
-			return
-		}
-		next(w, r)
+// Observe registers fn to be called with the new value on every leadership
+// change, and once immediately with the current value (branchd wires the
+// pgoverlay_leader gauge here). fn runs under the gate's lock, in order, and
+// must not call back into the gate.
+func (g *LeaderGate) Observe(fn func(leader bool)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.observers = append(g.observers, fn)
+	fn(g.leader)
+}
+
+// admit returns the current term's context when this instance is the leader.
+func (g *LeaderGate) admit() (context.Context, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.term, g.leader
+}
+
+// mutations tracks the sagas the API has in flight so shutdown can wait for
+// them, refuse new ones, and as a last resort cancel the stragglers.
+type mutations struct {
+	mu       sync.Mutex
+	wg       sync.WaitGroup
+	draining bool
+	ctx      context.Context // parent of every mutation; cancelled by cancelAll
+	cancel   context.CancelFunc
+}
+
+func newMutations() *mutations {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &mutations{ctx: ctx, cancel: cancel}
+}
+
+// begin admits one mutation. The returned context keeps the request's values
+// (the audit actor, the role) but not its cancellation: a client that
+// disconnects, times out or sits behind a load balancer with a short idle
+// timeout must not abort a half-done saga. It is cancelled instead when the
+// leadership term ends, when shutdown gives up waiting (cancelAll), or after
+// timeout (0 = no deadline). done must be called when the handler returns.
+func (m *mutations) begin(r *http.Request, term context.Context, timeout time.Duration) (ctx context.Context, done func(), ok bool) {
+	m.mu.Lock()
+	if m.draining {
+		m.mu.Unlock()
+		return nil, nil, false
+	}
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	base := context.WithoutCancel(r.Context())
+	cancelTimeout := context.CancelFunc(func() {})
+	if timeout > 0 {
+		base, cancelTimeout = context.WithTimeoutCause(base, timeout, &mutationTimeoutError{limit: timeout, start: time.Now()})
+	}
+	ctx, cancel := context.WithCancelCause(base)
+	stopTerm := context.AfterFunc(term, func() { cancel(errLeadershipLost) })
+	stopAll := context.AfterFunc(m.ctx, func() { cancel(errShuttingDown) })
+	return ctx, func() {
+		stopTerm()
+		stopAll()
+		cancel(nil)
+		cancelTimeout()
+		m.wg.Done()
+	}, true
+}
+
+// Causes recorded on a mutation's context when something other than the saga
+// itself ends it; writeEngineError turns them into a retryable status. A
+// timed-out mutation's cause is a *mutationTimeoutError, which matches
+// errMutationTimeout.
+var (
+	errLeadershipLost  = errors.New("leadership moved to another replica while the operation ran")
+	errShuttingDown    = errors.New("branchd is shutting down")
+	errMutationTimeout = errors.New("operation exceeded the stuck timeout")
+)
+
+// mutationTimeoutError is the cause recorded when a branch mutation runs past
+// the stuck timeout. It carries the limit and the start, so the 504 can say
+// how long the operation ran and which setting bounds it.
+type mutationTimeoutError struct {
+	limit time.Duration
+	start time.Time
+}
+
+func (e *mutationTimeoutError) Error() string {
+	return fmt.Sprintf("%s (%s)", errMutationTimeout, e.limit)
+}
+
+func (e *mutationTimeoutError) Is(target error) bool { return target == errMutationTimeout }
+
+// message is the 504 body: what happened, the elapsed time against the limit,
+// and what to change when the operation is legitimately that slow.
+func (e *mutationTimeoutError) message() string {
+	return fmt.Sprintf("the operation ran %s, past branchd's stuck timeout of %s, and was cancelled; its partial work was rolled back. "+
+		"If it is legitimately this slow (a long masking script, a slow image pull), raise branchd's --stuck-timeout "+
+		"(Helm value stuckTimeout) above its run time, then retry",
+		roundElapsed(time.Since(e.start)), e.limit)
+}
+
+// roundElapsed rounds a duration for a message: whole seconds from a second
+// up, milliseconds below.
+func roundElapsed(d time.Duration) time.Duration {
+	if d >= time.Second {
+		return d.Round(time.Second)
+	}
+	return d.Round(time.Millisecond)
+}
+
+// stopAdmitting makes every later begin fail; in-flight mutations continue.
+func (m *mutations) stopAdmitting() {
+	m.mu.Lock()
+	m.draining = true
+	m.mu.Unlock()
+}
+
+// cancelAll cancels every in-flight mutation (cause errShuttingDown).
+func (m *mutations) cancelAll() { m.cancel() }
+
+// wait blocks until every admitted mutation has returned or ctx is done.
+func (m *mutations) wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-// mutate composes the leader gate with the role check for a mutating route:
-// the leader gate is checked first (a non-leader rejects before doing any auth
-// work), then the minimum-role bearer check.
-func (s *Server) mutate(min string, next http.HandlerFunc) http.HandlerFunc {
-	return s.requireLeader(s.requireRole(min, next))
+// requireLeader wraps a mutating handler: a non-leader answers 503 "not
+// leader", a draining server 503 "shutting down"; otherwise the handler runs on
+// a tracked context detached from the client connection (see mutations.begin).
+// It always sits INSIDE requireRole, so an unauthenticated or under-privileged
+// caller gets 401/403 before leadership is revealed.
+func (s *Server) requireLeader(timeout time.Duration, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		term, ok := s.leader.admit()
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "not leader")
+			return
+		}
+		ctx, done, ok := s.muts.begin(r, term, timeout)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "shutting down")
+			return
+		}
+		defer done()
+		next(w, r.WithContext(ctx))
+	}
 }
+
+// mutate composes the role check with the leader gate for a mutating route:
+// authentication and the minimum role are checked first (401/403 win over
+// 503), then leadership. The mutation runs until it finishes, the leadership
+// term ends, or shutdown cancels it.
+func (s *Server) mutate(min string, next http.HandlerFunc) http.HandlerFunc {
+	return s.requireRole(min, s.requireLeader(0, next))
+}
+
+// mutateBranch is mutate for branch sagas (create, reset, recover, destroy,
+// diff, reconcile): they are additionally bounded by the stuck timeout. A
+// running saga heartbeats its rows (engine keepAlive), so reconcile never
+// fails a row whose saga is alive; the bound is what ends a saga that is
+// alive but wedged (a hung runtime call, a masking script that never
+// returns), which the heartbeat would otherwise keep in creating/resetting
+// forever. The saga then compensates itself and the client gets a 504.
+func (s *Server) mutateBranch(min string, next http.HandlerFunc) http.HandlerFunc {
+	return s.requireRole(min, s.requireLeader(s.stuckTimeout, next))
+}
+
+// StopAdmitting makes the API refuse new mutations with 503 "shutting down";
+// mutations already in flight continue. branchd calls it on SIGTERM.
+func (s *Server) StopAdmitting() { s.muts.stopAdmitting() }
+
+// WaitMutations blocks until every in-flight mutation has returned or ctx is
+// done (then it returns ctx.Err()).
+func (s *Server) WaitMutations(ctx context.Context) error { return s.muts.wait(ctx) }
+
+// CancelMutations cancels every in-flight mutation's context. The sagas then
+// run their compensations (on a detached context) and return; use
+// WaitMutations to wait for that. branchd calls it when the shutdown drain
+// budget runs out.
+func (s *Server) CancelMutations() { s.muts.cancelAll() }

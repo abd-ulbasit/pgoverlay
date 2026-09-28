@@ -1,4 +1,7 @@
-# branchd manages branch/helper pods in its own namespace only.
+# branchd manages branch/helper pods in its own namespace only. Anyone who
+# installs this chart must hold every rule below themselves (Kubernetes RBAC
+# escalation prevention); deploy/preview-deployer-rbac.yaml is kept a
+# superset, and internal/deploy tests that it stays one.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -15,6 +18,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # Helper pods read their environment (the source password when seeding)
+  # from a short-lived Secret branchd creates with the pod and deletes once
+  # the container has started, so it never sits in a Pod spec. No get/list:
+  # branchd never reads Secrets back.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
   {{- if eq .Values.storage.mode "csi" }}
   # csi storage: branchd provisions PVCs (sources, branch clones) and — when
   # storage.snapshotClass is set — VolumeSnapshots, in its own namespace.
@@ -31,6 +41,15 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update", "watch", "list"]
+  # The leader labels its own pod pgoverlay.leader=true (the API Service
+  # selects it) and strips a stale label from a previous leader's pod.
+  # RBAC cannot limit this to the release's own pods (their names are
+  # generated and resourceNames cannot match labels), so the Role can patch
+  # any pod in the namespace. That is no wider than the pod create/delete
+  # granted above; branchd only ever patches the pgoverlay.leader label.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

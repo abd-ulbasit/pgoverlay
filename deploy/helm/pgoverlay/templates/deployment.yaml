@@ -27,9 +27,38 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: {{ include "pgoverlay.fullname" . }}
-      # Pin to the storage node: branchd's sqlite state shares the node (and
-      # data root) with the CoW volumes it manages.
+      {{- if eq (include "pgoverlay.pinNode" .) "true" }}
+      # Pinned to the storage node: in hostpath mode the CoW volumes live on
+      # its disk, and without persistence so does branchd's sqlite state.
       nodeName: {{ required "set node to the storage node name (kubectl get nodes)" .Values.node }}
+      {{- end }}
+      # On SIGTERM branchd drains in-flight sagas for --shutdown-timeout, then
+      # cancels and rolls back the rest (up to 15s more) before it exits; the
+      # kubelet must not SIGKILL it first.
+      terminationGracePeriodSeconds: {{ add (int .Values.shutdownTimeout) 30 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if and (ne (include "pgoverlay.pinNode" .) "true") (gt (int .Values.replicaCount) 1) }}
+      # Unpinned HA: every replica mounts the same ReadWriteOnce state PVC, so
+      # they must share a node. The first replica goes wherever the scheduler
+      # (and the volume's topology) puts it; the others follow it.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "pgoverlay.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
       containers:
         - name: branchd
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -39,8 +68,13 @@ spec:
           {{- end }}
           args:
             - --runtime=kube
+            {{- if eq .Values.storage.mode "hostpath" }}
             - --kube-node={{ .Values.node }}
+            {{- end }}
             - --kube-data-root={{ .Values.dataRoot }}
+            {{- with .Values.helperImage }}
+            - --kube-helper-image={{ . }}
+            {{- end }}
             {{- if eq .Values.storage.mode "csi" }}
             - --kube-storage=csi
             - --csi-storage-class={{ required "set storage.storageClass to a StorageClass supporting PVC cloning (required with storage.mode=csi)" .Values.storage.storageClass }}
@@ -63,6 +97,7 @@ spec:
             {{- end }}
             - --reconcile-interval={{ .Values.reconcileInterval }}
             - --stuck-timeout={{ .Values.stuckTimeout }}
+            - --shutdown-timeout={{ int .Values.shutdownTimeout }}s
             {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
             # HA: contend for the pgoverlay-branchd Lease; only the leader
             # reconciles + accepts mutating /v1 requests (see docs/ha.md).
@@ -81,6 +116,17 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # branchd makes its own pod the owner of the helper pods (and their
+            # env Secrets) it starts, so they are garbage-collected with it if
+            # branchd dies mid-seed.
+            - name: PGOVERLAY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PGOVERLAY_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
             # leader-election identity (the Lease holder)
             - name: POD_NAME

@@ -130,3 +130,16 @@ func TestAuthzUnauthenticatedProbes(t *testing.T) {
 		t.Errorf("unauthenticated GET /healthz = %d, want 200", code)
 	}
 }
+
+// Token names that would impersonate another audit identity (the env token's
+// "root", the daemon's "system:reconcile") or make "name (role)" ambiguous are
+// a 400, not a stored token.
+func TestCreateTokenRejectsReservedName(t *testing.T) {
+	ts, _ := newTestServer(t)
+	for _, name := range []string{"root", "system:reconcile", "x (admin)"} {
+		code, body := do(t, ts, testToken, "POST", "/v1/tokens", CreateTokenRequest{Name: name, Role: registry.RoleAdmin})
+		if code != http.StatusBadRequest {
+			t.Errorf("token %q: %d %s, want 400", name, code, body)
+		}
+	}
+}

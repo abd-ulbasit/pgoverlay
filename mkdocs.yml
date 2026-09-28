@@ -1,6 +1,9 @@
-# pgoverlay docs site. No CI, no hosting — build locally:
-#   pip install mkdocs-material && mkdocs serve
+# pgoverlay docs site. .github/workflows/docs.yml builds it with --strict on
+# every pull request that touches docs/ and publishes it to GitHub Pages from
+# main. Preview locally:
+#   pip install "mkdocs==1.6.1" "mkdocs-material==9.7.7" && mkdocs serve
 site_name: pgoverlay
+site_url: https://abd-ulbasit.github.io/pgoverlay/
 site_description: "git branch for Postgres: instant copy-on-write database branches"
 repo_url: https://github.com/abd-ulbasit/pgoverlay
 repo_name: abd-ulbasit/pgoverlay
@@ -20,6 +23,11 @@ nav:
   - Home: index.md
   - Quickstart: quickstart.md
   - Ways to use it: usage.md
+  - Reference:
+      - Commands and configuration: reference.md
+      - REST API: api.md
+      - Troubleshooting: troubleshooting.md
+      - Upgrading to v1.0: upgrading.md
   - How it works:
       - Core concepts: concepts.md
       - Architecture: architecture.md
@@ -33,10 +41,16 @@ nav:
   - GitHub App: github-app.md
   - Observability: observability.md
   - High availability: ha.md
+  - Security: security.md
   - ZFS backend (experimental): zfs.md
-  - API stability: api.md
 
 markdown_extensions:
   - admonition
   - tables
-  - pymdownx.superfences
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format

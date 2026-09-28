@@ -48,9 +48,20 @@ type csiStorage struct {
 // nodeName: no pin — PVCs travel with their pods, the scheduler places them.
 func (s *csiStorage) nodeName() string { return "" }
 
-// branchSecurityContext: none. CSI branch pods run postgres directly on
-// their cloned claim — no in-container overlay mount, no SYS_ADMIN.
-func (s *csiStorage) branchSecurityContext() *corev1.SecurityContext { return nil }
+// branchSecurityContext: no added capabilities. CSI branch pods run postgres
+// directly on their cloned claim — no in-container overlay mount, no
+// SYS_ADMIN — so they run under the container runtime's default seccomp
+// profile (stated explicitly: unset means Unconfined on any kubelet without
+// seccompDefault) with privilege escalation off. The entrypoint still starts
+// as root, as the official image's does, to chown PGDATA and drop to the
+// postgres user via gosu; neither needs escalation or extra syscalls. That
+// fits Pod Security "baseline"; "restricted" would need a non-root start.
+func (s *csiStorage) branchSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: boolPtr(false),
+		SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+}
 
 // podVolumes maps MountVolume to the named PVC. MountHostPath cannot occur in
 // csi mode (the csi cow backend mounts only PVCs and the zfs backend is
@@ -157,15 +168,15 @@ func (s *csiStorage) cloneVolume(ctx context.Context, src, dst string, labels ma
 
 // listVolumes returns the names of every pgoverlay-managed PVC in the namespace
 // owned by instanceID.
-func (s *csiStorage) listVolumes(ctx context.Context, instanceID string) ([]string, error) {
+func (s *csiStorage) listVolumes(ctx context.Context, instanceID string) ([]VolumeInfo, error) {
 	list, err := s.d.cs.CoreV1().PersistentVolumeClaims(s.d.namespace).List(ctx,
 		metav1.ListOptions{LabelSelector: "pgoverlay.managed=true," + LabelInstance + "=" + instanceID})
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(list.Items))
+	out := make([]VolumeInfo, 0, len(list.Items))
 	for _, pvc := range list.Items {
-		out = append(out, pvc.Name)
+		out = append(out, VolumeInfo{Name: pvc.Name, Created: pvc.CreationTimestamp.Time})
 	}
 	return out, nil
 }

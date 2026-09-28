@@ -60,10 +60,11 @@ cleanup() {
     log "cleaning up (exit status $status)"
     "$PGB" branch destroy "$BRANCH" >/dev/null 2>&1
     "$PGB" source rm "$SOURCE" >/dev/null 2>&1
-    docker rm -f "pgoverlay-br-$BRANCH" >/dev/null 2>&1
-    docker rm -f "$SRC_CONTAINER" >/dev/null 2>&1
-    docker volume rm -f "pgoverlay-br-$BRANCH-rw" >/dev/null 2>&1
-    docker volume ls -q | grep "^pgoverlay-src-$SOURCE" | while read -r v; do
+    docker rm -f -v "pgoverlay-br-$BRANCH" >/dev/null 2>&1
+    docker rm -f -v "$SRC_CONTAINER" >/dev/null 2>&1
+    # a recreated branch name gets a new rw volume generation
+    # (pgoverlay-br-<name>-rw, then -rw-g2, -rw-g3, ...)
+    docker volume ls -q | grep -E "^(pgoverlay-br-$BRANCH-rw|pgoverlay-src-$SOURCE)" | while read -r v; do
         docker volume rm -f "$v" >/dev/null 2>&1
     done
     rm -rf "$PGOVERLAY_HOME"
@@ -77,9 +78,25 @@ psql_src() { docker exec "$SRC_CONTAINER" psql -U postgres -d postgres "$@"; }
 # overlay on that filesystem, so df inside a one-shot container measures it).
 free_kib() { docker run --rm "$HELPER_IMAGE" df -Pk / | awk 'NR==2{print $4}'; }
 
+# The branch's rw volume, read from its container's mounts. Its name is not
+# derivable from the branch name: every create after a destroy of the same name
+# takes the next generation (pgoverlay-br-<name>-rw-g2, -g3, ...), and docker
+# run -v would silently auto-create (and measure) an empty volume under a
+# guessed name.
+rw_volume() {
+    docker inspect -f '{{range .Mounts}}{{if eq .Destination "/pgoverlay/rw"}}{{.Name}}{{end}}{{end}}' \
+        "pgoverlay-br-$BRANCH"
+}
+
 # Branch rw volume size in bytes — same du -sb the engine's usage API runs.
 rw_usage() {
-    docker run --rm -v "pgoverlay-br-$BRANCH-rw:/rw:ro" "$HELPER_IMAGE" \
+    local vol
+    vol=$(rw_volume)
+    if [ -z "$vol" ]; then
+        echo "error: no /pgoverlay/rw mount on container pgoverlay-br-$BRANCH" >&2
+        return 1
+    fi
+    docker run --rm -v "$vol:/rw:ro" "$HELPER_IMAGE" \
         du -sb /rw | awk '{print $1}'
 }
 
@@ -115,7 +132,13 @@ docker exec "$SRC_CONTAINER" pg_isready -U postgres >/dev/null
 docker exec "$SRC_CONTAINER" sh -c \
     'echo "host replication all all scram-sha-256" >> "$PGDATA/pg_hba.conf"'
 psql_src -c "SELECT pg_reload_conf();" >/dev/null
-SRC_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' "$SRC_CONTAINER")
+# Per-network lookup: Docker Engine 29 (API 1.52) dropped the top-level
+# .NetworkSettings.IPAddress, which now fails the template.
+SRC_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$SRC_CONTAINER")
+if [ -z "$SRC_IP" ]; then
+    log "could not read the IP address of $SRC_CONTAINER"
+    exit 1
+fi
 
 # ----------------------------------------------------------- calibration ----
 log "calibrating pgbench bytes-per-scale (scale 10)"
@@ -173,7 +196,7 @@ run_size() {
     runs_csv=$(echo "$times" | awk '{ out = $1; for (i = 2; i <= NF; i++) out = out "," $i; print out }')
 
     overhead=$(rw_usage)
-    log "rw overhead after create: $overhead B"
+    log "rw overhead after create: $overhead B ($(rw_volume))"
 
     rows=$(( scale * 1000 ))  # pgbench_accounts has scale*100000 rows; 1% = scale*1000
     log "write-amplification probe: UPDATE $rows rows (1%) on the branch"
@@ -200,7 +223,7 @@ done
 
 # -------------------------------------------------------- markdown emit  ----
 log "raw results: $RESULTS_JSON"
-awk '
+awk -v runs="$RUNS" '
 function gib(b) { return sprintf("%.2f GiB", b / 1073741824) }
 function mib(b) { return sprintf("%.1f MiB", b / 1048576) }
 function field(line, key,    re, v) {
@@ -211,7 +234,7 @@ function field(line, key,    re, v) {
     return v
 }
 BEGIN {
-    print "| Database size | pgbench scale | Seed time | Branch create (p50 of 5) | Branch rw overhead | rw after 1% update |"
+    print "| Database size | pgbench scale | Seed time | Branch create (p50 of " runs ") | Branch rw overhead | rw after 1% update |"
     print "|---|---|---|---|---|---|"
 }
 {

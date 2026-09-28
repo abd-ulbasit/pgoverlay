@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11, migrateV12, migrateV13, migrateV14, migrateV15}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -176,4 +176,71 @@ CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_hash ON api_tokens(token_hash);
 // backfill to the empty string (unknown actor, predating the audit log).
 const migrateV11 = `
 ALTER TABLE transitions ADD COLUMN actor TEXT NOT NULL DEFAULT '';
+`
+
+// v12: indexes for the queries that scanned every row, tombstones included.
+// Destroyed branch rows and their transitions are kept for history, so
+// without these, GET /v1/branches/{name}/history (transitions by entity id,
+// branches by name), the reconcile loop's expiry, stuck and destroying scans,
+// the layer refcount walk and branch create's volume-name check all slowed
+// down linearly with the number of branches ever created, holding the single
+// registry connection while other requests queued behind it.
+const migrateV12 = `
+CREATE INDEX IF NOT EXISTS transitions_entity ON transitions(entity, entity_id);
+CREATE INDEX IF NOT EXISTS branches_name ON branches(name);
+CREATE INDEX IF NOT EXISTS branches_state_updated ON branches(state, updated_at);
+CREATE INDEX IF NOT EXISTS branches_expiry ON branches(expires_at) WHERE expires_at != '';
+CREATE INDEX IF NOT EXISTS branches_rw_volume ON branches(rw_volume);
+CREATE INDEX IF NOT EXISTS branches_source_volume ON branches(source_volume);
+CREATE INDEX IF NOT EXISTS branches_base_layer ON branches(base_layer_id) WHERE base_layer_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS layers_volume ON layers(volume);
+`
+
+// v13: a per-source image override. Branches (and the seed helpers) default
+// to the docker-library postgres:<pg_version> image; a source that needs
+// extensions (PostGIS, pgvector, TimescaleDB), extra locales or a matching
+// libc records its own image here (empty = the default).
+const migrateV13 = `
+ALTER TABLE sources ADD COLUMN image TEXT NOT NULL DEFAULT '';
+`
+
+// v14: volumes a saga creates before any row names them. A freeze creates the
+// parent's fresh rw volume minutes before CommitFreeze records it, and a
+// source refresh seeds its next-generation volume before the generation bump;
+// reconcile's volume GC saw both as orphans. The saga now claims the volume
+// on its owner row first (branches.pending_volume on the freeze parent,
+// sources.pending_volume on the refreshed source), LiveVolumeSet counts the
+// claim, and the commit or the undo clears it.
+const migrateV14 = `
+ALTER TABLE branches ADD COLUMN pending_volume TEXT NOT NULL DEFAULT '';
+ALTER TABLE sources ADD COLUMN pending_volume TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS branches_pending_volume ON branches(pending_volume);
+`
+
+// v15: the audit trail outlives the rows it describes, and
+// destroyed branches stop carrying credentials.
+//
+//   - transitions.entity_name: DeleteSource removes a source's destroyed branch
+//     rows (the branches.source_id foreign key forbids keeping them), which
+//     used to orphan their transitions: BranchHistory joined by id and found
+//     nothing. DeleteSource now stamps each entity's name on its transitions
+//     rows first, and BranchHistory also matches on it. Empty means the
+//     entity row still exists (resolve the name through it).
+//   - A destroyed branch's password is dead weight at best and a live secret
+//     at worst (the tombstone is kept for history forever). Existing
+//     tombstones are cleared here, and a trigger clears the column whenever a
+//     branch enters 'destroyed', whichever code path moves it there.
+//   - transitions_entity_name indexes the stamped names (partial: only the
+//     rows of removed entities carry one), so BranchHistory's name match
+//     stays an index lookup like v12's transitions_entity.
+const migrateV15 = `
+ALTER TABLE transitions ADD COLUMN entity_name TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS transitions_entity_name ON transitions(entity, entity_name) WHERE entity_name != '';
+UPDATE branches SET password = '' WHERE state = 'destroyed' AND password != '';
+CREATE TRIGGER branches_destroyed_forget_password
+  AFTER UPDATE OF state ON branches
+  WHEN NEW.state = 'destroyed' AND NEW.password != ''
+BEGIN
+  UPDATE branches SET password = '' WHERE id = NEW.id;
+END;
 `

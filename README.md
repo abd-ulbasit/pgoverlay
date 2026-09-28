@@ -4,224 +4,144 @@
 
 `git branch` for Postgres: seed once from any running database, then spin up isolated, writable copies that never write back to it.
 
-Branches are **OverlayFS copy-on-write** mounts over `PGDATA`. Every branch shares one read-only copy of the seeded source and stores only the blocks it actually changes, so creating one is a mount rather than a copy — 5 GiB branched in **1.89 s** behind a **33.1 MiB** writable layer, and the same 1.89 s at 1 GiB. Each branch is its own live Postgres container, so branches run concurrently, and a branch can itself be branched.
+Each branch is its own Postgres container whose data directory is an **OverlayFS copy-on-write** mount over one shared, read-only seed of the source. Creating a branch mounts that seed instead of copying it: a 5 GiB database branches in **1.89 s**, and the fresh branch holds **33.1 MiB** of its own data. Branches run side by side, can be reset, diffed against their base, and branched again.
 
 ![pgoverlay demo](docs/demo.gif)
 
-*branching a 1 GiB database, recorded for real — see [docs/benchmarks.md](docs/benchmarks.md)*
+*branching a 1 GiB database, recorded for real (see [docs/benchmarks.md](docs/benchmarks.md))*
 
-## The copy-on-write system that copied the whole database
+## Install
 
-The first real benchmark said branching a 5 GiB database took **61.9 s** and left a **5.05 GiB** writable layer behind. For a design whose entire premise is that branches share one base and store only what they change, that is not a slow path — it is the feature not working. Create time tracked the VM's effective disk throughput (~87 MB/s), which is what copying 5 GiB looks like.
+- **Release binaries** (from v1.0.0): `pgb` (CLI), `branchd` (daemon) and `pgoverlay-github` (webhook service) for Linux and macOS, amd64 and arm64, on the [releases page](https://github.com/abd-ulbasit/pgoverlay/releases), with `checksums.txt` and build provenance ([verifying a download](SECURITY.md#release-integrity)).
+- **With Go** (1.26.6 or newer; available once v1.0.0 is tagged):
 
-**The diagnosis.** A branch is a stock `postgres` container whose `PGDATA` is an OverlayFS mount: the seeded source volume read-only below, an empty writable volume on top. The seed comes from `pg_basebackup`, so a branch's first boot is crash recovery — and *before* replaying any WAL, Postgres runs `SyncDataDirectory`. Under the default `recovery_init_sync_method=fsync`, that pass opens **every** file in the data directory read-write in order to fsync it. On OverlayFS, a read-write open of a lower-layer file forces a full copy-up of that file. So the sync pass that runs before recovery copied the entire dataset into a supposedly empty writable layer, before the branch could serve a single query. The WAL replay it was preparing for was trivial: `redo done ... elapsed: 0.00 s` in the branch logs.
+  ```bash
+  go install github.com/abd-ulbasit/pgoverlay/cmd/pgb@latest
+  go install github.com/abd-ulbasit/pgoverlay/cmd/branchd@latest
+  ```
 
-Two measurements turned that from a theory into the cause. The writable layer immediately after create was ≈ the full database size (5.05 GiB for a 5.00 GiB database; 1.05 GiB for a 1.00 GiB one). And a control run identical except for `-c recovery_init_sync_method=syncfs` finished recovery with the writable layer at **16 KiB** — no copy-up at all.
+- **Container images**: `ghcr.io/abd-ulbasit/pgoverlay-branchd` and `ghcr.io/abd-ulbasit/pgoverlay-ghook`, tagged per release. Images from v1.0.0 on are multi-arch (linux/amd64, linux/arm64); the earlier `-rc` images are linux/amd64 only.
+- **From source**: `make build` puts all three binaries in `./bin`.
 
-**The fix is that flag**, now in the branch entrypoint ([`internal/cow/entrypoint.sh`](internal/cow/entrypoint.sh)): one `syncfs()` call per filesystem instead of a per-file fsync pass. It opens nothing read-write, so it copies nothing up, and it syncs a *superset* of what the per-file pass covered — the durability guarantee that pass exists for is preserved, and crash-recovery semantics are unchanged. `syncfs` is Linux-only and Postgres 14+, which is why PG 13 and older are unsupported here.
-
-| 5.00 GiB database | branch create (p50 of 5) | writable layer after create |
-|---|---|---|
-| before | 61.9 s | 5.05 GiB |
-| after | **1.89 s** | **33.1 MiB** |
-
-Creation is now independent of database size — 1.90 s at 1 GiB, 1.89 s at 5 GiB, on a Colima VM on an M1 Pro. The cost did not disappear, it moved: OverlayFS copies up whole files and Postgres heap/index segments run to 1 GiB each, so a branch that rewrites everything still converges on ~1× the database — paid per file at first write instead of all at once at create. [docs/benchmarks.md](docs/benchmarks.md) has both tables in full, the methodology, the hardware, and the pre-fix numbers kept intact, including the write-amplification column that looked better before the fix than after it.
-
-The long-form write-up of the diagnosis — what `SyncDataDirectory` does, why OverlayFS turns it into a full copy, and how the control run pinned it down — is [**Postgres copied 5 GiB before recovery started**](https://www.basit.engineer/posts/postgres-copied-5gb-before-recovery-started.html).
-
-## The alternatives, and where pgoverlay sits
-
-Every team wants production-like databases for development, CI, and PR review apps. The options today:
-
-- **`pg_dump`/`pg_restore` or `createdb -T`** — a full physical copy every time. Minutes to hours for real datasets, and N copies cost N times the disk.
-- **Neon / Supabase branching** — genuinely instant, but cloud-only. Your data lives on their storage layer; you can't point them at the Postgres you already run.
-- **DBLab (Database Lab Engine)** — self-hosted thin clones, but built around ZFS (or LVM) pools you must provision and operate.
-
-pgoverlay takes the middle path: plain Docker, plain Postgres images, and OverlayFS copy-on-write — the same mechanism container images use — applied to `PGDATA`. No special filesystem, no cloud, no fork of Postgres.
+`pgb version` prints what you are running.
 
 ## Quickstart
 
-**New here?** [**Ways to use pgoverlay**](docs/usage.md) walks through the common workflows — local dev, a database per test, branch-per-PR, preview environments, and reviewing migrations with `pgb diff` — each with a worked example.
-
-Requirements: Docker (Colima works on macOS), Go 1.26.5+ to build. The source database needs `wal_level=replica` and a user with `REPLICATION` privilege (pg_basebackup does the seeding) — or use `--via dump` for managed Postgres, see below.
+You need Docker (Docker Engine on Linux, or Docker Desktop / Colima on macOS) and `psql`. This walkthrough starts a throwaway source database; skip that part if you already have a Postgres that containers can reach.
 
 ```bash
-make build   # produces ./bin/pgb (CLI) and ./bin/branchd (daemon)
-```
-
-Demo source (skip if you already have a Postgres reachable from containers):
-
-```bash
+# A demo source. The stock image has no pg_hba entry for remote replication.
 docker run -d --name demo-src -e POSTGRES_PASSWORD=secret postgres:17 \
   -c wal_level=replica -c max_wal_senders=4
-docker exec demo-src sh -c 'until pg_isready -U postgres; do sleep 1; done'
+until docker exec demo-src pg_isready -h 127.0.0.1 -U postgres >/dev/null; do sleep 1; done
 docker exec demo-src psql -U postgres \
   -c "CREATE TABLE t(i int); INSERT INTO t SELECT generate_series(1,100000);"
-
-# The stock postgres image's pg_hba.conf has no remote *replication* entry
-# (the catch-all "host all all all" doesn't match replication connections):
 docker exec demo-src sh -c \
   'echo "host replication all all scram-sha-256" >> "$PGDATA/pg_hba.conf"'
 docker exec demo-src psql -U postgres -c "SELECT pg_reload_conf();"
 
-SRC_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' demo-src)
-```
+# Works on every Docker version (Docker 29 removed .NetworkSettings.IPAddress).
+SRC_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' demo-src)
+export PGPASSWORD=secret   # the source's password; branches inherit its roles
 
-Seed once, branch many:
+# Seed once, branch many.
+pgb source add main --host "$SRC_IP" --user postgres
+pgb branch create pr-1 --from main
+# branch "pr-1" ready in 2.482s (port 34467)
 
-```bash
-PGPASSWORD=secret ./bin/pgb source add main --host "$SRC_IP" --user postgres
-
-./bin/pgb branch create pr-1 --from main
-# branch "pr-1" ready in 2.533s (port 32774)
-
-./bin/pgb branch ls
-psql "$(./bin/pgb connect pr-1)" -c "SELECT count(*) FROM t"   # 100000
-
-# Writes stay in the branch — the source is mounted read-only underneath:
-psql "$(./bin/pgb connect pr-1)" -c "DELETE FROM t WHERE i > 50000"
+pgb branch ls
+psql "$(pgb connect pr-1)" -c "SELECT count(*) FROM t"            # 100000
+psql "$(pgb connect pr-1)" -c "DELETE FROM t WHERE i > 50000"      # only in the branch
 docker exec demo-src psql -U postgres -c "SELECT count(*) FROM t"  # still 100000
 
-./bin/pgb branch destroy pr-1
-docker rm -f demo-src
+pgb branch destroy pr-1
+pgb source rm main
+docker rm -f -v demo-src
 ```
 
-`--host` must be reachable *from containers* (use `host.docker.internal` for a host-local DB, or `--network <net>` for a DB on a Docker network). The password is read from the env var named by `--password-env` (default `PGPASSWORD`). State lives in `~/.pgoverlay` (override with `PGOVERLAY_HOME`).
+`--host` must be reachable **from containers**, not just from your shell. For a database on the Docker host itself, use `host.docker.internal` on Docker Desktop and Colima; on Linux Docker Engine that name does not resolve inside containers, so use the `docker0` gateway address (usually `172.17.0.1`) or the host's IP, or put the database on a user-defined network and pass `--network <net>`. State lives in `~/.pgoverlay` (`PGOVERLAY_HOME`). The Docker endpoint comes from `DOCKER_HOST` or your current docker context; `ssh://` contexts are not supported (run pgoverlay on the Docker host instead). The full walkthrough, including the server, is in [docs/quickstart.md](docs/quickstart.md).
 
-### Seeding from managed Postgres (Supabase, Neon, RDS)
+> [!IMPORTANT]
+> **Honest limits.** Read these before you adopt pgoverlay.
+>
+> - **It is a dev/test tool.** Branches are disposable Postgres instances for development, CI, review apps and migration rehearsal. There are no backups, no replication of branches and no merge-back, and a branch never follows its source after seeding.
+> - **Branch containers are privileged.** On Docker and in Kubernetes hostpath mode every branch container gets `CAP_SYS_ADMIN` with AppArmor unconfined (and seccomp unconfined on Kubernetes), because it mounts its own overlay. Do not give branches to untrusted code. Kubernetes csi mode adds no capabilities. See [docs/security.md](docs/security.md).
+> - **Reads copy data too.** A fresh branch costs about 33 MiB, but Postgres opens table files read-write even to read them, and OverlayFS copies a file whole into the branch the first time that happens. A `SELECT count(*)` on a 489 MB table grew a branch from 33 MiB to 523 MiB ([measurement](docs/benchmarks.md#reads-copy-up-too)). Branches grow toward the size of the tables they touch; for read-heavy branches of large databases use the [zfs](docs/zfs.md) or [csi](docs/kubernetes.md) backend, which copy blocks, not files.
+> - **Postgres 14 to 18, Linux containers.** Seeding with `pg_basebackup` needs a `REPLICATION` user and `wal_level=replica` on the source; managed Postgres needs `--via dump`.
+> - **One writer.** The registry is a SQLite file owned by one `branchd`. More replicas give failover through leader election, not more throughput.
 
-Managed providers don't allow physical replication connections, so `pg_basebackup` can't seed from them. `--via dump` seeds with `pg_dump` piped into a fresh cluster instead — it needs only a normal user (no `REPLICATION` privilege), and can be scoped to schemas:
+## What you can do with it
 
-```bash
-PGPASSWORD=... ./bin/pgb source add prod --via dump --dump-schema public \
-  --host db.<ref>.supabase.co --port 5432 --user postgres --pg-version 17
-```
-
-`--pg-version` must be **>=** the remote server's major version (`pg_dump` cannot dump newer servers); branches run on `--pg-version`. A logical dump is slower than `pg_basebackup` at size, but branching afterwards is the same instant CoW either way.
-
-Branches can self-destruct (`--ttl 24h`, reaped by `branchd`), be reset to their source snapshot (`pgb branch reset pr-1` — discards all writes, new container/port), and sources can be re-seeded (`pgb source refresh main` — existing branches keep their old snapshot; new branches see the fresh one) or removed (`pgb source rm main`).
+| You want | Use | Read |
+|---|---|---|
+| Throwaway production-shaped databases on a laptop | `pgb` | [Ways to use it](docs/usage.md#1-local-development) |
+| One stable endpoint, a REST API and a web UI for a team | `branchd` | [Run the server](#run-the-server-branchd) |
+| An isolated database for every test | `pgoverlaytest` (Go), `pgoverlay-test` (JS), the GitHub Action | [Testing](docs/testing.md) |
+| A masked database branch for every pull request | `pgoverlay-github` | [GitHub App](docs/github-app.md) |
+| Branches as pods in a cluster | the Helm chart | [Kubernetes](docs/kubernetes.md) |
+| To see what a migration did to real data | `pgb diff` | [What changed in a branch?](#what-changed-in-a-branch) |
 
 ## Run the server (`branchd`)
 
-`branchd` is the daemon form: a REST API and a Postgres wire-protocol router in one process, sharing the engine the CLI embeds, plus a TTL reaper for abandoned branches.
+`branchd` serves the same engine over a REST API (`:7070`), routes Postgres connections to branches by name (`:6432`), serves a small web UI at `/ui/`, and runs a reconcile loop that reaps expired branches and repairs drift.
 
 ```bash
-make build                       # produces ./bin/pgb and ./bin/branchd
-PGOVERLAY_TOKEN=$(openssl rand -hex 16) ./bin/branchd
-# 2026/06/10 12:00:00 REST API listening on :7070
-# 2026/06/10 12:00:00 pg router listening on :6432 (connect with dbname@branch)
+export PGOVERLAY_TOKEN=$(openssl rand -hex 16)   # admin token, at least 16 characters
+branchd
+# REST API listening on :7070 (TLS false)
+# pg router listening on :6432 (connect with dbname@branch; TLS false)
 ```
 
-Flags: `--api-addr :7070` (REST), `--pg-addr :6432` (router), `--reap-interval 30s` (TTL reaper tick), `--rotate-branch-credentials` (give every branch its own generated password instead of inheriting the source's — returned as `password` in branch responses; see [docs/architecture.md](docs/architecture.md)). `PGOVERLAY_TOKEN` is required — branchd refuses to start without it; every `/v1` request needs `Authorization: Bearer <token>` (`GET /healthz` is open). `SIGINT`/`SIGTERM` shut down gracefully and leave branch containers running.
-
-REST API:
-
-```bash
-AUTH="Authorization: Bearer $PGOVERLAY_TOKEN"
-
-# sources (the password is used for pg_basebackup only — never stored)
-curl -H "$AUTH" -d '{"name":"main","host":"host.docker.internal","port":5432,
-  "user":"postgres","pg_version":"17","password":"secret"}' localhost:7070/v1/sources
-curl -H "$AUTH" localhost:7070/v1/sources
-curl -H "$AUTH" -d '{"password":"secret"}' localhost:7070/v1/sources/main/refresh
-curl -H "$AUTH" -X DELETE localhost:7070/v1/sources/main
-
-# branches (ttl_seconds=0 or omitted = never reaped)
-curl -H "$AUTH" -d '{"name":"pr-42","source":"main","ttl_seconds":86400}' localhost:7070/v1/branches
-curl -H "$AUTH" localhost:7070/v1/branches
-curl -H "$AUTH" localhost:7070/v1/branches/pr-42
-curl -H "$AUTH" localhost:7070/v1/branches/pr-42/usage   # {"bytes":N} — rw-layer size (runs a helper container)
-curl -H "$AUTH" -X POST localhost:7070/v1/branches/pr-42/reset
-curl -H "$AUTH" -X DELETE localhost:7070/v1/branches/pr-42
-```
-
-**One stable endpoint for every branch.** Instead of chasing per-branch host ports, connect to the router on `:6432` with the branch name suffixed to the database:
+Connect to any branch through the router by suffixing the branch name to the database. The router reads the startup message, finds the branch, and from then on relays bytes untouched, so authentication (SCRAM included) happens between your client and the branch, and `Ctrl-C` cancels a query as usual:
 
 ```bash
 psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
 ```
-
-The router reads the startup message, resolves `pr-42` to its container, rewrites the database back to `postgres`, and relays bytes transparently from then on — authentication (including SCRAM) happens between your client and the branch's Postgres, untouched.
 
 The CLI drives a running branchd in server mode:
 
 ```bash
 export PGOVERLAY_SERVER=http://localhost:7070   # or --server per command
-export PGOVERLAY_TOKEN=<same token as branchd>
+pgb source add main --host "$SRC_IP" --user postgres   # branchd runs the seed
 pgb branch create pr-42 --from main --ttl 24h
-pgb connect pr-42    # prints the direct-port URL and the :6432 proxy URL
+pgb connect pr-42    # the direct URL (branchd host only) and the router URL
 ```
 
-`pgb branch ls --usage` adds a SIZE column showing each branch's copy-on-write rw layer (its own writes, not the shared source data). It runs one helper container per branch, so it's opt-in.
+Things to know before you expose it:
 
-Honest caveat: the registry is SQLite, which is single-writer. Don't run local-mode CLI commands (no `--server`) against the same `PGOVERLAY_HOME` while branchd is running — use server mode; that's the supported combination.
+- Both listeners bind every interface by default and speak plaintext until you add `--api-tls-cert`/`--api-tls-key` and `--pg-tls-cert`/`--pg-tls-key`. Clients trust a private CA with `PGOVERLAY_CA_CERT=<pem file>`.
+- Hand out scoped tokens instead of the admin token: `pgb token create ci --role operator` (roles: viewer, operator, admin).
+- `--rotate-branch-credentials` gives every branch its own password, encrypted at rest under a key in the state directory (`secret.key`, or `PGOVERLAY_SECRET_KEY` / `--secret-key-file`). Rotating `PGOVERLAY_TOKEN` does not affect stored passwords. Back up `secret.key` together with the registry.
+- `--reconcile-interval 60s` sets the reconcile tick (TTL reaping, drift repair, garbage collection), and `--stuck-timeout 10m` is when an abandoned operation is failed. `--default-ttl`, `--max-ttl` and `--max-branches` bound what clients can create.
+- Don't run local-mode `pgb` (no `--server`) against the `PGOVERLAY_HOME` a running branchd owns: the registry has one writer.
 
-## Web UI
+Every flag, variable and endpoint is in the [reference](docs/reference.md) and [REST API](docs/api.md) pages; [docs/security.md](docs/security.md) is the threat model and hardening checklist.
 
-branchd serves a small embedded web UI at `http://localhost:7070/ui/` (the exact URL is logged at startup) — a single static page baked into the binary, no build toolchain, no CDN, works air-gapped. Paste your `PGOVERLAY_TOKEN` once (kept in the browser's localStorage); the page lists sources and branches with state, endpoint, expiry countdown and rw-layer disk usage, and has create/reset/destroy controls. Auto-refreshes every 5 seconds.
+## Beyond the laptop
 
-## Run on Kubernetes
-
-branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm chart deploys the whole thing — for a soup-to-nuts AWS walkthrough (Terraform, images, LoadBalancers, version upgrades, and the production bugs found doing it) see [docs/eks.md](docs/eks.md):
+**Kubernetes.** A Helm chart runs branchd in-cluster with branches as pods, either on one storage node (hostpath, the default) or as CSI PVC clones that schedule anywhere and need no extra capabilities. [docs/kubernetes.md](docs/kubernetes.md) covers both modes, Pod Security, NetworkPolicies and proxy TLS; [docs/eks.md](docs/eks.md) is a full AWS walkthrough; [docs/ha.md](docs/ha.md) covers leader election.
 
 ```bash
-helm install pgoverlay deploy/helm/pgoverlay \
-  --namespace pgoverlay-system --create-namespace \
-  --set node=<storage-node-name> \
-  --set token=$(openssl rand -hex 16)
+kubectl create namespace pgoverlay-system
+kubectl label namespace pgoverlay-system pod-security.kubernetes.io/enforce=privileged
+helm install pgoverlay deploy/helm/pgoverlay -n pgoverlay-system \
+  --set node=<storage-node-name> --set token=$(openssl rand -hex 16)
 ```
 
-That pulls the published image at the chart's `appVersion`, so there is nothing to build first. The published images are `linux/amd64` only, so on an arm64 cluster (a kind cluster on Apple Silicon, say) take the local-build path below instead. To deploy a local build — the usual kind loop — build it, side-load it, and point the chart at that tag:
+**A branch per pull request.** `pgoverlay-github` receives signed GitHub webhooks and creates `gh-<repo-key>-pr-<number>` when a PR opens (the repository key keeps PRs of different repositories apart), optionally resets it on every push, and destroys it on close. It reports a `pgoverlay/branch` commit status that turns green only once the branch is ready, and keeps one live connect-info comment on the PR. See it on a real pull request: a migration that passes on an empty dev database fails against the PR's masked clone of production (37 legacy duplicate emails), gets fixed, and the branch is destroyed on merge: [pgoverlay-demo PR #1](https://github.com/abd-ulbasit/pgoverlay-demo/pull/1). Setup: [docs/github-app.md](docs/github-app.md).
 
-```bash
-make docker-build                                                 # ghcr.io/abd-ulbasit/pgoverlay-branchd:dev
-kind load docker-image ghcr.io/abd-ulbasit/pgoverlay-branchd:dev
-helm install pgoverlay deploy/helm/pgoverlay ... --set image.tag=dev
-```
-
-Values that matter:
-
-- **`node` (required)** — the name of the **storage node** (`kubectl get nodes`). All CoW data lives under `dataRoot` (default `/var/lib/pgoverlay`) on this one node as plain directories; branchd, every branch pod, and every helper pod are pinned there with `nodeName` + `hostPath`. This is the default `hostpath` storage mode; set `storage.mode=csi` with `storage.storageClass=<class supporting PVC cloning>` for multi-node storage — branches become PVC clones, pods schedule on any node, and no `SYS_ADMIN` is needed (see [docs/kubernetes.md](docs/kubernetes.md)).
-- **`token` / `existingSecret`** — the REST API bearer token. Either let the chart render a Secret from `token`, or point `existingSecret` at a pre-created Secret with key `token`.
-- **`proxy.service.type`** — set to `NodePort` (with `proxy.service.nodePort`) to reach branches from outside the cluster without a port-forward.
-
-The chart creates a single-replica Deployment (branchd's registry is SQLite — single writer, so one replica, `Recreate` strategy, state in `hostPath <dataRoot>/state` on the storage node), a namespace-scoped Role (pods create/delete/get/list/watch, pods/exec, pods/log — branchd manages pods only in its own namespace), and two Services: `pgoverlay-api` (REST, :7070) and `pgoverlay-proxy` (Postgres router, :6432). The branchd container runs as root for write access to its hostPath state dir; branch pods get `CAP_SYS_ADMIN` for their in-container overlay mount, same as on Docker.
-
-Using it is the same REST API as above; branch hosts are pod IPs, so connect via the proxy Service:
-
-```bash
-kubectl -n pgoverlay-system port-forward svc/pgoverlay-api 7070 &
-curl -H "$AUTH" -d '{"name":"main","host":"db.prod.internal","port":5432,
-  "user":"postgres","password":"secret"}' localhost:7070/v1/sources
-curl -H "$AUTH" -d '{"name":"pr-42","source":"main"}' localhost:7070/v1/branches
-
-# in-cluster: psql "host=pgoverlay-proxy.pgoverlay-system port=6432 dbname=postgres@pr-42 user=postgres"
-kubectl -n pgoverlay-system port-forward svc/pgoverlay-proxy 6432 &
-psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
-```
-
-`make helm-test` lints and grep-asserts the rendered chart; `make k8s-it` runs the full integration suite against a local [kind](https://kind.sigs.k8s.io) cluster (`hack/kind-up.sh` creates `pgoverlay-test` and preloads images).
-
-## Branch per pull request
-
-`pgoverlay-github` (`cmd/pgoverlay-github`, image `ghcr.io/abd-ulbasit/pgoverlay-ghook` via `make docker-build-ghook`) turns pull requests into branches: a signed GitHub webhook creates `pr-<number>` when a PR opens, optionally resets it on every push, and destroys it on close. It reports back as a `pgoverlay/branch` commit status (pending → success/failure, so CI can gate on branch readiness) plus a live connect-info comment kept current on the PR, authenticating either as a GitHub App (installation tokens minted from the App key) or with a plain PAT. The Helm chart ships it as an optional sub-deployment (`--set ghook.enabled=true ...`). Setup, permissions, and the full `GHOOK_*` environment reference live in [docs/github-app.md](docs/github-app.md).
-
-See it end-to-end on a real pull request — a migration that passes on an empty dev database, fails against the PR's masked clone of production (37 legacy duplicate emails), gets fixed, and the branch is destroyed on merge: [pgoverlay-demo PR #1](https://github.com/abd-ulbasit/pgoverlay-demo/pull/1).
-
-## Branches in your test suite
-
-Every test gets its own copy-on-write branch — full production-shaped data, isolated writes, destroyed when the test ends. In Go (`pgoverlaytest` is self-contained: no pgoverlay internals, no extra dependencies; the test is skipped when `PGOVERLAY_SERVER` is unset):
+**Tests.** Every test gets its own branch, destroyed when it ends. Connect through the router (`ProxyDSN`): the direct address only works from the branchd host or inside the cluster.
 
 ```go
 func TestOrderTotals(t *testing.T) {
     t.Parallel()
-    b := pgoverlaytest.Acquire(t)        // branch created, ready, destroyed via t.Cleanup
-    db, _ := sql.Open("pgx", b.DSN)
+    b := pgoverlaytest.Acquire(t)   // skipped when PGOVERLAY_SERVER is unset
+    db, _ := sql.Open("pgx", b.ProxyDSN)
     // ...
 }
 ```
 
-In CI, the composite action provisions the branch and waits for readiness:
+In CI, the Action creates the branch and the destroy step cleans it up even when the job fails:
 
 ```yaml
 - uses: abd-ulbasit/pgoverlay/action@v1
@@ -229,76 +149,104 @@ In CI, the composite action provisions the branch and waits for readiness:
   with:
     server: ${{ vars.PGOVERLAY_SERVER }}
     token: ${{ secrets.PGOVERLAY_TOKEN }}
-- run: go test ./...   # steps.branch.outputs.{host,port,database}
+- run: go test ./...
+  env:
+    PGHOST: ${{ steps.branch.outputs.proxy_host }}
+    PGPORT: ${{ steps.branch.outputs.proxy_port }}
+    PGDATABASE: ${{ steps.branch.outputs.proxy_database }}
+    PGUSER: ${{ steps.branch.outputs.user }}
 - uses: abd-ulbasit/pgoverlay/action/destroy@v1
   if: always()
-  with: { server: "${{ vars.PGOVERLAY_SERVER }}", token: "${{ secrets.PGOVERLAY_TOKEN }}", branch: "${{ steps.branch.outputs.branch }}" }
+  with:
+    server: ${{ vars.PGOVERLAY_SERVER }}
+    token: ${{ secrets.PGOVERLAY_TOKEN }}
+    branch: ${{ steps.branch.outputs.branch }}
 ```
 
-A zero-dependency JS package (`sdk/js`, `pgoverlay-test`) covers Node test suites. Naming, TTL safety nets, and parallelism semantics: [docs/testing.md](docs/testing.md).
+The Action's `proxy_host` input (and `PGOVERLAY_PROXY_HOST` for the SDKs) points at the router when it has its own address, such as the Helm chart's `pgoverlay-proxy` Service. JS, naming and TTL rules: [docs/testing.md](docs/testing.md).
 
 ## What changed in a branch?
 
-`pgb diff NAME` (API: `GET /v1/branches/{name}/diff`) compares a branch against the exact base it was cloned from — schema first (a unified diff of `pg_dump --schema-only` output), then per-table row-count deltas:
+`pgb diff NAME` (API: `GET /v1/branches/{name}/diff`) compares a branch with the state a reset would return it to: a unified diff of `pg_dump --schema-only`, then per-table row-count changes.
 
 ```console
 $ pgb diff pr-42
-@@ -312,6 +312,14 @@
- CREATE TABLE public.users (
-     id integer NOT NULL,
-+    deleted_at timestamp with time zone,
-     email text
- );
+@@ -23,12 +23,31 @@
+...
 +CREATE TABLE public.audit_log (
 +    id bigint NOT NULL,
 +    entry jsonb
 +);
+...
+ CREATE TABLE public.t (
+-    i integer
++    i integer,
++    note text
+ );
 
-TABLE      BASE   BRANCH  DELTA
-audit_log  0      1204    +1204
-users      51230  51198   -32
+TABLE      BASE  BRANCH  DELTA
+audit_log  0     1204    +1204
 (row counts are planner estimates)
 ```
 
-Under the hood the engine provisions a temporary branch from the target's recorded base (same source generation and frozen-layer chain — not the source's current state) and dumps both instances, so a diff takes a few seconds and never touches the source. Row counts come from `pg_class.reltuples`: planner estimates, exact enough to see what a migration did, not an audit. `--all` lists unchanged tables too.
+The engine starts a temporary branch from the target's recorded base, dumps both, and destroys the temporary branch, so a diff takes a few seconds and never touches the source. Row counts are planner estimates, exact enough to see what a migration did; tables whose count is unknown show `?`. `--all` lists unchanged tables and `--data` samples the new rows. On the overlay backend the base is the branch's fork point; for a branch created from another branch on zfs or csi it is the parent's current state. More in [docs/usage.md](docs/usage.md#5-reviewing-migrations-with-pgb-diff).
+
+## The copy-on-write system that copied the whole database
+
+The first real benchmark said branching a 5 GiB database took **61.9 s** and left a **5.05 GiB** writable layer behind. For a design whose premise is that branches share one base, that is not a slow path; it is the feature not working.
+
+**The diagnosis.** A branch is a stock `postgres` container whose `PGDATA` is an OverlayFS mount: the seeded source read-only below, an empty writable volume on top. The seed comes from `pg_basebackup`, so a branch's first boot is crash recovery, and before replaying any WAL Postgres runs `SyncDataDirectory`. Under the default `recovery_init_sync_method=fsync` that pass opens **every** file in the data directory read-write to fsync it, and on OverlayFS a read-write open of a lower-layer file copies the whole file up. The sync pass copied the entire dataset into the empty layer before the branch served a single query; the WAL replay it prepared for took `0.00 s`. A control run identical except for `-c recovery_init_sync_method=syncfs` finished recovery with the writable layer at **16 KiB**.
+
+**The fix is that flag**, now in the branch entrypoint ([`internal/cow/entrypoint.sh`](internal/cow/entrypoint.sh)): one `syncfs()` per filesystem instead of a per-file pass, which opens nothing read-write, copies nothing up, and syncs a superset of what the per-file pass covered.
+
+| 5.00 GiB database | branch create (p50 of 5) | writable layer after create |
+|---|---|---|
+| before | 61.9 s | 5.05 GiB |
+| after | **1.89 s** | **33.1 MiB** |
+
+Creation no longer depends on database size (1.90 s at 1 GiB, 1.89 s at 5 GiB). The long-form write-up is [**Postgres copied 5 GiB before recovery started**](https://www.basit.engineer/posts/postgres-copied-5gb-before-recovery-started.html).
+
+**The same mechanism is still on the read path.** Postgres opens relation files `O_RDWR` for every access (`src/backend/storage/smgr/md.c`; checked in `REL_14_STABLE` and `REL_17_STABLE`), so the first query that touches a table copies its files up whole, reads included. The pre-v1 review measured it: a fresh branch at 33.1 MiB, a 1-row `UPDATE` on a small table at 33.5 MiB, and a `SELECT count(*)` on a 489 MB frozen table at 523.1 MiB. `syncfs` fixed branch creation; it cannot fix this, because it is how stock Postgres reads. That is why the zfs and csi backends exist. [docs/benchmarks.md](docs/benchmarks.md) has every number, the methodology, and the pre-fix results kept as they were.
 
 ## How it works
 
-`pgb source add` runs `pg_basebackup` in a one-shot helper container, streaming the source cluster into a named Docker volume. That volume becomes the read-only **lower layer** for every branch.
+`pgb source add` runs `pg_basebackup` (or `pg_dump` with `--via dump`) in a one-shot helper container and writes the seed into a volume. That volume becomes the read-only lower layer of every branch of the source.
 
-`pgb branch create` creates one empty volume for the branch's writes, then starts a stock `postgres:17` container with a tiny entrypoint that assembles an OverlayFS mount *inside the container* (so the same code works on Colima/macOS and bare Linux — volumes sit on ext4 inside the VM):
+`pgb branch create` makes an empty volume for the branch and starts a stock `postgres` container whose entrypoint mounts the overlay **inside the container**, so the same code works on Colima, Docker Desktop and bare Linux:
 
 ```
-            host (pgb CLI)
-            │  SQLite registry · saga orchestration · Docker API
-            ▼
  ┌─ branch container (CAP_SYS_ADMIN) ──────────────────────────┐
- │                                                             │
  │   PGDATA = /pgoverlay/merged   ← overlayfs mount             │
- │                ▲                                            │
- │     ┌──────────┴───────────┐                                │
+ │     ┌──────────────────────┐                                │
  │     │ upper+work (writes)  │  volume: pgoverlay-br-pr-1-rw   │
  │     ├──────────────────────┤                                │
  │     │ lower (read-only)    │  volume: pgoverlay-src-main ────┼─▶ shared by
- │     └──────────────────────┘  (pg_basebackup snapshot)      │   all branches
- │                                                             │
- │   entrypoint.sh: mount overlay → exec docker-entrypoint.sh  │
+ │     └──────────────────────┘  (the seed)                    │   all branches
  └─────────────────────────────────────────────────────────────┘
 ```
 
-Postgres starts on the merged view and performs ordinary WAL crash recovery — exactly as if the machine had power-cycled at backup time. Pages a branch modifies are copied up into its own volume on first write; everything else is read through the shared lower layer. Branches are fully isolated from the source and from each other.
+Postgres boots on the merged view and runs ordinary crash recovery, as if the machine had lost power at backup time. Postgres opens table and index files read-write even to read them, and the first such open of a file from the shared seed makes OverlayFS copy that whole file (a relation segment is up to 1 GiB) into the branch's own volume. Files a branch never touches stay shared. Branches are isolated from the source and from each other.
 
-Host-side Go code is pure control plane: a SQLite registry with a journaled state machine, and create/destroy implemented as sagas (every step registers a compensation, so a failure mid-create leaves no orphan containers or volumes).
+Branching from a branch (`pgb branch create child --from-branch parent`) freezes the parent's writable layer into an immutable shared layer, so the parent is checkpointed, stopped and restarted (about twice the create time of a plain branch). The zfs backend snapshots the parent instead, with no interruption; the csi backend clones the parent's volume after a brief checkpoint and stop.
 
-For hosts that already run ZFS there is an **experimental zfs backend** (`branchd --cow zfs --zfs-dataset tank/pgoverlay`): branches become `zfs snapshot` + `zfs clone` instead of overlay layers — block-level CoW, no whole-file copy-up. It is unit-tested with manual-verification instructions (no ZFS in this project's CI); see [docs/zfs.md](docs/zfs.md) before relying on it.
+The Go code is a control plane only: a SQLite registry with a journaled state machine, sagas whose every step registers a compensation (a failed create leaves no containers or volumes behind), and a reconcile loop that converges the registry and the container runtime. The [architecture](docs/architecture.md) page has the details.
 
-## Scope: what this is and isn't
+## How it compares
 
-pgoverlay is a **dev/test tool**. Branches are disposable Postgres instances for development, CI, PR review apps, and migration rehearsal.
+All of these give you production-shaped databases faster than a full copy. They differ in what they ask you to run.
 
-It is **not** a production database platform: no HA, no replication of branches, no backups, no connection pooling, and the branch container needs `CAP_SYS_ADMIN` (for the overlay mount) — fine for a dev box or CI runner, not something to expose to untrusted workloads. A branch is a point-in-time snapshot; it does not follow the source after seeding.
+| | What it needs | A branch is | Notes |
+|---|---|---|---|
+| **pgoverlay** (overlay backend) | Docker, or Kubernetes with one storage node | a Postgres container on an OverlayFS view of a shared seed | Any Postgres 14 to 18 as the source; stock images; copies whole files on first open (see limits) |
+| **pgoverlay** (zfs / csi backends) | a ZFS pool, or a CSI driver that clones volumes | a Postgres container on a block-level clone | zfs is experimental |
+| [DBLab Engine](https://github.com/postgres-ai/database-lab-engine) | a ZFS (or LVM) pool on the host | a Postgres container on a thin clone | Mature, self-hosted, block-level CoW |
+| [Neon](https://neon.com) | Neon's service | a copy-on-write branch in Neon's storage engine | The storage is open source, but there is no supported self-hosted path; your data lives in Neon |
+| [Supabase branching](https://supabase.com/docs/guides/deployment/branching) | the hosted Supabase platform | a separate Supabase project | Hosted-only |
+| [Xata](https://github.com/xataio) (open source) | Kubernetes with CloudNativePG and OpenEBS | a CloudNativePG cluster on a copy-on-write volume | Self-hosted on Kubernetes |
+| PostgreSQL 18 `file_copy_method = clone` | a filesystem that can clone files (reflinks: XFS, Btrfs, ...) | a database cloned inside the same instance | No extra software, but every branch shares one server, and the template database must have no other connections while it is copied |
+| `pg_dump` / `createdb -T` | nothing | a full copy | Minutes to hours for real datasets; N copies cost N times the disk |
 
-Branching from another branch works (`pgb branch create child --from-branch parent`), with one caveat worth knowing on the default overlay backend: it is a **freeze**, so the parent is checkpointed, stopped and restarted over its now-immutable layer — a brief parent interruption, and roughly 2× the create time of branching from a source ([benchmarks](docs/benchmarks.md#branch-from-branch)). The ZFS and CSI backends snapshot/clone the parent instead, with no freeze and no parent restart.
+pgoverlay's niche is the middle: plain Docker and stock Postgres images, against the Postgres you already run, with no special filesystem. If you already operate ZFS, DBLab Engine or pgoverlay's zfs backend will use less disk for read-heavy branches.
 
 ## Supported Postgres versions
 
@@ -306,67 +254,47 @@ Branching from another branch works (`pgb branch create child --from-branch pare
 |---|---|---|---|---|---|---|
 | Supported | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-Declare the major when registering a source (`pgb source add main --pg-version 16 …`, or `"pg_version":"16"` over the API); branches then run `postgres:<major>` so the binary matches the seeded data directory. Versions outside 14–18 are rejected at registration time.
-
-PG 13 and older are unsupported because branch startup passes `-c recovery_init_sync_method=syncfs`, a GUC added in **PG 14** — it is what makes WAL crash recovery on a fresh overlay fast (one `syncfs()` instead of fsyncing every data file; see [benchmarks](docs/benchmarks.md)). The matrix is exercised end-to-end by `make matrix` (seed → branch → verify → destroy per major; defaults to 14 and 18, the range edges).
-
-## Comparison
-
-|  | pgoverlay | Neon | DBLab (DLE) | pg_dump/restore |
-|---|---|---|---|---|
-| Branch creation | seconds, CoW | seconds, CoW | seconds, CoW | minutes–hours, full copy |
-| Disk per branch | rw overlay, ~33 MiB + files written ([benchmarks](docs/benchmarks.md)) | only changed pages | only changed pages | full copy |
-| Works with your existing Postgres | yes (pg_basebackup from any PG) | no — data must live in Neon | yes | yes |
-| Self-hosted | yes | cloud service | yes | yes |
-| Infra requirements | Docker only | — | ZFS/LVM pool to provision | none |
-| Postgres | stock images | forked storage engine | stock | stock |
-| Production-grade HA | no (dev/test tool) | yes | no (dev/test tool) | n/a |
-
-## Roadmap
-
-- **Phase 2** ✅ — `pgproxy` wire-protocol router (one stable endpoint, route by branch name), REST API + auth (`branchd` daemon reusing the same engine), TTL reaper for abandoned branches, branch reset, source refresh with generations. Branch-from-branch moved to a later phase.
-- **Phase 3** ✅ — Kubernetes runtime driver (branch pods on a storage node), Helm chart, GitHub webhook service (a branch per PR, automatically).
-- **Phase 4** ✅ — data masking hooks, embedded web UI with per-branch disk usage, published benchmarks (with the copy-up fix they motivated), experimental ZFS backend, docs site.
-- **Phase 5** ✅ — TLS (router + REST API), Postgres 14–18 support matrix, branch-from-branch (frozen-layer DAG), multi-node CSI storage for Kubernetes (PVC-clone branches, no `SYS_ADMIN`, any node).
-- **Phase 6** ✅ — GitHub story (commit statuses, App auth, live PR comment, git-ref branch naming), test-suite SDKs (Go + JS) and a reusable Action, dump-based seeding for managed Postgres (Supabase/Neon/RDS), per-branch credential rotation, registry on a PVC, and `pgb diff`.
-- **Phase 7 — road to v1** ✅ — operational trust: Prometheus `/metrics` + real `/readyz`; a periodic reconcile loop with leak-proof, instance-scoped GC (`pgb doctor`/`pgb gc`); a role-based authz model (scoped API tokens, proxy TLS, namespaced deployer RBAC); and HA via leader election.
-- **Future** — merge-back of branch data and multi-writer branches remain non-goals; ideas welcome in issues.
-
-## How this was built
-
-Most of the commits here carry a `Co-authored-by: Claude` trailer — run `git log --grep='^Co-authored-by: Claude' -i --oneline | wc -l` against `git log --oneline | wc -l` for the current ratio. I build with coding agents running in parallel git worktrees — one per phase of the roadmap above — and I review, benchmark, and integrate what comes back; the phase structure in the roadmap is what that parallelism is organised around. The parts that decided the shape of this project were not generated: the OverlayFS copy-up diagnosis at the top of this README came from reading `SyncDataDirectory`, instrumenting the writable layer, and running a single-variable control to prove the mechanism, and [docs/benchmarks.md](docs/benchmarks.md) still carries the pre-fix numbers that contradicted the project's own thesis rather than quietly replacing them. If you want to judge the engineering rather than the tooling, read that file and [docs/deep-dives.md](docs/deep-dives.md).
+Declare the source's major with `--pg-version` (`"pg_version"` over the API); branches run `postgres:<major>`, and a seed whose data directory reports a different major is refused. A source that needs extensions or locales the stock image lacks names its own image with `--image` (for example `postgis/postgis:17-3.5`). PG 13 and older are unsupported because branch startup relies on `recovery_init_sync_method=syncfs`, added in PG 14. `make matrix` runs seed, branch, verify and destroy per major, and CI runs 14 through 18 weekly.
 
 ## Documentation
 
-`docs/` is a small MkDocs site — no hosting or CI, build it locally with `pip install mkdocs-material && mkdocs serve`:
+The docs are a MkDocs site, built in CI and published at [abd-ulbasit.github.io/pgoverlay](https://abd-ulbasit.github.io/pgoverlay/) (`pip install mkdocs-material && mkdocs serve` to preview locally).
 
-- [Quickstart](docs/quickstart.md) — Docker on a laptop: CLI, `branchd`, REST API, router, web UI.
-- [Ways to use it](docs/usage.md) — local dev, a DB per test, branch-per-PR, preview environments, reviewing migrations.
-- [Benchmarks](docs/benchmarks.md) — measured numbers, methodology, and the copy-up diagnosis.
-- [Core concepts](docs/concepts.md) — copy-on-write, OverlayFS layers, seeding, the frozen-layer DAG, from first principles.
-- [Architecture](docs/architecture.md) — components, CoW mechanics, sagas, generations, routing — as built.
-- [Code tour](docs/code-tour.md) — the codebase package by package, plus the branch-create and proxy request paths.
-- [Design decisions](docs/DESIGN-DECISIONS.md) — ten ADRs: no operator, SQLite registry, sagas, the proxy, dual runtime, HA, and what each cost.
-- [Deep dives](docs/deep-dives.md) — the reconcile loop that deleted live data, the state-machine CAS, three more places the obvious implementation was wrong, and what an adversarial pre-v1 review turned up.
-- [Testing](docs/testing.md) — a real database for every test: Go/JS SDKs and the GitHub Action.
-- [Kubernetes](docs/kubernetes.md) — Helm chart, storage modes, proxy TLS, scoped RBAC.
-- [Running on EKS](docs/eks.md) — a full cloud walkthrough end to end.
-- [Observability](docs/observability.md) — Prometheus metrics and readiness.
-- [High availability](docs/ha.md) — leader election and failover.
-- [GitHub App](docs/github-app.md) — a database branch per pull request.
-- [ZFS backend](docs/zfs.md) — experimental; requirements and manual verification walkthrough.
+- [Quickstart](docs/quickstart.md): Docker on a laptop, the CLI, `branchd`, the REST API, the router, the web UI.
+- [Ways to use it](docs/usage.md): local dev, a database per test, a branch per PR, preview environments, reviewing migrations.
+- [Reference](docs/reference.md): every `pgb` command, `branchd` flag and environment variable.
+- [REST API](docs/api.md): endpoints, roles, status codes and the `/v1` stability promise.
+- [Troubleshooting](docs/troubleshooting.md): failed branches, recovery, reachability, common errors.
+- [Security](docs/security.md): threat model and hardening checklist.
+- [Benchmarks](docs/benchmarks.md), [Core concepts](docs/concepts.md), [Architecture](docs/architecture.md), [Code tour](docs/code-tour.md), [Design decisions](docs/DESIGN-DECISIONS.md), [Deep dives](docs/deep-dives.md).
+- [Kubernetes](docs/kubernetes.md), [Running on EKS](docs/eks.md), [High availability](docs/ha.md), [Observability](docs/observability.md), [GitHub App](docs/github-app.md), [Testing](docs/testing.md), [ZFS backend](docs/zfs.md), [Upgrading to v1.0](docs/upgrading.md).
 
 ## Development
 
 ```bash
-make test    # unit tests
-make it      # integration tests (needs Docker): PGOVERLAY_IT=1, ~min on first pull
-make matrix  # Postgres version matrix (PGOVERLAY_MATRIX_VERSIONS="14 18" by default)
-make lint    # go vet
-make vuln    # the CI supply-chain gate (govulncheck, same script CI runs)
-make check-toolchain  # Dockerfile base image vs go.mod's `go` directive
+make build            # bin/pgb, bin/branchd, bin/pgoverlay-github, version-stamped from git describe
+make test             # unit tests
+make it               # Docker integration tests (PGOVERLAY_IT=1), one package at a time like CI
+make k8s-it           # Kubernetes integration tests on a kind cluster (hack/kind-up.sh)
+make matrix           # Postgres version matrix (PGOVERLAY_MATRIX_VERSIONS, default "14 18")
+make helm-test        # lint and assert the rendered chart
+make js-sdk-test      # both JavaScript SDKs
+make lint             # go vet
+make vuln             # the CI govulncheck gate; make vuln-test tests the gate itself
+make check-toolchain  # Dockerfile base images vs go.mod's go directive
+make release-check    # validate .goreleaser.yaml
 ```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the setup and conventions.
+
+## How this was built
+
+Most of the commits here carry a `Co-authored-by: Claude` trailer; run `git log --grep='^Co-authored-by: Claude' -i --oneline | wc -l` against `git log --oneline | wc -l` for the current ratio. I build with coding agents running in parallel git worktrees and I review, benchmark, and integrate what comes back. The parts that decided the shape of this project were not generated: the copy-up diagnosis above came from reading `SyncDataDirectory`, instrumenting the writable layer, and running a single-variable control, and [docs/benchmarks.md](docs/benchmarks.md) still carries the numbers that contradicted the project's own thesis, including the read-path measurement that corrected this README. If you want to judge the engineering rather than the tooling, read that file and [docs/deep-dives.md](docs/deep-dives.md).
+
+## Security
+
+Report vulnerabilities privately through [GitHub's private vulnerability reporting](https://github.com/abd-ulbasit/pgoverlay/security/advisories/new); see [SECURITY.md](SECURITY.md). The threat model is in [docs/security.md](docs/security.md).
 
 ## License
 
-[Apache-2.0](LICENSE) — Copyright 2026 Abdul Basit.
+[Apache-2.0](LICENSE). Copyright 2026 Abdul Basit.

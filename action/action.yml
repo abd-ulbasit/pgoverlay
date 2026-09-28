@@ -7,10 +7,22 @@
 #       server: ${{ vars.PGOVERLAY_SERVER }}
 #       token: ${{ secrets.PGOVERLAY_TOKEN }}
 #       source: main
-#   - run: psql "host=${{ steps.branch.outputs.host }} port=${{ steps.branch.outputs.port }} ..."
+#   - run: psql -c 'SELECT 1'
+#     env:
+#       PGHOST: ${{ steps.branch.outputs.proxy_host }}
+#       PGPORT: ${{ steps.branch.outputs.proxy_port }}
+#       PGDATABASE: ${{ steps.branch.outputs.proxy_database }}
+#       PGUSER: ${{ steps.branch.outputs.user }}
+#       PGPASSWORD: ${{ steps.branch.outputs.password || secrets.DB_PASSWORD }}
+#
+# Connect through the proxy_* outputs (the pgoverlay router): the direct
+# host/port are reachable only from the branchd host (Docker publishes branch
+# ports on 127.0.0.1) or from inside the cluster (Kubernetes pod IPs).
 #
 # Pair with abd-ulbasit/pgoverlay/action/destroy@v1 in an `if: always()`
-# step; the TTL reaps leaked branches as a fallback.
+# step; `branch` is set as soon as the branch exists, so the destroy step
+# cleans up even when the ready-wait fails. The TTL reaps leaked branches as
+# a fallback.
 name: pgoverlay branch
 description: Create a copy-on-write Postgres branch on a pgoverlay server and wait until it is ready
 author: abd-ulbasit
@@ -36,25 +48,55 @@ inputs:
     required: false
     default: ""
   ttl:
-    description: branch TTL in seconds, a safety net for leaked branches (0 = never reaped)
+    description: >-
+      branch TTL in seconds, a safety net for leaked branches; 0 turns it off
+      (the server's --default-ttl applies if set, otherwise never reaped)
     required: false
     default: "3600"
+  proxy_host:
+    description: >-
+      host[:port] of the pgoverlay router, for the proxy_* outputs (port
+      defaults to 6432; IPv6 as [addr]:port). Default: the server's host.
+      Set it when the router has its own address, e.g. the Helm chart's
+      pgoverlay-proxy Service
+    required: false
+    default: ""
 
 outputs:
   branch:
-    description: the branch name (pass it to the destroy action)
+    description: >-
+      the branch name (pass it to the destroy action); set as soon as the
+      branch is created, even if it then fails to become ready
     value: ${{ steps.create.outputs.branch }}
+  proxy_host:
+    description: host of the pgoverlay router to connect through (recommended)
+    value: ${{ steps.create.outputs.proxy_host }}
+  proxy_port:
+    description: port of the pgoverlay router
+    value: ${{ steps.create.outputs.proxy_port }}
+  proxy_database:
+    description: database name to use through the router (dbname@branch)
+    value: ${{ steps.create.outputs.proxy_database }}
+  user:
+    description: database user of the branch
+    value: ${{ steps.create.outputs.user }}
+  password:
+    description: >-
+      the branch's own password, set only when branchd runs with
+      --rotate-branch-credentials (masked in logs); empty in the default
+      inherit mode, where the branch keeps the source's credentials
+    value: ${{ steps.create.outputs.password }}
   host:
-    description: direct Postgres host of the branch
+    description: >-
+      direct Postgres host of the branch; reachable only from the branchd
+      host (Docker) or inside the cluster (Kubernetes); prefer proxy_host
     value: ${{ steps.create.outputs.host }}
   port:
-    description: direct Postgres port of the branch
+    description: direct Postgres port of the branch (see host)
     value: ${{ steps.create.outputs.port }}
   database:
-    description: database name
+    description: database name for a direct connection (see host)
     value: ${{ steps.create.outputs.database }}
-  # no password output: branch credentials are inherited from the source,
-  # which the workflow already holds as its own secret
 
 runs:
   using: composite
@@ -67,4 +109,5 @@ runs:
         PGOVERLAY_SOURCE: ${{ inputs.source }}
         PGOVERLAY_BRANCH: ${{ inputs.name }}
         PGOVERLAY_TTL: ${{ inputs.ttl }}
+        PGOVERLAY_PROXY_HOST: ${{ inputs.proxy_host }}
       run: '"$GITHUB_ACTION_PATH/entrypoint.sh"'

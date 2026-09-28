@@ -32,6 +32,33 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{/* Whether branchd must be pinned to .Values.node ("true"/"false" string).
+     It must when something it needs lives on that node's disk: all CoW data
+     in hostpath mode, and its sqlite state whenever that is a hostPath
+     (persistence off). csi mode with the state on a PVC needs no node at all;
+     pinning it there would keep branchd Pending forever once that node is
+     replaced (an EKS node-group roll), though nothing on it is needed. */}}
+{{- define "pgoverlay.pinNode" -}}
+{{- if or (eq .Values.storage.mode "hostpath") (ne (include "pgoverlay.persistenceEnabled" .) "true") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/* Pod Security Admission level the release's pods need in this namespace:
+     "privileged" when anything uses hostPath volumes or added capabilities
+     (hostpath mode: branch pods, helpers and branchd's state; csi without
+     persistence: branchd's hostPath state), else "baseline". "restricted" is
+     never enough: branchd and the postgres entrypoint start as root. */}}
+{{- define "pgoverlay.podSecurityLevel" -}}
+{{- if or (eq .Values.storage.mode "hostpath") (ne (include "pgoverlay.persistenceEnabled" .) "true") -}}
+privileged
+{{- else -}}
+baseline
+{{- end -}}
+{{- end -}}
+
 {{/* Whether leader election is effectively on ("true"/"false" string): when
      leaderElection.enabled OR replicaCount > 1. Running >1 replica without
      leader election would let multiple instances reconcile/write the shared
@@ -41,6 +68,19 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 true
 {{- else -}}
 false
+{{- end -}}
+{{- end -}}
+
+{{/* NetworkPolicy peers for cluster DNS: networkPolicy.dnsFrom, or the
+     kube-dns pods in any namespace (the CoreDNS convention). */}}
+{{- define "pgoverlay.dnsPeers" -}}
+{{- with .Values.networkPolicy.dnsFrom -}}
+{{- toYaml . -}}
+{{- else -}}
+- namespaceSelector: {}
+  podSelector:
+    matchLabels:
+      k8s-app: kube-dns
 {{- end -}}
 {{- end -}}
 

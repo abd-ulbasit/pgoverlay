@@ -28,9 +28,11 @@ also run on a laptop under Docker, with no apiserver in sight.
 
 **Decision.** Ship `branchd`, a single daemon (`cmd/branchd/main.go`) exposing a
 REST control plane (`--api-addr`, default `:7070`) and a Postgres router
-(`--pg-addr`), driven by a CLI and a Helm chart (`deploy/helm/pgoverlay`). There
-are no CustomResourceDefinitions anywhere in the tree (`grep
-CustomResourceDefinition` over the repo returns nothing). The reconciliation
+(`--pg-addr`), driven by a CLI and a Helm chart (`deploy/helm/pgoverlay`).
+pgoverlay defines no CustomResourceDefinitions: the only matches for
+`grep -rl CustomResourceDefinition` are the vendored external-snapshotter CRDs
+under `hack/csi/snapshotter/`, which the CSI integration tests install into a
+kind cluster (and this sentence). The reconciliation
 benefit is kept as an in-process loop: `Engine.RunReconcile` runs on a ticker
 (`internal/engine/reconcile.go`) and computes a plan/apply diff just like a
 controller's reconcile.
@@ -57,11 +59,15 @@ bootstrapping circularity.
 **Decision.** Use SQLite via `modernc.org/sqlite` (pure Go, no CGO — `go.mod`,
 `internal/registry/registry.go`), so `branchd` stays a single static binary. The
 file is opened with `journal_mode(WAL)`, `busy_timeout(5000)` and
-`foreign_keys(1)` pragmas, and `db.SetMaxOpenConns(1)` serializes all writers
-(registry.go:115–119). Schema is versioned by `PRAGMA user_version`: a
-`migrations` slice where entry *i* upgrades version *i*→*i+1*, applied in a
-transaction that bumps the pragma (`internal/registry/schema.go`, now through
-**v11** — actor column on the audit log).
+`foreign_keys(1)` pragmas and `_txlock=immediate` (every transaction takes the
+write lock up front), and `db.SetMaxOpenConns(1)` serializes all writers
+(`dsnParams` and `Open` in `registry.go`). Schema is versioned by
+`PRAGMA user_version`: a `migrations` slice where entry *i* upgrades version
+*i*→*i+1*, applied in a transaction that bumps the pragma
+(`internal/registry/schema.go`, now through **v15** — the audit trail keeps
+the names of removed sources' branches, and destroyed branches drop their
+passwords). A binary refuses a registry whose version is newer than it knows
+(`ErrSchemaTooNew`).
 
 **Alternatives considered.** Postgres (the bootstrapping problem above); etcd
 (operational weight, another distributed system to run for single-node state).
@@ -120,14 +126,24 @@ else `'N'`.
 **Alternatives considered.** Port-per-branch (sprawl, churn); DNS-per-branch
 (needs DNS plumbing, still per-branch endpoints).
 
+Because it relays the backend's startup response, it also sees each session's
+`BackendKeyData` and forwards a `CancelRequest` to the backend holding that key
+(`internal/pgproxy/cancel.go`), so query cancellation works through it.
+
 **Consequences / trade-offs.** One stable endpoint, auth-transparent, branch
 selection in the connection string (works with any Postgres client). Cost: the
 proxy is an **unauthenticated routing surface** — anyone who can dial it can
-attempt to route. Hardening in code: uniform `genericRouteRefusal` so an
-unauth client can't enumerate branch names or distinguish "unknown" from
-"not-ready" from "down"; a startup-phase deadline, a `MaxConns` connection cap
-(fast-refuse, not queue), and an idle timeout against slow-loris/DoS. Production
-posture leans further on TLS, NetworkPolicy and credential rotation.
+attempt to route. Hardening in code: a uniform `genericRouteRefusal`, so an
+unauthenticated client cannot tell "unknown" from "not-ready" from
+"unreachable"; startup deadlines (first byte, whole startup, backend
+`ReadyForQuery`), a `MaxConns` cap and a per-IP cap on connections still in
+startup (fast-refuse, not queue), and an idle timeout against slow-loris/DoS.
+The residual is honest: a *ready* branch can still be confirmed before
+authenticating, because its auth challenge is relayed, and a blackholed
+backend is refused only after the dial timeout. Hiding that would need the
+proxy to take part in authentication (a synthetic SCRAM exchange), which is on
+the roadmap. Production posture leans further on TLS, NetworkPolicy and
+credential rotation.
 
 ---
 
@@ -199,21 +215,25 @@ would corrupt state.
 (`internal/ha/leader.go`, client-go `leaderelection`). Only the leader runs the
 reconcile loop and accepts **mutating** `/v1` requests; the API composes a
 `LeaderGate` in front of every mutating route (`internal/api/leader.go` —
-`mutate = requireLeader ∘ requireRole`), returning **503 "not leader"** on
-followers. Reads, `/healthz`, `/readyz`, `/metrics` and the proxy serve from any
-replica off a read-only registry handle. Gaining the Lease opens the gate and
-runs an immediate reconcile to converge drift; losing it cancels the loop and
-closes the gate. The gate defaults to `leader=true`, so with election **off**
-(Docker / single instance) every node is always leader and mutations behave
-normally.
+`mutate = requireRole` first, then `requireLeader`), returning **503 "not
+leader"** on followers. Reads, `/healthz`, `/readyz`, `/metrics` and the proxy
+serve from any replica. Every replica opens the same read-write registry; the
+gate, not the handle, is what keeps followers from writing. Gaining the Lease
+opens the gate, labels the leader's pod `pgoverlay.leader=true` (the chart's
+API Service selects it, so clients reach the leader) and runs an immediate
+reconcile to converge drift; losing it closes the gate, cancels the loop and
+cancels every mutation admitted during the term, whose sagas roll back. The
+gate defaults to `leader=true`, so with election **off** (Docker / single
+instance) every node is always leader and mutations behave normally.
 
 **Alternatives considered.** A distributed multi-writer store (defeats ADR-02);
 active/active without coordination (registry corruption).
 
 **Consequences / trade-offs.** Availability without giving up single-writer
-safety; reads/proxy scale out. Cost: writes are not HA-scaled (only the leader
-mutates), and an RWO PVC binds all replicas to one node (a co-scheduling caveat
-called out in the Helm values).
+safety; the proxy scales out. Cost: writes are not HA-scaled (only the leader
+mutates), and an RWO state volume binds all replicas to one node (the chart
+pins them with `nodeName` in hostpath mode, or co-locates them with a pod
+affinity in csi mode; see [High availability](ha.md)).
 
 ---
 
@@ -270,33 +290,60 @@ an external IdP/OIDC (heavy for a self-hosted single binary).
 **Consequences / trade-offs.** No recoverable secrets at rest, clean role
 ranking, and the resolved actor is threaded into the request context
 (`registry.WithActor`) so every mutation is attributable in the audit log
-(schema v11). Cost: the env bootstrap token is a single shared admin
-credential — powerful, and rotating it has a side effect (ADR-10).
+(schema v11). Stored token names are restricted to lowercase letters, digits,
+`.`, `_` and `-`, and `root` is reserved, so no token can pass for another
+identity in that log. Cost: the env bootstrap token is a single shared admin
+credential — powerful, so branchd refuses one shorter than 16 characters.
+Rotating it has no side effect on stored data since the at-rest key became
+independent of it (ADR-10).
 
 ---
 
-## ADR-10: Secrets at rest — AES-256-GCM, key derived from the admin token
+## ADR-10: Secrets at rest — AES-256-GCM under a dedicated key
 
 **Context.** With per-branch credential rotation on (ADR-05 / `--rotate-branch-
 credentials`), each branch's generated password is persisted in the registry.
 Storing those passwords in plaintext in the SQLite file is a leak if the file is
-read.
+read. The first design derived the key from the admin token
+(`sha256(PGOVERLAY_TOKEN)`). That coupled password recoverability to the
+credential most likely to be rotated after an incident: rotating the token made
+every stored password undecryptable, and because a decrypt failure failed the
+whole row read, it took down listing, reconcile, reset and destroy fleet-wide
+(issue #9). It also made the registry file an offline oracle for a weak token.
 
-**Decision.** Encrypt branch passwords at rest with **AES-256-GCM**
-(`internal/registry/crypto.go`, `secretBox`): a random 12-byte nonce is
-prepended to the ciphertext, base64-encoded, and tagged with an `enc:v1:` prefix
-(the prefix versions the scheme so a future KDF/AEAD can coexist). The key is
-`sha256(PGOVERLAY_TOKEN)` (`DeriveSecretKey`). Encryption is **optional**: a nil
-box (no token) stores plaintext, and values without the `enc:` prefix are read
-back as legacy plaintext — back-compat for inherit-mode and pre-encryption rows.
+**Decision.** Encrypt branch passwords with **AES-256-GCM**
+(`internal/registry/crypto.go`) under a **dedicated random 32-byte key**,
+independent of the admin token. branchd takes it from `$PGOVERLAY_SECRET_KEY`,
+else `--secret-key-file` (`$PGOVERLAY_SECRET_KEY_FILE`), else
+`<state dir>/secret.key`, which it generates (0600, published atomically so HA
+replicas agree) on first start. Values are stored as
+`enc:v2:<kid>:base64(nonce || ciphertext)`; `kid` is a short domain-separated
+hash of the key, so a row names the key it needs. Legacy `enc:v1:` rows
+(encrypted under `sha256(PGOVERLAY_TOKEN)`) are read with the current token as a
+decrypt-only fallback, and at startup `ReencryptSecrets` moves every live row not
+yet under the dedicated key (legacy ciphertext and legacy plaintext) under it.
+**A row no configured key can open never fails a read**: the branch comes back
+with an empty password and `PasswordUnavailable` set (`password_unavailable` in
+the API), so list, routing, reconcile, reset (which mints and stores a new
+password) and destroy keep working. A destroyed branch's password is cleared
+(schema v15 trigger). Encryption stays optional in the registry package (no key
+= plaintext) for tests and embedded use; branchd always configures a key.
+Local-mode `pgb` loads the same key (never generates one) plus the legacy token
+key, so it can read what branchd wrote.
 
-**Alternatives considered.** A separate KMS/keyfile (more moving parts for a
-single-binary tool); no encryption (plaintext-at-rest leak).
+**Alternatives considered.** Keep deriving the key from the token, with a KDF
+and a previous-token list (still couples rotation of two unrelated secrets); an
+external KMS (more moving parts for a single-binary tool); no encryption
+(plaintext-at-rest leak).
 
-**Consequences / trade-offs.** Branch passwords are unreadable from the raw DB
-file without the token, with no new dependency. Cost: because the key is derived
-from `PGOVERLAY_TOKEN`, **rotating the token orphans every existing encrypted
-password** (decrypt fails with the wrong key). This is deliberate and acceptable
-for ephemeral branches — re-run rotation (reset the branch) after a token change
-to re-encrypt under the new key; `decrypt` returns a loud, actionable error
-rather than leaking ciphertext, and it is documented in `docs/usage.md`.
+**Consequences / trade-offs.** The admin token rotates freely. A copy of the
+registry file alone (a backup, a snapshot, a support bundle) reveals no branch
+password. The default key file sits next to the registry, so an attacker who
+can read the whole state directory can read both; operators who want the key
+elsewhere set `PGOVERLAY_SECRET_KEY` from a secret manager (for example a
+Kubernetes Secret). Losing the key does not lose branches, only their stored
+passwords, and resetting a branch recovers it. The at-rest key itself rotates
+through the key id: retired keys in `PGOVERLAY_SECRET_KEY_PREVIOUS` (and a
+state-dir `secret.key` that is no longer the primary) are decrypt-only, and the
+startup sweep moves their rows under the new key, after which they can be
+dropped.
