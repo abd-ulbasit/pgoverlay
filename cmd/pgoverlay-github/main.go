@@ -1,8 +1,9 @@
 // pgoverlay-github is the branch-per-PR webhook service: it receives GitHub
 // pull_request webhooks and drives branchd through its REST API — opened or
-// reopened PRs get a branch pr-<number>, pushes optionally reset it, closing
-// the PR destroys it. With GitHub credentials (App or PAT) it also sets the
-// pgoverlay/branch commit status and keeps a live connect-info comment.
+// reopened PRs get a branch gh-<repo-key>-pr-<number>, pushes optionally
+// reset it, closing the PR destroys it. With GitHub credentials (App or PAT)
+// it also sets the pgoverlay/branch commit status and keeps a live
+// connect-info comment.
 //
 // Configuration is environment-only (GHOOK_*); see docs/github-app.md.
 // Shutdown (SIGINT/SIGTERM) is graceful: in-flight deliveries finish.
@@ -26,6 +27,26 @@ import (
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// newServer returns the webhook HTTP server. /webhook faces the internet and
+// its body has to be read before the signature can be checked, so every
+// phase of a request is time-bounded, not only the headers: a client that
+// sends headers and then trickles the body (up to the 1 MiB cap) is cut off
+// by ReadTimeout instead of holding a connection and a goroutine forever.
+// The handler acknowledges within milliseconds (branch work runs detached),
+// so the write and idle limits are generous. A GitHub delivery is well under
+// 1 MiB and arrives in far less than 30 seconds.
+func newServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
 	}
 }
 
@@ -56,11 +77,7 @@ func run() error {
 	}
 
 	svc := ghook.New(cfg.Config, apiclient.New(cfg.PGOverlayServer, cfg.PGOverlayToken), gh, logger)
-	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           svc.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := newServer(cfg.Listen, svc.Handler())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -159,7 +159,12 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusRequestEntityTooLarge)
+		code := http.StatusBadRequest // e.g. the server's read deadline passed
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			code = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, "read body: "+err.Error(), code)
 		return
 	}
 	if !verifySignature(s.cfg.WebhookSecret, body, r.Header.Get("X-Hub-Signature-256")) {

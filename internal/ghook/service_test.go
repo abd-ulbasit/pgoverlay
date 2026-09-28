@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
 )
@@ -153,8 +154,8 @@ func TestWebhookBodySizeLimited(t *testing.T) {
 		big[i] = 'a'
 	}
 	rr := post(t, h, "pull_request", sign(testSecret, big), big)
-	if rr.Code < 400 || rr.Code >= 500 {
-		t.Fatalf("over-limit body: code=%d, want a 4xx rejection", rr.Code)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("over-limit body: code=%d, want 413", rr.Code)
 	}
 
 	// A normal-sized, correctly signed payload still verifies and is accepted.
@@ -163,6 +164,20 @@ func TestWebhookBodySizeLimited(t *testing.T) {
 		t.Fatalf("normal signed payload: code=%d, want 202", rr.Code)
 	}
 	svc.Wait() // let the detached branch op finish against the stub
+}
+
+// A body read that fails for another reason than size (the server's read
+// deadline cutting off a slow client, a dropped connection) is a 400, not a
+// misleading 413.
+func TestWebhookBodyReadErrorIsBadRequest(t *testing.T) {
+	h := newService(Config{}, "http://127.0.0.1:1", nil).Handler()
+	req := httptest.NewRequest("POST", "/webhook", iotest.ErrReader(os.ErrDeadlineExceeded))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("read error: code=%d, want 400", rr.Code)
+	}
 }
 
 func TestWebhookRejectsInvalidJSON(t *testing.T) {
