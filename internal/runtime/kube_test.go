@@ -58,16 +58,21 @@ func TestBuildHelperPod(t *testing.T) {
 		Network: "ignored-on-k8s",
 		User:    "postgres",
 	}
-	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, spec)
+	meta := helperObjectMeta("pgb", "pgoverlay-helper-abcde", "inst-1", nil)
+	pod := buildHelperPod(meta, &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, spec)
 
-	if pod.GenerateName != "pgoverlay-helper-" {
-		t.Errorf("GenerateName = %q", pod.GenerateName)
+	if pod.Name != "pgoverlay-helper-abcde" {
+		t.Errorf("Name = %q", pod.Name)
 	}
 	if pod.Namespace != "pgb" {
 		t.Errorf("Namespace = %q", pod.Namespace)
 	}
 	if pod.Labels["pgoverlay.managed"] != "true" || pod.Labels["pgoverlay.role"] != "helper" {
 		t.Errorf("labels = %v", pod.Labels)
+	}
+	// the instance label lets orphan GC attribute a leaked helper to its registry
+	if pod.Labels[LabelInstance] != "inst-1" {
+		t.Errorf("instance label = %q, want inst-1", pod.Labels[LabelInstance])
 	}
 	if pod.Spec.NodeName != "node-1" {
 		t.Errorf("NodeName = %q", pod.Spec.NodeName)
@@ -89,15 +94,22 @@ func TestBuildHelperPod(t *testing.T) {
 	if len(c.Command) != 3 || c.Command[0] != "pg_basebackup" {
 		t.Errorf("Command = %v", c.Command)
 	}
-	if len(c.Env) != 1 || c.Env[0].Name != "PGPASSWORD" || c.Env[0].Value != "secret" {
-		t.Errorf("Env = %v", c.Env)
+	// The password is referenced from the helper's Secret, never inlined.
+	if len(c.Env) != 1 || c.Env[0].Name != "PGPASSWORD" || c.Env[0].Value != "" {
+		t.Fatalf("Env = %+v, want PGPASSWORD with no literal value", c.Env)
 	}
-	if c.SecurityContext == nil || c.SecurityContext.RunAsUser == nil || *c.SecurityContext.RunAsUser != 999 {
-		t.Errorf("SecurityContext = %+v, want RunAsUser 999 for user postgres", c.SecurityContext)
+	ref := c.Env[0].ValueFrom
+	if ref == nil || ref.SecretKeyRef == nil || ref.SecretKeyRef.Name != pod.Name || ref.SecretKeyRef.Key != "PGPASSWORD" {
+		t.Errorf("PGPASSWORD source = %+v, want secretKeyRef %s/PGPASSWORD", ref, pod.Name)
 	}
-	if c.SecurityContext.RunAsGroup == nil || *c.SecurityContext.RunAsGroup != 999 {
-		t.Errorf("RunAsGroup = %v, want 999", c.SecurityContext.RunAsGroup)
+	sc := c.SecurityContext
+	if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 999 {
+		t.Fatalf("SecurityContext = %+v, want RunAsUser 999 for user postgres", sc)
 	}
+	if sc.RunAsGroup == nil || *sc.RunAsGroup != 999 {
+		t.Errorf("RunAsGroup = %v, want 999", sc.RunAsGroup)
+	}
+	assertHardenedHelper(t, sc)
 	if len(pod.Spec.Volumes) != 1 || len(c.VolumeMounts) != 1 {
 		t.Fatalf("volumes/mounts = %d/%d", len(pod.Spec.Volumes), len(c.VolumeMounts))
 	}
@@ -114,21 +126,82 @@ func TestBuildHelperPod(t *testing.T) {
 	}
 }
 
+// assertHardenedHelper checks the posture every unprivileged helper gets:
+// RuntimeDefault seccomp and no privilege escalation.
+func assertHardenedHelper(t *testing.T, sc *corev1.SecurityContext) {
+	t.Helper()
+	if sc == nil {
+		t.Fatal("SecurityContext = nil, want RuntimeDefault seccomp + allowPrivilegeEscalation=false")
+	}
+	if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("seccomp = %+v, want RuntimeDefault", sc.SeccompProfile)
+	}
+	if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Errorf("AllowPrivilegeEscalation = %v, want false", sc.AllowPrivilegeEscalation)
+	}
+	if sc.Privileged != nil && *sc.Privileged {
+		t.Error("unprivileged helper rendered privileged")
+	}
+}
+
+// The helper's environment lives in a Secret named like its pod, with the
+// pod's labels and owner, and only when there is environment to hold.
+func TestBuildHelperSecret(t *testing.T) {
+	owner := &metav1.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: "branchd-0", UID: "uid-1"}
+	meta := helperObjectMeta("pgb", "pgoverlay-helper-abcde", "inst-1", owner)
+	s := buildHelperSecret(meta, []string{"PGB_USER=app", "PGB_PASSWORD=p=w'd", "EMPTY="})
+	if s == nil {
+		t.Fatal("no Secret for a helper with environment")
+	}
+	if s.Name != "pgoverlay-helper-abcde" || s.Namespace != "pgb" {
+		t.Errorf("secret = %s/%s, want pgb/pgoverlay-helper-abcde (named like its pod)", s.Namespace, s.Name)
+	}
+	want := map[string]string{"PGB_USER": "app", "PGB_PASSWORD": "p=w'd", "EMPTY": ""}
+	if len(s.Data) != len(want) {
+		t.Errorf("data keys = %d, want %d", len(s.Data), len(want))
+	}
+	for k, v := range want {
+		if got, ok := s.Data[k]; !ok || string(got) != v {
+			t.Errorf("data[%s] = %q (present %v), want %q", k, got, ok, v)
+		}
+	}
+	if s.Immutable == nil || !*s.Immutable {
+		t.Error("helper Secret is not immutable")
+	}
+	if s.Labels["pgoverlay.role"] != "helper" || s.Labels[LabelInstance] != "inst-1" {
+		t.Errorf("labels = %v", s.Labels)
+	}
+	if len(s.OwnerReferences) != 1 || s.OwnerReferences[0].UID != "uid-1" {
+		t.Errorf("ownerReferences = %+v, want branchd's pod", s.OwnerReferences)
+	}
+	if buildHelperSecret(meta, nil) != nil {
+		t.Error("a helper without environment must not get a Secret")
+	}
+}
+
 func TestBuildHelperPodNoUser(t *testing.T) {
-	pod := buildHelperPod("default", &hostPathStorage{node: "n", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{Image: "alpine:3.21", Cmd: []string{"true"}})
-	if sc := pod.Spec.Containers[0].SecurityContext; sc != nil {
-		t.Errorf("SecurityContext = %+v, want nil when User empty", sc)
+	meta := helperObjectMeta("default", "pgoverlay-helper-x", "", nil)
+	pod := buildHelperPod(meta, &hostPathStorage{node: "n", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{Image: UtilityImage, Cmd: []string{"true"}})
+	sc := pod.Spec.Containers[0].SecurityContext
+	assertHardenedHelper(t, sc)
+	if sc.RunAsUser != nil || sc.RunAsGroup != nil {
+		t.Errorf("SecurityContext = %+v, want no runAs identity when User is empty", sc)
 	}
 	if env := pod.Spec.Containers[0].Env; len(env) != 0 {
 		t.Errorf("Env = %v, want empty", env)
+	}
+	if _, ok := pod.Labels[LabelInstance]; ok {
+		t.Error("instance label rendered without an instance id")
 	}
 }
 
 func TestBuildHelperPodPrivileged(t *testing.T) {
 	// zfs helpers: privileged pod (a privileged container sees host devices,
 	// so HostDevices needs no explicit kube mapping)
-	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{
-		Image:       "alpine:3.21",
+	st := &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}
+	meta := helperObjectMeta("pgb", "pgoverlay-helper-x", "", nil)
+	pod := buildHelperPod(meta, st, HelperSpec{
+		Image:       UtilityImage,
 		Cmd:         []string{"sh", "-c", "zfs snapshot tank/pgoverlay/src-main-g1@br-pr-1"},
 		Privileged:  true,
 		HostDevices: []string{"/dev/zfs"},
@@ -137,9 +210,13 @@ func TestBuildHelperPodPrivileged(t *testing.T) {
 	if sc == nil || sc.Privileged == nil || !*sc.Privileged {
 		t.Fatalf("SecurityContext = %+v, want privileged", sc)
 	}
+	// the API rejects privileged together with allowPrivilegeEscalation=false
+	if sc.AllowPrivilegeEscalation != nil || sc.SeccompProfile != nil {
+		t.Errorf("privileged helper also got allowPrivilegeEscalation=%v seccomp=%+v", sc.AllowPrivilegeEscalation, sc.SeccompProfile)
+	}
 	// privileged + user compose (not used today, but must not panic or drop one)
-	pod = buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{
-		Image: "alpine:3.21", Cmd: []string{"true"}, User: "postgres", Privileged: true,
+	pod = buildHelperPod(meta, st, HelperSpec{
+		Image: UtilityImage, Cmd: []string{"true"}, User: "postgres", Privileged: true,
 	})
 	sc = pod.Spec.Containers[0].SecurityContext
 	if sc == nil || sc.Privileged == nil || !*sc.Privileged || sc.RunAsUser == nil || *sc.RunAsUser != 999 {
@@ -150,8 +227,8 @@ func TestBuildHelperPodPrivileged(t *testing.T) {
 func TestBuildHelperPodHostPathMount(t *testing.T) {
 	// MountHostPath mounts an absolute host path (a zfs dataset mountpoint)
 	// directly — not a dataRoot subdirectory — and requires it to exist.
-	pod := buildHelperPod("pgb", &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{
-		Image: "alpine:3.21",
+	pod := buildHelperPod(helperObjectMeta("pgb", "pgoverlay-helper-x", "", nil), &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}, HelperSpec{
+		Image: UtilityImage,
 		Cmd:   []string{"true"},
 		Mounts: []Mount{
 			{Kind: MountHostPath, Volume: "/tank/pgoverlay/br-pr-1", Target: "/pgoverlay/rw"},
@@ -432,8 +509,7 @@ func TestKubeInspectMissingPodIsNotFound(t *testing.T) {
 func TestKubeListHelpers(t *testing.T) {
 	d, cs := fakeKubeDriver(t)
 	ctx := context.Background()
-	helper := buildHelperPod("default", d.storage, HelperSpec{Image: "alpine:3.21"})
-	helper.Name = "pgoverlay-helper-a"
+	helper := buildHelperPod(helperObjectMeta("default", "pgoverlay-helper-a", "", nil), d.storage, HelperSpec{Image: UtilityImage})
 	branch := buildBranchPod("default", d.storage, BranchSpec{Name: "pgoverlay-br-x", Image: "postgres:17",
 		Labels: map[string]string{"pgoverlay.managed": "true", "pgoverlay.role": "branch"}})
 	for _, p := range []*corev1.Pod{helper, branch} {
@@ -481,6 +557,18 @@ func TestHostPathHelperArgvIsExecSafe(t *testing.T) {
 		mu.Unlock()
 		return false, nil, nil
 	})
+	// Helper environment now travels in a Secret; the kubelet hands its values
+	// to the process as envp, which has the same NUL-terminated contract.
+	envValues := map[string][]string{} // secret (= pod) name -> values
+	cs.PrependReactor("create", "secrets", func(action ktesting.Action) (bool, kruntime.Object, error) {
+		s := action.(ktesting.CreateAction).GetObject().(*corev1.Secret)
+		mu.Lock()
+		for _, v := range s.Data {
+			envValues[s.Name] = append(envValues[s.Name], string(v))
+		}
+		mu.Unlock()
+		return false, nil, nil
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -517,6 +605,7 @@ func TestHostPathHelperArgvIsExecSafe(t *testing.T) {
 			for _, e := range c.Env {
 				args = append(args, e.Value)
 			}
+			args = append(args, envValues[pod.Name]...)
 			for i, a := range args {
 				// The exact conversion the exec path performs: it returns
 				// EINVAL for any string containing a NUL byte.

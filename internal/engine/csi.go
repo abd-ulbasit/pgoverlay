@@ -195,7 +195,7 @@ func (e *Engine) restartCSIBranch(ctx context.Context, b *registry.Branch, src *
 // cloned volume, next to its data/ dir (plain unprivileged helper).
 func (e *Engine) installDirectEntrypoint(ctx context.Context, volume string) error {
 	_, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
-		Image:  "alpine:3.21",
+		Image:  runtime.UtilityImage,
 		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh`},
 		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScriptDirect},
 		Mounts: []runtime.Mount{{Volume: volume, Target: cow.RWPath}},

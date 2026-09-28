@@ -51,6 +51,11 @@ halves as the `helm install` below does, and note two practical traps:
 - **Cross-compile on the host** (`GOOS=linux GOARCH=amd64 CGO_ENABLED=0`,
   pure-Go thanks to modernc.org/sqlite) and build a copy-only image.
   Running the Go toolchain under qemu emulation on Apple Silicon segfaults.
+- **Nodes without Docker Hub access** (private subnets without NAT, a
+  registry allow-list) also need the images branchd starts at runtime: set
+  `helperImage` to a mirror of the utility helper image (see
+  [Images](kubernetes.md#images)); the `postgres:<major>` images are pulled
+  by that name, so they need a registry mirror configured on the nodes.
 - **GHCR packages default to private.** Either make them public or create a
   pull secret and attach it to the service accounts (the chart's own SA for
   branchd, and `default` for branch/helper pods):
@@ -66,38 +71,143 @@ kubectl -n pgoverlay patch serviceaccount default \
 
 ## Deploy
 
+> **Read this before putting the proxy on a public load balancer.** Every
+> branch is a copy of production, and the proxy serves the Postgres wire
+> protocol: without TLS the data crosses the internet in cleartext (clients
+> on the default `sslmode=prefer` fall back to plaintext without a word), and
+> without per-branch credentials a branch accepts the production password.
+> The router also accepts connections before any authentication, so an
+> endpoint open to the whole internet is denial-of-service surface. The
+> walkthrough below therefore turns on TLS, per-branch credentials and a
+> source-address allow-list. Even so, do not make branches that hold
+> unmasked production data reachable from the internet: mask the source
+> first (`pgb source set-mask`, see [usage](usage.md)), or keep the proxy
+> internal and run the consumers in the VPC.
+
+The default hostpath mode used here runs privileged pods (hostPath volumes,
+`CAP_SYS_ADMIN` on branch pods), so the namespace must allow Pod Security
+`privileged` ([csi mode](kubernetes.md#recommended-csi-mode) needs only
+`baseline`):
+
 ```bash
-helm install pgoverlay deploy/helm/pgoverlay -n pgoverlay --create-namespace \
+kubectl create namespace pgoverlay
+kubectl label namespace pgoverlay pod-security.kubernetes.io/enforce=privileged
+```
+
+**TLS for the proxy.** Clients will verify the proxy's certificate against a
+name you control (here `pg.preview.example.com`, a CNAME to the proxy's load
+balancer once it exists). Install cert-manager and issue that certificate
+from a private CA (use an ACME issuer with a DNS-01 solver instead if you
+want a publicly trusted certificate):
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm install cert-manager jetstack/cert-manager -n cert-manager --create-namespace \
+  --set crds.enabled=true
+kubectl -n pgoverlay apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: { name: selfsigned }
+spec: { selfSigned: {} }
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: pgoverlay-ca }
+spec:
+  isCA: true
+  commonName: pgoverlay-ca
+  secretName: pgoverlay-ca
+  issuerRef: { name: selfsigned, kind: Issuer }
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: { name: pgoverlay-ca }
+spec: { ca: { secretName: pgoverlay-ca } }
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: pgoverlay-proxy-tls }
+spec:
+  secretName: pgoverlay-proxy-tls
+  dnsNames: ["pg.preview.example.com"]
+  issuerRef: { name: pgoverlay-ca, kind: Issuer }
+EOF
+```
+
+**Install.** `proxy.service.loadBalancerSourceRanges` is the allow-list of
+client networks (your CI runners' egress, an office or VPN range);
+`ghook.service.loadBalancerSourceRanges` admits only GitHub's webhook
+senders (IPv4 ranges from `api.github.com/meta`):
+
+```bash
+helm install pgoverlay deploy/helm/pgoverlay -n pgoverlay \
   --set node=<storage-node-name> \
   --set image.repository=ghcr.io/<user>/pgoverlay-branchd --set image.tag=<tag> \
   --set token=$(openssl rand -hex 16) \
+  --set rotateBranchCredentials=true \
   --set proxy.service.type=LoadBalancer \
+  --set proxy.tls.certSecret=pgoverlay-proxy-tls \
+  --set 'proxy.service.loadBalancerSourceRanges={<ci-egress-cidr>,<vpn-cidr>}' \
   --set ghook.enabled=true \
   --set ghook.image.repository=ghcr.io/<user>/pgoverlay-ghook --set ghook.image.tag=<tag> \
   --set ghook.webhookSecret=$(openssl rand -hex 16) \
   --set ghook.githubToken=<token-with-issues-write> \
   --set ghook.source=prod --set ghook.resetOnPush=true \
   --set ghook.repos=<owner>/<repo> \
-  --set ghook.service.type=LoadBalancer
+  --set ghook.service.type=LoadBalancer \
+  --set "ghook.service.loadBalancerSourceRanges={$(curl -s https://api.github.com/meta \
+    | jq -r '.hooks | map(select(contains(":") | not)) | join(",")')}"
 ```
 
 `type: LoadBalancer` on EKS provisions Classic ELBs out of the box (raw TCP
 — exactly what the wire-protocol proxy needs; no aws-load-balancer-controller
-required). Once the proxy ELB has a hostname, feed it back so PR comments
-show the right address:
+required), and `loadBalancerSourceRanges` becomes the ELB's security-group
+rules. Platforms without fixed egress addresses (Vercel without Secure
+Compute, for one) cannot be allow-listed; for those, TLS with `verify-full`
+and per-branch credentials are what protect the endpoint, which is one more
+reason to mask the source. To keep the proxy off the internet entirely, add
+`--set proxy.service.annotations."service\.beta\.kubernetes\.io/aws-load-balancer-internal"=true`.
+
+Once the proxy ELB has a hostname, point `pg.preview.example.com` at it (a
+CNAME) and feed the name back so PR comments show the right address:
 
 ```bash
+kubectl -n pgoverlay get svc pgoverlay-proxy \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'   # CNAME target
 helm upgrade pgoverlay deploy/helm/pgoverlay -n pgoverlay --reuse-values \
-  --set ghook.proxyHost=$(kubectl -n pgoverlay get svc pgoverlay-proxy \
-    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'):6432
+  --set ghook.proxyHost=pg.preview.example.com:6432
+```
+
+Clients connect through the proxy with `dbname@branch`, verifying the
+certificate against the CA:
+
+```bash
+kubectl -n pgoverlay get secret pgoverlay-ca -o jsonpath='{.data.ca\.crt}' | base64 -d > pgoverlay-ca.crt
+psql "host=pg.preview.example.com port=6432 dbname=app@gh-pr-42 user=app sslmode=verify-full sslrootcert=pgoverlay-ca.crt"
+```
+
+**Give ghook its own token.** The install above hands ghook branchd's admin
+token (the chart's NOTES warn about it). ghook only creates, resets and
+destroys branches, so swap in an operator-role token:
+
+```bash
+kubectl -n pgoverlay port-forward svc/pgoverlay-api 7070 &
+PGOVERLAY_SERVER=http://localhost:7070 PGOVERLAY_TOKEN=<admin token> \
+  pgb token create ghook --role operator                # prints the token once
+kubectl -n pgoverlay create secret generic pgoverlay-ghook-api --from-literal=token=<it>
+helm upgrade pgoverlay deploy/helm/pgoverlay -n pgoverlay --reuse-values \
+  --set ghook.apiTokenSecret=pgoverlay-ghook-api
 ```
 
 Point the GitHub webhook at
-`http://<ghook-elb>:8080/webhook` (`pull_request` events, the same secret) —
-deliveries are HMAC-verified, so public exposure is by design. Seed the
-source the native way (`pgb source add` against the in-cluster service via a
-port-forward of `pgoverlay-api`), and external consumers (CI, Vercel) connect
-through the proxy ELB with `dbname@branch`.
+`http://<ghook-elb>:8080/webhook` (`pull_request` events, the same secret).
+Deliveries are HMAC-verified, and the allow-list keeps everyone but GitHub
+off the endpoint; put an HTTPS ingress in front if the PR metadata in the
+payloads should not travel in cleartext. Seed the source the native way
+(`pgb source add` against the in-cluster service via the port-forward of
+`pgoverlay-api` above); if you enable `networkPolicy`, set
+`networkPolicy.sourceEgress` to the source so the seed helpers can reach it
+and nothing else.
 
 ## Upgrading Kubernetes
 
@@ -113,11 +223,15 @@ done
 Each step upgrades the control plane (~10 min) and rolls the node group.
 pgoverlay itself is indifferent — it uses only stable v1 APIs — but
 **hostpath mode keeps all CoW data and the registry on the storage node's
-disk, and a node rollover recycles that disk**. Branches are disposable by
-design, so the procedure is: upgrade, then re-seed sources and let the
+disk, and a node rollover recycles that disk**. It also pins branchd to that
+node by name, so once the node is replaced branchd stays Pending until you
+point it at the new one. Branches are disposable by design, so the procedure
+is: upgrade, `helm upgrade pgoverlay deploy/helm/pgoverlay -n pgoverlay
+--reuse-values --set node=<new-node-name>`, then re-seed sources and let the
 webhook recreate PR branches (or `pgb branch create` what you need). If
 branch survival across node loss matters, use `storage.mode=csi` — PVC
-clones live in EBS, not on the node.
+clones live in EBS, not on the node, the registry moves to a PVC too, and
+branchd is not pinned, so it comes back on a new node by itself.
 
 ## Teardown
 

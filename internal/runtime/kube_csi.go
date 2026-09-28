@@ -48,9 +48,20 @@ type csiStorage struct {
 // nodeName: no pin — PVCs travel with their pods, the scheduler places them.
 func (s *csiStorage) nodeName() string { return "" }
 
-// branchSecurityContext: none. CSI branch pods run postgres directly on
-// their cloned claim — no in-container overlay mount, no SYS_ADMIN.
-func (s *csiStorage) branchSecurityContext() *corev1.SecurityContext { return nil }
+// branchSecurityContext: no added capabilities. CSI branch pods run postgres
+// directly on their cloned claim — no in-container overlay mount, no
+// SYS_ADMIN — so they run under the container runtime's default seccomp
+// profile (stated explicitly: unset means Unconfined on any kubelet without
+// seccompDefault) with privilege escalation off. The entrypoint still starts
+// as root, as the official image's does, to chown PGDATA and drop to the
+// postgres user via gosu; neither needs escalation or extra syscalls. That
+// fits Pod Security "baseline"; "restricted" would need a non-root start.
+func (s *csiStorage) branchSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: boolPtr(false),
+		SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+}
 
 // podVolumes maps MountVolume to the named PVC. MountHostPath cannot occur in
 // csi mode (the csi cow backend mounts only PVCs and the zfs backend is

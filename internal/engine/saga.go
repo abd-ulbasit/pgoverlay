@@ -248,7 +248,7 @@ func layerVolumes(chain []registry.Layer) []string {
 // volume and prepares its upper/work dirs.
 func (e *Engine) installOverlayEntrypoint(ctx context.Context, rwVolume string) error {
 	_, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
-		Image:  "alpine:3.21",
+		Image:  runtime.UtilityImage,
 		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh && mkdir -p /pgoverlay/rw/upper /pgoverlay/rw/work`},
 		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScript},
 		Mounts: []runtime.Mount{{Volume: rwVolume, Target: cow.RWPath}},
@@ -318,7 +318,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	// (plain unprivileged helper: it only writes a file)
 	cloneMount := runtime.Mount{Kind: runtime.MountHostPath, Volume: e.planner.Mountpoint(b.RWVolume), Target: cow.RWPath}
 	if _, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
-		Image:  "alpine:3.21",
+		Image:  runtime.UtilityImage,
 		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh`},
 		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScriptDirect},
 		Mounts: []runtime.Mount{cloneMount},

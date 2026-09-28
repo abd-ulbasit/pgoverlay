@@ -43,7 +43,8 @@ under `<prefix>` instead of docker/kube volumes:
 - **Seeding** (`pg_basebackup`) targets the dataset's mountpoint, bind-mounted
   into the seed helpers. The backend assumes **default mountpoints**
   (`/<dataset>` — no `altroot`, no custom `mountpoint=`).
-- **zfs commands run in privileged one-shot helpers** (`alpine:3.21`,
+- **zfs commands run in privileged one-shot helpers** (the pinned alpine
+  helper image, `runtime.UtilityImage`: alpine 3.24 by digest,
   `--privileged`, host `/dev/zfs` mapped in; on kube, a privileged pod). The
   helper installs the zfs userland at run time (`apk add zfs`), so it needs
   network access and an alpine `zfs` package version compatible with the

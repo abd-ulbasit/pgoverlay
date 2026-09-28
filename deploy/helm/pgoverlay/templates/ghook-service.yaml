@@ -6,8 +6,18 @@ metadata:
   labels:
     {{- include "pgoverlay.labels" . | nindent 4 }}
     app.kubernetes.io/component: ghook
+  {{- with .Values.ghook.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.ghook.service.type }}
+  {{- if and (eq .Values.ghook.service.type "LoadBalancer") .Values.ghook.service.loadBalancerSourceRanges }}
+  # Only these CIDRs reach the webhook (e.g. GitHub's hook ranges from
+  # https://api.github.com/meta).
+  loadBalancerSourceRanges:
+    {{- toYaml .Values.ghook.service.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
   selector:
     {{- include "pgoverlay.ghook.selectorLabels" . | nindent 4 }}
   ports:
