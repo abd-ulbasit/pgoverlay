@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -25,6 +26,11 @@ const (
 	// SecretKeyFileName is the key file branchd generates in the state
 	// directory when no key is configured.
 	SecretKeyFileName = "secret.key"
+	// SecretKeyPreviousEnv holds retired at-rest keys, comma-separated, in
+	// the same encoding. They only decrypt, so rotating the at-rest key is:
+	// set the new key, put the old one here for one start (branchd
+	// re-encrypts every row under the new key), then drop it.
+	SecretKeyPreviousEnv = "PGOVERLAY_SECRET_KEY_PREVIOUS"
 )
 
 // SecretKeyFile is the default at-rest key file: <state dir>/secret.key.
@@ -73,6 +79,30 @@ func (c *Config) LoadSecretKey(keyFile string, generate bool) (key []byte, origi
 		return nil, "", fmt.Errorf("generate at-rest key %s: %w", path, err)
 	}
 	return key, path, nil
+}
+
+// PreviousSecretKeys returns the decrypt-only at-rest keys to accept next to
+// primary: every key in $PGOVERLAY_SECRET_KEY_PREVIOUS, plus
+// <state dir>/secret.key when it exists and differs from primary (the key an
+// install used before the operator moved to $PGOVERLAY_SECRET_KEY or
+// --secret-key-file). A malformed previous key is an error; a missing or
+// unreadable state-dir file is not.
+func (c *Config) PreviousSecretKeys(primary []byte) ([][]byte, error) {
+	var out [][]byte
+	for _, v := range strings.Split(os.Getenv(SecretKeyPreviousEnv), ",") {
+		if strings.TrimSpace(v) == "" {
+			continue
+		}
+		key, err := ParseSecretKey(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", SecretKeyPreviousEnv, err)
+		}
+		out = append(out, key)
+	}
+	if key, err := readKeyFile(c.SecretKeyFile()); err == nil && !bytes.Equal(key, primary) {
+		out = append(out, key)
+	}
+	return out, nil
 }
 
 // ParseSecretKey decodes an at-rest key: 32 bytes as 64 hex characters or as

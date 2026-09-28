@@ -197,20 +197,26 @@ func storageRoot(runtimeName, kubeStorage, kubeDataRoot, home string) string {
 // configureSecrets sets up at-rest encryption of rotated branch passwords. The
 // key is a dedicated random key, independent of PGOVERLAY_TOKEN, so the admin
 // token can be rotated freely: $PGOVERLAY_SECRET_KEY, else --secret-key-file,
-// else <state dir>/secret.key (generated 0600 on first start). The legacy key
-// sha256(PGOVERLAY_TOKEN), which encrypted passwords before the dedicated key
-// existed, is kept as a decrypt-only fallback, and every row not yet under the
-// dedicated key (legacy ciphertext, or plaintext written without a key) is
-// re-encrypted under it before serving. Rows no key can open are reported and
+// else <state dir>/secret.key (generated 0600 on first start). Retired keys
+// ($PGOVERLAY_SECRET_KEY_PREVIOUS, and a state-dir secret.key that is no longer
+// the primary) and the legacy key sha256(PGOVERLAY_TOKEN), which encrypted
+// passwords before the dedicated key existed, are kept as decrypt-only
+// fallbacks, and every row not yet under the primary key (older ciphertext, or
+// plaintext written without a key) is re-encrypted under it before serving. Rows no key can open are reported and
 // left alone: they read as password-unavailable, and a reset re-mints them.
 func configureSecrets(reg *registry.Registry, cfg *config.Config, keyFile, token string) error {
 	key, origin, err := cfg.LoadSecretKey(keyFile, true)
 	if err != nil {
 		return err
 	}
+	previous, err := cfg.PreviousSecretKeys(key)
+	if err != nil {
+		return err
+	}
 	if err := reg.SetSecretKeys(registry.SecretKeys{
-		Primary: key,
-		Legacy:  [][]byte{registry.LegacyTokenKey(token)},
+		Primary:  key,
+		Previous: previous,
+		Legacy:   [][]byte{registry.LegacyTokenKey(token)},
 	}); err != nil {
 		return err
 	}

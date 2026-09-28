@@ -15,6 +15,7 @@ func testConfig(t *testing.T) *Config {
 	t.Helper()
 	t.Setenv("PGOVERLAY_HOME", filepath.Join(t.TempDir(), "state"))
 	t.Setenv(SecretKeyEnv, "")
+	t.Setenv(SecretKeyPreviousEnv, "")
 	c, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -102,6 +103,38 @@ func TestLoadSecretKeyConcurrentGenerationAgrees(t *testing.T) {
 		if errs[i] != nil || !bytes.Equal(keys[i], keys[0]) {
 			t.Fatalf("starter %d: key=%x err=%v, want all equal to %x", i, keys[i], errs[i], keys[0])
 		}
+	}
+}
+
+func TestPreviousSecretKeys(t *testing.T) {
+	c := testConfig(t)
+	t.Setenv(SecretKeyPreviousEnv, "")
+	a, b := bytes.Repeat([]byte{0xa}, 32), bytes.Repeat([]byte{0xb}, 32)
+
+	if prev, err := c.PreviousSecretKeys(a); err != nil || len(prev) != 0 {
+		t.Fatalf("nothing configured: %x %v", prev, err)
+	}
+	t.Setenv(SecretKeyPreviousEnv, hex.EncodeToString(a)+", "+base64.StdEncoding.EncodeToString(b))
+	prev, err := c.PreviousSecretKeys(nil)
+	if err != nil || len(prev) != 2 || !bytes.Equal(prev[0], a) || !bytes.Equal(prev[1], b) {
+		t.Fatalf("env list: %x %v", prev, err)
+	}
+	t.Setenv(SecretKeyPreviousEnv, "garbage")
+	if _, err := c.PreviousSecretKeys(nil); err == nil || !strings.Contains(err.Error(), SecretKeyPreviousEnv) {
+		t.Fatalf("malformed previous key err=%v", err)
+	}
+	t.Setenv(SecretKeyPreviousEnv, "")
+
+	// the state-dir key counts as previous only when it is not the primary
+	stateKey, _, err := c.LoadSecretKey("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prev, _ := c.PreviousSecretKeys(stateKey); len(prev) != 0 {
+		t.Fatalf("state-dir key listed as previous while it is the primary: %x", prev)
+	}
+	if prev, _ := c.PreviousSecretKeys(a); len(prev) != 1 || !bytes.Equal(prev[0], stateKey) {
+		t.Fatalf("state-dir key not offered as previous next to another primary: %x", prev)
 	}
 }
 

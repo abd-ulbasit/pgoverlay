@@ -318,6 +318,8 @@ password. The default key file sits next to the registry, so an attacker who
 can read the whole state directory can read both; operators who want the key
 elsewhere set `PGOVERLAY_SECRET_KEY` from a secret manager (for example a
 Kubernetes Secret). Losing the key does not lose branches, only their stored
-passwords, and resetting a branch recovers it. Rotating the at-rest key itself
-has no in-place re-encryption path yet (the key id leaves room for one):
-replacing the key marks existing passwords unavailable until reset.
+passwords, and resetting a branch recovers it. The at-rest key itself rotates
+through the key id: retired keys in `PGOVERLAY_SECRET_KEY_PREVIOUS` (and a
+state-dir `secret.key` that is no longer the primary) are decrypt-only, and the
+startup sweep moves their rows under the new key, after which they can be
+dropped.

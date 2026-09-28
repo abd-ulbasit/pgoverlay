@@ -221,6 +221,44 @@ func TestLegacyTokenRowsReencryptAndSurviveTokenRotation(t *testing.T) {
 	}
 }
 
+// Rotating the at-rest key itself: rows under a previous (decrypt-only) key
+// stay readable and the sweep moves them under the new primary, after which
+// the previous key is no longer needed.
+func TestPreviousKeyRowsMoveToPrimary(t *testing.T) {
+	r := openTest(t)
+	oldKey, newKey := testKey(t), testKey(t)
+	if err := r.SetSecretKey(oldKey); err != nil {
+		t.Fatal(err)
+	}
+	b := makeBranch(t, r, "pr-1")
+	if err := r.SetBranchPassword(b.ID, "0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.SetSecretKeys(SecretKeys{Primary: newKey, Previous: [][]byte{oldKey}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := r.GetBranchByName("pr-1"); err != nil || got.Password != "0123456789abcdef" {
+		t.Fatalf("read under a previous key: %+v err=%v", got, err)
+	}
+	rep, err := r.ReencryptSecrets()
+	if err != nil || rep.Reencrypted != 1 {
+		t.Fatalf("sweep %+v err=%v, want 1 re-encrypted", rep, err)
+	}
+	if raw := rawBranchPassword(t, r, b.ID); !strings.HasPrefix(raw, encPrefixV2+KeyID(newKey)+":") {
+		t.Fatalf("raw %q not under the new key", raw)
+	}
+	if err := r.SetSecretKey(newKey); err != nil { // previous key dropped
+		t.Fatal(err)
+	}
+	if got, err := r.GetBranchByName("pr-1"); err != nil || got.PasswordUnavailable || got.Password != "0123456789abcdef" {
+		t.Fatalf("after dropping the previous key: %+v err=%v", got, err)
+	}
+	if err := r.SetSecretKeys(SecretKeys{Primary: newKey, Previous: [][]byte{[]byte("short")}}); err == nil {
+		t.Fatal("a malformed previous key was accepted")
+	}
+}
+
 // SECRETS-07: legacy plaintext rows are encrypted by the sweep; rows no key
 // can open are reported and left untouched; destroyed tombstones and inherit
 // rows are ignored; without a primary key the sweep is a no-op.

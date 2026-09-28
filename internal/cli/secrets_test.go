@@ -27,6 +27,7 @@ func localHome(t *testing.T) string {
 	t.Setenv("PGOVERLAY_TOKEN", "")
 	t.Setenv(config.SecretKeyEnv, "")
 	t.Setenv(config.SecretKeyFileEnv, "")
+	t.Setenv(config.SecretKeyPreviousEnv, "")
 	return home
 }
 

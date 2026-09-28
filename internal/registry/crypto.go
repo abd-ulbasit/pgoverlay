@@ -43,6 +43,10 @@ type SecretKeys struct {
 	// password (enc:v2:) and decrypts rows carrying its key id. nil disables
 	// encryption: new passwords are stored as plaintext.
 	Primary []byte
+	// Previous holds retired dedicated keys, decrypt-only: enc:v2: rows
+	// under them stay readable, so after the at-rest key itself is rotated
+	// ReencryptSecrets can move those rows under Primary.
+	Previous [][]byte
 	// Legacy holds decrypt-only keys for enc:v1: rows, which were encrypted
 	// under sha256(PGOVERLAY_TOKEN) (see LegacyTokenKey). They let an upgraded
 	// registry read its old rows so ReencryptSecrets can move them under
@@ -99,7 +103,7 @@ func newAEAD(key []byte) (cipher.AEAD, error) {
 // newSecretBox builds a secretBox. No keys at all yields a nil box
 // (encryption disabled); a wrong-length key is a configuration error.
 func newSecretBox(k SecretKeys) (*secretBox, error) {
-	if len(k.Primary) == 0 && len(k.Legacy) == 0 {
+	if len(k.Primary) == 0 && len(k.Previous) == 0 && len(k.Legacy) == 0 {
 		return nil, nil
 	}
 	b := &secretBox{byID: map[string]cipher.AEAD{}}
@@ -110,6 +114,18 @@ func newSecretBox(k SecretKeys) (*secretBox, error) {
 		}
 		b.primaryID = KeyID(k.Primary)
 		b.byID[b.primaryID] = aead
+	}
+	for _, key := range k.Previous {
+		if len(key) == 0 {
+			continue
+		}
+		aead, err := newAEAD(key)
+		if err != nil {
+			return nil, fmt.Errorf("previous key: %w", err)
+		}
+		if id := KeyID(key); b.byID[id] == nil {
+			b.byID[id] = aead
+		}
 	}
 	for _, key := range k.Legacy {
 		if len(key) == 0 {

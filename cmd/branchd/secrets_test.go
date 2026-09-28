@@ -53,6 +53,7 @@ func rawPassword(t *testing.T, path, name string) string {
 func TestConfigureSecretsKeyLifecycle(t *testing.T) {
 	t.Setenv("PGOVERLAY_HOME", filepath.Join(t.TempDir(), "state"))
 	t.Setenv(config.SecretKeyEnv, "")
+	t.Setenv(config.SecretKeyPreviousEnv, "")
 
 	// an older registry: a branch with a plaintext rotated password
 	cfg, err := config.Load()
@@ -93,9 +94,28 @@ func TestConfigureSecretsKeyLifecycle(t *testing.T) {
 	reg.Close()
 
 	_, reg = startup(t, "second-admin-token-002") // token rotated
-	defer reg.Close()
 	got, err := reg.GetBranchByName("pr-1")
 	if err != nil || got.PasswordUnavailable || got.Password != "plaintextpassword000000000000001" {
 		t.Fatalf("after token rotation: %+v err=%v", got, err)
+	}
+	reg.Close()
+
+	// the operator moves to an explicit key (e.g. from a Kubernetes Secret)
+	// with a new value: the generated state-dir key is read as a previous key
+	// and the row is re-encrypted under the new one
+	newKey := strings.Repeat("ab", 32)
+	t.Setenv(config.SecretKeyEnv, newKey)
+	_, reg = startup(t, "second-admin-token-002")
+	defer reg.Close()
+	got, err = reg.GetBranchByName("pr-1")
+	if err != nil || got.PasswordUnavailable || got.Password != "plaintextpassword000000000000001" {
+		t.Fatalf("after moving to an explicit key: %+v err=%v", got, err)
+	}
+	parsed, err := config.ParseSecretKey(newKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw := rawPassword(t, cfg.RegistryPath, "pr-1"); !strings.HasPrefix(raw, "enc:v2:"+registry.KeyID(parsed)+":") {
+		t.Fatalf("row not re-encrypted under the explicit key: %q", raw)
 	}
 }

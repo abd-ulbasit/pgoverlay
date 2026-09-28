@@ -63,7 +63,8 @@ func openRegistry() (*registry.Registry, error) {
 // at-rest keys branchd uses, so local mode can read passwords a branchd on this
 // state dir stored: the dedicated key ($PGOVERLAY_SECRET_KEY, else
 // $PGOVERLAY_SECRET_KEY_FILE, else <state dir>/secret.key; never generated
-// here) plus sha256($PGOVERLAY_TOKEN) for legacy rows. A key that cannot be
+// here), the retired keys branchd accepts, and sha256($PGOVERLAY_TOKEN) for
+// legacy rows. A key that cannot be
 // loaded is a warning, not an error: only rotated passwords need it, and they
 // then read as unavailable.
 func openRegistryAt(cfg *config.Config) (*registry.Registry, error) {
@@ -79,9 +80,15 @@ func openRegistryAt(cfg *config.Config) (*registry.Registry, error) {
 		fmt.Fprintf(os.Stderr, "warning: %v (rotated branch passwords will read as unavailable)\n", err)
 		key = nil
 	}
+	previous, err := cfg.PreviousSecretKeys(key)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		previous = nil
+	}
 	if err := reg.SetSecretKeys(registry.SecretKeys{
-		Primary: key,
-		Legacy:  [][]byte{registry.LegacyTokenKey(os.Getenv("PGOVERLAY_TOKEN"))},
+		Primary:  key,
+		Previous: previous,
+		Legacy:   [][]byte{registry.LegacyTokenKey(os.Getenv("PGOVERLAY_TOKEN"))},
 	}); err != nil {
 		reg.Close()
 		return nil, err

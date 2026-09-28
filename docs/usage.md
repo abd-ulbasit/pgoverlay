@@ -32,13 +32,16 @@ A note that informs several patterns below — **credential modes**:
   branchd generates (mode 0600) on first start. **Rotating `PGOVERLAY_TOKEN`
   does not touch stored passwords**: restart branchd with the new token and
   every branch keeps working. Keep the key with the registry (back them up
-  together). If the key is lost or replaced, branches whose passwords it
-  encrypted keep working for list, routing, reset and destroy but report
-  `password_unavailable: true` with no `password`; reset them to mint a new
-  password. Registries from before the dedicated key (encrypted under
-  `sha256(PGOVERLAY_TOKEN)`) are re-encrypted automatically on the first
-  start with the same token. Local-mode `pgb` reads the same key from the
-  state dir (or the same variables).
+  together). To rotate the at-rest key itself, set the new key and put the
+  old one in `PGOVERLAY_SECRET_KEY_PREVIOUS` for one start (a generated
+  `secret.key` left in the state dir is picked up automatically); branchd
+  re-encrypts every password under the new key. If the key is lost,
+  branches whose passwords it encrypted keep working for list, routing,
+  reset and destroy but report `password_unavailable: true` with no
+  `password`; reset them to mint a new password. Registries from before the
+  dedicated key (encrypted under `sha256(PGOVERLAY_TOKEN)`) are re-encrypted
+  automatically on the first start with the same token. Local-mode `pgb`
+  reads the same keys from the state dir (or the same variables).
 
 **Rotation *and* static config — the connect helper.** With rotation on, an
 app can't hold a fixed `PGPASSWORD`. The `pgoverlayconnect` helper resolves
