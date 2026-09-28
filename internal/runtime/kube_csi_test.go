@@ -181,8 +181,20 @@ func TestBuildBranchPodCSI(t *testing.T) {
 		t.Errorf("AutomountServiceAccountToken = %v, want false", pod.Spec.AutomountServiceAccountToken)
 	}
 	c := pod.Spec.Containers[0]
-	if c.SecurityContext != nil {
-		t.Errorf("SecurityContext = %+v, want none (no SYS_ADMIN in csi mode)", c.SecurityContext)
+	// no added capabilities, and an explicit RuntimeDefault profile: an unset
+	// one is Unconfined on any kubelet without seccompDefault
+	sc := c.SecurityContext
+	if sc == nil {
+		t.Fatal("SecurityContext = nil, want RuntimeDefault seccomp + allowPrivilegeEscalation=false")
+	}
+	if sc.Capabilities != nil || (sc.Privileged != nil && *sc.Privileged) {
+		t.Errorf("SecurityContext = %+v, want no capabilities or privilege in csi mode", sc)
+	}
+	if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("seccomp = %+v, want RuntimeDefault", sc.SeccompProfile)
+	}
+	if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Errorf("AllowPrivilegeEscalation = %v, want false", sc.AllowPrivilegeEscalation)
 	}
 	if len(pod.Spec.Volumes) != 1 {
 		t.Fatalf("volumes = %d", len(pod.Spec.Volumes))
@@ -202,7 +214,7 @@ func TestBuildBranchPodCSI(t *testing.T) {
 // Helper pods in csi mode are unpinned and mount PVCs (read-only respected).
 func TestBuildHelperPodCSI(t *testing.T) {
 	s, _, _ := testCSIStorage("")
-	pod := buildHelperPod("pgb", s, HelperSpec{
+	pod := buildHelperPod(helperObjectMeta("pgb", "pgoverlay-helper-x", "", nil), s, HelperSpec{
 		Image: "postgres:17",
 		Cmd:   []string{"pg_basebackup"},
 		User:  "postgres",
@@ -233,6 +245,7 @@ func TestBuildHelperPodCSI(t *testing.T) {
 	if sc := pod.Spec.Containers[0].SecurityContext; sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 999 {
 		t.Errorf("SecurityContext = %+v, want RunAsUser 999", pod.Spec.Containers[0].SecurityContext)
 	}
+	assertHardenedHelper(t, pod.Spec.Containers[0].SecurityContext)
 }
 
 // The hostPath strategy must keep pinning and SYS_ADMIN (zero regression).
@@ -254,8 +267,12 @@ func TestStrategySelection(t *testing.T) {
 		t.Errorf("hostPath branch AppArmor = %+v, want Unconfined", sc.AppArmorProfile)
 	}
 	csi, _, _ := testCSIStorage("")
-	if csi.nodeName() != "" || csi.branchSecurityContext() != nil {
-		t.Errorf("csi strategy must not pin nodes or add capabilities")
+	if csi.nodeName() != "" {
+		t.Errorf("csi strategy must not pin nodes")
+	}
+	if sc := csi.branchSecurityContext(); sc == nil || sc.Capabilities != nil ||
+		sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("csi branch security = %+v, want RuntimeDefault seccomp and no capabilities", sc)
 	}
 }
 
