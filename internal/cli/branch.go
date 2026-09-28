@@ -2,7 +2,9 @@ package cli
 
 import (
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"text/tabwriter"
 	"time"
 
@@ -253,15 +255,37 @@ func newHistoryCmd() *cobra.Command {
 	}
 }
 
+// defaultProxyPort is branchd's default --pg-addr port, assumed for servers
+// that do not advertise their router address.
+const defaultProxyPort = 6432
+
 func newConnectCmd() *cobra.Command {
-	return &cobra.Command{
+	var proxyHost string
+	var proxyPort int
+	cmd := &cobra.Command{
 		Use:   "connect NAME",
 		Short: "Print connection strings for a branch",
-		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
+		Long: `Print connection strings for a ready branch.
+
+In server mode it prints two URLs: the branch's own Postgres (direct) and
+branchd's wire-protocol router (database "db@branch"). The router address is
+taken from --proxy-host/--proxy-port when given, else from what branchd
+advertises (--advertise-proxy-addr), else the --server host and port 6432.
+A branch that is not ready (creating, resetting, failed) is refused.`,
+		Args: nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if proxyPort != 0 {
+				if err := validPort("proxy-port", proxyPort); err != nil {
+					return err
+				}
+			}
+			name := args[0]
 			if c := serverClient(cmd); c != nil {
-				b, err := c.GetBranch(cmd.Context(), args[0])
+				b, err := c.GetBranch(cmd.Context(), name)
 				if err != nil {
+					return err
+				}
+				if err := requireReady(name, b.State); err != nil {
 					return err
 				}
 				u, err := url.Parse(c.BaseURL)
@@ -275,37 +299,83 @@ func newConnectCmd() *cobra.Command {
 				if directHost == "" {
 					directHost = serverHost
 				}
+				// the router: explicit flags, else what branchd advertises,
+				// else the API host on the default port (older servers)
+				pxHost := firstNonEmpty(proxyHost, b.ProxyHost, serverHost)
+				pxPort := proxyPort
+				if pxPort == 0 {
+					pxPort = b.ProxyPort
+				}
+				if pxPort == 0 {
+					pxPort = defaultProxyPort
+				}
 				// rotate mode: the server returns a per-branch password —
 				// include it so the DSNs are copy-pasteable
-				auth := userInfo(b.User, b.Password)
-				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", auth, directHost, b.Port, b.Database)
-				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:6432/%s\n", auth, serverHost, b.ProxyDatabase)
+				fmt.Fprintln(cmd.OutOrStdout(), postgresURL(b.User, b.Password, directHost, b.Port, b.Database))
+				fmt.Fprintln(cmd.OutOrStdout(), postgresURL(b.User, b.Password, pxHost, pxPort, b.ProxyDatabase))
 				return nil
 			}
-			_, reg, err := open()
+			// metadata only: no container runtime needed
+			reg, err := openRegistry()
 			if err != nil {
 				return err
 			}
 			defer reg.Close()
-			b, err := reg.GetBranchByName(args[0])
+			b, err := reg.GetBranchByName(name)
 			if err != nil {
+				return err
+			}
+			if err := requireReady(name, string(b.State)); err != nil {
 				return err
 			}
 			s, err := reg.GetSourceByID(b.SourceID)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:%d/%s\n", userInfo(s.ConnUser, b.Password), b.Host, b.Port, s.ConnDB)
+			fmt.Fprintln(cmd.OutOrStdout(), postgresURL(s.ConnUser, b.Password, b.Host, b.Port, s.ConnDB))
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&proxyHost, "proxy-host", "", "host of branchd's Postgres router for the proxy URL (default: what branchd advertises, else the --server host)")
+	cmd.Flags().IntVar(&proxyPort, "proxy-port", 0, "port of branchd's Postgres router for the proxy URL (default: what branchd advertises, else 6432)")
+	return cmd
 }
 
-// userInfo renders the DSN userinfo part: user, or user:password when the
-// branch carries its own rotated password.
-func userInfo(user, password string) string {
-	if password == "" {
-		return user
+// requireReady refuses to print a DSN for a branch that is not ready: before
+// its container runs a row has no host/port (a failed create prints port 0),
+// and a creating or resetting branch does not accept connections yet.
+func requireReady(name, state string) error {
+	if state == string(registry.BranchReady) {
+		return nil
 	}
-	return user + ":" + url.QueryEscape(password)
+	hint := ""
+	switch registry.BranchState(state) {
+	case registry.BranchCreating, registry.BranchResetting:
+		hint = "; wait until `pgb branch ls` shows it ready"
+	case registry.BranchFailed:
+		hint = fmt.Sprintf("; see `pgb history %s` for the cause, then reset or destroy it", name)
+	}
+	return fmt.Errorf("branch %q is %s, not ready%s", name, state, hint)
+}
+
+// postgresURL renders a libpq connection URI. User, password and database are
+// percent-encoded (RFC 3986: a space is %20, never '+'), so an Azure-style
+// "app@server" login or a database named "my db" survive; an IPv6 host is
+// bracketed. The router's "db@branch" database keeps its '@', which is legal
+// in a URI path.
+func postgresURL(user, password, host string, port int, db string) string {
+	ui := url.User(user)
+	if password != "" {
+		ui = url.UserPassword(user, password)
+	}
+	return "postgres://" + ui.String() + "@" + net.JoinHostPort(host, strconv.Itoa(port)) + "/" + url.PathEscape(db)
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
