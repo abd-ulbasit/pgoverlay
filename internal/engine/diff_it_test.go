@@ -295,8 +295,9 @@ func TestDiffBranchSchemasAndUnanalyzedEndToEnd(t *testing.T) {
 	mustExec(t, ctx, branchConn(b), `INSERT INTO app.orders SELECT i, 'new' || i FROM generate_series(101,103) i;
 		DELETE FROM app.orders WHERE id = 7;
 		ANALYZE app.orders;
-		CREATE TABLE audit_log(id bigint primary key, entry text) WITH (autovacuum_enabled = false);
+		CREATE TABLE audit_log(id bigint primary key, entry text);
 		INSERT INTO audit_log SELECT i, 'e' || i FROM generate_series(1,40) i;
+		ANALYZE audit_log;
 		INSERT INTO unanalyzed SELECT generate_series(301,310)`)
 
 	res, err := e.DiffBranch(ctx, "diffs-pr-1", WithDataSample(5))
