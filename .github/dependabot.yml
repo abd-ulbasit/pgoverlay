@@ -20,7 +20,9 @@ updates:
   # Workflow actions, batched the same way. The workflows pin every action to
   # a commit SHA with the version in a trailing comment; Dependabot bumps both.
   # Tool versions passed as inputs (helm, goreleaser) and the kind/kubectl
-  # checksums in ci.yml are not visible to it and are bumped by hand.
+  # checksums in ci.yml are not visible to it and are bumped by hand. A
+  # goreleaser bump goes in the Makefile and release.yml together, and only to
+  # a version whose go.mod needs no newer Go than ours (make check-toolchain).
   - package-ecosystem: github-actions
     directory: /
     schedule:

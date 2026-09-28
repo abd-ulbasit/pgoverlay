@@ -44,7 +44,10 @@ jobs:
       - run: go vet ./...
       # The golang base image pins GOTOOLCHAIN=local, so a Dockerfile trailing
       # go.mod's `go` directive fails at `RUN go mod download` — which is how
-      # `make docker-build` and the helm ITs silently broke once already.
+      # `make docker-build` and the helm ITs silently broke once already. It
+      # also keeps the goreleaser pin buildable with go.mod's Go (make
+      # release-check runs it with go run) and equal in the Makefile and
+      # release.yml.
       - run: make check-toolchain
       - name: gofmt
         run: |
