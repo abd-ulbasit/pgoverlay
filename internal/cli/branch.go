@@ -64,7 +64,8 @@ func newBranchCreateCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&from, "from", "", "source to branch from")
 	cmd.Flags().StringVar(&fromBranch, "from-branch", "", "existing branch to branch from (branch-from-branch)")
-	cmd.Flags().DurationVar(&ttl, "ttl", 0, "auto-destroy after this duration (e.g. 24h); 0 = never")
+	cmd.Flags().DurationVar(&ttl, "ttl", 0, "expire the branch after this duration (e.g. 24h; 0 = never). "+
+		"Expired branches are destroyed by branchd's reconcile loop or by `pgb gc`; local mode does not reap them on its own")
 	return cmd
 }
 
@@ -113,11 +114,24 @@ func newBranchLsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			expired := 0
+			now := time.Now()
 			for _, b := range branches {
 				row(b.Name, b.ParentBranchName, string(b.State), b.Port, b.ExpiresAt, b.CreatedAt,
 					func() (int64, error) { return e.BranchUsage(cmd.Context(), b.Name) })
+				if t, err := time.Parse(time.RFC3339, b.ExpiresAt); err == nil && t.Before(now) {
+					expired++
+				}
 			}
-			return w.Flush()
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			// Without branchd nothing reaps expired branches; say so rather
+			// than let an EXPIRES in the past look like a bug.
+			if expired > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: %d branch(es) are past their TTL; local mode does not reap them, run `pgb gc` to destroy them\n", expired)
+			}
+			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&withUsage, "usage", false, "measure each branch's rw-layer disk usage (runs one helper container per branch)")
