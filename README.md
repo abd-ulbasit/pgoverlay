@@ -12,7 +12,7 @@ Each branch is its own Postgres container whose data directory is an **OverlayFS
 
 ## Install
 
-- **Release binaries**: `pgb` (CLI), `branchd` (daemon) and `pgoverlay-github` (webhook service) for Linux and macOS, amd64 and arm64, on the [releases page](https://github.com/abd-ulbasit/pgoverlay/releases), with `checksums.txt` and build provenance ([verifying a download](SECURITY.md#release-integrity)).
+- **Release binaries** (from v1.0.0): `pgb` (CLI), `branchd` (daemon) and `pgoverlay-github` (webhook service) for Linux and macOS, amd64 and arm64, on the [releases page](https://github.com/abd-ulbasit/pgoverlay/releases), with `checksums.txt` and build provenance ([verifying a download](SECURITY.md#release-integrity)).
 - **With Go** (1.26.6 or newer; available once v1.0.0 is tagged):
 
   ```bash

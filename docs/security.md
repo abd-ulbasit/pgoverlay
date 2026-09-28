@@ -9,8 +9,9 @@ the end.
 pgoverlay is a development and test tool. Its security goal is that a
 deployment done by the checklist below does not widen access to the data it
 copies: only the people and systems you give a token or a branch password can
-reach a branch, and a branch cannot reach or change its source. It is not
-built to contain hostile code running inside a branch.
+reach a branch, and nothing done in a branch changes the source (branches run
+on a read-only copy and never connect to it). It is not built to contain
+hostile code running inside a branch.
 
 ## What there is to protect
 
@@ -114,8 +115,11 @@ own Postgres.
     and no AppArmor profile, which makes escaping to the host much easier.
     Treat superuser on a branch as close to root on the Docker host or storage
     node, and do not run untrusted code in branches.
-- Branches never connect to the source. On Kubernetes with
-  `networkPolicy.enabled`, branch pods may only reach cluster DNS.
+- pgoverlay never connects a branch to the source, but the network may allow
+  it. On Docker, branch containers join the source's `--network` (or the
+  default bridge), so code running in a branch can open connections to
+  anything those containers can reach, the source included. On Kubernetes
+  with `networkPolicy.enabled`, branch pods may only reach cluster DNS.
 - Masking scripts run inside each new or reset branch before it is marked
   ready, so a masked source never serves unmasked data. They run on the branch,
   not the source: the seed volume itself holds unmasked data.
@@ -125,10 +129,10 @@ own Postgres.
 One-shot helpers seed sources, install entrypoints, measure disk usage and,
 in Kubernetes hostpath mode, create and remove volume directories.
 
-- On Kubernetes hostpath the file helpers run as root with the whole data root
-  mounted; other helpers run with `RuntimeDefault` seccomp and
-  `allowPrivilegeEscalation: false`. The zfs backend's helpers are privileged
-  and see `/dev/zfs`.
+- On Kubernetes every helper runs with `RuntimeDefault` seccomp and
+  `allowPrivilegeEscalation: false`, except the zfs backend's, which are
+  privileged and see `/dev/zfs`. In hostpath mode the file helpers run as
+  root with the whole data root mounted.
 - The **source password** reaches a seed helper through its environment. On
   Docker, anyone who can run `docker inspect` on the host can read it while the
   helper exists. On Kubernetes it lives in a short-lived Secret, created just
