@@ -297,14 +297,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	}
 
 	// 4. branch container on the clone mountpoint
-	cid, err := e.drv.StartBranch(ctx, runtime.BranchSpec{
-		Name:       "pgoverlay-br-" + b.Name,
-		Image:      e.image(src.PGVersion),
-		Env:        []string{"PGDATA=" + cow.DirectDataPath},
-		Mounts:     []runtime.Mount{cloneMount},
-		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
-		Labels:     e.branchLabels(b),
-	})
+	cid, err := e.startZFSBranch(ctx, b, e.image(src.PGVersion))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -317,6 +310,19 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 		return fail(err)
 	}
 	return nil
+}
+
+// startZFSBranch starts a zfs branch's container straight on its clone's
+// mountpoint, where provisionZFS installed the direct entrypoint.
+func (e *Engine) startZFSBranch(ctx context.Context, b *registry.Branch, image string) (string, error) {
+	return e.drv.StartBranch(ctx, runtime.BranchSpec{
+		Name:       "pgoverlay-br-" + b.Name,
+		Image:      image,
+		Env:        []string{"PGDATA=" + cow.DirectDataPath},
+		Mounts:     []runtime.Mount{{Kind: runtime.MountHostPath, Volume: e.planner.Mountpoint(b.RWVolume), Target: cow.RWPath}},
+		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
+		Labels:     e.branchLabels(b),
+	})
 }
 
 func (e *Engine) branchLabels(b *registry.Branch) map[string]string {
@@ -432,9 +438,12 @@ func (e *Engine) inspectAddr(ctx context.Context, cid string) (runtime.Container
 	}
 }
 
-// ResetBranch throws away a ready branch's writes and reprovisions it from
-// its recorded source volume on the same registry row (ready -> resetting ->
-// ready; new container id and host port).
+// ResetBranch throws away a branch's writes and reprovisions it from its
+// recorded base (source volume plus frozen layer chain) on the same registry
+// row (ready|failed -> resetting -> ready; new container id and host port).
+// Resetting a failed branch is how a failed create is retried, and how a
+// branch whose data is gone is brought back; RecoverBranch instead restarts a
+// failed branch on the data it still has.
 func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Branch, err error) {
 	defer e.observeOp("reset", &err)()
 	b, err := e.reg.GetBranchByName(name)
@@ -445,7 +454,14 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 	if err != nil {
 		return nil, err
 	}
-	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchResetting, "reset requested"); err != nil {
+	if err := e.checkChildrenAllowReprovision(b); err != nil {
+		return nil, err
+	}
+	reason := "reset requested"
+	if b.State == registry.BranchFailed {
+		reason = "reset requested (from failed)"
+	}
+	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchResetting, reason); err != nil {
 		return nil, err
 	}
 	fail := func(stepErr error) (*registry.Branch, error) {
@@ -465,6 +481,33 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 		return fail(fmt.Errorf("reset %q: %w", name, err))
 	}
 	return e.reg.GetBranchByName(name)
+}
+
+// checkChildrenAllowReprovision refuses to stop and rebuild b while branches
+// created from it still depend on its live volumes. It runs before any state
+// change, so a refusal leaves b exactly as it was.
+//
+//   - zfs children are clones of snapshots of b's dataset: `zfs destroy -r`
+//     of the parent fails once the container is gone, which used to leave a
+//     healthy parent failed. DestroyBranch refuses the same way.
+//   - a child still being created may be mid-freeze or mid-clone on b's
+//     volume.
+func (e *Engine) checkChildrenAllowReprovision(b *registry.Branch) error {
+	if e.zfs() {
+		if n, err := e.reg.CountLiveBranchesByVolume(b.RWVolume); err != nil {
+			return err
+		} else if n > 0 {
+			return fmt.Errorf("branch %q has %d child branch(es) cloned from it; destroy them first", b.Name, n)
+		}
+	}
+	kids, err := e.reg.InFlightChildren(b.Name)
+	if err != nil {
+		return err
+	}
+	if len(kids) > 0 {
+		return fmt.Errorf("branch %q has an in-flight child branch %q being created from it; wait for it to finish or destroy it first", b.Name, kids[0])
+	}
+	return nil
 }
 
 // applyMasking runs the source's masking scripts (registry order) inside the

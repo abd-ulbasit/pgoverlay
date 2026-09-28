@@ -537,18 +537,25 @@ func TestResetBranchFailsToFailedAndUnwinds(t *testing.T) {
 	}
 }
 
-func TestResetBranchRequiresReady(t *testing.T) {
+// Resetting a failed branch re-provisions it from its base (failed ->
+// resetting); if provisioning fails again it is failed again, and once the
+// cause is gone a reset brings it back to ready.
+func TestResetBranchFromFailedReprovisions(t *testing.T) {
 	d := newFake()
 	d.failStart = true
 	e, r := testEngine(t, d)
 	readySource(t, r)
 	e.CreateBranch(context.Background(), "pr-1", "main", 0) // fails -> failed state
 	if _, err := e.ResetBranch(context.Background(), "pr-1"); err == nil {
-		t.Fatal("want error resetting a failed branch")
+		t.Fatal("want error: provisioning still fails")
 	}
 	b, _ := r.GetBranchByName("pr-1")
 	if b.State != registry.BranchFailed {
 		t.Fatalf("state=%q", b.State)
+	}
+	d.failStart = false
+	if b, err := e.ResetBranch(context.Background(), "pr-1"); err != nil || b.State != registry.BranchReady {
+		t.Fatalf("reset from failed: %+v err=%v", b, err)
 	}
 }
 
