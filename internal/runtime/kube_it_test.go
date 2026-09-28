@@ -143,9 +143,13 @@ func TestKubeHelperEnvThroughSecret(t *testing.T) {
 		close(seen)
 	}()
 
+	// The command compares against the password split into two adjacent
+	// shell words ("it-helpe""r-s3cret"), so the Pod's own command line never
+	// contains the literal value the scan below looks for; only Env could.
+	half := len(pw) / 2
 	out, err := drv.RunHelper(ctx, rt.HelperSpec{
 		Image: "alpine:3.21",
-		Cmd:   []string{"sh", "-c", `test "$PGPASSWORD" = "` + pw + `" && echo env-ok`},
+		Cmd:   []string{"sh", "-c", `test "$PGPASSWORD" = "` + pw[:half] + `""` + pw[half:] + `" && echo env-ok`},
 		Env:   []string{"PGPASSWORD=" + pw},
 	})
 	if err != nil {
