@@ -217,7 +217,7 @@ done
 
 # -------------------------------------------------------- markdown emit  ----
 log "raw results: $RESULTS_JSON"
-awk '
+awk -v runs="$RUNS" '
 function gib(b) { return sprintf("%.2f GiB", b / 1073741824) }
 function mib(b) { return sprintf("%.1f MiB", b / 1048576) }
 function field(line, key,    re, v) {
@@ -228,7 +228,7 @@ function field(line, key,    re, v) {
     return v
 }
 BEGIN {
-    print "| Database size | pgbench scale | Seed time | Branch create (p50 of 5) | Branch rw overhead | rw after 1% update |"
+    print "| Database size | pgbench scale | Seed time | Branch create (p50 of " runs ") | Branch rw overhead | rw after 1% update |"
     print "|---|---|---|---|---|---|"
 }
 {
