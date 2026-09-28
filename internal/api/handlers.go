@@ -30,20 +30,24 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 // writeEngineError maps engine/registry failures to HTTP statuses: invalid
-// input -> 400, missing rows -> 404, quota exceeded -> 403, a mutation
-// interrupted by lost leadership or shutdown -> 503 (stuck timeout -> 504), a
-// failing seed or masking script -> 422, name/lifecycle conflicts -> 409,
-// everything else -> 500.
+// input -> 400, missing rows -> 404, quota exceeded -> 403, a failed destroy
+// teardown -> 409 (a resource still in use), 502 (the runtime unreachable) or
+// 500, a mutation interrupted by lost leadership or shutdown -> 503 (stuck
+// timeout -> 504), a failing seed or masking script -> 422, name/lifecycle
+// conflicts -> 409, everything else -> 500.
 //
 // The mapped 4xx cases return their (intentional, already-clean) messages;
 // seed/masking failures return the tool's output (never a password: it only
-// travels in the helper's environment), clipped. A duplicate name returns a
-// plain sentence instead of the raw SQLite constraint text. The default 500
-// case does NOT return the message: err.Error() can carry SQLite/driver/
-// volume/path internals, so the real error is logged server-side and the
-// client sees a generic body. r may be nil (logs without method/path then).
+// travels in the helper's environment), clipped. A failed destroy returns the
+// cause it journaled, the same text `pgb history` shows any viewer. A
+// duplicate name returns a plain sentence instead of the raw SQLite
+// constraint text. The default 500 case does NOT return the message:
+// err.Error() can carry SQLite/driver/volume/path internals, so the real
+// error is logged server-side and the client sees a generic body. r may be
+// nil (logs without method/path then).
 func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	msg := err.Error()
+	var destroyErr *engine.DestroyError
 	switch {
 	case errors.Is(err, engine.ErrInvalidName),
 		errors.Is(err, registry.ErrUnsupportedPGVersion),
@@ -58,6 +62,21 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusConflict, msg)
 	case errors.Is(err, engine.ErrQuotaExceeded):
 		writeError(w, http.StatusForbidden, msg)
+	case errors.As(err, &destroyErr):
+		// The teardown failed and the branch stays in destroying with the
+		// cause journaled. Checked before the interruption case: the teardown
+		// runs detached from the request, so its failure is its own even when
+		// the request's deadline passed meanwhile.
+		code := http.StatusInternalServerError
+		switch {
+		case destroyErr.InUse:
+			code = http.StatusConflict // free the resource, then destroy again
+		case destroyErr.RuntimeUnavailable:
+			code = http.StatusBadGateway // the runtime behind branchd is down
+		}
+		slog.Warn("api: destroy failed", "branch", destroyErr.Branch, "error", err)
+		writeError(w, code, clipMessage(fmt.Sprintf("destroy of branch %q failed; it stays in destroying, destroy it again to retry: %s",
+			destroyErr.Branch, destroyErr.Reason)))
 	case r != nil && r.Context().Err() != nil && interruptedStatus(r.Context()) != 0:
 		// The mutation's context was ended from outside the saga (leadership
 		// lost, shutdown, stuck timeout): the failure is that interruption, and

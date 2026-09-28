@@ -2,10 +2,12 @@ package api
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"unicode/utf8"
 
@@ -56,6 +58,54 @@ func TestMaskingFailureIs422WithCause(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("422 body missing %s: %s", want, body)
 		}
+	}
+}
+
+// A destroy whose teardown fails answers with the cause it journaled (the
+// text `pgb history` shows) and a status saying what to do, not a bare 500
+// (issue #10): 409 while something still uses the branch's volume, 502 when
+// the container runtime cannot be reached, 500 with the cause otherwise.
+// The branch stays in destroying, and a later destroy finishes it.
+func TestDestroyFailureReturnsTheCause(t *testing.T) {
+	ts, d := newTestServer(t)
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create: %d %s", code, body)
+	}
+	for _, tc := range []struct {
+		name  string
+		err   error
+		code  int
+		cause string
+	}{
+		{"volume in use", errors.New("Error response from daemon: remove pgoverlay-br-pr-1-rw: volume is in use - [766ac31a4b2c]"),
+			http.StatusConflict, "volume is in use - [766ac31a4b2c]"},
+		{"runtime unreachable", &net.OpError{Op: "dial", Net: "unix", Err: syscall.ECONNREFUSED},
+			http.StatusBadGateway, "connection refused"},
+		{"other failure", errors.New("driver failed"), http.StatusInternalServerError, "driver failed"},
+	} {
+		d.rmVolErr = tc.err
+		code, body := do(t, ts, testToken, "DELETE", "/v1/branches/pr-1", nil)
+		if code != tc.code {
+			t.Errorf("%s: destroy = %d %s, want %d", tc.name, code, body, tc.code)
+		}
+		for _, want := range []string{`destroy of branch \"pr-1\" failed`, "destroy it again to retry", "remove branch layer: ", tc.cause} {
+			if !strings.Contains(string(body), want) {
+				t.Errorf("%s: body %s does not contain %q", tc.name, body, want)
+			}
+		}
+		// the same cause is in the history
+		_, hist := do(t, ts, testToken, "GET", "/v1/branches/pr-1/history", nil)
+		if !strings.Contains(string(hist), tc.cause) {
+			t.Errorf("%s: history %s does not carry the cause", tc.name, hist)
+		}
+		if _, got := do(t, ts, testToken, "GET", "/v1/branches/pr-1", nil); !strings.Contains(string(got), `"state":"destroying"`) {
+			t.Errorf("%s: branch after the failed destroy = %s, want destroying", tc.name, got)
+		}
+	}
+	d.rmVolErr = nil
+	if code, body := do(t, ts, testToken, "DELETE", "/v1/branches/pr-1", nil); code != http.StatusNoContent {
+		t.Fatalf("destroy after the cause is gone = %d %s, want 204", code, body)
 	}
 }
 

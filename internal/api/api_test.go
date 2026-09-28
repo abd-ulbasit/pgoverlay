@@ -32,6 +32,7 @@ type fakeDriver struct {
 	execOutErr error      // returned by every ExecOutput call when set
 	seedErr    error      // returned by the pg_basebackup helper when set
 	execErr    error      // returned by every in-branch psql Exec when set
+	rmVolErr   error      // returned by every RemoveVolume when set
 
 	// startBlock, when set, parks every StartBranch until it is closed or the
 	// saga's context is cancelled; startEntered receives once per parked call
@@ -50,6 +51,9 @@ func (f *fakeDriver) CreateVolume(ctx context.Context, name string, l map[string
 	return nil
 }
 func (f *fakeDriver) RemoveVolume(ctx context.Context, name string) error {
+	if f.rmVolErr != nil {
+		return f.rmVolErr
+	}
 	delete(f.volumes, name)
 	return nil
 }

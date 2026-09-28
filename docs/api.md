@@ -177,16 +177,27 @@ Every non-2xx response has the body `{"error": "<message>"}`.
 | `401` | no token, or an unknown one |
 | `403` | the token's role is below the route's minimum; `--max-branches` reached; the parent's overlay layer chain is at `--max-layer-depth` |
 | `404` | unknown source, branch or token; the message names it |
-| `409` | the name is taken (the message names the holder's state), the branch is in the wrong state for the operation, a source still has live branches, a zfs parent has live clones, a csi child's parent is gone, or there is nothing to recover |
+| `409` | the name is taken (the message names the holder's state), the branch is in the wrong state for the operation, a source still has live branches, a zfs parent has live clones, a csi child's parent is gone, there is nothing to recover, or a destroy could not remove something that is still in use (see below) |
 | `413` | request body over 1 MiB |
 | `422` | the seed or a masking script failed; the message carries the tool's output (clipped to 2 KiB; the full text is in branchd's log, never the password) |
-| `500` | an internal error; the body says only `internal server error` and the detail is logged |
+| `500` | an internal error; the body says only `internal server error` and the detail is logged. A failed destroy is the exception (see below) |
+| `502` | a destroy could not reach the container runtime (the Docker daemon or the Kubernetes API server) |
 | `503` | `not leader`, `shutting down`, or the leader lost its Lease mid-operation. The operation was rolled back; retry, ideally against the Service that routes to the leader |
 | `504` | a branch operation ran past `--stuck-timeout` and was rolled back |
 
+**A failed destroy** (`DELETE /v1/branches/{name}`) answers with the cause of
+the failure, the same text `GET /v1/branches/{name}/history` records:
+`409` when the runtime refused to remove something another user still holds
+(a volume another container mounts), `502` when the runtime could not be
+reached or did not answer in time, and `500` otherwise. The branch stays in
+`destroying`; destroy it again once the cause is gone, or let reconcile retry
+it after `--stuck-timeout`.
+
 The Go client (`internal/apiclient`, used by `pgb`) retries `503` for every
-method, `502`, `504` and connection resets for idempotent methods, and dial
-failures, with jittered backoff over about eight seconds.
+method, dial failures, connection resets for idempotent methods, and `502`
+and `504` for idempotent methods when a proxy in front of branchd sent them;
+branchd's own `502` and `504` are final. Retries use jittered backoff over
+about eight seconds.
 
 ## Stability promise
 

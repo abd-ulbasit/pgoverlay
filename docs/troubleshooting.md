@@ -27,7 +27,7 @@ stateDiagram-v2
 |---|---|---|
 | `creating`, `resetting` | an operation is running. `resetting` also covers a branch-from-branch freeze or clone of this branch | wait. If the process running it died, reconcile fails the row once it has made no progress for `--stuck-timeout` (default 10m); live operations heartbeat, so a slow one is never failed |
 | `failed` | a create, reset, recover or restart did not finish | read `pgb history NAME`. `pgb branch recover NAME` restarts it on its existing data and keeps its writes (for a branch that failed with its volumes intact, such as a parent interrupted mid-freeze or a branch whose container could not be restarted). `pgb branch reset NAME` discards its writes and re-clones it; for a failed create this is a retry. Or destroy it |
-| `destroying` | a destroy started and did not finish | run `pgb branch destroy NAME` again; it retries the teardown. Reconcile also retries it after `--stuck-timeout`. Each failed attempt is a `destroying -> destroying` entry in the history |
+| `destroying` | a destroy started and did not finish | the destroy's error and each `destroying -> destroying` entry in the history say why (through the API: `409` while something still uses the branch's volume, `502` when the runtime is unreachable). Remove the cause, then run `pgb branch destroy NAME` again; it retries the teardown. Reconcile also retries it after `--stuck-timeout` |
 
 Reset and recover are refused while another branch is still being created
 from this one. The failure reason stored in the registry is capped at 1 KiB

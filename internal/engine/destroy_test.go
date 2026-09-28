@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -104,6 +106,50 @@ func TestDestroyRetriesFromDestroying(t *testing.T) {
 			// the name and the quota slot are free again
 			if _, err := e.CreateBranch(ctx, "pr-1", "main", 0); err != nil {
 				t.Fatalf("recreate after retried destroy: %v", err)
+			}
+		})
+	}
+}
+
+// A failed teardown is a *DestroyError carrying the journaled reason and a
+// classification of the cause, so the API can answer 409 or 502 instead of a
+// bare 500 (issue #10).
+func TestDestroyFailureIsClassified(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		arm                func(*flakyDriver)
+		inUse, unavailable bool
+	}{
+		{"volume in use", func(f *flakyDriver) {
+			f.rmVolErrs = []error{errors.New("Error response from daemon: remove pgoverlay-br-pr-1-rw: volume is in use - [766ac31a4b2c]")}
+		}, true, false},
+		{"runtime unreachable", func(f *flakyDriver) {
+			f.stopErrs = []error{&net.OpError{Op: "dial", Net: "unix", Err: syscall.ECONNREFUSED}}
+		}, false, true},
+		{"other", func(f *flakyDriver) { f.rmVolErrs = []error{errors.New("driver failed")} }, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &flakyDriver{fakeDriver: newFake()}
+			e, r := testEngine(t, d)
+			readySource(t, r)
+			ctx := context.Background()
+			if _, err := e.CreateBranch(ctx, "pr-1", "main", 0); err != nil {
+				t.Fatal(err)
+			}
+			tc.arm(d)
+			err := e.DestroyBranch(ctx, "pr-1")
+			var de *DestroyError
+			if !errors.As(err, &de) {
+				t.Fatalf("DestroyBranch = %v (%T), want a *DestroyError", err, err)
+			}
+			if de.Branch != "pr-1" || de.InUse != tc.inUse || de.RuntimeUnavailable != tc.unavailable {
+				t.Fatalf("DestroyError = %+v, want in use %v, unavailable %v", de, tc.inUse, tc.unavailable)
+			}
+			if last := lastTransition(t, r, "pr-1"); last.Reason != "destroy failed, destroy again to retry: "+de.Reason {
+				t.Fatalf("journaled %q, error reason %q: they must be the same cause", last.Reason, de.Reason)
+			}
+			if de.Error() != de.Err.Error() || !errors.Is(err, de.Err) {
+				t.Fatalf("DestroyError must read and unwrap as the teardown error: %q vs %q", de.Error(), de.Err)
 			}
 		})
 	}
