@@ -240,11 +240,17 @@ func (e *Engine) expiresAtFor(ttl time.Duration) string {
 	return time.Now().Add(ttl).UTC().Format(time.RFC3339)
 }
 
-func (e *Engine) image(pgVersion string) string {
-	if pgVersion == "" {
+// image is the container image for a source's seed helpers and branches: the
+// source's own image when it set one (extensions, locales, a matching libc),
+// else postgres:<pg_version>, else the engine default.
+func (e *Engine) image(src *registry.Source) string {
+	switch {
+	case src.Image != "":
+		return src.Image
+	case src.PGVersion == "":
 		return e.defaultImage
 	}
-	return "postgres:" + pgVersion
+	return "postgres:" + src.PGVersion
 }
 
 // seedSource runs the source's seeding method (pg_basebackup or pg_dump,
@@ -253,7 +259,7 @@ func (e *Engine) image(pgVersion string) string {
 func (e *Engine) seedSource(ctx context.Context, s *registry.Source, layer, password string) error {
 	seedVol, seedKind := e.seedTarget(layer)
 	spec := pgctl.SeedSpec{
-		Image: e.image(s.PGVersion), Volume: seedVol, MountKind: seedKind, Network: s.Network,
+		Image: e.image(s), Volume: seedVol, MountKind: seedKind, Network: s.Network,
 		Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser, Password: password,
 	}
 	if s.SeedVia == registry.SeedViaDump {

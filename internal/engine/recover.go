@@ -130,7 +130,7 @@ func (e *Engine) checkBranchData(ctx context.Context, b *registry.Branch, chain 
 // masked or rotated. On failure the new container is removed; the data is
 // never touched. The caller owns the state transitions.
 func (e *Engine) restartOnOwnData(ctx context.Context, b *registry.Branch, src *registry.Source, chain []registry.Layer) (string, runtime.ContainerInfo, error) {
-	image := e.image(src.PGVersion)
+	image := e.image(src)
 	var cid string
 	var err error
 	switch {

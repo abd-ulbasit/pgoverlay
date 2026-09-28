@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -67,6 +68,25 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &serr) && serr.Code() == sqlitelib.SQLITE_CONSTRAINT_UNIQUE
 }
 
+// ErrInvalidImage rejects a source image override that is not a plausible
+// container image reference. The API maps it to 400.
+var ErrInvalidImage = errors.New("invalid image reference")
+
+// imageRefRe is a conservative image reference: optional registry host[:port],
+// lowercase path components, optional :tag and @sha256 digest. It only has to
+// keep garbage (spaces, shell or YAML metacharacters) out of the runtime.
+var imageRefRe = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]+)?(/[a-z0-9]+([._-]{1,2}[a-z0-9]+)*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$`)
+
+func validateImage(image string) error {
+	if image == "" {
+		return nil
+	}
+	if len(image) > 255 || !imageRefRe.MatchString(image) {
+		return fmt.Errorf("%w %q: want e.g. postgis/postgis:17-3.5 or ghcr.io/acme/postgres:17@sha256:…", ErrInvalidImage, image)
+	}
+	return nil
+}
+
 // ErrUnsupportedPGVersion rejects sources whose pg_version is outside the
 // supported matrix. Majors 14-18 only: branch startup relies on
 // recovery_init_sync_method=syncfs, which PG 13 and older do not have.
@@ -104,6 +124,12 @@ type Source struct {
 	Generation                          int
 	State                               SourceState
 	CreatedAt                           string
+
+	// Image overrides the container image for the source's seed helpers and
+	// every branch of it ("" = postgres:<PGVersion>). Branches run the
+	// source's data directory, so the image must carry the same extensions,
+	// locales and libc collation as the source server.
+	Image string
 }
 
 type Branch struct {
@@ -411,6 +437,9 @@ func (r *Registry) CreateSource(s *Source) error {
 	if err := validatePGVersion(s.PGVersion); err != nil {
 		return err
 	}
+	if err := validateImage(s.Image); err != nil {
+		return err
+	}
 	if s.SeedVia == "" {
 		s.SeedVia = SeedViaBasebackup
 	}
@@ -424,10 +453,10 @@ func (r *Registry) CreateSource(s *Source) error {
 		return fmt.Errorf("create source %q: %w", s.Name, err)
 	}
 	_, err = tx.Exec(`INSERT INTO sources
-		(id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,seed_via,dump_schemas,state)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,seed_via,dump_schemas,state,image)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		s.ID, s.Name, s.PGVersion, s.Volume, s.ConnHost, s.ConnPort, s.ConnUser, s.ConnDB, s.Network,
-		s.SeedVia, strings.Join(s.DumpSchemas, ","), s.State)
+		s.SeedVia, strings.Join(s.DumpSchemas, ","), s.State, s.Image)
 	if isUniqueViolation(err) {
 		var state string
 		if qerr := tx.QueryRow(`SELECT state FROM sources WHERE name=? AND state!='failed'`, s.Name).Scan(&state); qerr != nil {
@@ -529,7 +558,7 @@ func scanSource(row interface{ Scan(...any) error }) (*Source, error) {
 	s := &Source{}
 	var dumpSchemas string
 	err := row.Scan(&s.ID, &s.Name, &s.PGVersion, &s.Volume, &s.ConnHost, &s.ConnPort,
-		&s.ConnUser, &s.ConnDB, &s.Network, &s.SeedVia, &dumpSchemas, &s.State, &s.Generation, &s.CreatedAt)
+		&s.ConnUser, &s.ConnDB, &s.Network, &s.SeedVia, &dumpSchemas, &s.State, &s.Generation, &s.CreatedAt, &s.Image)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -539,7 +568,7 @@ func scanSource(row interface{ Scan(...any) error }) (*Source, error) {
 	return s, err
 }
 
-const sourceCols = `id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,seed_via,dump_schemas,state,generation,created_at`
+const sourceCols = `id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,seed_via,dump_schemas,state,generation,created_at,image`
 
 func (r *Registry) GetSourceByName(name string) (*Source, error) {
 	// failed rows may share a name with a live retry; prefer the live one

@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11, migrateV12}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11, migrateV12, migrateV13}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -194,4 +194,12 @@ CREATE INDEX IF NOT EXISTS branches_rw_volume ON branches(rw_volume);
 CREATE INDEX IF NOT EXISTS branches_source_volume ON branches(source_volume);
 CREATE INDEX IF NOT EXISTS branches_base_layer ON branches(base_layer_id) WHERE base_layer_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS layers_volume ON layers(volume);
+`
+
+// v13: a per-source image override. Branches (and the seed helpers) default
+// to the docker-library postgres:<pg_version> image; a source that needs
+// extensions (PostGIS, pgvector, TimescaleDB), extra locales or a matching
+// libc records its own image here (empty = the default).
+const migrateV13 = `
+ALTER TABLE sources ADD COLUMN image TEXT NOT NULL DEFAULT '';
 `

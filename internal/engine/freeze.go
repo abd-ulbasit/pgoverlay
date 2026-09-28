@@ -117,7 +117,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	}
 	parentPlan := cow.PlanBranch(newRW, parent.SourceVolume, frozen)
 	childPlan := cow.PlanBranch(child.RWVolume, child.SourceVolume, frozen)
-	image := e.image(src.PGVersion)
+	image := e.image(src)
 
 	if err := e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchResetting, "freeze for child "+child.Name); err != nil {
 		return err

@@ -161,7 +161,7 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 	}
 
 	// 3. branch container
-	cid, err := e.startOverlayBranch(ctx, b.Name, plan, e.image(src.PGVersion), e.branchLabels(b))
+	cid, err := e.startOverlayBranch(ctx, b.Name, plan, e.image(src), e.branchLabels(b))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}
@@ -307,7 +307,7 @@ func (e *Engine) provisionZFS(ctx context.Context, b *registry.Branch, src *regi
 	}
 
 	// 4. branch container on the clone mountpoint
-	cid, err := e.startZFSBranch(ctx, b, e.image(src.PGVersion))
+	cid, err := e.startZFSBranch(ctx, b, e.image(src))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}

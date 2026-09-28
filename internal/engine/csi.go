@@ -105,7 +105,7 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 	}
 
 	// 4. branch container on the clone
-	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), e.branchLabels(b))
+	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src), e.branchLabels(b))
 	if err != nil {
 		return fail(fmt.Errorf("start instance: %w", err))
 	}

@@ -36,7 +36,8 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	msg := err.Error()
 	switch {
 	case errors.Is(err, engine.ErrInvalidName),
-		errors.Is(err, registry.ErrUnsupportedPGVersion):
+		errors.Is(err, registry.ErrUnsupportedPGVersion),
+		errors.Is(err, registry.ErrInvalidImage):
 		writeError(w, http.StatusBadRequest, msg)
 	case errors.Is(err, registry.ErrNotFound):
 		writeError(w, http.StatusNotFound, msg)
@@ -75,7 +76,7 @@ func sourceJSON(s *registry.Source) Source {
 	return Source{
 		Name: s.Name, PGVersion: s.PGVersion, Host: s.ConnHost, Port: s.ConnPort,
 		User: s.ConnUser, Database: s.ConnDB, Network: s.Network,
-		Via: s.SeedVia, DumpSchemas: s.DumpSchemas,
+		Via: s.SeedVia, DumpSchemas: s.DumpSchemas, Image: s.Image,
 		State: string(s.State), Generation: s.Generation, CreatedAt: s.CreatedAt,
 	}
 }
@@ -134,7 +135,7 @@ func (s *Server) createSource(w http.ResponseWriter, r *http.Request) {
 	src := &registry.Source{
 		Name: req.Name, PGVersion: req.PGVersion, ConnHost: req.Host,
 		ConnPort: req.Port, ConnUser: req.User, ConnDB: req.Database, Network: req.Network,
-		SeedVia: req.Via, DumpSchemas: req.DumpSchemas,
+		SeedVia: req.Via, DumpSchemas: req.DumpSchemas, Image: req.Image,
 	}
 	if err := s.eng.AddSource(r.Context(), src, req.Password); err != nil {
 		writeEngineError(w, r, err)

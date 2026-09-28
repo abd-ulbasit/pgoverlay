@@ -28,7 +28,7 @@ func passwordFromEnv(env string) (string, error) {
 }
 
 func newSourceAddCmd() *cobra.Command {
-	var host, user, db, network, pgVersion, passwordEnv, via string
+	var host, user, db, network, pgVersion, passwordEnv, via, image string
 	var dumpSchemas []string
 	var port int
 	cmd := &cobra.Command{
@@ -58,7 +58,7 @@ Seeding methods (--via):
 				s, err := c.CreateSource(cmd.Context(), api.CreateSourceRequest{
 					Name: args[0], Host: host, Port: port, User: user,
 					Database: db, Network: network, PGVersion: pgVersion, Password: password,
-					Via: via, DumpSchemas: dumpSchemas,
+					Via: via, DumpSchemas: dumpSchemas, Image: image,
 				})
 				if err != nil {
 					return err
@@ -73,7 +73,7 @@ Seeding methods (--via):
 			defer reg.Close()
 			s := &registry.Source{Name: args[0], PGVersion: pgVersion,
 				ConnHost: host, ConnPort: port, ConnUser: user, ConnDB: db, Network: network,
-				SeedVia: via, DumpSchemas: dumpSchemas}
+				SeedVia: via, DumpSchemas: dumpSchemas, Image: image}
 			if err := e.AddSource(cmd.Context(), s, password); err != nil {
 				return err
 			}
@@ -90,6 +90,7 @@ Seeding methods (--via):
 	cmd.Flags().StringVar(&passwordEnv, "password-env", "PGPASSWORD", "env var holding the source password")
 	cmd.Flags().StringVar(&via, "via", registry.SeedViaBasebackup, `seeding method: "basebackup" or "dump" (managed Postgres: Supabase/Neon/RDS)`)
 	cmd.Flags().StringArrayVar(&dumpSchemas, "dump-schema", nil, "schema to dump (repeatable; --via dump only; default: the whole database)")
+	cmd.Flags().StringVar(&image, "image", "", "container image for the seed helpers and every branch (default postgres:<pg-version>); must carry the source's extensions, locales and libc, e.g. postgis/postgis:17-3.5")
 	cmd.MarkFlagRequired("host")
 	return cmd
 }
