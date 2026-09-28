@@ -5,3 +5,7 @@
 
 # local working notes, not part of the docs site
 /.notes/
+
+# goreleaser and mkdocs build output
+/dist/
+/site/

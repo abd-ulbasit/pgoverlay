@@ -1,6 +1,9 @@
-# pgoverlay docs site. No CI, no hosting — build locally:
-#   pip install mkdocs-material && mkdocs serve
+# pgoverlay docs site. .github/workflows/docs.yml builds it with --strict on
+# every pull request that touches docs/ and publishes it to GitHub Pages from
+# main. Preview locally:
+#   pip install "mkdocs==1.6.1" "mkdocs-material==9.7.7" && mkdocs serve
 site_name: pgoverlay
+site_url: https://abd-ulbasit.github.io/pgoverlay/
 site_description: "git branch for Postgres: instant copy-on-write database branches"
 repo_url: https://github.com/abd-ulbasit/pgoverlay
 repo_name: abd-ulbasit/pgoverlay

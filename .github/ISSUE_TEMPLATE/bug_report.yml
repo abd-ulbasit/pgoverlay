@@ -1,0 +1,62 @@
+name: Bug report
+description: Something in pgoverlay does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Security vulnerabilities do not belong here:
+        report them privately as described in SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence of `pgb` commands, API calls or Helm values that shows the problem.
+      placeholder: |
+        1. pgb source add main --host ... --pg-version 17
+        2. pgb branch create pr-1 --source main
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: Relevant `pgb` output, `branchd` logs, or `kubectl describe` output. Remove passwords and tokens.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: pgoverlay version
+      description: Output of `pgb version`, or the release tag or commit you built from.
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      options:
+        - Docker
+        - Kubernetes (hostPath)
+        - Kubernetes (CSI)
+        - ZFS (experimental)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and architecture, Docker or Kubernetes version, Postgres major of the source.
+      placeholder: |
+        OS: Ubuntu 24.04, amd64
+        Docker Engine 29.x / Kubernetes 1.32 (kind)
+        Source Postgres: 17
+    validations:
+      required: true

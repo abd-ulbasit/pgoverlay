@@ -37,6 +37,34 @@ hasnt "$out" 'pgoverlay-branchd:dev' default # `dev` was never pushed anywhere
 # creates at runtime and must NOT leak into any chart-rendered manifest.
 hasnt "$out" 'SYS_ADMIN' default
 
+# Container hardening. The images leave it to the chart: the branchd image
+# runs as root (for the hostPath state dir) and relies on the chart for
+# everything else, and the ghook image's non-root USER only holds if the
+# chart does not override it. Asserted per template (--show-only), so the
+# other deployment's copy of a field cannot satisfy the check.
+hardened() { # render label
+  has "$1" 'allowPrivilegeEscalation: false' "$2"
+  has "$1" 'readOnlyRootFilesystem: true' "$2"
+  has "$1" 'drop: [ALL]' "$2"
+  has "$1" 'type: RuntimeDefault' "$2" # seccompProfile
+  hasnt "$1" 'privileged: true' "$2"
+  hasnt "$1" 'add:' "$2" # no capability is ever added back
+}
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret \
+  --show-only templates/deployment.yaml)
+hardened "$out" branchd-deployment
+has "$out" 'runAsUser: 0' branchd-deployment # values.yaml runAsUser default
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret \
+  --set runAsUser=1000 --show-only templates/deployment.yaml)
+has "$out" 'runAsUser: 1000' branchd-deployment-uid
+hardened "$out" branchd-deployment-uid
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set ghook.enabled=true --set ghook.webhookSecret=w --set ghook.source=main \
+  --show-only templates/ghook-deployment.yaml)
+hardened "$out" ghook-deployment
+has "$out" 'runAsNonRoot: true' ghook-deployment
+has "$out" 'runAsUser: 65532' ghook-deployment # matches Dockerfile.ghook's USER
+
 # The local-build path stays available: --set image.tag=dev must still reach
 # the image `make docker-build` produces and side-loads (README, docs).
 out=$(helm template pgoverlay "$CHART" --set node=n --set token=t --set image.tag=dev)

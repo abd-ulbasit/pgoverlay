@@ -5,9 +5,8 @@
 // kills the leader pod, and asserts the surviving replica acquires the Lease
 // and a branch create succeeds within the renew deadline.
 //
-// NOT RUN in this change's sandbox (no kind/Docker) and NOT in default CI
-// (CI runs PGOVERLAY_IT only, not PGOVERLAY_K8S_IT). Written to compile and be
-// correct; reuses the helm/port-forward/source-pod helpers in helm_it_test.go.
+// Runs in CI's kube job (PGOVERLAY_K8S_IT=1 go test ./internal/deploy/) and
+// reuses the helm/port-forward/source-pod helpers in helm_it_test.go.
 package deploy
 
 import (
@@ -111,6 +110,7 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 	// as long as the forward lives. Naming the pod makes the test deterministic
 	// and is what lets the post-failover step below prove the *new* leader
 	// accepts writes.
+	waitPodReady(t, kc, haNS, holder, 2*time.Minute)
 	base := portForward(t, kc, haNS, "pod/"+holder)
 	client := apiclient.New(base, haToken)
 	srcIP := startHASourcePod(t, kc)
@@ -142,7 +142,14 @@ func TestHelmLeaderElectionFailover(t *testing.T) {
 	// The old forward went down with the pod we just deleted ("lost connection
 	// to pod"), so every later request would get connection-refused on a dead
 	// local port and look like a failover failure. Re-establish against the
-	// survivor before asserting it accepts writes.
+	// new leader before asserting it accepts writes.
+	//
+	// The new leader is not necessarily the surviving replica: the Deployment
+	// replaces the killed pod at once, and that replacement can win the Lease
+	// within a second of starting, before the API server shows it Running.
+	// Forwarding to it then fails with "pod is not running. Current
+	// status=Pending" (CI 30340851419), so wait for it to be Ready first.
+	waitPodReady(t, kc, haNS, newHolder, 2*time.Minute)
 	client = apiclient.New(portForward(t, kc, haNS, "pod/"+newHolder), haToken)
 
 	// A create now succeeds against the new leader within the budget.
