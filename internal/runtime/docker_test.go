@@ -201,19 +201,108 @@ func TestIsPortRace(t *testing.T) {
 	retry := []string{
 		"start branch container: ... failed to listen on TCP socket: address already in use",
 		"driver failed programming external connectivity: port is already allocated",
-		"failed to set up container networking",
+		"failed to set up container networking: driver failed programming external connectivity on endpoint x: Bind for 127.0.0.1:40001 failed: port is already allocated",
 	}
 	for _, m := range retry {
 		if !isPortRace(errors.New(m)) {
 			t.Errorf("isPortRace(%q) = false, want true", m)
 		}
 	}
-	for _, m := range []string{"no such image", "permission denied", ""} {
+	// the generic networking prefix alone is not a port collision: a missing
+	// network fails the same way on every attempt
+	for _, m := range []string{"no such image", "permission denied", "", "failed to set up container networking: network pgnet not found"} {
 		if isPortRace(errors.New(m)) {
 			t.Errorf("isPortRace(%q) = true, want false", m)
 		}
 	}
 	if isPortRace(nil) {
 		t.Error("isPortRace(nil) = true")
+	}
+}
+
+// scriptPorts makes pickHostPort return the given ports in order.
+func scriptPorts(t *testing.T, ports ...int) {
+	t.Helper()
+	orig := pickHostPort
+	t.Cleanup(func() { pickHostPort = orig })
+	pickHostPort = func() (int, error) {
+		if len(ports) == 0 {
+			t.Fatal("pickHostPort called more often than scripted")
+		}
+		p := ports[0]
+		ports = ports[1:]
+		return p, nil
+	}
+}
+
+func publishedPort(t *testing.T, c *fakeContainer) string {
+	t.Helper()
+	b := c.host.PortBindings["5432/tcp"]
+	if len(b) != 1 || b[0].HostIP != "127.0.0.1" {
+		t.Fatalf("5432/tcp bindings = %+v, want one loopback binding", b)
+	}
+	return b[0].HostPort
+}
+
+// A branch container publishes 5432 on a host port chosen up front, so the
+// binding is part of the container config and a docker restart (restart
+// policy, daemon or host reboot) brings it back on the same port.
+func TestStartBranchPinsHostPort(t *testing.T) {
+	f, d := newFakeDockerAPI(t)
+	scriptPorts(t, 40001)
+	id, err := d.StartBranch(context.Background(), BranchSpec{Name: "pgoverlay-br-x", Image: "postgres:17"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := f.containers[id]
+	if got := publishedPort(t, c); got != "40001" {
+		t.Errorf("HostPort = %q, want the picked port 40001 (not an ephemeral \"\")", got)
+	}
+	if c.host.RestartPolicy.Name != container.RestartPolicyUnlessStopped {
+		t.Errorf("restart policy = %q", c.host.RestartPolicy.Name)
+	}
+	info, err := d.Inspect(context.Background(), id)
+	if err != nil || info.Port != 40001 {
+		t.Fatalf("Inspect = %+v, %v; want port 40001", info, err)
+	}
+}
+
+// A port collision at start is retried on a new port. The failed container is
+// removed and waited for before the retry reuses its name, even when the
+// daemon finishes removal after the DELETE call returns.
+func TestStartBranchRetriesPortCollision(t *testing.T) {
+	f, d := newFakeDockerAPI(t)
+	scriptPorts(t, 40001, 40002)
+	f.startErrs = []string{"failed to set up container networking: Bind for 127.0.0.1:40001 failed: port is already allocated"}
+	f.removeLag = 2
+	id, err := d.StartBranch(context.Background(), BranchSpec{Name: "pgoverlay-br-x", Image: "postgres:17"})
+	if err != nil {
+		t.Fatalf("StartBranch after one collision: %v", err)
+	}
+	if got := publishedPort(t, f.containers[id]); got != "40002" {
+		t.Errorf("HostPort = %q, want the second pick 40002", got)
+	}
+	if len(f.containers) != 1 {
+		t.Errorf("containers = %d, want only the started one (failed attempt removed)", len(f.containers))
+	}
+	if n := f.called("POST /containers/create"); n != 2 {
+		t.Errorf("creates = %d, want 2", n)
+	}
+}
+
+// A networking failure that is not a port collision fails at once.
+func TestStartBranchDoesNotRetryOtherNetworkErrors(t *testing.T) {
+	f, d := newFakeDockerAPI(t)
+	scriptPorts(t, 40001)
+	f.startErrs = []string{"failed to set up container networking: network pgnet not found"}
+	_, err := d.StartBranch(context.Background(), BranchSpec{Name: "pgoverlay-br-x", Image: "postgres:17"})
+	if err == nil || !strings.Contains(err.Error(), "network pgnet not found") {
+		t.Fatalf("StartBranch = %v, want the network error", err)
+	}
+	if n := f.called("POST /containers/create"); n != 1 {
+		t.Errorf("creates = %d, want 1 (no retry)", n)
+	}
+	if len(f.containers) != 0 {
+		t.Errorf("failed container left behind: %d", len(f.containers))
 	}
 }

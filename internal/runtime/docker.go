@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -197,26 +198,40 @@ func (d *DockerDriver) StartBranch(ctx context.Context, spec BranchSpec) (string
 	}
 	host := &container.HostConfig{
 		Mounts:        toMounts(spec.Mounts),
-		CapAdd:        []string{"SYS_ADMIN"},                                          // overlay mount inside container
-		SecurityOpt:   []string{"apparmor=unconfined"},                                // no-op where AppArmor absent
-		PortBindings:  nat.PortMap{"5432/tcp": {{HostIP: "127.0.0.1", HostPort: ""}}}, // random host port
+		CapAdd:        []string{"SYS_ADMIN"},           // overlay mount inside container
+		SecurityOpt:   []string{"apparmor=unconfined"}, // no-op where AppArmor absent
 		NetworkMode:   container.NetworkMode(spec.Network),
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyUnlessStopped},
 	}
-	// Publishing to an ephemeral host port (HostPort "") can rarely lose a
-	// race — Docker picks a free port, but another process binds it before
-	// the container's start completes ("address already in use" / "port is
-	// already allocated"). The next attempt picks a different port, so retry
-	// a few times on that specific failure; any other error is returned.
+	// The host port is chosen here and published explicitly, not left to
+	// docker's ephemeral allocator (HostPort ""). Docker re-runs that
+	// allocator on every start, so with the unless-stopped restart policy a
+	// daemon or host restart brought the branch back on a different port
+	// while the registry, the proxy and `pgb connect` kept the old one. An
+	// explicit HostPort is part of the container's config and survives
+	// restarts.
+	//
+	// The chosen port can still be taken by another process before the start
+	// binds it ("address already in use" / "port is already allocated"), so
+	// that specific failure is retried with a new port; any other error is
+	// returned. The failed container is removed and waited for (StopRemove)
+	// before the retry reuses its name.
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < startBranchAttempts; attempt++ {
+		port, err := pickHostPort()
+		if err != nil {
+			return "", fmt.Errorf("pick host port: %w", err)
+		}
+		host.PortBindings = nat.PortMap{"5432/tcp": {{HostIP: "127.0.0.1", HostPort: strconv.Itoa(port)}}}
 		cr, err := d.cli.ContainerCreate(ctx, cfg, host, nil, nil, spec.Name)
 		if err != nil {
 			return "", fmt.Errorf("create branch container: %w", err)
 		}
 		if err := d.cli.ContainerStart(ctx, cr.ID, container.StartOptions{}); err != nil {
-			d.cli.ContainerRemove(context.WithoutCancel(ctx), cr.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 			lastErr = fmt.Errorf("start branch container: %w", err)
+			if rmErr := d.StopRemove(context.WithoutCancel(ctx), cr.ID); rmErr != nil {
+				return "", fmt.Errorf("%w (removing the failed container: %v)", lastErr, rmErr)
+			}
 			if isPortRace(err) {
 				continue
 			}
@@ -227,16 +242,34 @@ func (d *DockerDriver) StartBranch(ctx context.Context, spec BranchSpec) (string
 	return "", lastErr
 }
 
-// isPortRace reports whether a container-start error is a transient host-port
-// allocation collision worth retrying with a fresh ephemeral port.
+// startBranchAttempts bounds StartBranch's retries on a host-port collision.
+const startBranchAttempts = 5
+
+// pickHostPort chooses the host port a branch container publishes 5432 on.
+// It asks the kernel for a free loopback port and releases it for docker to
+// bind; the small window in which another process can take it is covered by
+// StartBranch's retry. A variable so tests can script the choice.
+var pickHostPort = func() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// isPortRace reports whether a container-start error is a host-port
+// collision worth retrying with another port. Only the two collision
+// messages count: "failed to set up container networking" also prefixes
+// unrelated failures (a missing network, a bad driver option) that a retry
+// cannot fix.
 func isPortRace(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "address already in use") ||
-		strings.Contains(msg, "port is already allocated") ||
-		strings.Contains(msg, "failed to set up container networking")
+		strings.Contains(msg, "port is already allocated")
 }
 
 func (d *DockerDriver) Exec(ctx context.Context, id string, cmd []string) error {
