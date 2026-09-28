@@ -17,7 +17,9 @@ want=$(awk '/^go [0-9]/ {print $2; exit}' go.mod)
 
 rc=0
 for df in Dockerfile Dockerfile.ghook; do
-  got=$(sed -n 's/^FROM golang:\([0-9][^-@ ]*\).*/\1/p' "$df" | head -1)
+  # The optional --platform flag is how the build stage cross-compiles from
+  # the builder's platform for multi-arch images.
+  got=$(sed -nE 's/^FROM[[:space:]]+(--platform=[^[:space:]]+[[:space:]]+)?golang:([0-9][^-@ ]*).*/\2/p' "$df" | head -1)
   if [ -z "$got" ]; then
     echo "FAIL: $df has no 'FROM golang:<version>' line" >&2
     rc=1
