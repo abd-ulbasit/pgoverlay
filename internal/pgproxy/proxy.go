@@ -50,10 +50,12 @@ func (r *RegistryResolver) ResolveBranch(name string) (string, error) {
 	return net.JoinHostPort(b.Host, strconv.Itoa(b.Port)), nil
 }
 
-// DoS-hardening defaults. Each is overridable via the corresponding Proxy
-// field (the constructor seeds these; a zero field falls back to the default
-// at use-site so a struct literal without New() is still safe).
+// DoS-hardening defaults. New() seeds the Proxy fields with these, and every
+// field is also read through a use-site helper, so a zero field falls back to
+// the default and a bare &Proxy{Resolver: r} is exactly as protected as New(r).
+// Only the cap can be switched off, and only with a negative value.
 const (
+	defaultDialTimeout    = 5 * time.Second
 	defaultStartupTimeout = 10 * time.Second // client must finish the startup phase within this
 	defaultMaxConns       = 256              // cap on concurrently-handled connections
 	defaultIdleTimeout    = 15 * time.Minute // relay closes after this long with no bytes either way
@@ -70,7 +72,8 @@ type Proxy struct {
 	StartupTimeout time.Duration
 	// MaxConns caps the number of connections handled concurrently. When the
 	// cap is reached, further accepts are refused fast (connection closed)
-	// rather than queued unbounded. Defaults to 256.
+	// rather than queued unbounded. Defaults to 256; a negative value disables
+	// the cap.
 	MaxConns int
 	// IdleTimeout closes a relayed session that has seen no bytes in either
 	// direction for this long, reclaiming abandoned-but-open connections.
@@ -87,28 +90,46 @@ type Proxy struct {
 func New(r BranchResolver) *Proxy {
 	return &Proxy{
 		Resolver:       r,
-		DialTimeout:    5 * time.Second,
+		DialTimeout:    defaultDialTimeout,
 		StartupTimeout: defaultStartupTimeout,
 		MaxConns:       defaultMaxConns,
 		IdleTimeout:    defaultIdleTimeout,
 	}
 }
 
-// startupTimeout / idleTimeout return the effective values, tolerating a Proxy
-// built as a bare struct literal (zero field -> default).
-func (p *Proxy) startupTimeout() time.Duration {
-	if p.StartupTimeout > 0 {
-		return p.StartupTimeout
+// durationOr returns d, or def when d is not positive.
+func durationOr(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
 	}
-	return defaultStartupTimeout
+	return def
+}
+
+// capOr returns n, def when n is zero, and 0 ("no cap") when n is negative.
+func capOr(n, def int) int {
+	switch {
+	case n > 0:
+		return n
+	case n == 0:
+		return def
+	default:
+		return 0
+	}
+}
+
+func (p *Proxy) dialTimeout() time.Duration {
+	return durationOr(p.DialTimeout, defaultDialTimeout)
+}
+
+func (p *Proxy) startupTimeout() time.Duration {
+	return durationOr(p.StartupTimeout, defaultStartupTimeout)
 }
 
 func (p *Proxy) idleTimeout() time.Duration {
-	if p.IdleTimeout > 0 {
-		return p.IdleTimeout
-	}
-	return defaultIdleTimeout
+	return durationOr(p.IdleTimeout, defaultIdleTimeout)
 }
+
+func (p *Proxy) maxConns() int { return capOr(p.MaxConns, defaultMaxConns) }
 
 // Serve accepts connections until ctx is cancelled (which closes the
 // listener) or Accept fails. Each connection is handled in its own goroutine.
@@ -117,10 +138,10 @@ func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 	defer stop()
 	// Size the connection-cap semaphore from MaxConns once, here, so callers
 	// that set MaxConns after New() (the field is exported for exactly that)
-	// still get the cap they asked for. A non-positive MaxConns disables it.
+	// still get the cap they asked for.
 	var sem chan struct{}
-	if p.MaxConns > 0 {
-		sem = make(chan struct{}, p.MaxConns)
+	if n := p.maxConns(); n > 0 {
+		sem = make(chan struct{}, n)
 	}
 	for {
 		conn, err := lis.Accept()
@@ -238,7 +259,7 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 		writeRefusal(client, "08P01", "pgoverlay: "+err.Error())
 		return
 	}
-	backend, err := net.DialTimeout("tcp", addr, p.DialTimeout)
+	backend, err := net.DialTimeout("tcp", addr, p.dialTimeout())
 	if err != nil {
 		// A resolved-but-unreachable backend would otherwise confirm the branch
 		// name and its (down) state — collapse it into the same generic refusal.
