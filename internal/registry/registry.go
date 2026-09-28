@@ -939,13 +939,13 @@ type Transition struct {
 // a since-recreated name is still recoverable, and also by the entity_name
 // DeleteSource stamps on the rows of branches it removes, so the trail
 // outlives the source. ErrNotFound when the name was never used.
+//
+// The two matches are separate index lookups (transitions_entity and
+// transitions_entity_name) combined by id: written as one OR, SQLite scans
+// every branch transition instead, which is the linear slowdown the v12
+// indexes removed.
 func (r *Registry) BranchHistory(name string) ([]Transition, error) {
-	rows, err := r.db.Query(`SELECT t.from_state, t.to_state, t.reason, t.actor, t.at
-		FROM transitions t
-		WHERE t.entity = 'branch'
-		  AND (t.entity_id IN (SELECT id FROM branches WHERE name = ?)
-		       OR (t.entity_name != '' AND t.entity_name = ?))
-		ORDER BY t.id ASC`, name, name)
+	rows, err := r.db.Query(branchHistoryQuery, name, name)
 	if err != nil {
 		return nil, err
 	}
@@ -966,6 +966,17 @@ func (r *Registry) BranchHistory(name string) ([]Transition, error) {
 	}
 	return out, nil
 }
+
+// branchHistoryQuery takes the branch name twice (see BranchHistory).
+const branchHistoryQuery = `SELECT t.from_state, t.to_state, t.reason, t.actor, t.at
+	FROM transitions t
+	WHERE t.id IN (
+	  SELECT id FROM transitions
+	   WHERE entity = 'branch' AND entity_id IN (SELECT id FROM branches WHERE name = ?)
+	  UNION ALL
+	  SELECT id FROM transitions
+	   WHERE entity = 'branch' AND entity_name != '' AND entity_name = ?)
+	ORDER BY t.id ASC`
 
 // ListExpiredBranches returns ready/failed branches whose expiry (RFC3339
 // UTC, lexicographically comparable) has passed. now must be RFC3339 UTC.

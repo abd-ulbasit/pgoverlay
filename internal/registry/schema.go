@@ -230,8 +230,12 @@ CREATE INDEX IF NOT EXISTS branches_pending_volume ON branches(pending_volume);
 //     at worst (the tombstone is kept for history forever). Existing
 //     tombstones are cleared here, and a trigger clears the column whenever a
 //     branch enters 'destroyed', whichever code path moves it there.
+//   - transitions_entity_name indexes the stamped names (partial: only the
+//     rows of removed entities carry one), so BranchHistory's name match
+//     stays an index lookup like v12's transitions_entity.
 const migrateV15 = `
 ALTER TABLE transitions ADD COLUMN entity_name TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS transitions_entity_name ON transitions(entity, entity_name) WHERE entity_name != '';
 UPDATE branches SET password = '' WHERE state = 'destroyed' AND password != '';
 CREATE TRIGGER branches_destroyed_forget_password
   AFTER UPDATE OF state ON branches
