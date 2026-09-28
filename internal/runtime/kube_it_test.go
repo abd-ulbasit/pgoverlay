@@ -117,6 +117,58 @@ func TestKubeVolumeAndHelperRoundtrip(t *testing.T) {
 	}
 }
 
+// TestKubeHelperEnvThroughSecret runs a helper whose environment carries a
+// password on a real kubelet: the value must reach the process (through the
+// helper's Secret), must never appear in the Pod object, and no helper Secret
+// may be left behind.
+func TestKubeHelperEnvThroughSecret(t *testing.T) {
+	drv, cs, _ := kubeIT(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	const pw = "it-helper-s3cret"
+
+	// Snapshot every helper pod object the API server stores while it runs.
+	seen := make(chan string, 64)
+	w, err := cs.CoreV1().Pods(kubeNS).Watch(ctx, metav1.ListOptions{LabelSelector: "pgoverlay.role=helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	go func() {
+		for ev := range w.ResultChan() {
+			if pod, ok := ev.Object.(*corev1.Pod); ok {
+				seen <- fmt.Sprintf("%+v", pod.Spec)
+			}
+		}
+		close(seen)
+	}()
+
+	out, err := drv.RunHelper(ctx, rt.HelperSpec{
+		Image: "alpine:3.21",
+		Cmd:   []string{"sh", "-c", `test "$PGPASSWORD" = "` + pw + `" && echo env-ok`},
+		Env:   []string{"PGPASSWORD=" + pw},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "env-ok") {
+		t.Fatalf("helper did not receive its environment: %q", out)
+	}
+	w.Stop()
+	for spec := range seen {
+		if strings.Contains(spec, pw) {
+			t.Fatalf("the helper Pod object carried the password: %s", spec)
+		}
+	}
+	left, err := cs.CoreV1().Secrets(kubeNS).List(ctx, metav1.ListOptions{LabelSelector: "pgoverlay.role=helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left.Items) != 0 {
+		t.Fatalf("%d helper Secrets left behind", len(left.Items))
+	}
+}
+
 // startSourcePod runs a vanilla "production" postgres pod the engine will
 // seed from (the kube equivalent of pgctl.StartSourcePG): wal_level=replica,
 // replication pg_hba entry appended + reloaded after startup.
