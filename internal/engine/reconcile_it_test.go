@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -248,9 +249,36 @@ func TestReconcileRepairsDockerDrift(t *testing.T) {
 	if err := cli.ContainerStop(ctx, b2.ContainerID, container.StopOptions{Timeout: &timeout}); err != nil {
 		t.Fatal(err)
 	}
-	taken, err = e.ApplyReconcile(ctx, time.Now(), 10*time.Minute)
-	if err != nil || !hasAction(taken, ActionRestartBranch, "drift-pr") {
-		t.Fatalf("reconcile after docker stop: %+v, %v", taken.Actions, err)
+	// Reconcile deliberately leaves a container alone while the runtime still
+	// reports it as transitioning (restarting, removing), so wait until docker
+	// reports it stopped, and give reconcile a few passes, as the periodic
+	// loop would.
+	var stopped runtime.ContainerInfo
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		info, err := d.Inspect(ctx, b2.ContainerID)
+		if err == nil && info.Stopped {
+			stopped = info
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("container not reported stopped after docker stop: %+v, %v", info, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	var passes []string
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		taken, err = e.ApplyReconcile(ctx, time.Now(), 10*time.Minute)
+		if err == nil && hasAction(taken, ActionRestartBranch, "drift-pr") {
+			break
+		}
+		passes = append(passes, fmt.Sprintf("%+v (err %v)", taken.Actions, err))
+		if time.Now().After(deadline) {
+			listed, lerr := d.ListManaged(ctx)
+			cur, _ := r.GetBranchByName("drift-pr")
+			t.Fatalf("reconcile after docker stop never restarted the branch.\ninspect after stop: %+v\nbranch row: %+v\nListManaged: %+v (err %v)\npasses: %v",
+				stopped, cur, listed, lerr, passes)
+		}
+		time.Sleep(time.Second)
 	}
 	b3, err := r.GetBranchByName("drift-pr")
 	if err != nil {

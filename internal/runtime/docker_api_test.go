@@ -3,6 +3,7 @@ package runtime
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -275,12 +276,24 @@ func (f *fakeDockerAPI) serveContainers(w http.ResponseWriter, r *http.Request, 
 func (f *fakeDockerAPI) serveExec(w http.ResponseWriter, r *http.Request, parts []string) {
 	switch {
 	case len(parts) == 3 && parts[2] == "start":
+		// Consume the request body before hijacking, and close the connection
+		// gracefully below. Closing a TCP socket that still holds unread input
+		// makes Linux send RST instead of FIN, and the client then loses the
+		// output it has not read yet ("connection reset by peer").
+		io.Copy(io.Discard, r.Body)
 		conn, buf, err := w.(http.Hijacker).Hijack()
 		if err != nil {
 			f.t.Errorf("hijack: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+				cw.CloseWrite()
+			}
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			io.Copy(io.Discard, conn)
+			conn.Close()
+		}()
 		fmt.Fprint(buf, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
 		f.mu.Lock()
 		out, truncate := f.execOut, f.execTruncate
