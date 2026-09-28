@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"text/tabwriter"
 	"time"
 
@@ -12,17 +14,56 @@ import (
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 )
 
+// Process exit statuses (see ExitCode). Every command exits ExitError on
+// failure, except `pgb doctor`, which separates drift from not knowing.
+const (
+	ExitError = 1
+	// ExitDrift: `pgb doctor` computed the plan and found drift.
+	ExitDrift = 1
+	// ExitDoctorFailed: `pgb doctor` could not compute the plan (branchd
+	// unreachable, bad token, bad flags), so it cannot say whether there is
+	// drift.
+	ExitDoctorFailed = 2
+)
+
+// exitOnErrorAnnotation on a command overrides ExitError for its failures
+// other than drift.
+const exitOnErrorAnnotation = "pgoverlay.io/exit-on-error"
+
+// ExitCode maps the command that ran and the error it returned (as from
+// cobra's ExecuteC) to the process exit status. Drift is ExitDrift; any other
+// failure is ExitError unless the command sets exitOnErrorAnnotation.
+func ExitCode(cmd *cobra.Command, err error) int {
+	if err == nil {
+		return 0
+	}
+	var d errDrift
+	if errors.As(err, &d) {
+		return ExitDrift
+	}
+	if cmd != nil {
+		if n, convErr := strconv.Atoi(cmd.Annotations[exitOnErrorAnnotation]); convErr == nil {
+			return n
+		}
+	}
+	return ExitError
+}
+
 // newDoctorCmd reports reconcile drift read-only: stuck rows, orphaned
-// containers, dangling layers/volumes. It mutates nothing and exits non-zero
-// when drift is found (CI-friendly: `pgb doctor && deploy`).
+// containers, dangling layers/volumes. It mutates nothing and exits 1 when
+// drift is found (CI-friendly: `pgb doctor && deploy`), and 2 when it could
+// not compute the plan, so a gate can treat the two differently.
 func newDoctorCmd() *cobra.Command {
 	var stuck time.Duration
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Report reconcile drift (orphans, stuck rows, dangling layers/volumes) read-only",
-		Long: "doctor computes the reconcile plan and prints it without changing anything. " +
-			"It exits non-zero when drift is found so it can gate CI. Run `pgb gc` to apply.",
-		Args: cobra.NoArgs,
+		Long: "doctor computes the reconcile plan and prints it without changing anything, so it can gate CI. " +
+			"Run `pgb gc` to apply the plan.\n\n" +
+			"Exit status: 0 no drift; 1 drift found; 2 the plan could not be computed " +
+			"(branchd unreachable, authentication failed, invalid flags).",
+		Annotations: map[string]string{exitOnErrorAnnotation: strconv.Itoa(ExitDoctorFailed)},
+		Args:        cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			plan, err := planReconcile(cmd, stuck)
 			if err != nil {

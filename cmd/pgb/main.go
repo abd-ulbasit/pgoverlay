@@ -7,7 +7,9 @@ import (
 )
 
 func main() {
-	if err := cli.NewRootCmd().Execute(); err != nil {
-		os.Exit(1)
+	// ExecuteC reports which command ran: `pgb doctor` exits 1 for drift and
+	// 2 when it could not compute the plan, everything else 1 on error.
+	if cmd, err := cli.NewRootCmd().ExecuteC(); err != nil {
+		os.Exit(cli.ExitCode(cmd, err))
 	}
 }
