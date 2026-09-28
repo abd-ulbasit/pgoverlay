@@ -1,4 +1,4 @@
-.PHONY: build test it k8s-it csi-it matrix lint vuln vuln-test check-toolchain docker-build docker-build-ghook helm-test js-sdk-test
+.PHONY: build test it k8s-it csi-it matrix lint vuln vuln-test check-toolchain docker-build docker-build-ghook helm-test js-sdk-test release-check
 
 build:
 	go build -o bin/pgb ./cmd/pgb
@@ -73,3 +73,11 @@ js-sdk-test:
 	cd sdk/js && $(NPM) pack --dry-run
 	cd sdk/js-connect && $(NODE) --test test/*.test.mjs
 	cd sdk/js-connect && $(NPM) pack --dry-run
+
+# Validates .goreleaser.yaml with the goreleaser version the release workflow
+# pins. `make release-check GORELEASER_ARGS="release --snapshot --clean"`
+# builds every release archive locally into dist/ without publishing.
+GORELEASER_VERSION ?= v2.18.2
+GORELEASER_ARGS ?= check
+release-check:
+	go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION) $(GORELEASER_ARGS)

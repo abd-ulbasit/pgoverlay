@@ -1,0 +1,84 @@
+# Release binaries for pgoverlay. Run by .github/workflows/release.yml on a
+# v* tag; validate locally with `make release-check`, or build every archive
+# without publishing: make release-check GORELEASER_ARGS="release --snapshot --clean"
+#
+# The container images are built by the same workflow from the repository's
+# Dockerfiles (docker/build-push-action), not here, so there is one image
+# recipe for local builds, the Helm ITs and releases.
+version: 2
+
+project_name: pgoverlay
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - &build
+    id: pgb
+    main: ./cmd/pgb
+    binary: pgb
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/abd-ulbasit/pgoverlay/internal/version.Version={{ .Version }}
+      - -X github.com/abd-ulbasit/pgoverlay/internal/version.Commit={{ .FullCommit }}
+      - -X github.com/abd-ulbasit/pgoverlay/internal/version.Date={{ .CommitDate }}
+    # Reproducible: timestamps come from the commit, not the build machine.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - <<: *build
+    id: branchd
+    main: ./cmd/branchd
+    binary: branchd
+  - <<: *build
+    id: pgoverlay-github
+    main: ./cmd/pgoverlay-github
+    binary: pgoverlay-github
+
+archives:
+  - id: pgoverlay
+    ids: [pgb, branchd, pgoverlay-github]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - SECURITY.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+
+release:
+  github:
+    owner: abd-ulbasit
+    name: pgoverlay
+  # A tag with a pre-release suffix (v1.1.0-rc.1) is published as a
+  # pre-release, so it never becomes "Latest".
+  prerelease: auto
+  footer: |
+    ## Container images
+
+    Multi-arch (linux/amd64, linux/arm64), built from this tag:
+
+    ```
+    ghcr.io/abd-ulbasit/pgoverlay-branchd:{{ .Tag }}
+    ghcr.io/abd-ulbasit/pgoverlay-ghook:{{ .Tag }}
+    ```
+
+    Verify a download with `sha256sum --check --ignore-missing checksums.txt`.
