@@ -464,6 +464,56 @@ func TestDiffBranchExactCountFailureKeepsEstimates(t *testing.T) {
 	}
 }
 
+// A cancelled diff stops counting at once: no further count statement runs
+// (neither the base's remaining chunks nor the branch side), the diff returns
+// the context error instead of a partial result, and the throwaway is still
+// cleaned up. Covers both a count that fails because of the cancellation and
+// one that completes just as the context ends.
+func TestDiffBranchExactCountStopsWhenCancelled(t *testing.T) {
+	for _, countFails := range []bool{true, false} {
+		t.Run(fmt.Sprintf("countFails=%v", countFails), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// 3 chunks per side of never-analyzed small tables
+			base, branch := fakeDB{}, fakeDB{}
+			for i := range 2*countChunk + 50 {
+				k := pub(fmt.Sprintf("t%03d", i))
+				base[k] = &fakeTable{reltuples: -1, rows: idRows(1)}
+				branch[k] = &fakeTable{reltuples: -1, rows: idRows(1, 2)}
+			}
+			counts := 0
+			pg := &fakePG{base: base, branch: branch, fail: func(_ bool, sql string) error {
+				if !strings.Contains(sql, "count(*)") {
+					return nil
+				}
+				counts++
+				cancel()
+				if countFails {
+					return errors.New("ERROR: canceling statement due to user request")
+				}
+				return nil
+			}}
+			d := newFake()
+			d.execOutFn = pg.exec
+			e, r := testEngine(t, d)
+			readySource(t, r)
+			if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := e.DiffBranch(ctx, "pr-1"); !errors.Is(err, context.Canceled) {
+				t.Fatalf("DiffBranch err = %v, want context.Canceled", err)
+			}
+			if counts != 1 {
+				t.Errorf("%d count statements ran, want 1 (none after the cancellation)", counts)
+			}
+			if names := liveDiffBranches(t, r); len(names) != 0 {
+				t.Errorf("throwaway rows left: %v", names)
+			}
+		})
+	}
+}
+
 // DIFF-03: tables are keyed by schema — same-named tables in different
 // schemas stay separate, names with a '|' parse, and every sampling query is
 // schema-qualified (a table outside search_path must not break the diff).

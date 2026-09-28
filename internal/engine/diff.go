@@ -252,13 +252,15 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 	}
 	baseStats, err := e.tableStats(ctx, twRow.ContainerID, src)
 	if err != nil {
-		return nil, fmt.Errorf("diff %q: base row estimates: %w", name, err)
+		return nil, fmt.Errorf("diff %q: base table stats: %w", name, err)
 	}
 	branchStats, err := e.tableStats(ctx, b.ContainerID, src)
 	if err != nil {
-		return nil, fmt.Errorf("diff %q: branch row estimates: %w", name, err)
+		return nil, fmt.Errorf("diff %q: branch table stats: %w", name, err)
 	}
-	e.countUnestimated(ctx, twRow.ContainerID, b.ContainerID, src, baseStats, branchStats)
+	if err := e.countUnestimated(ctx, twRow.ContainerID, b.ContainerID, src, baseStats, branchStats); err != nil {
+		return nil, fmt.Errorf("diff %q: count rows: %w", name, err)
+	}
 
 	res := &DiffResult{
 		SchemaDiff: diffutil.Unified(stripDumpNoise(baseDump), stripDumpNoise(branchDump)),
@@ -320,8 +322,9 @@ func (e *Engine) tableStats(ctx context.Context, cid string, src *registry.Sourc
 // table with no estimate on EITHER side is counted on both sides (so its delta
 // compares like with like) wherever its heap is at most exactCountMaxBytes.
 // Whatever cannot be counted keeps its estimate, or stays UnknownRows. A
-// failed count only loses precision, so it is logged, not returned.
-func (e *Engine) countUnestimated(ctx context.Context, baseCID, branchCID string, src *registry.Source, base, branch map[tableKey]tableStat) {
+// failed count only loses precision, so it is logged, not returned: the only
+// error is ctx's, once it is done (no further count runs then).
+func (e *Engine) countUnestimated(ctx context.Context, baseCID, branchCID string, src *registry.Source, base, branch map[tableKey]tableStat) error {
 	need := map[tableKey]bool{}
 	for _, stats := range []map[tableKey]tableStat{base, branch} {
 		for k, s := range stats {
@@ -331,21 +334,24 @@ func (e *Engine) countUnestimated(ctx context.Context, baseCID, branchCID string
 		}
 	}
 	if len(need) == 0 {
-		return
+		return nil
 	}
 	keys := make([]tableKey, 0, len(need))
 	for k := range need {
 		keys = append(keys, k)
 	}
 	sortKeys(keys)
-	e.countExact(ctx, baseCID, src, base, keys)
-	e.countExact(ctx, branchCID, src, branch, keys)
+	if err := e.countExact(ctx, baseCID, src, base, keys); err != nil {
+		return err
+	}
+	return e.countExact(ctx, branchCID, src, branch, keys)
 }
 
 // countExact counts the rows of every listed table present in stats whose
 // heap is small enough, in statements of up to countChunk tables each, and
-// records the counts in stats.
-func (e *Engine) countExact(ctx context.Context, cid string, src *registry.Source, stats map[tableKey]tableStat, keys []tableKey) {
+// records the counts in stats. Once ctx is done it returns ctx's error
+// instead of running the remaining chunks.
+func (e *Engine) countExact(ctx context.Context, cid string, src *registry.Source, stats map[tableKey]tableStat, keys []tableKey) error {
 	var todo []tableKey
 	for _, k := range keys {
 		if s, ok := stats[k]; ok && s.bytes <= exactCountMaxBytes {
@@ -353,6 +359,9 @@ func (e *Engine) countExact(ctx context.Context, cid string, src *registry.Sourc
 		}
 	}
 	for len(todo) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		chunk := todo[:min(countChunk, len(todo))]
 		todo = todo[len(chunk):]
 		subs := make([]string, len(chunk))
@@ -367,6 +376,9 @@ func (e *Engine) countExact(ctx context.Context, cid string, src *registry.Sourc
 			}
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			slog.Warn("diff: exact row count failed; keeping planner estimates", "container", cid, "tables", len(chunk), "err", err)
 			continue
 		}
@@ -376,6 +388,7 @@ func (e *Engine) countExact(ctx context.Context, cid string, src *registry.Sourc
 			stats[k] = s
 		}
 	}
+	return nil
 }
 
 // sampleScanKeys is how many of a grown table's highest primary keys are
