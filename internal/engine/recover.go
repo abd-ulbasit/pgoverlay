@@ -130,18 +130,7 @@ func (e *Engine) checkBranchData(ctx context.Context, b *registry.Branch, chain 
 // masked or rotated. On failure the new container is removed; the data is
 // never touched. The caller owns the state transitions.
 func (e *Engine) restartOnOwnData(ctx context.Context, b *registry.Branch, src *registry.Source, chain []registry.Layer) (string, runtime.ContainerInfo, error) {
-	image := e.image(src)
-	var cid string
-	var err error
-	switch {
-	case e.zfs():
-		cid, err = e.startZFSBranch(ctx, b, image)
-	case e.csi():
-		cid, err = e.startDirectBranch(ctx, b.Name, b.RWVolume, image, e.branchLabels(b))
-	default:
-		plan := cow.PlanBranch(b.RWVolume, b.SourceVolume, layerVolumes(chain))
-		cid, err = e.startOverlayBranch(ctx, b.Name, plan, image, e.branchLabels(b))
-	}
+	cid, err := e.startOnOwnData(ctx, b, src, chain)
 	if err != nil {
 		return "", runtime.ContainerInfo{}, fmt.Errorf("start instance: %w", err)
 	}
@@ -163,6 +152,24 @@ func (e *Engine) restartOnOwnData(ctx context.Context, b *registry.Branch, src *
 		return "", runtime.ContainerInfo{}, err
 	}
 	return cid, info, nil
+}
+
+// startOnOwnData starts a branch's instance on the volumes its row records:
+// the overlay stack of its writable layer over its frozen chain and source
+// volume, its zfs clone, or its csi PVC. It only starts the container; the
+// callers own readiness and the registry. Shared by restartOnOwnData
+// (recover, restoring a freeze or clone parent) and reconcile's restart of a
+// ready branch whose container was lost (restartBranch).
+func (e *Engine) startOnOwnData(ctx context.Context, b *registry.Branch, src *registry.Source, chain []registry.Layer) (string, error) {
+	image := e.image(src)
+	switch {
+	case e.zfs():
+		return e.startZFSBranch(ctx, b, image)
+	case e.csi():
+		return e.startDirectBranch(ctx, b.Name, b.RWVolume, image, e.branchLabels(b))
+	}
+	plan := cow.PlanBranch(b.RWVolume, b.SourceVolume, layerVolumes(chain))
+	return e.startOverlayBranch(ctx, b.Name, plan, image, e.branchLabels(b))
 }
 
 // restartAndMarkReady is restartOnOwnData followed by the transition to

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/abd-ulbasit/pgoverlay/internal/cow"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -766,15 +765,16 @@ var errBranchMoved = errors.New("branch changed while it was being restarted; le
 // after the runtime lost it: removed (`docker rm`, a pod deleted or drained),
 // or stopped for good (`docker stop`, an evicted pod, a container docker could
 // not start again after a reboot). The data lives in the volumes, so this is
-// the same restart a freeze or csi quiesce performs; masking and credential
-// rotation are not repeated (the data already carries both).
+// the same start RecoverBranch and a freeze or csi quiesce perform
+// (startOnOwnData); masking and credential rotation are not repeated (the
+// data already carries both).
 //
 // The row stays ready throughout; its address was dead anyway. The new
 // container is recorded before the readiness wait so no other pass reaps it,
 // and its address once it is ready. A branch that does not come back within
-// restartReadyTimeout is failed, keeping its volumes. A failure to start the
-// container at all is returned without failing the row, so the next pass
-// tries again.
+// restartReadyTimeout is failed, keeping its volumes, so `pgb branch recover`
+// can try again later. A failure to start the container at all is returned
+// without failing the row, so the next pass tries again.
 func (e *Engine) restartBranch(ctx context.Context, b *registry.Branch) error {
 	bg := context.WithoutCancel(ctx)
 	src, err := e.reg.GetSourceByID(b.SourceID)
@@ -790,7 +790,13 @@ func (e *Engine) restartBranch(ctx context.Context, b *registry.Branch) error {
 	if err := e.removeStrayBranchContainer(ctx, b); err != nil {
 		return err
 	}
-	cid, err := e.startExistingBranch(ctx, b, src)
+	chain, err := e.reg.LayerChain(b.ID)
+	if err != nil {
+		return err
+	}
+	// the same start RecoverBranch uses: the branch's own volumes, no
+	// re-clone, masking or rotation
+	cid, err := e.startOnOwnData(ctx, b, src, chain)
 	if err != nil {
 		return fmt.Errorf("start branch %q: %w", b.Name, err)
 	}
@@ -858,31 +864,6 @@ func (e *Engine) removeStrayBranchContainer(ctx context.Context, b *registry.Bra
 		return fmt.Errorf("container name %s is taken by %s, which is not this branch's container", name, shortID(info.ID))
 	}
 	return e.drv.StopRemove(ctx, info.ID)
-}
-
-// startExistingBranch starts a branch's instance on the volumes it already
-// has: the overlay stack over its layer chain, its zfs clone, or its csi PVC.
-func (e *Engine) startExistingBranch(ctx context.Context, b *registry.Branch, src *registry.Source) (string, error) {
-	image := e.image(src)
-	switch {
-	case e.zfs():
-		// same spec as provisionZFS step 4
-		return e.drv.StartBranch(ctx, runtime.BranchSpec{
-			Name:       branchContainerName(b.Name),
-			Image:      image,
-			Env:        []string{"PGDATA=" + cow.DirectDataPath},
-			Mounts:     []runtime.Mount{{Kind: runtime.MountHostPath, Volume: e.planner.Mountpoint(b.RWVolume), Target: cow.RWPath}},
-			Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
-			Labels:     e.branchLabels(b),
-		})
-	case e.csi():
-		return e.startDirectBranch(ctx, b.Name, b.RWVolume, image, e.branchLabels(b))
-	}
-	chain, err := e.reg.LayerChain(b.ID)
-	if err != nil {
-		return "", err
-	}
-	return e.startOverlayBranch(ctx, b.Name, cow.PlanBranch(b.RWVolume, b.SourceVolume, layerVolumes(chain)), image, e.branchLabels(b))
 }
 
 // endpointRefreshInterval bounds how often RefreshBranchEndpoint asks the
