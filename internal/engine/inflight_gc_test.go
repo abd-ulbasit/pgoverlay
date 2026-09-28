@@ -2,50 +2,49 @@ package engine
 
 import (
 	"context"
-	"strings"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
-// hookDriver runs onHelper inside RunHelper calls whose command contains
-// match — a point in a saga after it created a volume that no registry row
-// names yet.
-type hookDriver struct {
-	*fakeDriver
-	match    string
-	onHelper func()
-}
+// Issue #11 (LIFECYCLE-08 / DRIFT-02): volumes a saga creates before any row
+// names them are claimed in the registry (pending_volume) and counted by
+// LiveVolumeSet. TestReconcileMidFreezeKeepsParentsNewRWVolume and
+// TestReconcileMidRefreshKeepsNextGenerationVolume (reconcile_test.go) run
+// reconcile at the parent's restart and in the middle of a refresh's seed;
+// the tests here cover the freeze's earlier window and the claim's release.
 
-func (d *hookDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
-	if d.onHelper != nil && strings.Contains(strings.Join(s.Cmd, " ")+" "+mountsOf(s), d.match) {
-		f := d.onHelper
-		d.onHelper = nil
-		f()
-	}
-	return d.fakeDriver.RunHelper(ctx, s)
-}
-
-func mountsOf(s runtime.HelperSpec) string {
-	var out []string
+// mounts reports whether a helper mounts volume.
+func mounts(s runtime.HelperSpec, volume string) bool {
 	for _, m := range s.Mounts {
-		out = append(out, m.Volume)
+		if m.Volume == volume {
+			return true
+		}
 	}
-	return strings.Join(out, " ")
+	return false
 }
 
-// LIFECYCLE-08: a reconcile pass landing while a freeze has created the
-// parent's swap volume (before CommitFreeze records it) must not GC it.
+// A reconcile pass landing right after a freeze created the parent's swap
+// volume (installing its entrypoint, before the parent restarts) must not GC
+// it, and the claim is released at commit: afterwards the volume is live only
+// because the parent row names it.
 func TestReconcileDuringFreezeKeepsParentSwapVolume(t *testing.T) {
-	d := &hookDriver{fakeDriver: newFake(), match: "pgoverlay-br-p-rw-g2"}
+	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
 	if _, err := e.CreateBranch(context.Background(), "p", "main", 0); err != nil {
 		t.Fatal(err)
 	}
+	const swap = "pgoverlay-br-p-rw-g2"
 	var taken ReconcilePlan
-	d.onHelper = func() {
+	ran := false
+	d.onRunHelper = func(s runtime.HelperSpec) {
+		if ran || !mounts(s, swap) {
+			return
+		}
+		ran = true
 		var err error
 		taken, err = e.ApplyReconcile(context.Background(), time.Now(), time.Hour)
 		if err != nil {
@@ -55,18 +54,20 @@ func TestReconcileDuringFreezeKeepsParentSwapVolume(t *testing.T) {
 	if _, err := e.CreateBranchFrom(context.Background(), "c", "p", 0); err != nil {
 		t.Fatal(err)
 	}
+	if !ran {
+		t.Fatal("hook never ran")
+	}
 	for _, a := range taken.Actions {
 		if a.Kind == ActionGCVolume {
 			t.Fatalf("reconcile GC'd an in-flight volume: %+v", a)
 		}
 	}
 	p, _ := r.GetBranchByName("p")
-	if p.RWVolume != "pgoverlay-br-p-rw-g2" || !d.volumes[p.RWVolume] {
+	if p.RWVolume != swap || !d.volumes[p.RWVolume] {
 		t.Fatalf("parent after freeze: rw=%q present=%v", p.RWVolume, d.volumes[p.RWVolume])
 	}
-	// the claim is released at commit: nothing else keeps the volume live
 	live, _ := r.LiveVolumeSet()
-	if !live["pgoverlay-br-p-rw-g2"] || !live["pgoverlay-br-p-rw"] {
+	if !live[swap] || !live["pgoverlay-br-p-rw"] {
 		t.Fatalf("live set after freeze: %v", live)
 	}
 }
@@ -89,33 +90,19 @@ func TestFailedFreezeReleasesSwapVolumeClaim(t *testing.T) {
 	}
 }
 
-// Same for a source refresh: the next generation is being seeded before
-// BumpSourceGeneration records it.
-func TestReconcileDuringRefreshKeepsNewGeneration(t *testing.T) {
-	d := &hookDriver{fakeDriver: newFake(), match: "pgoverlay-src-main-g2"}
+// A failed refresh seed releases the next generation's claim as well.
+func TestFailedRefreshReleasesNextGenerationClaim(t *testing.T) {
+	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	var taken ReconcilePlan
-	d.onHelper = func() {
-		var err error
-		taken, err = e.ApplyReconcile(context.Background(), time.Now(), time.Hour)
-		if err != nil {
-			t.Errorf("reconcile: %v", err)
-		}
+	d.helperErr = errors.New("pg_basebackup: boom")
+	if err := e.RefreshSource(context.Background(), "main", "pw"); err == nil {
+		t.Fatal("want failure")
 	}
-	if err := e.RefreshSource(context.Background(), "main", "pw"); err != nil {
-		t.Fatal(err)
+	if live, _ := r.LiveVolumeSet(); live["pgoverlay-src-main-g2"] {
+		t.Fatal("failed refresh left its next generation claimed")
 	}
-	for _, a := range taken.Actions {
-		if a.Kind == ActionGCVolume {
-			t.Fatalf("reconcile GC'd the generation being seeded: %+v", a)
-		}
-	}
-	if !d.volumes["pgoverlay-src-main-g2"] {
-		t.Fatal("new generation volume gone")
-	}
-	s := mustSource(t, r)
-	if s.Volume != "pgoverlay-src-main-g2" {
-		t.Fatalf("source volume=%q", s.Volume)
+	if s := mustSource(t, r); s.Volume == "pgoverlay-src-main-g2" {
+		t.Fatalf("failed refresh bumped the generation: %q", s.Volume)
 	}
 }

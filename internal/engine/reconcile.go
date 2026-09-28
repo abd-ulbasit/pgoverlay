@@ -76,17 +76,20 @@ func (p *ReconcilePlan) add(kind ActionKind, target, reason string) {
 
 // reconcileState is the engine's in-process reconcile bookkeeping.
 //
-// claims counts resources that a running operation has created, or is about
-// to create, before the registry records them: a freeze's fresh parent rw
-// volume until CommitFreeze, a refresh's next-generation volume until
-// BumpSourceGeneration, a source being seeded, a branch reconcile is
-// restarting. PlanReconcile and applyAction consult it, so those resources are
-// never taken for orphans or abandoned rows while they are in use.
+// claims counts work this process has in flight that reconcile must not
+// mistake for abandoned: a source being seeded (fail_stuck_source) and a
+// branch a reconcile pass is restarting (restart_branch). PlanReconcile and
+// applyAction consult it.
 //
-// Claims only cover operations in this process. Volume GC additionally skips
-// any volume younger than the stuck timeout, which covers another process (a
-// CLI next to branchd, a previous leader) that has just created one, and a
-// running seed heartbeats its source row for the same reason.
+// Volumes are not claimed here. A volume a saga creates before any row names
+// it (a freeze's fresh parent rw volume until CommitFreeze, a refresh's next
+// generation until BumpSourceGeneration) is claimed in the registry instead
+// (branches/sources.pending_volume, counted by LiveVolumeSet), so the claim
+// also holds against a reconcile pass in another process: an HA peer or a
+// local pgb next to branchd. As defence in depth, volume GC also skips any
+// volume younger than the stuck timeout (a writer that predates the claim
+// columns, or a window no claim covers). A running seed heartbeats its source
+// row for the same cross-process reason.
 type reconcileState struct {
 	mu        sync.Mutex
 	claims    map[string]int
@@ -150,32 +153,23 @@ func (s *reconcileState) allowRefresh(name string, now time.Time) bool {
 	return true
 }
 
-func volumeClaim(name string) string { return "volume:" + name }
 func sourceClaim(id string) string   { return "source:" + id }
 func branchClaim(name string) string { return "branch:" + name }
 
-// claimVolume marks a volume the caller is about to create as in flight until
-// release is called: after the registry records the volume, or after the
-// caller's compensation removed it. Claim BEFORE creating the volume.
-func (e *Engine) claimVolume(name string) (release func()) {
-	return e.rs.claim(volumeClaim(name))
-}
-
-// seedHeartbeat is how often a running seed bumps its source row.
-var seedHeartbeat = 30 * time.Second
-
 // trackSeeding marks source id as being seeded by this process until stop is
-// called. Reconcile skips a claimed source, and the heartbeat keeps its
-// updated_at fresh so no other process's reconcile takes a long seed for an
-// abandoned one (fail_stuck_source).
+// called. Reconcile skips a claimed source, and the heartbeat (the same
+// interval as a branch saga's keepAlive) keeps its updated_at fresh so no
+// other process's reconcile takes a long seed for an abandoned one
+// (fail_stuck_source).
 func (e *Engine) trackSeeding(id string) (stop func()) {
 	release := e.rs.claim(sourceClaim(id))
+	every := e.heartbeatInterval()
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		t := time.NewTicker(seedHeartbeat)
+		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
 			select {
@@ -345,13 +339,15 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 			}
 		}
 		for _, v := range vols {
-			if liveVols[v.Name] || planned[v.Name] || e.rs.claimed(volumeClaim(v.Name)) {
+			// liveVols includes the pending_volume claims of in-flight
+			// freezes and refreshes, whichever process runs them
+			if liveVols[v.Name] || planned[v.Name] {
 				continue
 			}
-			// A volume the registry does not name yet may belong to an
-			// operation in another process that has just created it (a freeze
-			// before CommitFreeze, a refresh before BumpSourceGeneration). Give
-			// it the stuck timeout before calling it an orphan.
+			// Defence in depth: a volume no row names or claims may still
+			// belong to an operation that has just created it outside any
+			// claim (e.g. a process predating the claim columns). Give it the
+			// stuck timeout before calling it an orphan.
 			if !v.Created.IsZero() && now.Sub(v.Created) < stuckTimeout {
 				continue
 			}
@@ -472,10 +468,10 @@ func (e *Engine) ApplyReconcile(ctx context.Context, now time.Time, stuckTimeout
 }
 
 // resumeDestroy finishes the teardown of a branch wedged in destroying. It
-// is DestroyBranch, which resumes from the destroying state once the
-// lifecycle fix for failed destroys (LIFECYCLE-02, issue #10) makes it
-// re-entrant; until then the retry reports DestroyBranch's refusal. A
-// variable so tests can observe the call.
+// is DestroyBranch, which accepts a row already in destroying and re-runs its
+// idempotent teardown (issue #10); a failed attempt is journaled and bumps
+// updated_at, so the next retry waits another stuck timeout. A variable so
+// tests can observe the call.
 var resumeDestroy = (*Engine).DestroyBranch
 
 // applyAction executes one planned action after re-validating it against the
@@ -733,10 +729,7 @@ func (e *Engine) applyAction(ctx context.Context, a Action, p reconcilePass) (ap
 	case ActionGCVolume:
 		// re-check ownership immediately before deleting: never remove a volume
 		// that any live branch's layer chain / rw / source volume now
-		// references, or that an operation in this process has claimed.
-		if e.rs.claimed(volumeClaim(a.Target)) {
-			return false, nil
-		}
+		// references, or that an in-flight saga has claimed (pending_volume).
 		liveVols, err := e.reg.LiveVolumeSet()
 		if err != nil {
 			return false, err

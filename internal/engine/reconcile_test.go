@@ -815,34 +815,56 @@ func TestReconcileVolumeGCGracePeriod(t *testing.T) {
 	}
 }
 
-// A volume claimed by an operation in this process is skipped at plan time
-// and re-checked at apply time.
+// A volume an in-flight saga has claimed in the registry (pending_volume on
+// its owner row, as a freeze does for the parent's swap volume) is skipped at
+// plan time and re-checked at apply time. The claim is a registry column, so
+// it holds whichever process runs the saga; it stops counting once the owner
+// row leaves creating/resetting (a crashed saga's row is failed by reconcile).
 func TestReconcileSkipsClaimedVolume(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	readySource(t, r)
-	d.addOrphanVolume("pgoverlay-br-x-rw-g2", r.InstanceID())
-
-	release := e.claimVolume("pgoverlay-br-x-rw-g2")
-	plan, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
-	if err != nil {
+	x := readyBranch(t, e, "x")
+	if err := r.TransitionBranch(x.ID, registry.BranchResetting, "freeze for child c"); err != nil {
 		t.Fatal(err)
 	}
-	if hasAction(plan, ActionGCVolume, "pgoverlay-br-x-rw-g2") {
-		t.Fatalf("claimed volume planned for GC: %+v", plan.Actions)
+	const swap = "pgoverlay-br-x-rw-g2"
+	d.addOrphanVolume(swap, r.InstanceID())
+	plan := func() ReconcilePlan {
+		t.Helper()
+		p, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
-	release()
 
-	plan, err = e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
-	if err != nil || !hasAction(plan, ActionGCVolume, "pgoverlay-br-x-rw-g2") {
-		t.Fatalf("released volume not planned: %+v, %v", plan.Actions, err)
+	if err := r.SetBranchPendingVolume(x.ID, swap); err != nil {
+		t.Fatal(err)
+	}
+	if p := plan(); hasAction(p, ActionGCVolume, swap) {
+		t.Fatalf("claimed volume planned for GC: %+v", p.Actions)
+	}
+	if err := r.SetBranchPendingVolume(x.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if p := plan(); !hasAction(p, ActionGCVolume, swap) {
+		t.Fatalf("released volume not planned: %+v", p.Actions)
 	}
 	// claimed between plan and apply: the apply-time re-check keeps it
-	release = e.claimVolume("pgoverlay-br-x-rw-g2")
-	defer release()
-	applied, err := e.applyAction(context.Background(), Action{Kind: ActionGCVolume, Target: "pgoverlay-br-x-rw-g2"}, reconcilePass{now: time.Now(), stuckTimeout: 10 * time.Minute})
-	if err != nil || applied || !d.volumes["pgoverlay-br-x-rw-g2"] {
-		t.Fatalf("apply on a claimed volume: applied=%v err=%v present=%v", applied, err, d.volumes["pgoverlay-br-x-rw-g2"])
+	if err := r.SetBranchPendingVolume(x.ID, swap); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := e.applyAction(context.Background(), Action{Kind: ActionGCVolume, Target: swap}, reconcilePass{now: time.Now(), stuckTimeout: 10 * time.Minute})
+	if err != nil || applied || !d.volumes[swap] {
+		t.Fatalf("apply on a claimed volume: applied=%v err=%v present=%v", applied, err, d.volumes[swap])
+	}
+	// the owner row failed (its saga died): the claim no longer pins the volume
+	if err := r.TransitionBranch(x.ID, registry.BranchFailed, "crashed mid-freeze"); err != nil {
+		t.Fatal(err)
+	}
+	if p := plan(); !hasAction(p, ActionGCVolume, swap) {
+		t.Fatalf("dead claim still pins the volume: %+v", p.Actions)
 	}
 }
 
@@ -990,12 +1012,9 @@ func TestReconcileFailsSourceStuckInSeeding(t *testing.T) {
 // A running seed heartbeats its source row, so a long seed is never mistaken
 // for an abandoned one by another process's reconcile.
 func TestSeedHeartbeatKeepsSourceFresh(t *testing.T) {
-	old := seedHeartbeat
-	seedHeartbeat = 5 * time.Millisecond
-	t.Cleanup(func() { seedHeartbeat = old })
-
 	d := newFake()
 	e, r := testEngine(t, d)
+	e.heartbeatEvery = 5 * time.Millisecond // what WithHeartbeatInterval sets
 	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)

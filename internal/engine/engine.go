@@ -38,14 +38,15 @@ type Engine struct {
 	// Both come from branchd --default-ttl / --max-ttl.
 	defaultTTL time.Duration
 	maxTTL     time.Duration
-	// heartbeatEvery is how often a running saga bumps its branch rows'
-	// updated_at (see keepAlive). 0 = defaultHeartbeat.
+	// heartbeatEvery is how often a running saga or seed bumps its rows'
+	// updated_at (see keepAlive, trackSeeding). 0 = defaultHeartbeat.
 	heartbeatEvery time.Duration
 	// maxLayerDepth caps an overlay branch's frozen layer chain (see
 	// checkLayerDepth). 0 = DefaultMaxLayerDepth.
 	maxLayerDepth int
-	// rs is reconcile's in-process bookkeeping: resources running sagas have
-	// claimed but not yet recorded in the registry (see reconcile.go).
+	// rs is reconcile's in-process bookkeeping: sources this process is
+	// seeding, branches reconcile is restarting, and the endpoint-refresh
+	// rate limit (see reconcile.go).
 	rs reconcileState
 }
 
@@ -95,9 +96,10 @@ func WithMetrics(m *metrics.Metrics) Option {
 const defaultHeartbeat = 30 * time.Second
 
 // WithHeartbeatInterval sets how often a running saga bumps its branch rows'
-// updated_at so reconcile never mistakes a slow-but-alive saga for an
-// abandoned one. Keep it well under the stuck timeout (branchd uses a quarter
-// of --stuck-timeout, capped at defaultHeartbeat). d <= 0 keeps the default.
+// (and a running seed its source row's) updated_at so reconcile never
+// mistakes a slow-but-alive operation for an abandoned one. Keep it well
+// under the stuck timeout (branchd uses a quarter of --stuck-timeout, capped
+// at defaultHeartbeat). d <= 0 keeps the default.
 func WithHeartbeatInterval(d time.Duration) Option {
 	return func(e *Engine) {
 		if d > 0 {
@@ -156,6 +158,15 @@ func (e *Engine) logCompensationErr(kind, msg string, err error, attrs ...any) {
 	slog.Warn(msg, append(attrs, "kind", kind, "err", err)...)
 }
 
+// heartbeatInterval is how often running work bumps its rows' updated_at:
+// branch sagas (keepAlive) and source seeds (trackSeeding) alike.
+func (e *Engine) heartbeatInterval() time.Duration {
+	if e.heartbeatEvery > 0 {
+		return e.heartbeatEvery
+	}
+	return defaultHeartbeat
+}
+
 // keepAlive bumps the given branch rows' updated_at every heartbeat until the
 // returned stop function is called (stop waits for the ticker goroutine, so no
 // touch lands after it returns). Sagas hold it for as long as they keep rows
@@ -164,10 +175,7 @@ func (e *Engine) logCompensationErr(kind, msg string, err error, attrs ...any) {
 // script (arbitrary user SQL) got a live branch — and, in a freeze, its
 // parent — failed and torn down mid-provision.
 func (e *Engine) keepAlive(ids ...string) (stop func()) {
-	every := e.heartbeatEvery
-	if every <= 0 {
-		every = defaultHeartbeat
-	}
+	every := e.heartbeatInterval()
 	done := make(chan struct{})
 	finished := make(chan struct{})
 	go func() {
