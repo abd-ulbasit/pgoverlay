@@ -8,6 +8,7 @@ package pgproxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -34,9 +35,31 @@ type BranchResolver interface {
 	ResolveBranch(name string) (addr string, err error)
 }
 
+// BranchRefresher is optionally implemented by a BranchResolver that can
+// re-read a branch's address from the runtime. When the dial to the resolved
+// address fails, the proxy asks it once and, if the address moved (a pod that
+// came back with a new IP, a container re-published on another port), dials
+// the new address instead of refusing until the next reconcile pass repairs
+// the registry.
+type BranchRefresher interface {
+	RefreshBranch(ctx context.Context, name string) (addr string, err error)
+}
+
 // RegistryResolver adapts the registry: only ready branches resolve.
 type RegistryResolver struct {
 	Reg *registry.Registry
+	// Refresh, when set, re-reads a ready branch's address from the runtime
+	// and records it if it moved (branchd wires engine.RefreshBranchEndpoint).
+	// nil disables the refresh after a failed dial.
+	Refresh func(ctx context.Context, name string) (string, error)
+}
+
+// RefreshBranch implements BranchRefresher through the Refresh hook.
+func (r *RegistryResolver) RefreshBranch(ctx context.Context, name string) (string, error) {
+	if r.Refresh == nil {
+		return "", errors.New("no address refresh configured")
+	}
+	return r.Refresh(ctx, name)
 }
 
 func (r *RegistryResolver) ResolveBranch(name string) (string, error) {
@@ -240,6 +263,9 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 	}
 	backend, err := net.DialTimeout("tcp", addr, p.DialTimeout)
 	if err != nil {
+		backend, err = p.redial(branch, addr, err)
+	}
+	if err != nil {
 		// A resolved-but-unreachable backend would otherwise confirm the branch
 		// name and its (down) state — collapse it into the same generic refusal.
 		slog.Warn("pgproxy: route refused", "branch", branch, "reason", "dial", "addr", addr, "error", err)
@@ -254,6 +280,28 @@ func (p *Proxy) route(client net.Conn, startup *pgproto3.StartupMessage) {
 	// own idle deadlines from here on.
 	client.SetReadDeadline(time.Time{})
 	relay(client, backend, p.idleTimeout())
+}
+
+// redial runs after the dial to a branch's resolved address failed: when the
+// resolver can refresh addresses and the branch moved, it dials the new
+// address once. Otherwise it returns the original dial error.
+func (p *Proxy) redial(branch, addr string, dialErr error) (net.Conn, error) {
+	rf, ok := p.Resolver.(BranchRefresher)
+	if !ok {
+		return nil, dialErr
+	}
+	timeout := p.DialTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	moved, err := rf.RefreshBranch(ctx, branch)
+	if err != nil || moved == "" || moved == addr {
+		return nil, dialErr
+	}
+	slog.Info("pgproxy: branch address moved; dialing the new one", "branch", branch, "from", addr, "to", moved)
+	return net.DialTimeout("tcp", moved, p.DialTimeout)
 }
 
 // relay copies bytes in both directions until both sides are done. Each

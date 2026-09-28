@@ -544,8 +544,12 @@ func (e *Engine) applyMasking(ctx context.Context, cid string, src *registry.Sou
 	return nil
 }
 
-// psqlCmd builds an in-container psql invocation over the local socket
-// (peer/local auth — no password needed) with the source's user/database.
+// psqlCmd builds an in-container psql invocation over the local socket with
+// the source's user/database. No password is sent, so the branch's pg_hba.conf
+// (copied from the source) must allow local connections for that role without
+// one: `trust`, or `peer` when the role is postgres (the docker driver execs as
+// the postgres OS user; kube exec runs as the container's user, so peer only
+// works there if that user is postgres).
 func psqlCmd(src *registry.Source, sql string) []string {
 	user, db := src.ConnUser, src.ConnDB
 	if user == "" {

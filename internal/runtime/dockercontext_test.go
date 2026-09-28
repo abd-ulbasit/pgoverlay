@@ -33,7 +33,7 @@ func dockerConfig(t *testing.T, current string) string {
 		t.Setenv(k, v)
 	}
 	if current != "" {
-		writeJSON(t, filepath.Join(dir, "config.json"), map[string]string{"currentContext": current})
+		writeJSONFile(t, filepath.Join(dir, "config.json"), map[string]string{"currentContext": current})
 	}
 	return dir
 }
@@ -43,14 +43,14 @@ func addContext(t *testing.T, dir, name, host string, skipTLS bool) string {
 	t.Helper()
 	sum := sha256.Sum256([]byte(name))
 	id := hex.EncodeToString(sum[:])
-	writeJSON(t, filepath.Join(dir, "contexts", "meta", id, "meta.json"), map[string]any{
+	writeJSONFile(t, filepath.Join(dir, "contexts", "meta", id, "meta.json"), map[string]any{
 		"Name":      name,
 		"Endpoints": map[string]any{"docker": map[string]any{"Host": host, "SkipTLSVerify": skipTLS}},
 	})
 	return filepath.Join(dir, "contexts", "tls", id, "docker")
 }
 
-func writeJSON(t *testing.T, path string, v any) {
+func writeJSONFile(t *testing.T, path string, v any) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestCLIContextResolution(t *testing.T) {
 	}
 	// ...a stale currentContext in config.json falls back to the default
 	t.Setenv("DOCKER_CONTEXT", "")
-	writeJSON(t, filepath.Join(dir, "config.json"), map[string]string{"currentContext": "gone"})
+	writeJSONFile(t, filepath.Join(dir, "config.json"), map[string]string{"currentContext": "gone"})
 	if got := DockerHostFromCLIContext(); got != "" {
 		t.Fatalf("stale currentContext: host = %q", got)
 	}

@@ -44,6 +44,9 @@ type Engine struct {
 	// maxLayerDepth caps an overlay branch's frozen layer chain (see
 	// checkLayerDepth). 0 = DefaultMaxLayerDepth.
 	maxLayerDepth int
+	// rs is reconcile's in-process bookkeeping: resources running sagas have
+	// claimed but not yet recorded in the registry (see reconcile.go).
+	rs reconcileState
 }
 
 // parentStepTimeout bounds a parent-affecting step (stopping a freeze or
@@ -279,6 +282,9 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 	if err := e.reg.CreateSource(s); err != nil {
 		return err
 	}
+	// heartbeat the seeding row so reconcile can tell a long seed from one
+	// whose process died (fail_stuck_source)
+	defer e.trackSeeding(s.ID)()
 	if err := e.createSourceLayer(ctx, s.Volume, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": s.Name})); err != nil {
 		e.logCompensationErr("transition", "add source: mark source failed after layer create failed",
 			e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed"), "source", s.Name)
@@ -309,7 +315,8 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 	newVol := e.planner.SourceLayerName(name, src.Generation+1)
 	// claim the next generation before creating it: nothing names it until
 	// BumpSourceGeneration, and reconcile's volume GC must not take it while
-	// it is being seeded
+	// it is being seeded. The claim is a registry column, so it also holds
+	// against a reconcile pass in another process (an HA peer, local pgb).
 	if err := e.reg.SetSourcePendingVolume(src.ID, newVol); err != nil {
 		return fmt.Errorf("refresh source %q: claim %s: %w", name, newVol, err)
 	}

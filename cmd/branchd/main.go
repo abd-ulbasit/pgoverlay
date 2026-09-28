@@ -412,7 +412,7 @@ func run() error {
 	}
 	g.Go(func() error {
 		log.Printf("pg router listening on %s (connect with dbname@branch; TLS %v)", *pgAddr, pgTLS != nil)
-		px := pgproxy.New(&pgproxy.RegistryResolver{Reg: reg})
+		px := pgproxy.New(&pgproxy.RegistryResolver{Reg: reg, Refresh: eng.RefreshBranchEndpoint})
 		px.TLSConfig = pgTLS
 		return px.Serve(ctx, lis)
 	})

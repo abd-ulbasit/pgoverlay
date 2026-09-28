@@ -162,7 +162,8 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 
 	// 3. fresh rw volume for the parent (the swap), with the entrypoint.
 	// Claimed on the parent row first: no column names it until
-	// CommitFreeze, and reconcile's volume GC must not take it meanwhile.
+	// CommitFreeze, and reconcile's volume GC (in this process or another)
+	// must not take it meanwhile.
 	if err := e.reg.SetBranchPendingVolume(parent.ID, newRW); err != nil {
 		return fail(fmt.Errorf("claim parent rw volume: %w", err))
 	}

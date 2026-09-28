@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -101,7 +102,10 @@ func (f *fakeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (s
 	return "", nil
 }
 func (f *fakeDriver) Inspect(ctx context.Context, id string) (runtime.ContainerInfo, error) {
-	return runtime.ContainerInfo{ID: id, Running: f.containers[id], Host: "127.0.0.1", Port: 54321}, nil
+	if !f.containers[id] {
+		return runtime.ContainerInfo{}, fmt.Errorf("container %s: %w", id, runtime.ErrNotFound)
+	}
+	return runtime.ContainerInfo{ID: id, Running: true, Host: "127.0.0.1", Port: 54321}, nil
 }
 func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 	delete(f.containers, id)
@@ -110,14 +114,17 @@ func (f *fakeDriver) StopRemove(ctx context.Context, id string) error {
 func (f *fakeDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, error) {
 	var out []runtime.ContainerInfo
 	for id := range f.containers {
-		out = append(out, runtime.ContainerInfo{ID: id, Running: true})
+		out = append(out, runtime.ContainerInfo{ID: id, Running: true, Host: "127.0.0.1", Port: 54321})
 	}
 	return out, nil
 }
-func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
-	var out []string
+func (f *fakeDriver) ListHelpers(ctx context.Context) ([]runtime.ContainerInfo, error) {
+	return nil, nil
+}
+func (f *fakeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]runtime.VolumeInfo, error) {
+	var out []runtime.VolumeInfo
 	for name := range f.volumes {
-		out = append(out, name)
+		out = append(out, runtime.VolumeInfo{Name: name})
 	}
 	return out, nil
 }

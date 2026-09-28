@@ -1454,3 +1454,162 @@ func (r *Registry) ListSources() ([]*Source, error) {
 	}
 	return out, rows.Err()
 }
+
+// Reconcile support: registry -> runtime drift repair and stuck-row recovery.
+//
+// The `before` arguments below are compared with updated_at, which is stored
+// as strftime('%Y-%m-%dT%H:%M:%fZ') (UTC, millisecond precision); format them
+// with TimeString so the lexicographic comparison is exact.
+
+// TimeString renders t in the registry's timestamp format (UTC, milliseconds),
+// for the `before` cut-offs taken by the stuck-row queries below.
+func TimeString(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// UpdateBranchEndpoint re-points a ready branch at a container and address
+// without a state change: reconcile's repair for a branch whose container
+// came back on a different address or had to be recreated. It is a
+// compare-and-swap on state='ready' AND container_id=fromContainerID, so it
+// never overwrites a branch that a concurrent reset, freeze or destroy has
+// taken over; updated reports whether the row changed.
+func (r *Registry) UpdateBranchEndpoint(id, fromContainerID, containerID, host string, port int) (updated bool, err error) {
+	res, err := r.db.Exec(`UPDATE branches SET container_id=?, host=?, port=?
+		WHERE id=? AND state=? AND container_id=?`,
+		containerID, host, port, id, string(BranchReady), fromContainerID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// FailReadyBranch marks a ready branch failed when reconcile could not bring
+// its container back. The state machine has no direct ready -> failed edge,
+// so the row takes the two legal edges ready -> resetting -> failed, both
+// journaled, in ONE transaction: a crash can never leave it parked in
+// resetting, where the stuck-row recovery would treat its writable layer as
+// a half-built reset and delete it. Compare-and-swap on state='ready' AND
+// container_id=containerID; failed reports whether the row changed.
+func (r *Registry) FailReadyBranch(ctx context.Context, id, containerID, reason string) (failed bool, err error) {
+	if !legalBranchTransition(BranchReady, BranchResetting) || !legalBranchTransition(BranchResetting, BranchFailed) {
+		return false, fmt.Errorf("illegal branch transition %s -> %s", BranchReady, BranchFailed)
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE branches SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=? AND container_id=?`, string(BranchFailed), id, string(BranchReady), containerID)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, err
+	}
+	actor := actorString(ctx)
+	for _, step := range [][2]BranchState{{BranchReady, BranchResetting}, {BranchResetting, BranchFailed}} {
+		if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+			"branch", id, string(step[0]), string(step[1]), reason, actor); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
+}
+
+// FailStuckBranch moves a branch still in creating or resetting whose last
+// update is older than before to failed, journaling reason — one
+// compare-and-swap on the same criterion ListStuckBranches uses. It returns
+// false and changes nothing when the row has moved on (its saga finished or
+// failed) or made progress since, so reconcile tears down only a branch it
+// actually failed.
+func (r *Registry) FailStuckBranch(ctx context.Context, id, before, reason string) (failed bool, err error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var from string
+	if err := tx.QueryRow(`SELECT state FROM branches WHERE id=? AND state IN (?,?) AND updated_at < ?`,
+		id, string(BranchCreating), string(BranchResetting), before).Scan(&from); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !legalBranchTransition(BranchState(from), BranchFailed) {
+		return false, fmt.Errorf("illegal branch transition %s -> %s", from, BranchFailed)
+	}
+	res, err := tx.Exec(`UPDATE branches SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=? AND updated_at < ?`, string(BranchFailed), id, from, before)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+		"branch", id, from, string(BranchFailed), reason, actorString(ctx)); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// ListStuckDestroyingBranches returns branches in destroying whose last update
+// is older than before: a destroy that failed or was interrupted part-way.
+func (r *Registry) ListStuckDestroyingBranches(before string) ([]*Branch, error) {
+	return r.listBranches(`state=? AND updated_at < ?`, string(BranchDestroying), before)
+}
+
+// TouchSource bumps a source's updated_at: the seeding heartbeat that tells
+// reconcile the seed is still running (see ListStuckSources).
+func (r *Registry) TouchSource(id string) error {
+	_, err := r.db.Exec(`UPDATE sources SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, id)
+	return err
+}
+
+// ListStuckSources returns sources still seeding whose last update is older
+// than before. A live seed heartbeats (TouchSource), so these are seeds whose
+// process died.
+func (r *Registry) ListStuckSources(before string) ([]*Source, error) {
+	rows, err := r.db.Query(`SELECT `+sourceCols+` FROM sources WHERE state=? AND updated_at < ? ORDER BY created_at`,
+		string(SourceSeeding), before)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Source
+	for rows.Next() {
+		s, err := scanSource(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// FailStuckSource moves a source still seeding whose last update is older than
+// before to failed, journaling reason, as one compare-and-swap; failed reports
+// whether it applied (false when the seed finished, failed or heartbeat since).
+func (r *Registry) FailStuckSource(ctx context.Context, id, before, reason string) (failed bool, err error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE sources SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=? AND updated_at < ?`, string(SourceFailed), id, string(SourceSeeding), before)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+		"source", id, string(SourceSeeding), string(SourceFailed), reason, actorString(ctx)); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}

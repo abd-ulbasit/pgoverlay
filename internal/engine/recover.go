@@ -109,7 +109,7 @@ func (e *Engine) checkBranchData(ctx context.Context, b *registry.Branch, chain 
 	}
 	have := make(map[string]bool, len(vols))
 	for _, v := range vols {
-		have[v] = true
+		have[v.Name] = true
 	}
 	var missing []string
 	for _, v := range need {
