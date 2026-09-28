@@ -272,8 +272,8 @@ func TestNoteBranchJournalsWithoutStateChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	if got, _ := r.ListDestroyingBranches(before); len(got) != 1 || got[0].ID != b.ID {
-		t.Fatalf("ListDestroyingBranches before note = %v, want [pr-1]", got)
+	if got, _ := r.ListStuckDestroyingBranches(before); len(got) != 1 || got[0].ID != b.ID {
+		t.Fatalf("ListStuckDestroyingBranches before note = %v, want [pr-1]", got)
 	}
 	if err := r.NoteBranchCtx(context.Background(), b.ID, "destroy failed: volume is in use"); err != nil {
 		t.Fatal(err)
@@ -288,8 +288,8 @@ func TestNoteBranchJournalsWithoutStateChange(t *testing.T) {
 		t.Fatalf("state=%s", got.State)
 	}
 	// the note bumped updated_at: no longer older than the cutoff
-	if got, _ := r.ListDestroyingBranches(before); len(got) != 0 {
-		t.Fatalf("ListDestroyingBranches after note = %v, want none (backoff)", got)
+	if got, _ := r.ListStuckDestroyingBranches(before); len(got) != 0 {
+		t.Fatalf("ListStuckDestroyingBranches after note = %v, want none (backoff)", got)
 	}
 	if err := r.NoteBranchCtx(context.Background(), "missing", "x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown id: %v", err)

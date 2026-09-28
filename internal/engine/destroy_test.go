@@ -177,7 +177,7 @@ func TestDestroyRaceLoserSucceeds(t *testing.T) {
 	}
 }
 
-// ListDestroyingBranches is the hook for a periodic retry (reconcile): a row
+// ListStuckDestroyingBranches is the hook for a periodic retry (reconcile): a row
 // left in destroying shows up once it is older than the cutoff, and a
 // DestroyBranch on it completes the destroy.
 func TestStuckDestroyingIsListedAndRetryable(t *testing.T) {
@@ -192,14 +192,14 @@ func TestStuckDestroyingIsListedAndRetryable(t *testing.T) {
 	if err := e.DestroyBranch(ctx, "pr-1"); err == nil {
 		t.Fatal("want first destroy to fail")
 	}
-	stuck, err := r.ListDestroyingBranches(time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	stuck, err := r.ListStuckDestroyingBranches(time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
 	if err != nil || len(stuck) != 1 || stuck[0].Name != "pr-1" {
-		t.Fatalf("ListDestroyingBranches=%v err=%v", stuck, err)
+		t.Fatalf("ListStuckDestroyingBranches=%v err=%v", stuck, err)
 	}
 	if err := e.DestroyBranch(ctx, stuck[0].Name); err != nil {
 		t.Fatal(err)
 	}
-	if stuck, _ := r.ListDestroyingBranches(time.Now().Add(time.Hour).UTC().Format(time.RFC3339)); len(stuck) != 0 {
+	if stuck, _ := r.ListStuckDestroyingBranches(time.Now().Add(time.Hour).UTC().Format(time.RFC3339)); len(stuck) != 0 {
 		t.Fatalf("still listed after retry: %v", stuck)
 	}
 }

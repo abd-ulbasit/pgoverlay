@@ -617,7 +617,8 @@ const destroyTimeout = 5 * time.Minute
 // earlier destroy that failed or was interrupted — re-runs the teardown, every
 // step of which tolerates already-gone resources. A teardown failure leaves
 // the row in destroying with the cause journaled (pgb history) for the next
-// attempt: another destroy call, or reconcile (Registry.ListDestroyingBranches).
+// attempt: another destroy call, or reconcile's retry_destroy
+// (Registry.ListStuckDestroyingBranches).
 func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	defer e.observeOp("destroy", &err)()
 	b, err := e.reg.GetBranchByName(name)

@@ -962,16 +962,6 @@ func (r *Registry) ListStuckBranches(before string) ([]*Branch, error) {
 	return out, rows.Err()
 }
 
-// ListDestroyingBranches returns branches left in destroying — a destroy
-// whose teardown failed or was interrupted (branchd crash, shutdown) — whose
-// last update predates before (RFC3339 UTC). DestroyBranch accepts such a row
-// and re-runs its idempotent teardown, so a periodic pass (reconcile) can
-// retry them; every failed attempt bumps updated_at (NoteBranchCtx), so the
-// retries back off by the cutoff's age.
-func (r *Registry) ListDestroyingBranches(before string) ([]*Branch, error) {
-	return r.listBranches(`state='destroying' AND updated_at < ?`, msCutoff(before))
-}
-
 // msCutoff renders an RFC3339 cutoff in the millisecond form updated_at is
 // stored in (strftime '%Y-%m-%dT%H:%M:%fZ'). The two are compared as text,
 // and a whole-second cutoff "…T15:04:05Z" sorts after every timestamp inside
@@ -982,7 +972,7 @@ func msCutoff(before string) string {
 	if err != nil {
 		return before
 	}
-	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+	return TimeString(t)
 }
 
 // VolumeNameUsed reports whether any registry row has ever used volume: as a
@@ -1459,7 +1449,9 @@ func (r *Registry) ListSources() ([]*Source, error) {
 //
 // The `before` arguments below are compared with updated_at, which is stored
 // as strftime('%Y-%m-%dT%H:%M:%fZ') (UTC, millisecond precision); format them
-// with TimeString so the lexicographic comparison is exact.
+// with TimeString so the lexicographic comparison is exact. (Each query also
+// normalises its cut-off through msCutoff, so an RFC3339 whole-second value
+// compares correctly too.)
 
 // TimeString renders t in the registry's timestamp format (UTC, milliseconds),
 // for the `before` cut-offs taken by the stuck-row queries below.
@@ -1493,7 +1485,7 @@ func (r *Registry) UpdateBranchEndpoint(id, fromContainerID, containerID, host s
 // container_id=containerID; failed reports whether the row changed.
 func (r *Registry) FailReadyBranch(ctx context.Context, id, containerID, reason string) (failed bool, err error) {
 	if !legalBranchTransition(BranchReady, BranchResetting) || !legalBranchTransition(BranchResetting, BranchFailed) {
-		return false, fmt.Errorf("illegal branch transition %s -> %s", BranchReady, BranchFailed)
+		return false, illegalTransition("branch", string(BranchReady), string(BranchFailed))
 	}
 	tx, err := r.db.Begin()
 	if err != nil {
@@ -1525,6 +1517,7 @@ func (r *Registry) FailReadyBranch(ctx context.Context, id, containerID, reason 
 // failed) or made progress since, so reconcile tears down only a branch it
 // actually failed.
 func (r *Registry) FailStuckBranch(ctx context.Context, id, before, reason string) (failed bool, err error) {
+	before = msCutoff(before)
 	tx, err := r.db.Begin()
 	if err != nil {
 		return false, err
@@ -1539,7 +1532,7 @@ func (r *Registry) FailStuckBranch(ctx context.Context, id, before, reason strin
 		return false, err
 	}
 	if !legalBranchTransition(BranchState(from), BranchFailed) {
-		return false, fmt.Errorf("illegal branch transition %s -> %s", from, BranchFailed)
+		return false, illegalTransition("branch", from, string(BranchFailed))
 	}
 	res, err := tx.Exec(`UPDATE branches SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		WHERE id=? AND state=? AND updated_at < ?`, string(BranchFailed), id, from, before)
@@ -1556,10 +1549,14 @@ func (r *Registry) FailStuckBranch(ctx context.Context, id, before, reason strin
 	return true, tx.Commit()
 }
 
-// ListStuckDestroyingBranches returns branches in destroying whose last update
-// is older than before: a destroy that failed or was interrupted part-way.
+// ListStuckDestroyingBranches returns branches left in destroying — a destroy
+// whose teardown failed or was interrupted (branchd crash, shutdown) — whose
+// last update predates before (RFC3339 UTC). DestroyBranch accepts such a row
+// and re-runs its idempotent teardown, so reconcile's retry_destroy can finish
+// them; every failed attempt bumps updated_at (NoteBranchCtx), so the retries
+// back off by the cutoff's age.
 func (r *Registry) ListStuckDestroyingBranches(before string) ([]*Branch, error) {
-	return r.listBranches(`state=? AND updated_at < ?`, string(BranchDestroying), before)
+	return r.listBranches(`state=? AND updated_at < ?`, string(BranchDestroying), msCutoff(before))
 }
 
 // TouchSource bumps a source's updated_at: the seeding heartbeat that tells
@@ -1574,7 +1571,7 @@ func (r *Registry) TouchSource(id string) error {
 // process died.
 func (r *Registry) ListStuckSources(before string) ([]*Source, error) {
 	rows, err := r.db.Query(`SELECT `+sourceCols+` FROM sources WHERE state=? AND updated_at < ? ORDER BY created_at`,
-		string(SourceSeeding), before)
+		string(SourceSeeding), msCutoff(before))
 	if err != nil {
 		return nil, err
 	}
@@ -1600,7 +1597,7 @@ func (r *Registry) FailStuckSource(ctx context.Context, id, before, reason strin
 	}
 	defer tx.Rollback()
 	res, err := tx.Exec(`UPDATE sources SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		WHERE id=? AND state=? AND updated_at < ?`, string(SourceFailed), id, string(SourceSeeding), before)
+		WHERE id=? AND state=? AND updated_at < ?`, string(SourceFailed), id, string(SourceSeeding), msCutoff(before))
 	if err != nil {
 		return false, err
 	}
