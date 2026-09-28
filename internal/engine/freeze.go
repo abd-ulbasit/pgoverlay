@@ -51,9 +51,13 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	if err != nil {
 		return nil, err
 	}
+	rw, err := e.freshBranchLayer(name, 1)
+	if err != nil {
+		return nil, err
+	}
 	expiresAt := e.expiresAtFor(ttl)
 	child := &registry.Branch{
-		Name: name, SourceID: parent.SourceID, RWVolume: e.planner.BranchLayerName(name),
+		Name: name, SourceID: parent.SourceID, RWVolume: rw,
 		SourceVolume: parent.SourceVolume, ExpiresAt: expiresAt, ParentBranchName: parentName,
 	}
 	if e.zfs() || e.csi() {
@@ -94,7 +98,12 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	origPlan := cow.PlanBranch(parent.RWVolume, parent.SourceVolume, layerVolumes(chain))
 	// the parent's current rw volume becomes the newest frozen layer
 	frozen := append([]string{parent.RWVolume}, layerVolumes(chain)...)
-	newRW := cow.BranchRWVolumeNameGen(parent.Name, len(chain)+2)
+	// a generation no row has used: a recreated parent may already sit on a
+	// later generation of its name (see freshBranchLayer)
+	newRW, err := e.freshBranchLayer(parent.Name, len(chain)+2)
+	if err != nil {
+		return err
+	}
 	parentPlan := cow.PlanBranch(newRW, parent.SourceVolume, frozen)
 	childPlan := cow.PlanBranch(child.RWVolume, child.SourceVolume, frozen)
 	image := e.image(src.PGVersion)

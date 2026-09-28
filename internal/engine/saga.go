@@ -85,9 +85,13 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	if src.State != registry.SourceReady {
 		return nil, fmt.Errorf("source %q is %s, not ready", sourceName, src.State)
 	}
+	rw, err := e.freshBranchLayer(name, 1)
+	if err != nil {
+		return nil, err
+	}
 	expiresAt := e.expiresAtFor(ttl)
 	b := &registry.Branch{
-		Name: name, SourceID: src.ID, RWVolume: e.planner.BranchLayerName(name),
+		Name: name, SourceID: src.ID, RWVolume: rw,
 		SourceVolume: src.Volume, ExpiresAt: expiresAt,
 	}
 	if err := e.reg.CreateBranchCtx(ctx, b); err != nil {
@@ -161,6 +165,41 @@ func (e *Engine) provision(ctx context.Context, b *registry.Branch, src *registr
 		return fail(err)
 	}
 	return nil
+}
+
+// maxLayerGenerations bounds freshBranchLayer's search. Each recreation of a
+// name whose old volumes are still known uses one more generation; reaching
+// this many means something else is wrong.
+const maxLayerGenerations = 10000
+
+// freshBranchLayer names the writable layer for a new branch row, or for a
+// freeze parent's swap volume: the lowest generation, from minGen up, that no
+// registry row has ever used (see Registry.VolumeNameUsed). Volume names used
+// to depend on the branch name alone, so a name destroyed and created again
+// silently adopted its predecessor's volume — docker VolumeCreate and the
+// hostPath mkdir -p are both idempotent — including a frozen layer that live
+// children still mount read-only: the "fresh" branch came up on the old
+// branch's writes and wrote into a mounted lower layer. The common case (a
+// name used for the first time) still gets the legacy name, and existing rows
+// keep the volume their row records.
+//
+// zfs clones are named by branch and removed with it, and a zfs parent cannot
+// be destroyed while clones of it live, so zfs keeps the plain name.
+func (e *Engine) freshBranchLayer(name string, minGen int) (string, error) {
+	if e.zfs() {
+		return e.planner.BranchLayerName(name), nil
+	}
+	for gen := max(minGen, 1); gen < minGen+maxLayerGenerations; gen++ {
+		v := cow.BranchRWVolumeNameGen(name, gen)
+		used, err := e.reg.VolumeNameUsed(v)
+		if err != nil {
+			return "", fmt.Errorf("pick writable volume for branch %q: %w", name, err)
+		}
+		if !used {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("pick writable volume for branch %q: no unused name in %d generations", name, maxLayerGenerations)
 }
 
 // layerVolumes projects a layer chain (topmost first) onto its volume names.
