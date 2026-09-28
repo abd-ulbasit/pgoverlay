@@ -198,6 +198,7 @@ func storageRoot(runtimeName, kubeStorage, kubeDataRoot, home string) string {
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
+	advertiseProxyAddr := flag.String("advertise-proxy-addr", "", "host:port where clients reach the Postgres router, returned as proxy_host/proxy_port in branch API responses and used by `pgb connect` (default: --pg-addr's port; clients use the API host)")
 	reconcileInterval := flag.Duration("reconcile-interval", 60*time.Second, "reconcile loop tick interval (TTL reap + leak GC + drift convergence)")
 	reapInterval := flag.Duration("reap-interval", 0, "DEPRECATED alias for --reconcile-interval (folded into the unified reconcile loop)")
 	stuckTimeout := flag.Duration("stuck-timeout", 10*time.Minute, "age past which a creating/resetting branch row is considered stuck and failed by reconcile")
@@ -242,6 +243,10 @@ func run() error {
 		return err
 	}
 	pgTLS, err := tlsConfigFromFlags(*pgTLSCert, *pgTLSKey, "pg")
+	if err != nil {
+		return err
+	}
+	proxyHost, proxyPort, err := advertisedProxy(*advertiseProxyAddr, *pgAddr)
 	if err != nil {
 		return err
 	}
@@ -372,6 +377,7 @@ func run() error {
 		apiLis = tls.NewListener(apiLis, apiTLS)
 	}
 	apiSrv := api.New(eng, reg, token, m.Handler(), ready, *stuckTimeout)
+	apiSrv.SetProxyEndpoint(proxyHost, proxyPort)
 	srv := &http.Server{Addr: *apiAddr, Handler: apiSrv.Handler()}
 	g.Go(func() error {
 		log.Printf("REST API listening on %s (TLS %v)", *apiAddr, apiTLS != nil)

@@ -95,6 +95,7 @@ func (s *Server) branchJSON(b *registry.Branch) Branch {
 		Name: b.Name, Source: srcName, Parent: b.ParentBranchName, State: string(b.State), Host: b.Host, Port: b.Port,
 		User: user, Password: b.Password, Database: db, ProxyDatabase: db + "@" + b.Name,
 		ExpiresAt: b.ExpiresAt, CreatedAt: b.CreatedAt,
+		ProxyHost: s.proxy.host, ProxyPort: s.proxy.port,
 	}
 }
 
