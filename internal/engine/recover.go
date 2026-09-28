@@ -40,6 +40,9 @@ func (e *Engine) RecoverBranch(ctx context.Context, name string) (_ *registry.Br
 	if b.State != registry.BranchFailed {
 		return nil, fmt.Errorf("%w: branch %q is %s; only a failed branch can be recovered", ErrNotRecoverable, name, b.State)
 	}
+	if err := e.checkChildCommitted(b); err != nil {
+		return nil, err
+	}
 	src, err := e.reg.GetSourceByID(b.SourceID)
 	if err != nil {
 		return nil, err
@@ -84,6 +87,24 @@ func (e *Engine) RecoverBranch(ctx context.Context, name string) (_ *registry.Br
 		return fail(err)
 	}
 	return e.reg.GetBranchByName(name)
+}
+
+// checkChildCommitted refuses to reset or recover an overlay branch-from-branch
+// child whose freeze never committed. Such a row names its parent but has no
+// base layer: the freeze that would have stacked the parent's frozen layer
+// under it was interrupted (a crash, a SIGKILL, a cancelled request) and
+// reconcile failed the row. Its layer chain is empty, so a reset would
+// re-clone it from the source, and a recover would mount its writable layer
+// over the bare source. Either way a branch listed as a child of the parent
+// would come up without the parent's data. zfs and csi children record the
+// parent's own volume as their SourceVolume and re-clone from the parent, so
+// only the overlay backend needs this guard.
+func (e *Engine) checkChildCommitted(b *registry.Branch) error {
+	if e.zfs() || e.csi() || b.ParentBranchName == "" || b.BaseLayerID != "" {
+		return nil
+	}
+	return fmt.Errorf("%w: branch %q was never created from %q: the freeze that gives it %q's data did not complete, so it has no base to reset or restart on; destroy it and create it again (pgb branch create %s --from-branch %s)",
+		ErrNotRecoverable, b.Name, b.ParentBranchName, b.ParentBranchName, b.Name, b.ParentBranchName)
 }
 
 // checkBranchData verifies that the volumes a restart on existing data would
