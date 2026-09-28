@@ -319,7 +319,9 @@ func run() error {
 	if diskRoot := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home); diskRoot != "" {
 		m.SetDiskRoot(diskRoot)
 	}
-	engOpts := []engine.Option{engine.WithMetrics(m)}
+	// running sagas bump their rows well inside the stuck timeout, so
+	// reconcile never fails a slow-but-alive create/reset/freeze
+	engOpts := []engine.Option{engine.WithMetrics(m), engine.WithHeartbeatInterval(min(*stuckTimeout/4, 30*time.Second))}
 	if *rotateCreds {
 		engOpts = append(engOpts, engine.WithCredentialRotation())
 	}

@@ -57,6 +57,7 @@ func (e *Engine) RecoverBranch(ctx context.Context, name string) (_ *registry.Br
 	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchResetting, "recover requested: restart on existing data"); err != nil {
 		return nil, err
 	}
+	defer e.keepAlive(b.ID)()
 	bg := context.WithoutCancel(ctx)
 	fail := func(stepErr error) (*registry.Branch, error) {
 		e.logCompensationErr("transition", "recover: mark branch failed after recover failed",

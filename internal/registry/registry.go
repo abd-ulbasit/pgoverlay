@@ -759,9 +759,10 @@ func (r *Registry) SetBranchContainer(id, containerID string) error {
 }
 
 // TouchBranch bumps a branch's updated_at without any other change: a saga
-// progress checkpoint that resets the stuck-timer. The freeze saga calls it at
-// its major waypoints (after the parent restart, after the child start) so a
-// long-but-progressing freeze never looks abandoned to ListStuckBranches.
+// progress checkpoint that resets the stuck-timer. Every saga's heartbeat
+// (engine keepAlive) calls it periodically for the rows it keeps in
+// creating/resetting, so a long-but-alive saga (slow readiness, long masking)
+// never looks abandoned to ListStuckBranches.
 func (r *Registry) TouchBranch(id string) error {
 	_, err := r.db.Exec(`UPDATE branches SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, id)
 	return err

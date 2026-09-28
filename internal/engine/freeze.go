@@ -70,6 +70,8 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	if err := e.reg.CreateBranchCtx(ctx, child); err != nil {
 		return nil, err
 	}
+	// the parent sits in resetting for most of a freeze or csi clone
+	defer e.keepAlive(child.ID, parent.ID)()
 	provision := func() error { return e.freezeAndProvision(ctx, child, parent, src) }
 	if e.zfs() {
 		provision = func() error { return e.provisionZFS(ctx, child, src) }

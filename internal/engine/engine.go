@@ -38,6 +38,9 @@ type Engine struct {
 	// Both come from branchd --default-ttl / --max-ttl.
 	defaultTTL time.Duration
 	maxTTL     time.Duration
+	// heartbeatEvery is how often a running saga bumps its branch rows'
+	// updated_at (see keepAlive). 0 = defaultHeartbeat.
+	heartbeatEvery time.Duration
 }
 
 // parentStepTimeout bounds a parent-affecting step (stopping a freeze or
@@ -81,6 +84,22 @@ func WithMetrics(m *metrics.Metrics) Option {
 	return func(e *Engine) { e.metrics = m }
 }
 
+// defaultHeartbeat is keepAlive's default period. It must stay well under
+// reconcile's stuck timeout (branchd --stuck-timeout, default 10m).
+const defaultHeartbeat = 30 * time.Second
+
+// WithHeartbeatInterval sets how often a running saga bumps its branch rows'
+// updated_at so reconcile never mistakes a slow-but-alive saga for an
+// abandoned one. Keep it well under the stuck timeout (branchd uses a quarter
+// of --stuck-timeout, capped at defaultHeartbeat). d <= 0 keeps the default.
+func WithHeartbeatInterval(d time.Duration) Option {
+	return func(e *Engine) {
+		if d > 0 {
+			e.heartbeatEvery = d
+		}
+	}
+}
+
 // New builds an engine on the default OverlayFS backend.
 func New(reg *registry.Registry, drv runtime.Driver, defaultImage string, opts ...Option) *Engine {
 	return NewWithPlanner(reg, drv, defaultImage, cow.Planner{Backend: cow.BackendOverlay}, opts...)
@@ -110,6 +129,41 @@ func (e *Engine) logCompensationErr(kind, msg string, err error, attrs ...any) {
 	}
 	e.metrics.IncCompensationFailure(kind)
 	slog.Warn(msg, append(attrs, "kind", kind, "err", err)...)
+}
+
+// keepAlive bumps the given branch rows' updated_at every heartbeat until the
+// returned stop function is called (stop waits for the ticker goroutine, so no
+// touch lands after it returns). Sagas hold it for as long as they keep rows
+// in creating/resetting: reconcile fails rows whose updated_at is older than
+// the stuck timeout, and without a heartbeat a long readiness wait or masking
+// script (arbitrary user SQL) got a live branch — and, in a freeze, its
+// parent — failed and torn down mid-provision.
+func (e *Engine) keepAlive(ids ...string) (stop func()) {
+	every := e.heartbeatEvery
+	if every <= 0 {
+		every = defaultHeartbeat
+	}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				for _, id := range ids {
+					e.logCompensationErr("transition", "heartbeat: touch branch stuck-timer", e.reg.TouchBranch(id), "branch_id", id)
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
 }
 
 // checkQuota enforces --max-branches before a create provisions anything:

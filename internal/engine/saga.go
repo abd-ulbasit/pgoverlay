@@ -97,6 +97,7 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	if err := e.reg.CreateBranchCtx(ctx, b); err != nil {
 		return nil, err
 	}
+	defer e.keepAlive(b.ID)()
 	if err := e.provision(ctx, b, src); err != nil {
 		e.logCompensationErr("transition", "create: mark branch failed after provision failed",
 			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, err.Error()), "branch", b.Name, "branch_id", b.ID)
@@ -464,6 +465,7 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchResetting, reason); err != nil {
 		return nil, err
 	}
+	defer e.keepAlive(b.ID)()
 	fail := func(stepErr error) (*registry.Branch, error) {
 		e.logCompensationErr("transition", "reset: mark branch failed after reset step failed",
 			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, stepErr.Error()), "branch", b.Name, "branch_id", b.ID)
