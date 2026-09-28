@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +49,12 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		strings.Contains(msg, "illegal branch transition"),
 		strings.Contains(msg, "not ready"):
 		writeError(w, http.StatusConflict, msg)
+	case r != nil && r.Context().Err() != nil && interruptedStatus(r.Context()) != 0:
+		// The mutation's context was ended from outside the saga (leadership
+		// lost, shutdown, stuck timeout): the failure is that interruption, and
+		// the saga has already compensated. Tell the client it can retry.
+		cause := context.Cause(r.Context())
+		writeError(w, interruptedStatus(r.Context()), cause.Error()+"; the operation was cancelled and its partial work rolled back, retry it")
 	default:
 		// Unmapped: treat as internal. Log the full detail; tell the client nothing.
 		attrs := []any{"error", err}
@@ -57,6 +64,20 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		slog.Error("api: internal server error", attrs...)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
+}
+
+// interruptedStatus maps why a mutation's context ended to a status: 503 when
+// leadership moved or branchd is shutting down (retry against the leader),
+// 504 when the saga ran past the stuck timeout, 0 for anything else (e.g. a
+// read whose client went away).
+func interruptedStatus(ctx context.Context) int {
+	switch cause := context.Cause(ctx); {
+	case errors.Is(cause, errLeadershipLost), errors.Is(cause, errShuttingDown):
+		return http.StatusServiceUnavailable
+	case errors.Is(cause, errMutationTimeout):
+		return http.StatusGatewayTimeout
+	}
+	return 0
 }
 
 func decode[T any](w http.ResponseWriter, r *http.Request) (T, bool) {

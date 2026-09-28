@@ -29,6 +29,13 @@ type fakeDriver struct {
 	starts     int
 	execs      [][]string // every Exec call, in order
 	execOutErr error      // returned by every ExecOutput call when set
+
+	// startBlock, when set, parks every StartBranch until it is closed or the
+	// saga's context is cancelled; startEntered receives once per parked call
+	// and startErr records the context error a cancelled call returned.
+	startBlock   chan struct{}
+	startEntered chan struct{}
+	startErr     chan error
 }
 
 func newFake() *fakeDriver {
@@ -55,6 +62,15 @@ func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (strin
 func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
 	if f.failStart {
 		return "", errors.New("boom")
+	}
+	if f.startBlock != nil {
+		f.startEntered <- struct{}{}
+		select {
+		case <-f.startBlock:
+		case <-ctx.Done():
+			f.startErr <- ctx.Err()
+			return "", ctx.Err()
+		}
 	}
 	f.starts++
 	f.containers["cid-"+s.Name] = true
@@ -126,30 +142,28 @@ const testToken = "sekrit"
 
 func newTestServer(t *testing.T, opts ...engine.Option) (*httptest.Server, *fakeDriver) {
 	t.Helper()
-	d := newFake()
-	reg, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { reg.Close() })
-	eng := engine.New(reg, d, "postgres:17", opts...)
-	m := metrics.New()
-	m.SetStateCounter(reg)
-	ready := func(ctx context.Context) error {
-		if err := reg.Ping(ctx); err != nil {
-			return err
-		}
-		_, err := d.ListManaged(ctx)
-		return err
-	}
-	ts := httptest.NewServer(New(eng, reg, testToken, m.Handler(), ready, 0).Handler())
-	t.Cleanup(ts.Close)
+	ts, _, d := newTestServerParts(t, opts...)
 	return ts, d
 }
 
 // newTestServerWithLeader builds the API like newTestServer but returns the
 // *Server too, so leader-gate tests can flip its gate.
 func newTestServerWithLeader(t *testing.T, opts ...engine.Option) (*httptest.Server, *Server) {
+	t.Helper()
+	ts, srv, _ := newTestServerParts(t, opts...)
+	return ts, srv
+}
+
+// newTestServerParts builds the API over a fresh registry and fake driver and
+// returns all three handles.
+func newTestServerParts(t *testing.T, opts ...engine.Option) (*httptest.Server, *Server, *fakeDriver) {
+	t.Helper()
+	return newTestServerCfg(t, 0, opts...)
+}
+
+// newTestServerCfg is newTestServerParts with an explicit stuck timeout (0 =
+// the default).
+func newTestServerCfg(t *testing.T, stuckTimeout time.Duration, opts ...engine.Option) (*httptest.Server, *Server, *fakeDriver) {
 	t.Helper()
 	d := newFake()
 	reg, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -167,10 +181,10 @@ func newTestServerWithLeader(t *testing.T, opts ...engine.Option) (*httptest.Ser
 		_, err := d.ListManaged(ctx)
 		return err
 	}
-	srv := New(eng, reg, testToken, m.Handler(), ready, 0)
+	srv := New(eng, reg, testToken, m.Handler(), ready, stuckTimeout)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return ts, srv
+	return ts, srv, d
 }
 
 // do sends an authenticated JSON request; token "" sends no Authorization.

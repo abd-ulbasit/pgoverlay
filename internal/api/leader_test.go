@@ -21,7 +21,8 @@ func TestLeaderGateDefaultIsLeader(t *testing.T) {
 }
 
 // When the gate is closed (not leader), mutating routes return 503 "not
-// leader" — and the leader-gate check happens regardless of auth role.
+// leader" to an authorized caller (auth runs first: see
+// TestMutationAuthCheckedBeforeLeaderGate).
 func TestLeaderGateBlocksMutations(t *testing.T) {
 	ts, srv := newTestServerWithLeader(t)
 	addSource(t, ts)
