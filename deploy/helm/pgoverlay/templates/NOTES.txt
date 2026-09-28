@@ -3,6 +3,12 @@ pgoverlay ({{ include "pgoverlay.fullname" . }}) is installed.
 branchd API:   {{ include "pgoverlay.fullname" . }}-api:{{ .Values.api.port }}   (ClusterIP{{ if ne .Values.api.service.type "ClusterIP" }} / {{ .Values.api.service.type }}{{ end }})
 Postgres proxy: {{ include "pgoverlay.fullname" . }}-proxy:{{ .Values.proxy.port }} ({{ .Values.proxy.service.type }})
 Storage mode:  {{ .Values.storage.mode }}{{ if eq .Values.storage.mode "hostpath" }} (single-node / trusted-workload posture){{ end }}
+Pod Security:  this configuration needs the namespace to allow "{{ include "pgoverlay.podSecurityLevel" . }}":
+  kubectl label namespace {{ .Release.Namespace }} pod-security.kubernetes.io/enforce={{ include "pgoverlay.podSecurityLevel" . }} --overwrite
+{{- if eq (include "pgoverlay.podSecurityLevel" .) "privileged" }}
+  (hostPath volumes{{ if eq .Values.storage.mode "hostpath" }}, and CAP_SYS_ADMIN + unconfined seccomp on branch pods{{ end }}; a "baseline" or
+  "restricted" namespace rejects them. csi mode with persistence fits "baseline".)
+{{- end }}
 
 Get the API token:
 {{- if .Values.existingSecret }}

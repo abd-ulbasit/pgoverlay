@@ -27,9 +27,34 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: {{ include "pgoverlay.fullname" . }}
-      # Pin to the storage node: branchd's sqlite state shares the node (and
-      # data root) with the CoW volumes it manages.
+      {{- if eq (include "pgoverlay.pinNode" .) "true" }}
+      # Pinned to the storage node: in hostpath mode the CoW volumes live on
+      # its disk, and without persistence so does branchd's sqlite state.
       nodeName: {{ required "set node to the storage node name (kubectl get nodes)" .Values.node }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if and (ne (include "pgoverlay.pinNode" .) "true") (gt (int .Values.replicaCount) 1) }}
+      # Unpinned HA: every replica mounts the same ReadWriteOnce state PVC, so
+      # they must share a node. The first replica goes wherever the scheduler
+      # (and the volume's topology) puts it; the others follow it.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "pgoverlay.selectorLabels" . | nindent 18 }}
+              topologyKey: kubernetes.io/hostname
+      {{- end }}
       containers:
         - name: branchd
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"

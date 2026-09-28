@@ -1,10 +1,16 @@
 # pgoverlay has two storage modes (docs/kubernetes.md): csi — branches as PVC
 # clones, schedulable on any node, the recommended production-ish deployment
 # — and hostpath (default), which keeps all CoW data on ONE designated
-# storage node (single-node/dev scope). branchd itself is always pinned to
-# `node`; in hostpath mode every branch/helper pod is pinned there too.
+# storage node (single-node/dev scope). In hostpath mode branchd and every
+# branch/helper pod are pinned to `node`; in csi mode (with the default
+# persistence) nothing is pinned and branchd follows its state PVC.
 
-# REQUIRED: name of the storage node (kubectl get nodes).
+# Name of the storage node (kubectl get nodes). REQUIRED in hostpath mode, and
+# whenever branchd's state is a hostPath (persistence off): branchd is pinned
+# to it with nodeName. Ignored in csi mode with persistence on (the default):
+# branchd then needs nothing from any particular node, and pinning it would
+# strand it Pending once that node is replaced. Use nodeSelector/affinity
+# below if you still want to steer it.
 node: ""
 
 # Host directory on the storage node holding all CoW volumes. branchd's own
@@ -24,7 +30,8 @@ dataRoot: /var/lib/pgoverlay
 #    pods schedule on ANY node with no extra capabilities. Requires a
 #    StorageClass whose CSI driver supports PVC cloning (e.g. EBS, Ceph RBD,
 #    zfs-localpv, LINSTOR) — or VolumeSnapshots when snapshotClass is set.
-#    `node` is still required: branchd itself keeps its sqlite state on it.
+#    branchd's sqlite state goes on a PVC too (persistence, auto-on), so
+#    `node` is not needed.
 storage:
   mode: hostpath
   # REQUIRED when mode=csi: StorageClass for all pgoverlay PVCs.
@@ -59,10 +66,19 @@ persistence:
 # replicaCount > 1 (or leaderElection.enabled) the chart turns on leader
 # election automatically — see leaderElection below and docs/ha.md.
 #
-# Co-scheduling caveat: an RWO PVC binds to one node, so all replicas must
-# schedule there (the chart already pins branchd to `node`). For replicas on
-# different nodes use an RWX volume / a CSI driver that supports it.
+# Co-scheduling caveat: an RWO volume attaches to one node, so all replicas
+# must run there. When branchd is pinned to `node` they are; when it is not
+# (csi mode with persistence) the chart adds a required podAffinity so the
+# replicas follow each other (unless you set `affinity` yourself). For
+# replicas on different nodes use an RWX volume / a CSI driver that supports it.
 replicaCount: 1
+
+# Scheduling knobs for the branchd pod (standard Kubernetes shapes). They add
+# to the `node` pin where there is one. `affinity`, when set, replaces the
+# HA co-location default described above.
+nodeSelector: {}
+tolerations: []
+affinity: {}
 
 # HA leader election (branchd --leader-elect). When on (or replicaCount > 1),
 # replicas contend for a coordination.k8s.io Lease (pgoverlay-branchd) in the
@@ -164,11 +180,16 @@ rotateBranchCredentials: false
 #  - hostpath/overlay mode (default): the branch pods branchd creates at
 #    runtime (NOT this chart) need CAP_SYS_ADMIN + an UNCONFINED seccomp
 #    profile to perform the in-container overlay mount (a privileged kernel
-#    op). That is a single-node / trusted-workload posture only.
+#    op), and every pod uses hostPath volumes. That is a single-node /
+#    trusted-workload posture only, and the namespace must allow Pod Security
+#    "privileged".
 #  - csi mode (storage.mode=csi) is the RECOMMENDED PRODUCTION DEFAULT:
-#    branches are PVC clones, branch pods need NO added capabilities and run
-#    under the cluster's default (RuntimeDefault) seccomp, schedulable on any
-#    node. Prefer csi whenever the cluster is shared/untrusted.
+#    branches are PVC clones, branch and helper pods need NO added
+#    capabilities and run with RuntimeDefault seccomp and no privilege
+#    escalation, schedulable on any node. With persistence on (the default)
+#    everything fits Pod Security "baseline". Prefer csi whenever the cluster
+#    is shared/untrusted. "restricted" fits neither mode: branchd and the
+#    postgres entrypoint start as root. NOTES.txt prints the level needed.
 runAsUser: 0
 
 resources: {}
