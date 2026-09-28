@@ -15,7 +15,7 @@ two or three together.
 
 ![pgoverlay feature tour](features.gif)
 
-*branch → apply a migration → `pgb diff` (schema + row deltas) → branch-off-a-branch, against a masked clone of prod.*
+*branch a masked clone of prod → query it through the router → apply a migration → `pgb diff` (schema + row deltas) → branch the branch. Recorded for real against a running `branchd`.*
 
 A note that informs several patterns below — **credential modes**:
 
