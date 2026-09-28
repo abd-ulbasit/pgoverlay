@@ -11,6 +11,8 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
 	"github.com/abd-ulbasit/pgoverlay/internal/ghook"
+	"github.com/abd-ulbasit/pgoverlay/internal/version"
 )
 
 func main() {
@@ -30,7 +33,16 @@ func main() {
 }
 
 func run() error {
+	// Configuration is environment-only; the one flag prints the version.
+	showVersion := flag.Bool("version", false, "print the pgoverlay-github version and exit")
+	flag.Parse()
+	if *showVersion {
+		fmt.Println("pgoverlay-github " + version.String())
+		return nil
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logger.Info("pgoverlay-github starting", "version", version.String())
 	cfg, err := ghook.LoadEnv(os.Getenv)
 	if err != nil {
 		return err

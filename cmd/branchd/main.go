@@ -34,6 +34,7 @@ import (
 	"github.com/abd-ulbasit/pgoverlay/internal/pgproxy"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/version"
 )
 
 func main() {
@@ -220,7 +221,14 @@ func run() error {
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
 	pgTLSKey := flag.String("pg-tls-key", "", "PEM private key for the Postgres router (requires --pg-tls-cert)")
 	leaderElect := flag.Bool("leader-elect", false, "HA: contend for a coordination.k8s.io Lease (pgoverlay-branchd) so only the leader runs reconcile and accepts mutating /v1 requests (kube runtime only; off = single-instance, always leader)")
+	showVersion := flag.Bool("version", false, "print the branchd version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("branchd " + version.String())
+		return nil
+	}
+	log.Printf("branchd %s", version.String())
 
 	// --reap-interval is a deprecated alias: when set (non-zero) it folds into
 	// the single reconcile loop's interval. We never run two loops.

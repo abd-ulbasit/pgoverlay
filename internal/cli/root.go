@@ -5,6 +5,7 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -14,6 +15,7 @@ import (
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
+	"github.com/abd-ulbasit/pgoverlay/internal/version"
 )
 
 func NewRootCmd() *cobra.Command {
@@ -22,11 +24,26 @@ func NewRootCmd() *cobra.Command {
 		Short:         "pgoverlay — git branch for Postgres",
 		SilenceUsage:  true,
 		SilenceErrors: false,
+		// --version prints the same line as `pgb version`.
+		Version: version.String(),
 	}
+	root.SetVersionTemplate("pgb {{.Version}}\n")
 	root.PersistentFlags().String("server", os.Getenv("PGOVERLAY_SERVER"),
 		"branchd base URL (http:// or https://, e.g. http://localhost:7070); enables server mode [env PGOVERLAY_SERVER, token from PGOVERLAY_TOKEN; PGOVERLAY_TLS_SKIP_VERIFY=1 for self-signed certs]")
-	root.AddCommand(newSourceCmd(), newBranchCmd(), newConnectCmd(), newDiffCmd(), newHistoryCmd(), newDoctorCmd(), newGCCmd(), newTokenCmd())
+	root.AddCommand(newSourceCmd(), newBranchCmd(), newConnectCmd(), newDiffCmd(), newHistoryCmd(),
+		newDoctorCmd(), newGCCmd(), newTokenCmd(), newVersionCmd())
 	return root
+}
+
+func newVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the pgb version",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Fprintln(cmd.OutOrStdout(), "pgb "+version.String())
+		},
+	}
 }
 
 // serverClient returns a REST client when server mode is enabled, else nil

@@ -1,9 +1,18 @@
 .PHONY: build test it k8s-it csi-it matrix lint vuln check-toolchain docker-build docker-build-ghook helm-test js-sdk-test
 
+# Build identity stamped into every binary (`pgb version`, `branchd -version`,
+# `pgoverlay-github -version`). Override for release builds, e.g.
+# `make build VERSION=v1.0.0`. Outside a git checkout it falls back to "dev".
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null)
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+VERSION_PKG := github.com/abd-ulbasit/pgoverlay/internal/version
+LDFLAGS := -X $(VERSION_PKG).Version=$(VERSION) -X $(VERSION_PKG).Commit=$(COMMIT) -X $(VERSION_PKG).Date=$(DATE)
+
 build:
-	go build -o bin/pgb ./cmd/pgb
-	go build -o bin/branchd ./cmd/branchd
-	go build -o bin/pgoverlay-github ./cmd/pgoverlay-github
+	go build -ldflags "$(LDFLAGS)" -o bin/pgb ./cmd/pgb
+	go build -ldflags "$(LDFLAGS)" -o bin/branchd ./cmd/branchd
+	go build -ldflags "$(LDFLAGS)" -o bin/pgoverlay-github ./cmd/pgoverlay-github
 
 test:
 	go test ./...
