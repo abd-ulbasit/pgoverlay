@@ -56,20 +56,43 @@ type Config struct {
 	BranchNaming string
 }
 
+// Service handles pull_request deliveries. Branch operations run detached
+// from the delivery, one at a time per branch, in arrival order.
 type Service struct {
 	cfg Config
 	pg  *apiclient.Client
 	gh  *GitHub // nil when commenting is disabled
 	log *slog.Logger
-	wg  sync.WaitGroup // in-flight detached branch operations
+	wg  sync.WaitGroup // queued and in-flight detached branch operations
+
+	// pollEvery is how often a branch that another operation is still
+	// creating, resetting or destroying is re-read.
+	pollEvery time.Duration
+
+	mu     sync.Mutex
+	queues map[string][]func() // per-branch pending work; a key exists while its worker runs
+	seen   *deliveryCache
 }
+
+// opTimeout bounds one branch operation, including waiting for a branch
+// another operation holds.
+const opTimeout = 5 * time.Minute
+
+// deliveryCacheSize is how many recent X-GitHub-Delivery ids are remembered
+// for de-duplication.
+const deliveryCacheSize = 4096
 
 // Wait blocks until all detached branch operations have finished. Call after
 // the HTTP server has shut down so in-flight work completes before exit.
 func (s *Service) Wait() { s.wg.Wait() }
 
 func New(cfg Config, pg *apiclient.Client, gh *GitHub, log *slog.Logger) *Service {
-	return &Service{cfg: cfg, pg: pg, gh: gh, log: log}
+	return &Service{
+		cfg: cfg, pg: pg, gh: gh, log: log,
+		pollEvery: 2 * time.Second,
+		queues:    map[string][]func(){},
+		seen:      newDeliveryCache(deliveryCacheSize),
+	}
 }
 
 // Handler returns the HTTP surface: POST /webhook and GET /healthz.
@@ -107,6 +130,9 @@ type payload struct {
 	Installation struct {
 		ID int64 `json:"id"`
 	} `json:"installation"`
+
+	// Delivery is the X-GitHub-Delivery id, for logs and failure statuses.
+	Delivery string `json:"-"`
 }
 
 // fromFork reports whether the pull request's head branch lives in another
@@ -150,12 +176,13 @@ func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	p.Delivery = r.Header.Get("X-GitHub-Delivery")
 	if !s.repoAllowed(p.Repository.FullName) {
-		s.log.Info("ignoring repo not on allow-list", "repo", p.Repository.FullName)
+		s.log.Info("ignoring repo not on allow-list", "repo", p.Repository.FullName, "delivery", p.Delivery)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	s.dispatch(w, r, &p)
+	s.dispatch(w, &p)
 }
 
 // verifySignature checks the GitHub HMAC-SHA256 signature header
@@ -186,28 +213,36 @@ func (s *Service) repoAllowed(fullName string) bool {
 	return false
 }
 
-func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
-	log := s.log.With("action", p.Action, "repo", p.Repository.FullName,
-		"pr", p.Number, "head_sha", p.PullRequest.Head.SHA)
-	branch := s.branchName(p)
-
+func (s *Service) dispatch(w http.ResponseWriter, p *payload) {
 	switch p.Action {
 	case "opened", "reopened", "synchronize", "closed":
 	default:
-		log.Debug("ignoring pull_request action")
+		s.log.Debug("ignoring pull_request action", "action", p.Action, "delivery", p.Delivery)
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	branch := s.branchName(p)
+	log := s.log.With("delivery", p.Delivery, "action", p.Action, "repo", p.Repository.FullName,
+		"pr", p.Number, "head_sha", p.PullRequest.Head.SHA, "branch", branch)
+
+	w.Header().Set("Content-Type", "application/json")
+	// A delivery can arrive twice: GitHub and proxies retry, and the
+	// Redeliver button reuses the id. Run each one once.
+	if p.Delivery != "" && !s.seen.add(p.Delivery) {
+		log.Info("ignoring duplicate delivery")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"branch": branch, "status": "duplicate"})
 		return
 	}
 
 	// GitHub abandons webhook deliveries after ~10s, and an abandoned
 	// request's canceled context would abort branchd's saga mid-flight —
 	// branch creation/reset at pod speed routinely exceeds that deadline.
-	// Ack the delivery now and run the operation detached.
+	// Ack the delivery now and run the operation detached, queued behind
+	// earlier work on the same branch.
 	payload := *p
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	s.enqueue(branch, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 		defer cancel()
 		switch payload.Action {
 		case "opened", "reopened", "synchronize":
@@ -215,11 +250,79 @@ func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 		case "closed":
 			s.handleClosed(ctx, log, &payload, branch)
 		}
-	}()
+	})
 
-	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"branch": branch, "status": "accepted"})
+}
+
+// enqueue runs job after every job queued earlier for the same branch, so
+// the deliveries for one pull request (opened, a burst of pushes, closed)
+// apply in the order they arrived instead of racing: a reset issued while
+// the create still runs would fail, and a status posted before the branch is
+// ready would send CI to a database that is not there yet. Different
+// branches run concurrently.
+func (s *Service) enqueue(branch string, job func()) {
+	s.wg.Add(1)
+	s.mu.Lock()
+	q, running := s.queues[branch]
+	s.queues[branch] = append(q, job)
+	s.mu.Unlock()
+	if !running {
+		go s.drain(branch)
+	}
+}
+
+// drain runs the branch's queued jobs one by one and retires the queue once
+// it is empty.
+func (s *Service) drain(branch string) {
+	for {
+		s.mu.Lock()
+		q := s.queues[branch]
+		if len(q) == 0 {
+			delete(s.queues, branch)
+			s.mu.Unlock()
+			return
+		}
+		job := q[0]
+		q[0] = nil
+		s.queues[branch] = q[1:]
+		s.mu.Unlock()
+
+		job()
+		s.wg.Done()
+	}
+}
+
+// deliveryCache remembers the most recent X-GitHub-Delivery ids. It is
+// bounded (the oldest id is forgotten first) and in memory, so it stops
+// retries and redeliveries, not a replay days later; handleClosed also asks
+// GitHub whether the pull request is still closed.
+type deliveryCache struct {
+	mu   sync.Mutex
+	ids  map[string]struct{}
+	ring []string
+	next int
+}
+
+func newDeliveryCache(n int) *deliveryCache {
+	return &deliveryCache{ids: make(map[string]struct{}, n), ring: make([]string, n)}
+}
+
+// add records id and reports whether it was new.
+func (c *deliveryCache) add(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.ids[id]; ok {
+		return false
+	}
+	if old := c.ring[c.next]; old != "" {
+		delete(c.ids, old)
+	}
+	c.ring[c.next] = id
+	c.ids[id] = struct{}{}
+	c.next = (c.next + 1) % len(c.ring)
+	return true
 }
 
 // branchName derives the pgoverlay branch name for a pull request according
@@ -241,9 +344,9 @@ func (s *Service) branchName(p *payload) string {
 
 // handleEnsure brackets the branch operation with commit statuses on the PR
 // head SHA — pending before, success/failure after — and keeps the live
-// comment current (creating/resetting → ready / reset @ sha). GitHub-side
-// failures are logged, never fatal: the branch operation is the point of
-// this service.
+// comment current (creating/resetting → ready / reset @ sha, or failed).
+// GitHub-side failures are logged, never fatal: the branch operation is the
+// point of this service.
 func (s *Service) handleEnsure(ctx context.Context, log *slog.Logger, p *payload, branch string) {
 	verb := "creating"
 	if p.Action == "synchronize" && s.cfg.ResetOnPush {
@@ -256,6 +359,7 @@ func (s *Service) handleEnsure(ctx context.Context, log *slog.Logger, p *payload
 	if err != nil {
 		log.Error("handling event failed", "err", err)
 		s.setStatus(ctx, log, p, "failure", err.Error())
+		s.upsertComment(ctx, log, p, commentMarker, commentBody(s.cfg.ProxyHost, branch, "failed (see the pgoverlay/branch status)", nil))
 		return
 	}
 	state := "ready"
@@ -287,7 +391,7 @@ func (s *Service) diffComment(ctx context.Context, log *slog.Logger, p *payload,
 	}
 	res, err := s.pg.DiffBranch(ctx, branch, 0)
 	if err != nil {
-		log.Warn("diff for PR comment failed", "branch", branch, "err", err)
+		log.Warn("diff for PR comment failed", "err", err)
 		return
 	}
 	if err := gh.UpsertComment(ctx, p.Repository.FullName, p.Number, diffMarker, diffCommentBody(branch, res)); err != nil {
@@ -299,6 +403,9 @@ func (s *Service) diffComment(ctx context.Context, log *slog.Logger, p *payload,
 // that (without a connect string — there is nothing left to connect to). No
 // status: statuses on a closed PR don't matter.
 func (s *Service) handleClosed(ctx context.Context, log *slog.Logger, p *payload, branch string) {
+	if s.reopened(ctx, log, p) {
+		return
+	}
 	if err := s.destroyBranch(ctx, log, branch); err != nil {
 		log.Error("handling event failed", "err", err)
 		return
@@ -313,6 +420,28 @@ func (s *Service) handleClosed(ctx context.Context, log *slog.Logger, p *payload
 	}
 }
 
+// reopened reports whether GitHub says the pull request is open again, which
+// makes this closed delivery stale (a redelivery, a replayed request, or one
+// that was queued behind the reopen): destroying the branch would pull it
+// from under the open pull request. Without GitHub credentials, or when the
+// lookup fails, the close goes ahead.
+func (s *Service) reopened(ctx context.Context, log *slog.Logger, p *payload) bool {
+	gh := s.github(p)
+	if gh == nil {
+		return false
+	}
+	state, err := gh.PullRequestState(ctx, p.Repository.FullName, p.Number)
+	if err != nil {
+		log.Warn("reading the pull request state failed; destroying the branch anyway", "err", err)
+		return false
+	}
+	if state == "open" {
+		log.Warn("pull request is open again; ignoring the stale closed delivery")
+		return true
+	}
+	return false
+}
+
 func shortSHA(sha string) string {
 	if len(sha) > 7 {
 		return sha[:7]
@@ -320,33 +449,129 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-// ensureBranch makes branch exist (creating it from the configured source if
-// missing). On synchronize with ResetOnPush, a pre-existing branch is reset
-// to the source snapshot (didReset reports that); a freshly created one is
-// already pristine.
+// Branch states as branchd reports them (registry.BranchState).
+const (
+	stateCreating   = "creating"
+	stateReady      = "ready"
+	stateFailed     = "failed"
+	stateResetting  = "resetting"
+	stateDestroying = "destroying"
+)
+
+// ensureBranch makes branch exist and be ready, creating it from the
+// configured source when missing. On synchronize with ResetOnPush a ready
+// branch is reset (didReset reports that); a freshly created one is already
+// pristine. A branch another operation is still creating, resetting or
+// destroying is waited for first. A failed branch (its create or reset did
+// not finish) is destroyed and created again: it cannot be reset and the
+// proxy does not route to it. The returned branch is always ready.
 func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload, branch string) (b *api.Branch, didReset bool, err error) {
-	b, err = s.pg.GetBranch(ctx, branch)
+	b, err = s.settledBranch(ctx, branch)
 	switch {
 	case apiclient.IsNotFound(err):
-		b, err = s.pg.CreateBranch(ctx, api.CreateBranchRequest{
-			Name: branch, Source: s.cfg.Source, TTLSeconds: s.cfg.TTLSeconds,
-		})
-		if err != nil {
-			return nil, false, fmt.Errorf("create branch %s: %w", branch, err)
-		}
-		log.Info("branch created", "branch", branch, "source", s.cfg.Source)
+		b, err = s.createBranch(ctx, log, branch)
+		return b, false, err
 	case err != nil:
-		return nil, false, fmt.Errorf("get branch %s: %w", branch, err)
-	case p.Action == "synchronize" && s.cfg.ResetOnPush:
-		if b, err = s.pg.ResetBranch(ctx, branch); err != nil {
-			return nil, false, fmt.Errorf("reset branch %s: %w", branch, err)
-		}
-		log.Info("branch reset on push", "branch", branch)
-		didReset = true
-	default:
-		log.Debug("branch already exists", "branch", branch)
+		return nil, false, err
 	}
-	return b, didReset, nil
+	switch b.State {
+	case stateReady:
+		if p.Action != "synchronize" || !s.cfg.ResetOnPush {
+			log.Debug("branch already exists")
+			return b, false, nil
+		}
+		if b, err = s.pg.ResetBranch(ctx, branch); err != nil {
+			return nil, false, &opError{op: "reset branch " + branch, err: err}
+		}
+		log.Info("branch reset on push")
+		b, err = s.requireReady(ctx, branch, b)
+		return b, err == nil, err
+	case stateFailed:
+		log.Warn("branch is failed; destroying it and creating it again")
+		if err := s.pg.DestroyBranch(ctx, branch); err != nil && !apiclient.IsNotFound(err) {
+			return nil, false, &opError{op: "destroy failed branch " + branch, err: err}
+		}
+		b, err = s.createBranch(ctx, log, branch)
+		return b, false, err
+	default:
+		return nil, false, &stateError{branch: branch, state: b.State}
+	}
+}
+
+func (s *Service) createBranch(ctx context.Context, log *slog.Logger, branch string) (*api.Branch, error) {
+	b, err := s.pg.CreateBranch(ctx, api.CreateBranchRequest{
+		Name: branch, Source: s.cfg.Source, TTLSeconds: s.cfg.TTLSeconds,
+	})
+	if err != nil {
+		return nil, &opError{op: "create branch " + branch, err: err}
+	}
+	log.Info("branch created", "source", s.cfg.Source)
+	return s.requireReady(ctx, branch, b)
+}
+
+// requireReady returns b when it is ready; otherwise it waits for the
+// operation still running on the branch and fails unless that leaves it
+// ready.
+func (s *Service) requireReady(ctx context.Context, branch string, b *api.Branch) (*api.Branch, error) {
+	if b.State == stateReady {
+		return b, nil
+	}
+	b, err := s.settledBranch(ctx, branch)
+	if err != nil {
+		return nil, err
+	}
+	if b.State != stateReady {
+		return nil, &stateError{branch: branch, state: b.State}
+	}
+	return b, nil
+}
+
+// settledBranch reads branch, re-reading while another operation still runs
+// on it (creating, resetting, destroying) until it settles or ctx ends. A
+// missing branch returns an error apiclient.IsNotFound recognizes.
+func (s *Service) settledBranch(ctx context.Context, branch string) (*api.Branch, error) {
+	for {
+		b, err := s.pg.GetBranch(ctx, branch)
+		if err != nil {
+			return nil, &opError{op: "get branch " + branch, err: err}
+		}
+		switch b.State {
+		case stateCreating, stateResetting, stateDestroying:
+		default:
+			return b, nil
+		}
+		t := time.NewTimer(s.pollEvery)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil, &stateError{branch: branch, state: b.State, timedOut: true}
+		case <-t.C:
+		}
+	}
+}
+
+// opError is a failed branchd call: op says which step ("create branch
+// gh-…"), err is the cause.
+type opError struct {
+	op  string
+	err error
+}
+
+func (e *opError) Error() string { return e.op + ": " + e.err.Error() }
+func (e *opError) Unwrap() error { return e.err }
+
+// stateError is a branch left in a state the operation cannot use, or one
+// that did not settle in time. Its wording is ghook's own.
+type stateError struct {
+	branch, state string
+	timedOut      bool
+}
+
+func (e *stateError) Error() string {
+	if e.timedOut {
+		return fmt.Sprintf("timed out waiting for branch %s (still %s)", e.branch, e.state)
+	}
+	return fmt.Sprintf("branch %s is %s, not ready", e.branch, e.state)
 }
 
 // setStatus posts a pgoverlay/branch commit status on the PR head SHA when a
@@ -373,15 +598,23 @@ func (s *Service) github(p *payload) *GitHub {
 	return s.gh.ForInstallation(p.Installation.ID)
 }
 
+// destroyBranch destroys branch once no other operation runs on it. A
+// branch that is already gone is not an error.
 func (s *Service) destroyBranch(ctx context.Context, log *slog.Logger, branch string) error {
-	err := s.pg.DestroyBranch(ctx, branch)
+	_, err := s.settledBranch(ctx, branch)
+	if err == nil {
+		err = s.pg.DestroyBranch(ctx, branch)
+		if err != nil {
+			err = &opError{op: "destroy branch " + branch, err: err}
+		}
+	}
 	switch {
 	case apiclient.IsNotFound(err):
-		log.Debug("branch already gone", "branch", branch)
+		log.Debug("branch already gone")
 	case err != nil:
-		return fmt.Errorf("destroy branch %s: %w", branch, err)
+		return err
 	default:
-		log.Info("branch destroyed", "branch", branch)
+		log.Info("branch destroyed")
 	}
 	return nil
 }

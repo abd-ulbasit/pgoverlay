@@ -29,6 +29,7 @@ type ghComment struct {
 // then PATCH.
 type fakeGitHub struct {
 	t        *testing.T
+	prState  string      // state served for GET /repos/acme/widgets/pulls/7 ("" = closed)
 	comments []ghComment // current comments (list endpoint state)
 	posted   []string    // bodies received by the create endpoint
 	patched  []string    // bodies received by the edit endpoint, in order
@@ -80,6 +81,14 @@ func newFakeGitHub(t *testing.T, existing ...string) *fakeGitHub {
 		}
 		t.Errorf("PATCH of unknown comment id %s", r.PathValue("id"))
 		w.WriteHeader(http.StatusNotFound)
+	})
+	mux.HandleFunc("GET /repos/acme/widgets/pulls/7", func(w http.ResponseWriter, r *http.Request) {
+		f.lastReq = r
+		state := f.prState
+		if state == "" {
+			state = "closed"
+		}
+		json.NewEncoder(w).Encode(map[string]any{"number": 7, "state": state})
 	})
 	mux.HandleFunc("POST /repos/acme/widgets/statuses/{sha}", func(w http.ResponseWriter, r *http.Request) {
 		f.lastReq = r
@@ -185,7 +194,7 @@ func TestClosedUpdatesCommentToDestroyed(t *testing.T) {
 	gh := newFakeGitHub(t, commentMarker+" branch "+pr7Branch+" ready, psql -h pg.example.com")
 	deliver(t, newService(Config{ProxyHost: "pg.example.com"}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
 
-	pg.assertCalls("DELETE /v1/branches/" + pr7Branch)
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "DELETE /v1/branches/"+pr7Branch)
 	if len(gh.patched) != 1 {
 		t.Fatalf("patched = %v, want exactly one destroyed update", gh.patched)
 	}
@@ -444,9 +453,26 @@ func TestClosedWithoutMarkerCommentCreatesNothing(t *testing.T) {
 	pg := newFakePG(t, true)
 	gh := newFakeGitHub(t, "unrelated comment")
 	deliver(t, newService(Config{}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
-	pg.assertCalls("DELETE /v1/branches/" + pr7Branch)
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "DELETE /v1/branches/"+pr7Branch)
 	if len(gh.posted) != 0 || len(gh.patched) != 0 || len(gh.statuses) != 0 {
 		t.Fatalf("posted=%v patched=%v statuses=%+v, want no GitHub writes on closed without a marker comment",
 			gh.posted, gh.patched, gh.statuses)
+	}
+}
+
+// A closed delivery for a pull request GitHub reports open again (a
+// redelivery, a replayed request, or one queued behind the reopen) must not
+// destroy the branch the open pull request uses.
+func TestClosedIgnoredWhenPullRequestIsOpenAgain(t *testing.T) {
+	pg := newFakePG(t, true)
+	gh := newFakeGitHub(t, commentMarker+" ready")
+	gh.prState = "open"
+	deliver(t, newService(Config{}, pg.srv.URL, gh.client()), fixture(t, "pr_closed.json"))
+	pg.assertCalls() // no destroy, not even a lookup
+	if len(gh.patched) != 0 {
+		t.Errorf("patched = %v, want the comment left alone", gh.patched)
+	}
+	if got := gh.lastReq.URL.Path; got != "/repos/acme/widgets/pulls/7" {
+		t.Errorf("last GitHub call = %s, want the pull request lookup", got)
 	}
 }

@@ -85,6 +85,18 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
+// PullRequestState returns the pull request's current state as GitHub
+// reports it: "open" or "closed".
+func (g *GitHub) PullRequestState(ctx context.Context, repo string, number int) (string, error) {
+	var pr struct {
+		State string `json:"state"`
+	}
+	if err := g.do(ctx, "GET", fmt.Sprintf("/repos/%s/pulls/%d", repo, number), nil, &pr); err != nil {
+		return "", fmt.Errorf("get pull request: %w", err)
+	}
+	return pr.State, nil
+}
+
 // UpsertComment makes the comment carrying marker on repo#number carry body:
 // PATCH in place when it exists, POST otherwise. Each marker is upserted
 // independently (e.g. the connect comment vs the diff comment).
