@@ -3,12 +3,127 @@ package pgproxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgproto3"
 )
+
+// The authentication phase is bounded by AuthTimeout, not IdleTimeout: a
+// client that stalls after the backend's auth challenge is dropped, and both
+// its connection slot and the backend connection are released.
+func TestAuthTimeoutBoundsAuthentication(t *testing.T) {
+	backendDone := make(chan struct{})
+	srv := startPGServer(t, func(conn net.Conn, be *pgproto3.Backend) {
+		defer close(backendDone)
+		be.Send(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}})
+		be.Flush()
+		io.Copy(io.Discard, conn) // wait for a SASL response that never comes
+	})
+	p := New(fakeResolver{"pr-1": srv.addr})
+	p.MaxConns = 1
+	p.AuthTimeout = 200 * time.Millisecond
+	p.IdleTimeout = time.Hour
+	addr := startProxyWith(t, p)
+
+	conn := dialProxy(t, addr)
+	fe := pgproto3.NewFrontend(conn, conn)
+	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@pr-1"})
+	if msg, err := fe.Receive(); err != nil {
+		t.Fatal(err)
+	} else if _, ok := msg.(*pgproto3.AuthenticationSASL); !ok {
+		t.Fatalf("got %T, want *AuthenticationSASL", msg)
+	}
+	expectClosedWithin(t, conn, 2*time.Second, "client stalled in authentication")
+	select {
+	case <-backendDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("backend connection still open after the auth timeout")
+	}
+	waitFor(t, 3*time.Second, "connection slot released", func() bool { return slotFree(addr) })
+}
+
+// When the backend closes (here right after the startup message, as a branch
+// does at authentication_timeout), a client that stays silent and keeps its
+// socket open must not pin the connection slot until IdleTimeout: the client
+// sees EOF at once and the slot is freed within the close grace.
+func TestBackendCloseFreesSlotPromptly(t *testing.T) {
+	srv := startPGServer(t, func(conn net.Conn, be *pgproto3.Backend) {})
+	p := New(fakeResolver{"pr-1": srv.addr})
+	p.MaxConns = 1
+	p.AuthTimeout = time.Hour
+	p.IdleTimeout = time.Hour
+	p.closeGrace = 200 * time.Millisecond
+	addr := startProxyWith(t, p)
+
+	conn := dialProxy(t, addr)
+	sendStartup(t, pgproto3.NewFrontend(conn, conn), map[string]string{"user": "postgres", "database": "postgres@pr-1"})
+	var b [1]byte
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(b[:]); err != io.EOF {
+		t.Fatalf("client read after backend close = %v, want EOF", err)
+	}
+	// Keep conn open and silent: the proxy must still let the slot go.
+	start := time.Now()
+	waitFor(t, 3*time.Second, "connection slot released", func() bool { return slotFree(addr) })
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("slot released after %v, want within the close grace", elapsed)
+	}
+}
+
+// A peer that stops reading cannot pin a session: the relay's blocked write
+// times out after IdleTimeout, and the whole session (both connections and
+// the slot) is torn down.
+func TestNonReadingClientDoesNotPinSession(t *testing.T) {
+	backendDone := make(chan error, 1)
+	srv := startPGServer(t, func(conn net.Conn, be *pgproto3.Backend) {
+		be.Send(&pgproto3.AuthenticationOk{})
+		be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		if err := be.Flush(); err != nil {
+			backendDone <- err
+			return
+		}
+		chunk := make([]byte, 64<<10)
+		for {
+			if _, err := conn.Write(chunk); err != nil {
+				backendDone <- err // the proxy closed the backend connection
+				return
+			}
+		}
+	})
+	p := New(fakeResolver{"pr-1": srv.addr})
+	p.MaxConns = 1
+	p.IdleTimeout = 300 * time.Millisecond
+	p.closeGrace = 200 * time.Millisecond
+	addr := startProxyWith(t, p)
+
+	conn := dialProxy(t, addr)
+	fe := pgproto3.NewFrontend(conn, conn)
+	sendStartup(t, fe, map[string]string{"user": "postgres", "database": "postgres@pr-1"})
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+	// Stop reading, keep the socket open.
+	select {
+	case err := <-backendDone:
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatal("fake backend hit its own deadline: the proxy never closed the session")
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("session with a non-reading client was never torn down")
+	}
+	waitFor(t, 3*time.Second, "connection slot released", func() bool { return slotFree(addr) })
+}
 
 // flakyListener returns the queued errors from Accept before delegating.
 type flakyListener struct {
@@ -131,6 +246,7 @@ func TestZeroValueProxyUsesDefaults(t *testing.T) {
 	}{
 		{"DialTimeout", p.dialTimeout(), defaultDialTimeout},
 		{"StartupTimeout", p.startupTimeout(), defaultStartupTimeout},
+		{"AuthTimeout", p.authTimeout(), defaultAuthTimeout},
 		{"IdleTimeout", p.idleTimeout(), defaultIdleTimeout},
 	} {
 		if tt.got != tt.want {

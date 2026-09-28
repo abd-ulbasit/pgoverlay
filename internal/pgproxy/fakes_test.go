@@ -3,6 +3,7 @@ package pgproxy
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -116,4 +117,38 @@ func slotFree(addr string) bool {
 	var b [1]byte
 	_, err = io.ReadFull(conn, b[:])
 	return err == nil && b[0] == 'N'
+}
+
+// waitFor polls cond until it holds or timeout passes.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for: %s", timeout, what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// expectClosedWithin reads from conn and fails unless the proxy closes it
+// within d. Our own deadline is generous, so it is the proxy that ends it.
+func expectClosedWithin(t *testing.T, conn net.Conn, d time.Duration, what string) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(d + 3*time.Second))
+	start := time.Now()
+	buf := make([]byte, 64<<10)
+	for {
+		_, err := conn.Read(buf)
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				t.Fatalf("%s: connection still open after %v", what, time.Since(start))
+			}
+			break
+		}
+	}
+	if elapsed := time.Since(start); elapsed > d {
+		t.Fatalf("%s: connection lingered %v, want closed within %v", what, elapsed, d)
+	}
 }
