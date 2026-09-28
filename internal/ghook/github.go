@@ -256,21 +256,43 @@ func diffCommentBody(branch string, res *engine.DiffResult) string {
 	}
 
 	var changed []engine.TableDelta
+	unknown := 0 // tables whose count is unknown have no delta to list
 	for _, t := range res.Tables {
 		if t.Delta != 0 {
 			changed = append(changed, t)
+		} else if t.RowsUnknown {
+			unknown++
 		}
 	}
 	if len(changed) == 0 {
-		sb.WriteString("\nTables: no row-count changes.\n")
-		return sb.String()
+		if unknown > 0 {
+			sb.WriteString("\nTables: no known row-count changes.\n")
+		} else {
+			sb.WriteString("\nTables: no row-count changes.\n")
+		}
+		return sb.String() + unknownCountNote(unknown)
 	}
 	sb.WriteString("\n| TABLE | BASE | BRANCH | DELTA |\n|---|---|---|---|\n")
 	for _, t := range changed {
-		fmt.Fprintf(&sb, "| `%s` | %d | %d | %+d |\n", t.Table, t.BaseRows, t.BranchRows, t.Delta)
+		base, branch, delta := t.Cells()
+		fmt.Fprintf(&sb, "| `%s` | %s | %s | %s |\n", t.Name(), base, branch, delta)
 	}
 	sb.WriteString("\n_(row counts are planner estimates)_\n")
-	return sb.String()
+	return sb.String() + unknownCountNote(unknown)
+}
+
+// unknownCountNote is the diff comment's footer for the tables left out of
+// its delta table because their row count is unknown (never analyzed and
+// too large to count exactly), so the comment never reads as "nothing
+// changed" while such a table grew. "" when there are none.
+func unknownCountNote(n int) string {
+	switch n {
+	case 0:
+		return ""
+	case 1:
+		return "\n_(1 table with an unknown row count is not listed: never analyzed and too large to count exactly. `pgb diff --all` lists it.)_\n"
+	}
+	return fmt.Sprintf("\n_(%d tables with an unknown row count are not listed: never analyzed and too large to count exactly. `pgb diff --all` lists them.)_\n", n)
 }
 
 // psqlCommand renders the proxy connect string shown in comments.
