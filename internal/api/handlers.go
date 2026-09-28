@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -80,10 +82,36 @@ func interruptedStatus(ctx context.Context) int {
 	return 0
 }
 
+// maxBodyBytes caps every JSON request body. The largest legitimate body is a
+// source's masking scripts; 1 MiB of SQL is far beyond any real set.
+const maxBodyBytes = 1 << 20
+
+// decode reads exactly one JSON value of type T from the request body. It is
+// strict on purpose: an unknown field (a typo such as "ttl" for
+// "ttl_seconds") is a 400 naming the field instead of being silently dropped,
+// trailing data after the value is a 400, and a body over maxBodyBytes is a
+// 413 before it is buffered.
 func decode[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
 	var v T
-	if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	dec.DisallowUnknownFields()
+	err := dec.Decode(&v)
+	if err == nil {
+		var extra json.RawMessage
+		if xerr := dec.Decode(&extra); xerr != io.EOF {
+			err = xerr
+			if err == nil {
+				err = errors.New("unexpected data after the JSON value")
+			}
+		}
+	}
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds %d bytes", tooBig.Limit))
+			return v, false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+strings.TrimPrefix(err.Error(), "json: "))
 		return v, false
 	}
 	return v, true
@@ -411,15 +439,28 @@ func (s *Server) reconcileApply(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, taken)
 }
 
+// tokenNameRe bounds token names: they are rendered into every audit entry as
+// "name (role)", so they stay short and printable.
+var tokenNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
 // createToken mints an API token (admin-only) and returns the plaintext once.
 func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
-	var req CreateTokenRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	req, ok := decode[CreateTokenRequest](w, r)
+	if !ok {
 		return
 	}
 	if req.Name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if !tokenNameRe.MatchString(req.Name) {
+		writeError(w, http.StatusBadRequest, "invalid token name: must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+		return
+	}
+	if req.Name == envTokenActor {
+		// The built-in PGOVERLAY_TOKEN is audited as "root (admin)"; a stored
+		// token with the same name would be indistinguishable from it.
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("token name %q is reserved for the built-in PGOVERLAY_TOKEN", envTokenActor))
 		return
 	}
 	if !registry.ValidRole(req.Role) {
