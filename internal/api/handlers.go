@@ -44,6 +44,7 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusForbidden, msg)
 	case errors.Is(err, registry.ErrAlreadyExists),
 		errors.Is(err, registry.ErrIllegalTransition),
+		errors.Is(err, engine.ErrNotRecoverable),
 		strings.Contains(msg, "UNIQUE constraint"),
 		strings.Contains(msg, "live branch"),
 		strings.Contains(msg, "child branch"),
@@ -360,6 +361,18 @@ func (s *Server) destroyBranch(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resetBranch(w http.ResponseWriter, r *http.Request) {
 	b, err := s.eng.ResetBranch(r.Context(), r.PathValue("name"))
+	if err != nil {
+		writeEngineError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.branchJSON(b))
+}
+
+// recoverBranch restarts a failed branch on its existing data (no re-clone):
+// the way back for a branch failed by crash recovery with its data intact.
+// 409 when the branch is not failed or its volumes are gone.
+func (s *Server) recoverBranch(w http.ResponseWriter, r *http.Request) {
+	b, err := s.eng.RecoverBranch(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeEngineError(w, r, err)
 		return

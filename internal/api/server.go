@@ -180,6 +180,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("GET /v1/branches/{name}/history", s.requireRole(viewer, s.branchHistory))
 	v1.HandleFunc("DELETE /v1/branches/{name}", s.mutate(operator, s.destroyBranch))
 	v1.HandleFunc("POST /v1/branches/{name}/reset", s.mutate(operator, s.resetBranch))
+	v1.HandleFunc("POST /v1/branches/{name}/recover", s.mutate(operator, s.recoverBranch))
 	v1.HandleFunc("GET /v1/reconcile/plan", s.requireRole(viewer, s.reconcilePlan))
 	v1.HandleFunc("POST /v1/reconcile", s.mutate(operator, s.reconcileApply))
 	v1.HandleFunc("POST /v1/tokens", s.mutate(admin, s.createToken))

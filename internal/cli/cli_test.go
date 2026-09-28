@@ -20,7 +20,7 @@ func TestCommandTree(t *testing.T) {
 	for _, path := range [][]string{
 		{"source", "add"}, {"source", "ls"}, {"source", "rm"}, {"source", "refresh"},
 		{"source", "set-mask"}, {"source", "get-mask"},
-		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"},
+		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"}, {"branch", "recover"},
 		{"connect"}, {"diff"}, {"history"}, {"doctor"}, {"gc"},
 		{"token", "create"}, {"token", "ls"}, {"token", "revoke"},
 	} {
