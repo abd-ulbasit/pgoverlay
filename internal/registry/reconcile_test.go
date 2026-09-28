@@ -130,3 +130,49 @@ func TestFailStuckBranch(t *testing.T) {
 		t.Fatalf("ready row failed as stuck: %v, %v", ok, err)
 	}
 }
+
+func TestListStuckDestroyingBranches(t *testing.T) {
+	r := openTest(t)
+	reconcileBranch(t, r, BranchDestroying)
+	if got, err := r.ListStuckDestroyingBranches(TimeString(time.Now().Add(-time.Hour))); err != nil || len(got) != 0 {
+		t.Fatalf("fresh destroying row listed: %v, %v", got, err)
+	}
+	if got, err := r.ListStuckDestroyingBranches(TimeString(time.Now().Add(time.Hour))); err != nil || len(got) != 1 || got[0].Name != "pr-1" {
+		t.Fatalf("stuck destroying row not listed: %v, %v", got, err)
+	}
+}
+
+// A seeding source whose heartbeat stopped is listed and can be failed once;
+// TouchSource (the heartbeat) keeps it off the list, and a ready source is
+// never touched.
+func TestStuckSources(t *testing.T) {
+	r := openTest(t)
+	s := &Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	cut := TimeString(time.Now())
+	if got, err := r.ListStuckSources(cut); err != nil || len(got) != 1 || got[0].ID != s.ID {
+		t.Fatalf("stuck seeding source not listed: %v, %v", got, err)
+	}
+	if err := r.TouchSource(s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.ListStuckSources(cut); len(got) != 0 {
+		t.Fatalf("heartbeat did not refresh the source: %v", got)
+	}
+	if ok, err := r.FailStuckSource(context.Background(), s.ID, cut, "x"); err != nil || ok {
+		t.Fatalf("source that heartbeat after the cut-off was failed: %v, %v", ok, err)
+	}
+	future := TimeString(time.Now().Add(time.Hour))
+	if ok, err := r.FailStuckSource(context.Background(), s.ID, future, "no progress"); err != nil || !ok {
+		t.Fatalf("FailStuckSource = %v, %v", ok, err)
+	}
+	if got, _ := r.GetSourceByID(s.ID); got.State != SourceFailed {
+		t.Fatalf("state = %q", got.State)
+	}
+	if ok, err := r.FailStuckSource(context.Background(), s.ID, future, "again"); err != nil || ok {
+		t.Fatalf("failed source failed again: %v, %v", ok, err)
+	}
+}

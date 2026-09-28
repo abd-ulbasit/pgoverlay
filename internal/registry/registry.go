@@ -1206,3 +1206,61 @@ func (r *Registry) FailStuckBranch(ctx context.Context, id, before, reason strin
 	}
 	return true, tx.Commit()
 }
+
+// ListStuckDestroyingBranches returns branches in destroying whose last update
+// is older than before: a destroy that failed or was interrupted part-way.
+func (r *Registry) ListStuckDestroyingBranches(before string) ([]*Branch, error) {
+	return r.listBranches(`state=? AND updated_at < ?`, string(BranchDestroying), before)
+}
+
+// TouchSource bumps a source's updated_at: the seeding heartbeat that tells
+// reconcile the seed is still running (see ListStuckSources).
+func (r *Registry) TouchSource(id string) error {
+	_, err := r.db.Exec(`UPDATE sources SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, id)
+	return err
+}
+
+// ListStuckSources returns sources still seeding whose last update is older
+// than before. A live seed heartbeats (TouchSource), so these are seeds whose
+// process died.
+func (r *Registry) ListStuckSources(before string) ([]*Source, error) {
+	rows, err := r.db.Query(`SELECT `+sourceCols+` FROM sources WHERE state=? AND updated_at < ? ORDER BY created_at`,
+		string(SourceSeeding), before)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Source
+	for rows.Next() {
+		s, err := scanSource(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// FailStuckSource moves a source still seeding whose last update is older than
+// before to failed, journaling reason, as one compare-and-swap; failed reports
+// whether it applied (false when the seed finished, failed or heartbeat since).
+func (r *Registry) FailStuckSource(ctx context.Context, id, before, reason string) (failed bool, err error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE sources SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=? AND updated_at < ?`, string(SourceFailed), id, string(SourceSeeding), before)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+		"source", id, string(SourceSeeding), string(SourceFailed), reason, actorString(ctx)); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}

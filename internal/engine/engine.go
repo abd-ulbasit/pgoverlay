@@ -180,6 +180,9 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 	if err := e.reg.CreateSource(s); err != nil {
 		return err
 	}
+	// heartbeat the seeding row so reconcile can tell a long seed from one
+	// whose process died (fail_stuck_source)
+	defer e.trackSeeding(s.ID)()
 	if err := e.createSourceLayer(ctx, s.Volume, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": s.Name})); err != nil {
 		e.logCompensationErr("transition", "add source: mark source failed after layer create failed",
 			e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed"), "source", s.Name)

@@ -71,7 +71,7 @@ func New() *Metrics {
 		}),
 		reconcileActs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "pgoverlay_reconcile_actions_total",
-			Help: "Reconcile actions taken by action (fail_stuck|remove_orphan_container|gc_layer|gc_volume).",
+			Help: "Reconcile actions taken by action (fail_stuck|fail_stuck_source|retry_destroy|restart_branch|update_endpoint|remove_orphan_container|remove_orphan_helper|gc_layer|gc_volume).",
 		}, []string{"action"}),
 		inflight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "pgoverlay_inflight_ops",

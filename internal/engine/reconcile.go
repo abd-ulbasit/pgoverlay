@@ -25,6 +25,13 @@ const (
 	// ActionFailStuck fails a branch wedged in creating/resetting past the
 	// stuck timeout and cleans its half-built resources.
 	ActionFailStuck ActionKind = "fail_stuck"
+	// ActionFailStuckSource fails a source wedged in seeding: its seed has not
+	// made progress (heartbeat) for the stuck timeout, so the process running
+	// it died. Its half-seeded volume is removed.
+	ActionFailStuckSource ActionKind = "fail_stuck_source"
+	// ActionRetryDestroy re-runs the teardown of a branch wedged in destroying
+	// (a destroy that failed or was interrupted part-way).
+	ActionRetryDestroy ActionKind = "retry_destroy"
 	// ActionRestartBranch recreates the container/pod of a ready branch that
 	// is gone or stopped for good, on the branch's existing volumes. If it does
 	// not become ready the branch is failed; its volumes are kept.
@@ -35,14 +42,17 @@ const (
 	// ActionRemoveOrphanContainer removes a managed container/pod with no live
 	// registry row.
 	ActionRemoveOrphanContainer ActionKind = "remove_orphan_container"
+	// ActionRemoveOrphanHelper removes a finished helper container/pod that
+	// the process which ran it never removed (it died first).
+	ActionRemoveOrphanHelper ActionKind = "remove_orphan_helper"
 	// ActionGCLayer removes a frozen layer (volume + row) whose refcount is 0.
 	ActionGCLayer ActionKind = "gc_layer"
 	// ActionGCVolume removes a managed volume owned by no live branch/source.
 	ActionGCVolume ActionKind = "gc_volume"
 )
 
-// Action is one intended convergence step. Target is the branch name,
-// container id, layer volume or volume name the action operates on;
+// Action is one intended convergence step. Target is the branch name, source
+// name, container id, layer volume or volume name the action operates on;
 // Reason is a human-readable justification. ReconcilePlan is a list of these.
 type Action struct {
 	Kind   ActionKind `json:"kind"`
@@ -70,13 +80,14 @@ func (p *ReconcilePlan) add(kind ActionKind, target, reason string) {
 // claims counts resources that a running operation has created, or is about
 // to create, before the registry records them: a freeze's fresh parent rw
 // volume until CommitFreeze, a refresh's next-generation volume until
-// BumpSourceGeneration, a branch reconcile is restarting. PlanReconcile and
-// applyAction consult it, so those resources are never taken for orphans
-// while they are in use.
+// BumpSourceGeneration, a source being seeded, a branch reconcile is
+// restarting. PlanReconcile and applyAction consult it, so those resources are
+// never taken for orphans or abandoned rows while they are in use.
 //
 // Claims only cover operations in this process. Volume GC additionally skips
 // any volume younger than the stuck timeout, which covers another process (a
-// CLI next to branchd, a previous leader) that has just created one.
+// CLI next to branchd, a previous leader) that has just created one, and a
+// running seed heartbeats its source row for the same reason.
 type reconcileState struct {
 	mu        sync.Mutex
 	claims    map[string]int
@@ -141,6 +152,7 @@ func (s *reconcileState) allowRefresh(name string, now time.Time) bool {
 }
 
 func volumeClaim(name string) string { return "volume:" + name }
+func sourceClaim(id string) string   { return "source:" + id }
 func branchClaim(name string) string { return "branch:" + name }
 
 // claimVolume marks a volume the caller is about to create as in flight until
@@ -148,6 +160,43 @@ func branchClaim(name string) string { return "branch:" + name }
 // caller's compensation removed it. Claim BEFORE creating the volume.
 func (e *Engine) claimVolume(name string) (release func()) {
 	return e.rs.claim(volumeClaim(name))
+}
+
+// seedHeartbeat is how often a running seed bumps its source row.
+var seedHeartbeat = 30 * time.Second
+
+// trackSeeding marks source id as being seeded by this process until stop is
+// called. Reconcile skips a claimed source, and the heartbeat keeps its
+// updated_at fresh so no other process's reconcile takes a long seed for an
+// abandoned one (fail_stuck_source).
+func (e *Engine) trackSeeding(id string) (stop func()) {
+	release := e.rs.claim(sourceClaim(id))
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(seedHeartbeat)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if err := e.reg.TouchSource(id); err != nil {
+					slog.Warn("seed heartbeat failed", "source_id", id, "err", err)
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			wg.Wait()
+			release()
+		})
+	}
 }
 
 // PlanReconcile computes the convergence plan WITHOUT mutating anything: it is
@@ -170,7 +219,9 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 		reaping[b.Name] = true
 	}
 
-	// (b) branches wedged in creating/resetting past the stuck timeout → fail.
+	// (b) rows wedged in a transient state past the stuck timeout: branches
+	// in creating/resetting → fail; sources in seeding → fail; branches in
+	// destroying → finish the teardown.
 	stuck, err := e.reg.ListStuckBranches(before)
 	if err != nil {
 		return plan, err
@@ -178,6 +229,25 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 	for _, b := range stuck {
 		plan.add(ActionFailStuck, b.Name,
 			fmt.Sprintf("stuck in %s longer than %s", b.State, stuckTimeout))
+	}
+	stuckSources, err := e.reg.ListStuckSources(before)
+	if err != nil {
+		return plan, err
+	}
+	for _, s := range stuckSources {
+		if e.rs.claimed(sourceClaim(s.ID)) {
+			continue // this process is seeding it
+		}
+		plan.add(ActionFailStuckSource, s.Name,
+			fmt.Sprintf("seeding with no progress for longer than %s", stuckTimeout))
+	}
+	destroying, err := e.reg.ListStuckDestroyingBranches(before)
+	if err != nil {
+		return plan, err
+	}
+	for _, b := range destroying {
+		plan.add(ActionRetryDestroy, b.Name,
+			fmt.Sprintf("stuck in destroying longer than %s", stuckTimeout))
 	}
 
 	live, err := e.reg.ListLiveBranches()
@@ -226,6 +296,17 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 		}
 		if !known[c.ID] && !ownedInFlight(c, liveByID) {
 			plan.add(ActionRemoveOrphanContainer, c.ID, "managed container with no live branch row")
+		}
+	}
+
+	// (d) finished helpers nobody removed (the process running them died).
+	helpers, err := e.drv.ListHelpers(ctx)
+	if err != nil {
+		return plan, err
+	}
+	for _, h := range helpers {
+		if orphanHelper(h, now, stuckTimeout) {
+			plan.add(ActionRemoveOrphanHelper, h.ID, fmt.Sprintf("helper finished (%s) and was never removed", h.Status))
 		}
 	}
 
@@ -331,6 +412,13 @@ func ownedInFlight(c runtime.ContainerInfo, liveByID map[string]*registry.Branch
 	return false
 }
 
+// orphanHelper reports whether a helper is finished and old enough that the
+// process which ran it would have removed it by now. Running helpers are left
+// alone: a live seed in another process looks the same as an orphaned one.
+func orphanHelper(h runtime.ContainerInfo, now time.Time, grace time.Duration) bool {
+	return h.Stopped && !h.Created.IsZero() && now.Sub(h.Created) >= grace
+}
+
 // reconcilePass carries a pass's clock into apply, so the apply-time
 // re-checks use the same cut-offs as the plan.
 type reconcilePass struct {
@@ -383,6 +471,13 @@ func (e *Engine) ApplyReconcile(ctx context.Context, now time.Time, stuckTimeout
 	}
 	return taken, errors.Join(errs...)
 }
+
+// resumeDestroy finishes the teardown of a branch wedged in destroying. It
+// is DestroyBranch, which resumes from the destroying state once the
+// lifecycle fix for failed destroys (LIFECYCLE-02, issue #10) makes it
+// re-entrant; until then the retry reports DestroyBranch's refusal. A
+// variable so tests can observe the call.
+var resumeDestroy = (*Engine).DestroyBranch
 
 // applyAction executes one planned action after re-validating it against the
 // live registry. Returns applied=false (no error) when the re-check shows the
@@ -455,6 +550,48 @@ func (e *Engine) applyAction(ctx context.Context, a Action, p reconcilePass) (ap
 				"branch", b.Name, "rw_volume", b.RWVolume, "referencing_branches", referenced)
 		} else if err := e.removeBranchLayer(ctx, b); err != nil {
 			slog.Warn("reconcile: remove stuck branch layer failed", "branch", b.Name, "rw_volume", b.RWVolume, "err", err)
+		}
+		return true, nil
+
+	case ActionFailStuckSource:
+		src, err := e.reg.GetSourceByName(a.Target)
+		if err != nil {
+			if errors.Is(err, registry.ErrNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if src.State != registry.SourceSeeding || e.rs.claimed(sourceClaim(src.ID)) {
+			return false, nil
+		}
+		failed, err := e.reg.FailStuckSource(ctx, src.ID, p.before(),
+			fmt.Sprintf("reconcile: seeding made no progress for %s (the seeding process stopped)", p.stuckTimeout))
+		if err != nil || !failed {
+			return false, err
+		}
+		slog.Warn("reconcile: failed source stuck in seeding", "source", src.Name, "volume", src.Volume)
+		// the half-seeded layer is useless; AddSource's own failure path
+		// removes it the same way (best-effort: a helper still writing to it
+		// keeps a docker volume busy, and RemoveSource cleans it up later)
+		if err := e.removeSourceLayer(ctx, src.Volume); err != nil {
+			slog.Warn("reconcile: remove half-seeded source layer failed", "source", src.Name, "volume", src.Volume, "err", err)
+		}
+		return true, nil
+
+	case ActionRetryDestroy:
+		b, err := e.reg.GetBranchByName(a.Target)
+		if err != nil {
+			if errors.Is(err, registry.ErrNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if b.State != registry.BranchDestroying {
+			return false, nil
+		}
+		slog.Warn("reconcile: retrying destroy of branch stuck in destroying", "branch", b.Name)
+		if err := resumeDestroy(e, ctx, b.Name); err != nil {
+			return false, err
 		}
 		return true, nil
 
@@ -538,6 +675,23 @@ func (e *Engine) applyAction(ctx context.Context, a Action, p reconcilePass) (ap
 			return false, nil
 		}
 		slog.Info("reconcile: removing orphan container", "container", a.Target)
+		if err := e.drv.StopRemove(ctx, a.Target); err != nil {
+			return false, err
+		}
+		return true, nil
+
+	case ActionRemoveOrphanHelper:
+		info, err := e.drv.Inspect(ctx, a.Target)
+		if errors.Is(err, runtime.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !info.Stopped {
+			return false, nil
+		}
+		slog.Info("reconcile: removing finished helper left behind", "helper", a.Target, "status", info.Status)
 		if err := e.drv.StopRemove(ctx, a.Target); err != nil {
 			return false, err
 		}
@@ -772,9 +926,9 @@ func (e *Engine) RefreshBranchEndpoint(ctx context.Context, name string) (string
 }
 
 // Reconcile converges the registry with reality in one pass: reaps TTL-expired
-// branches, fails branches stuck in creating/resetting past stuckTimeout,
-// repairs ready branches whose container is gone, stopped or moved, removes
-// orphaned managed containers, and GCs dangling layers/volumes. It is the
+// branches, fails rows stuck in a transient state past stuckTimeout, repairs
+// ready branches whose container is gone, stopped or moved, removes orphaned
+// managed containers and helpers, and GCs dangling layers/volumes. It is the
 // unified loop body branchd runs on a ticker (and once at startup); the
 // CLI/REST doctor (plan) and gc (apply) call PlanReconcile/ApplyReconcile
 // directly. logf (nil = silent) receives a one-line summary per pass.

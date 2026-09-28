@@ -945,3 +945,143 @@ func TestReconcileKeepsUnrecordedContainerOfInFlightBranch(t *testing.T) {
 		t.Fatalf("leftover of a failed branch not reclaimed: %+v", taken.Actions)
 	}
 }
+
+// --- stuck sources, stuck destroys, orphan helpers ---
+
+// A source left in seeding by a process that died (no heartbeat for the stuck
+// timeout) is failed and its half-seeded volume removed, so it no longer
+// blocks branch creates and refreshes forever.
+func TestReconcileFailsSourceStuckInSeeding(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
+	if err := r.CreateSource(s); err != nil { // state seeding
+		t.Fatal(err)
+	}
+	d.volumes[s.Volume] = true
+
+	// fresh: a seed in progress
+	if plan, _ := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute); hasAction(plan, ActionFailStuckSource, "main") {
+		t.Fatalf("fresh seeding source planned: %+v", plan.Actions)
+	}
+	// seeded by this process: skipped however old
+	stop := e.trackSeeding(s.ID)
+	if plan, _ := e.PlanReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute); hasAction(plan, ActionFailStuckSource, "main") {
+		t.Fatalf("source seeded in-process planned: %+v", plan.Actions)
+	}
+	stop()
+
+	taken, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionFailStuckSource, "main") {
+		t.Fatalf("stuck source not failed: %+v", taken.Actions)
+	}
+	got, err := r.GetSourceByID(s.ID)
+	if err != nil || got.State != registry.SourceFailed {
+		t.Fatalf("source = %+v, %v; want failed", got, err)
+	}
+	if d.volumes[s.Volume] {
+		t.Fatal("half-seeded volume not removed")
+	}
+}
+
+// A running seed heartbeats its source row, so a long seed is never mistaken
+// for an abandoned one by another process's reconcile.
+func TestSeedHeartbeatKeepsSourceFresh(t *testing.T) {
+	old := seedHeartbeat
+	seedHeartbeat = 5 * time.Millisecond
+	t.Cleanup(func() { seedHeartbeat = old })
+
+	d := newFake()
+	e, r := testEngine(t, d)
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
+	if err := r.CreateSource(s); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	start := registry.TimeString(time.Now())
+	if stuck, _ := r.ListStuckSources(start); len(stuck) != 1 {
+		t.Fatalf("precondition: source not older than %s", start)
+	}
+	stop := e.trackSeeding(s.ID)
+	defer stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		stuck, err := r.ListStuckSources(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(stuck) == 0 {
+			return // heartbeat moved updated_at past start
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed heartbeat never refreshed the source row")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A branch wedged in destroying past the stuck timeout gets its teardown
+// retried (DestroyBranch resumes from destroying once issue #10 lands).
+func TestReconcileRetriesStuckDestroy(t *testing.T) {
+	var resumed []string
+	old := resumeDestroy
+	resumeDestroy = func(e *Engine, ctx context.Context, name string) error {
+		resumed = append(resumed, name)
+		return nil
+	}
+	t.Cleanup(func() { resumeDestroy = old })
+
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "gone")
+	if err := r.TransitionBranch(b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
+		t.Fatal(err)
+	}
+	if plan, _ := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute); hasAction(plan, ActionRetryDestroy, "gone") {
+		t.Fatalf("destroy in progress planned for retry: %+v", plan.Actions)
+	}
+	taken, err := e.ApplyReconcile(context.Background(), time.Now().Add(time.Hour), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionRetryDestroy, "gone") || len(resumed) != 1 || resumed[0] != "gone" {
+		t.Fatalf("retry_destroy not applied: taken=%+v resumed=%v", taken.Actions, resumed)
+	}
+}
+
+// A helper container that finished but was never removed (the process that
+// ran it died) is reclaimed once it is older than the grace; running helpers
+// and recent ones are left alone.
+func TestReconcileRemovesFinishedOrphanHelper(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	now := time.Now()
+	helper := func(id string, state runtime.ContainerInfo) {
+		state.ID = id
+		d.containers[id] = true
+		d.containerState[id] = state
+		d.helperList = append(d.helperList, state)
+	}
+	helper("h-old-exited", runtime.ContainerInfo{Stopped: true, Status: "Exited (0)", Created: now.Add(-time.Hour)})
+	helper("h-old-running", runtime.ContainerInfo{Running: true, Created: now.Add(-time.Hour)})
+	helper("h-new-exited", runtime.ContainerInfo{Stopped: true, Created: now.Add(-time.Minute)})
+
+	taken, err := e.ApplyReconcile(context.Background(), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionRemoveOrphanHelper, "h-old-exited") || d.containers["h-old-exited"] {
+		t.Fatalf("finished orphan helper not removed: %+v", taken.Actions)
+	}
+	if hasAction(taken, ActionRemoveOrphanHelper, "h-old-running") || !d.containers["h-old-running"] {
+		t.Fatal("a running helper was removed")
+	}
+	if hasAction(taken, ActionRemoveOrphanHelper, "h-new-exited") || !d.containers["h-new-exited"] {
+		t.Fatal("a helper inside the grace period was removed")
+	}
+}
