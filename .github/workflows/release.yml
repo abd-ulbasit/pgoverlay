@@ -105,7 +105,7 @@ jobs:
           {
             echo "tags=$tags"
             # Same values goreleaser stamps into the release binaries.
-            echo "version=${GITHUB_REF_NAME#v}"
+            echo "version=$GITHUB_REF_NAME"
             echo "date=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"
           } >>"$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1

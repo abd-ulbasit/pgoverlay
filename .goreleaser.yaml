@@ -26,7 +26,7 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/abd-ulbasit/pgoverlay/internal/version.Version={{ .Version }}
+      - -X github.com/abd-ulbasit/pgoverlay/internal/version.Version={{ .Tag }}
       - -X github.com/abd-ulbasit/pgoverlay/internal/version.Commit={{ .FullCommit }}
       - -X github.com/abd-ulbasit/pgoverlay/internal/version.Date={{ .CommitDate }}
     # Reproducible: timestamps come from the commit, not the build machine.
