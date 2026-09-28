@@ -176,11 +176,27 @@ func sourceJSON(s *registry.Source) Source {
 }
 
 // branchJSON renders a branch with its source's connection identity and the
-// router hint (dbname@branch).
-func (s *Server) branchJSON(b *registry.Branch) Branch {
+// router hint (dbname@branch). A failed source lookup is returned (callers
+// answer 500) instead of being papered over with default credentials that
+// would send a client to the wrong database; only a source row that is
+// genuinely gone falls back to the defaults.
+func (s *Server) branchJSON(b *registry.Branch) (Branch, error) {
+	src, err := s.reg.GetSourceByID(b.SourceID)
+	if err != nil {
+		if !errors.Is(err, registry.ErrNotFound) {
+			return Branch{}, fmt.Errorf("branch %q: load source: %w", b.Name, err)
+		}
+		src = nil
+	}
+	return renderBranch(b, src), nil
+}
+
+// renderBranch builds the wire Branch from a branch row and its source (nil
+// when the source row no longer exists).
+func renderBranch(b *registry.Branch, src *registry.Source) Branch {
 	user, db := "postgres", "postgres"
 	srcName := ""
-	if src, err := s.reg.GetSourceByID(b.SourceID); err == nil {
+	if src != nil {
 		srcName = src.Name
 		if src.ConnUser != "" {
 			user = src.ConnUser
@@ -370,7 +386,17 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) {
 		writeEngineError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, s.branchJSON(b))
+	s.writeBranch(w, r, http.StatusCreated, b)
+}
+
+// writeBranch renders b (with its source's identity) or the lookup error.
+func (s *Server) writeBranch(w http.ResponseWriter, r *http.Request, code int, b *registry.Branch) {
+	out, err := s.branchJSON(b)
+	if err != nil {
+		writeEngineError(w, r, err)
+		return
+	}
+	writeJSON(w, code, out)
 }
 
 func (s *Server) listBranches(w http.ResponseWriter, r *http.Request) {
@@ -379,9 +405,19 @@ func (s *Server) listBranches(w http.ResponseWriter, r *http.Request) {
 		writeEngineError(w, r, err)
 		return
 	}
+	// one sources query for the whole list instead of one per branch
+	sources, err := s.reg.ListSources()
+	if err != nil {
+		writeEngineError(w, r, err)
+		return
+	}
+	byID := make(map[string]*registry.Source, len(sources))
+	for _, src := range sources {
+		byID[src.ID] = src
+	}
 	out := make([]Branch, 0, len(branches))
 	for _, b := range branches {
-		out = append(out, s.branchJSON(b))
+		out = append(out, renderBranch(b, byID[b.SourceID]))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -392,7 +428,7 @@ func (s *Server) getBranch(w http.ResponseWriter, r *http.Request) {
 		writeEngineError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.branchJSON(b))
+	s.writeBranch(w, r, http.StatusOK, b)
 }
 
 // branchUsage measures the branch's rw-layer disk usage via a one-shot
@@ -470,7 +506,7 @@ func (s *Server) resetBranch(w http.ResponseWriter, r *http.Request) {
 		writeEngineError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.branchJSON(b))
+	s.writeBranch(w, r, http.StatusOK, b)
 }
 
 // reconcilePlan computes the read-only convergence plan (drift report) and

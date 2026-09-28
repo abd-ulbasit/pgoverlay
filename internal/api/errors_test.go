@@ -3,6 +3,8 @@ package api
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -85,6 +87,36 @@ func TestDuplicateNamesAreClean409(t *testing.T) {
 		if !strings.Contains(string(body), tc.want) || strings.Contains(string(body), "constraint") {
 			t.Errorf("duplicate %s %s body = %s, want %q without SQLite text", tc.method, tc.path, body, tc.want)
 		}
+	}
+}
+
+// A failing source lookup is an error, not a 200 with default credentials
+// that would point a client at the wrong database; a source row that is
+// genuinely gone still renders with the defaults.
+func TestBranchJSONSurfacesSourceLookupErrors(t *testing.T) {
+	reg, err := registry.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(nil, reg, testToken, nil, nil, 0)
+	b := &registry.Branch{Name: "pr-1", SourceID: "gone"}
+
+	got, err := srv.branchJSON(b)
+	if err != nil {
+		t.Fatalf("missing source row: unexpected error %v", err)
+	}
+	if got.Source != "" || got.User != "postgres" || got.Database != "postgres" {
+		t.Fatalf("missing source row rendered %+v, want the defaults", got)
+	}
+
+	reg.Close() // every later query fails with a non-NotFound error
+	if _, err := srv.branchJSON(b); err == nil {
+		t.Fatal("source lookup failure was swallowed")
+	}
+	rec := httptest.NewRecorder()
+	srv.writeBranch(rec, httptest.NewRequest("GET", "/v1/branches/pr-1", nil), http.StatusOK, b)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("writeBranch on a failed lookup = %d %s, want 500", rec.Code, rec.Body)
 	}
 }
 
