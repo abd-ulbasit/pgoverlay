@@ -103,6 +103,9 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 		// remote leg: libpq's default sslmode unless configured, and a
 		// bounded connect time
 		"PGB_SSLMODE=prefer", "PGB_CONNECT_TIMEOUT=10",
+		// a scoped dump pre-creates extensions and makes CREATE SCHEMA
+		// idempotent
+		"PGB_SCOPED=1", "PGB_DATA=/seed/data",
 	} {
 		if !strings.Contains(env, want) {
 			t.Errorf("env missing %q: %v", want, dump.Env)
@@ -117,24 +120,31 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 	}
 	for _, want := range []string{
 		"set -euo pipefail",
-		"initdb -D /seed/data",
+		`initdb -D "$PGB_DATA"`,
 		"--auth-local=trust --auth-host=scram-sha-256",
 		"host all all all scram-sha-256",
 		"listen_addresses = '*'",
-		"pg_ctl -D /seed/data",
+		`pg_ctl -D "$PGB_DATA" -l /tmp/pgoverlay-seed.log`,
 		"unix_socket_directories=/tmp",
 		"createdb",
-		// public is in the scope: pg_dump will emit CREATE SCHEMA public, so
-		// the initdb-created one must be dropped first
-		"DROP SCHEMA public CASCADE",
+		"CREATE ROLE ' || quote_ident(rolname) || ' NOLOGIN",
+		"CREATE EXTENSION IF NOT EXISTS ' || quote_ident(e.extname)",
+		"CREATE SCHEMA IF NOT EXISTS \\1;",
 		"pg_dump --no-owner --no-acl -n 'public' -n 'audit'",
 		`PGSSLMODE="$PGB_SSLMODE" PGCONNECT_TIMEOUT="$PGB_CONNECT_TIMEOUT"`,
 		"ON_ERROR_STOP=1",
-		"pg_ctl -D /seed/data -w stop -m fast",
+		"VERBOSITY=terse",
+		"SHOW_CONTEXT=never",
+		`pg_ctl -D "$PGB_DATA" -w stop -m fast`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("script missing %q:\n%s", want, script)
 		}
+	}
+	// public is never dropped: the pattern-independent CREATE SCHEMA
+	// rewrite replaced the exact-match "public" special case
+	if strings.Contains(script, "DROP SCHEMA") {
+		t.Errorf("script drops a schema:\n%s", script)
 	}
 }
 
@@ -147,7 +157,7 @@ func TestSeedDumpNoSchemasDumpsWholeDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := d.helpers[1].Cmd[2]
-	if strings.Contains(script, " -n ") {
+	if !strings.Contains(script, "pg_dump --no-owner --no-acl \\\n") {
 		t.Fatalf("schema flags present for whole-database dump:\n%s", script)
 	}
 	// a whole-database dump never emits CREATE SCHEMA public; the
@@ -160,6 +170,10 @@ func TestSeedDumpNoSchemasDumpsWholeDatabase(t *testing.T) {
 	env := strings.Join(d.helpers[1].Env, "\n")
 	if !strings.Contains(env, "PGB_DB=postgres") {
 		t.Fatalf("env missing PGB_DB=postgres default: %v", d.helpers[1].Env)
+	}
+	// whole-database dumps carry their own extensions and schemas
+	if v, ok := envOf(d.helpers[1].Env, "PGB_SCOPED"); !ok || v != "" {
+		t.Fatalf("PGB_SCOPED = %q (set %v), want empty for a whole-database dump", v, ok)
 	}
 }
 
