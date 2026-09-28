@@ -144,8 +144,8 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 			}
 		}
 		for _, v := range vols {
-			if !liveVols[v] && !planned[v] {
-				plan.add(ActionGCVolume, v, "managed volume owned by no live branch or source")
+			if !liveVols[v.Name] && !planned[v.Name] {
+				plan.add(ActionGCVolume, v.Name, "managed volume owned by no live branch or source")
 			}
 		}
 	}

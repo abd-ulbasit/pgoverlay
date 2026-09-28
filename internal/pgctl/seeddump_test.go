@@ -42,7 +42,10 @@ func (f *recordingDriver) StopRemove(ctx context.Context, id string) error { ret
 func (f *recordingDriver) ListManaged(ctx context.Context) ([]runtime.ContainerInfo, error) {
 	return nil, nil
 }
-func (f *recordingDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
+func (f *recordingDriver) ListHelpers(ctx context.Context) ([]runtime.ContainerInfo, error) {
+	return nil, nil
+}
+func (f *recordingDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]runtime.VolumeInfo, error) {
 	return nil, nil
 }
 

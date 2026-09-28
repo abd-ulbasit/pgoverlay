@@ -273,13 +273,73 @@ func (d *DockerDriver) ExecOutput(ctx context.Context, id string, cmd []string) 
 func (d *DockerDriver) Inspect(ctx context.Context, id string) (ContainerInfo, error) {
 	j, err := d.cli.ContainerInspect(ctx, id)
 	if err != nil {
+		if client.IsErrNotFound(err) {
+			return ContainerInfo{}, fmt.Errorf("container %s: %w: %w", id, ErrNotFound, err)
+		}
 		return ContainerInfo{}, err
 	}
-	info := ContainerInfo{ID: j.ID, Running: j.State != nil && j.State.Running, Host: "127.0.0.1", Labels: j.Config.Labels}
-	if b, ok := j.NetworkSettings.Ports["5432/tcp"]; ok && len(b) > 0 {
-		info.Port, _ = strconv.Atoi(b[0].HostPort)
+	info := ContainerInfo{ID: j.ID}
+	if j.Config != nil {
+		info.Labels = j.Config.Labels
+	}
+	if j.State != nil {
+		info.Running, info.Stopped = dockerState(j.State.Status)
+		info.Status = j.State.Status
+		if info.Stopped && j.State.Status != container.StateCreated {
+			info.Status = fmt.Sprintf("%s (%d)", j.State.Status, j.State.ExitCode)
+		}
+	}
+	if t, err := time.Parse(time.RFC3339Nano, j.Created); err == nil {
+		info.Created = t
+	}
+	if info.Running {
+		info.Host = "127.0.0.1"
+		if j.NetworkSettings != nil {
+			if b, ok := j.NetworkSettings.Ports["5432/tcp"]; ok && len(b) > 0 {
+				info.Port, _ = strconv.Atoi(b[0].HostPort)
+			}
+		}
 	}
 	return info, nil
+}
+
+// dockerState maps a docker container state onto ContainerInfo's Running and
+// Stopped. exited, dead and created (never started) are Stopped: with the
+// unless-stopped restart policy docker brings back a container that crashed,
+// but not one that was stopped, failed to start or was never started.
+// restarting, removing and paused are neither — docker is still acting on the
+// container (or a person paused it on purpose).
+func dockerState(state string) (running, stopped bool) {
+	switch state {
+	case container.StateRunning:
+		return true, false
+	case container.StateExited, container.StateDead, container.StateCreated:
+		return false, true
+	}
+	return false, false
+}
+
+// summaryInfo converts a ContainerList entry. The list API reports published
+// ports only for a running container, which is when they are current.
+func summaryInfo(c container.Summary) ContainerInfo {
+	info := ContainerInfo{ID: c.ID, Status: c.Status, Labels: c.Labels}
+	if c.Status == "" {
+		info.Status = c.State
+	}
+	info.Running, info.Stopped = dockerState(c.State)
+	if c.Created > 0 {
+		info.Created = time.Unix(c.Created, 0)
+	}
+	if info.Running {
+		info.Host = "127.0.0.1"
+		for _, p := range c.Ports {
+			if p.PrivatePort == 5432 && p.PublicPort != 0 && (p.Type == "" || p.Type == "tcp") {
+				info.Port = int(p.PublicPort)
+				break
+			}
+		}
+	}
+	return info
 }
 
 // StopRemove stops and removes the container and waits until it is actually
@@ -322,19 +382,29 @@ func (d *DockerDriver) StopRemove(ctx context.Context, id string) error {
 }
 
 func (d *DockerDriver) ListManaged(ctx context.Context) ([]ContainerInfo, error) {
-	f := filters.NewArgs(filters.Arg("label", "pgoverlay.managed=true"), filters.Arg("label", "pgoverlay.role=branch"))
+	return d.listByRole(ctx, "branch")
+}
+
+// ListHelpers lists every pgoverlay helper container on the daemon, whichever
+// instance ran it (helpers carry no instance label).
+func (d *DockerDriver) ListHelpers(ctx context.Context) ([]ContainerInfo, error) {
+	return d.listByRole(ctx, "helper")
+}
+
+func (d *DockerDriver) listByRole(ctx context.Context, role string) ([]ContainerInfo, error) {
+	f := filters.NewArgs(filters.Arg("label", "pgoverlay.managed=true"), filters.Arg("label", "pgoverlay.role="+role))
 	cs, err := d.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
 	if err != nil {
 		return nil, err
 	}
 	out := make([]ContainerInfo, 0, len(cs))
 	for _, c := range cs {
-		out = append(out, ContainerInfo{ID: c.ID, Running: c.State == "running", Labels: c.Labels})
+		out = append(out, summaryInfo(c))
 	}
 	return out, nil
 }
 
-func (d *DockerDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
+func (d *DockerDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]VolumeInfo, error) {
 	f := filters.NewArgs(
 		filters.Arg("label", "pgoverlay.managed=true"),
 		filters.Arg("label", LabelInstance+"="+instanceID),
@@ -343,9 +413,13 @@ func (d *DockerDriver) ListManagedVolumes(ctx context.Context, instanceID string
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(resp.Volumes))
+	out := make([]VolumeInfo, 0, len(resp.Volumes))
 	for _, v := range resp.Volumes {
-		out = append(out, v.Name)
+		info := VolumeInfo{Name: v.Name}
+		if t, err := time.Parse(time.RFC3339, v.CreatedAt); err == nil {
+			info.Created = t
+		}
+		out = append(out, info)
 	}
 	return out, nil
 }

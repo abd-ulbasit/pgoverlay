@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,10 +47,10 @@ type kubeStorage interface {
 	createVolume(ctx context.Context, name string, labels map[string]string) error
 	removeVolume(ctx context.Context, name string) error
 	cloneVolume(ctx context.Context, src, dst string, labels map[string]string) error
-	// listVolumes returns the names of every pgoverlay-managed volume owned by
-	// instanceID (hostPath: dirs under the data root whose .pgoverlay-labels.json
-	// carries the id; csi: PVCs labelled pgoverlay.managed=true,pgoverlay.instance=<id>).
-	listVolumes(ctx context.Context, instanceID string) ([]string, error)
+	// listVolumes returns every pgoverlay-managed volume owned by instanceID
+	// (hostPath: dirs under the data root whose .pgoverlay-labels.json carries
+	// the id; csi: PVCs labelled pgoverlay.managed=true,pgoverlay.instance=<id>).
+	listVolumes(ctx context.Context, instanceID string) ([]VolumeInfo, error)
 	// podVolumes translates driver mounts to pod volumes + container mounts.
 	podVolumes(ms []Mount) ([]corev1.Volume, []corev1.VolumeMount)
 	// nodeName pins pods to the storage node ("" = let the scheduler place).
@@ -184,7 +185,7 @@ func (d *KubeDriver) CreateVolume(ctx context.Context, name string, labels map[s
 
 // ListManagedVolumes returns every pgoverlay-managed volume name (delegated to
 // the storage strategy: hostPath dirs or labelled PVCs).
-func (d *KubeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]string, error) {
+func (d *KubeDriver) ListManagedVolumes(ctx context.Context, instanceID string) ([]VolumeInfo, error) {
 	return d.storage.listVolumes(ctx, instanceID)
 }
 
@@ -254,7 +255,7 @@ func (s *hostPathStorage) podVolumes(ms []Mount) ([]corev1.Volume, []corev1.Volu
 // createVolume mkdirs the volume dir on the storage node via a helper pod and
 // records the labels in <vol>/.pgoverlay-labels.json.
 func (s *hostPathStorage) createVolume(ctx context.Context, name string, labels map[string]string) error {
-	j, err := json.Marshal(labels)
+	j, err := json.Marshal(withCreatedLabel(labels, time.Now()))
 	if err != nil {
 		return err
 	}
@@ -274,7 +275,7 @@ func (s *hostPathStorage) removeVolume(ctx context.Context, name string) error {
 // cloneVolume copies src's directory into a fresh dst dir (full copy — plain
 // directories have no CoW primitive) and stamps dst with its own labels.
 func (s *hostPathStorage) cloneVolume(ctx context.Context, src, dst string, labels map[string]string) error {
-	j, err := json.Marshal(labels)
+	j, err := json.Marshal(withCreatedLabel(labels, time.Now()))
 	if err != nil {
 		return err
 	}
@@ -291,12 +292,28 @@ func (s *hostPathStorage) cloneVolume(ctx context.Context, src, dst string, labe
 // file's contents on the next, with listVolumesSentinel bracketing each entry;
 // a dir whose marker is missing or names a different instance is foreign and
 // skipped. A missing data root (nothing created yet) lists nothing.
-func (s *hostPathStorage) listVolumes(ctx context.Context, instanceID string) ([]string, error) {
+func (s *hostPathStorage) listVolumes(ctx context.Context, instanceID string) ([]VolumeInfo, error) {
 	out, err := s.runRootHelper(ctx, listVolumesScript(dataRootMountPath), nil)
 	if err != nil {
 		return nil, err
 	}
 	return parseVolumeList(out, instanceID), nil
+}
+
+// labelCreated records, in a hostPath volume's label file, when the volume was
+// created (unix seconds). A plain directory has no reliable creation time of
+// its own, and reconcile's volume GC skips volumes younger than its grace
+// period. Volumes created before this label existed report no time.
+const labelCreated = "pgoverlay.created"
+
+// withCreatedLabel returns a copy of labels with labelCreated set to now.
+func withCreatedLabel(labels map[string]string, now time.Time) map[string]string {
+	out := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		out[k] = v
+	}
+	out[labelCreated] = strconv.FormatInt(now.Unix(), 10)
+	return out
 }
 
 // listVolumesScript prints, for every directory under root, the dir name on
@@ -314,8 +331,8 @@ func listVolumesScript(root string) string {
 // pgoverlay.instance=<instanceID>. A dir whose marker is missing, unparseable,
 // or names a different instance is foreign and is skipped, so reconcile never
 // reclaims another instance's data.
-func parseVolumeList(out, instanceID string) []string {
-	var names []string
+func parseVolumeList(out, instanceID string) []VolumeInfo {
+	var vols []VolumeInfo
 	for _, entry := range strings.Split(out, listVolumesSentinel) {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
@@ -331,10 +348,14 @@ func parseVolumeList(out, instanceID string) []string {
 			_ = json.Unmarshal([]byte(strings.TrimSpace(lines[1])), &labels)
 		}
 		if labels[LabelInstance] == instanceID {
-			names = append(names, name)
+			v := VolumeInfo{Name: name}
+			if sec, err := strconv.ParseInt(labels[labelCreated], 10, 64); err == nil && sec > 0 {
+				v.Created = time.Unix(sec, 0)
+			}
+			vols = append(vols, v)
 		}
 	}
-	return names
+	return vols
 }
 
 // listVolumesSentinel brackets each volume entry in the hostPath listVolumes
@@ -489,19 +510,40 @@ func (d *KubeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (s
 func (d *KubeDriver) Inspect(ctx context.Context, id string) (ContainerInfo, error) {
 	pod, err := d.cs.CoreV1().Pods(d.namespace).Get(ctx, id, metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ContainerInfo{}, fmt.Errorf("pod %s: %w: %w", id, ErrNotFound, err)
+		}
 		return ContainerInfo{}, err
 	}
 	return podInfo(pod), nil
 }
 
+// podInfo maps a pod onto ContainerInfo. Branch pods are bare Pods: an evicted
+// or otherwise Failed pod stays Failed (restartPolicy only restarts
+// containers), so Failed/Succeeded are Stopped. A pod being deleted is no
+// longer serving but not yet gone, so it is neither Running nor Stopped. The
+// pod IP is reported only while the pod runs: a Failed pod may keep
+// status.podIP, but nothing listens there any more.
 func podInfo(pod *corev1.Pod) ContainerInfo {
-	return ContainerInfo{
+	info := ContainerInfo{
 		ID:      pod.Name,
-		Running: pod.Status.Phase == corev1.PodRunning,
-		Host:    pod.Status.PodIP,
+		Running: pod.Status.Phase == corev1.PodRunning && pod.DeletionTimestamp == nil,
+		Stopped: pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded,
+		Status:  string(pod.Status.Phase),
 		Port:    5432,
+		Created: pod.CreationTimestamp.Time,
 		Labels:  pod.Labels,
 	}
+	if pod.Status.Reason != "" {
+		info.Status += " (" + pod.Status.Reason + ")"
+	}
+	if pod.DeletionTimestamp != nil {
+		info.Status += " (terminating)"
+	}
+	if info.Running {
+		info.Host = pod.Status.PodIP
+	}
+	return info
 }
 
 // StopRemove deletes the pod (30s grace, background propagation) and waits
@@ -531,8 +573,16 @@ func (d *KubeDriver) StopRemove(ctx context.Context, id string) error {
 }
 
 func (d *KubeDriver) ListManaged(ctx context.Context) ([]ContainerInfo, error) {
-	pods, err := d.cs.CoreV1().Pods(d.namespace).List(ctx,
-		metav1.ListOptions{LabelSelector: "pgoverlay.managed=true,pgoverlay.role=branch"})
+	return d.listPods(ctx, "pgoverlay.managed=true,pgoverlay.role=branch")
+}
+
+// ListHelpers lists the helper pods in the namespace, running or finished.
+func (d *KubeDriver) ListHelpers(ctx context.Context) ([]ContainerInfo, error) {
+	return d.listPods(ctx, "pgoverlay.managed=true,pgoverlay.role=helper")
+}
+
+func (d *KubeDriver) listPods(ctx context.Context, selector string) ([]ContainerInfo, error) {
+	pods, err := d.cs.CoreV1().Pods(d.namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
 		return nil, err
 	}

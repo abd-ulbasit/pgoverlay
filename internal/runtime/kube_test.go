@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -369,6 +370,93 @@ func TestKubeInspectAndListManaged(t *testing.T) {
 	}
 }
 
+// Reconcile decides what to do with a ready branch from Running/Stopped/Host,
+// so the pod-to-ContainerInfo mapping must be accurate for the states that
+// break branches: an evicted (Failed) pod keeps its podIP in status but serves
+// nothing and is never restarted; a terminating pod is on its way out; a
+// Pending pod is still being started.
+func TestPodInfoStates(t *testing.T) {
+	now := metav1.Now()
+	cases := []struct {
+		name                  string
+		phase                 corev1.PodPhase
+		reason                string
+		deleting              bool
+		running, stopped      bool
+		host, statusSubstring string
+	}{
+		{name: "running", phase: corev1.PodRunning, running: true, host: "10.0.0.9", statusSubstring: "Running"},
+		{name: "evicted", phase: corev1.PodFailed, reason: "Evicted", stopped: true, statusSubstring: "Evicted"},
+		{name: "succeeded", phase: corev1.PodSucceeded, stopped: true},
+		{name: "pending", phase: corev1.PodPending},
+		{name: "unknown", phase: corev1.PodUnknown},
+		{name: "terminating", phase: corev1.PodRunning, deleting: true, statusSubstring: "terminating"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pgoverlay-br-x", CreationTimestamp: now},
+				Status:     corev1.PodStatus{Phase: tc.phase, Reason: tc.reason, PodIP: "10.0.0.9"},
+			}
+			if tc.deleting {
+				pod.DeletionTimestamp = &now
+			}
+			info := podInfo(pod)
+			if info.Running != tc.running || info.Stopped != tc.stopped {
+				t.Errorf("Running=%v Stopped=%v, want %v/%v", info.Running, info.Stopped, tc.running, tc.stopped)
+			}
+			if info.Host != tc.host {
+				t.Errorf("Host=%q, want %q (only a running pod has a reachable address)", info.Host, tc.host)
+			}
+			if !strings.Contains(info.Status, tc.statusSubstring) {
+				t.Errorf("Status=%q, want it to mention %q", info.Status, tc.statusSubstring)
+			}
+			if !info.Created.Equal(now.Time) {
+				t.Errorf("Created=%v, want %v", info.Created, now.Time)
+			}
+		})
+	}
+}
+
+// Inspect on a deleted pod reports ErrNotFound so reconcile can tell a missing
+// branch pod apart from an API error.
+func TestKubeInspectMissingPodIsNotFound(t *testing.T) {
+	d, _ := fakeKubeDriver(t)
+	_, err := d.Inspect(context.Background(), "pgoverlay-br-gone")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Inspect(missing) = %v, want ErrNotFound", err)
+	}
+}
+
+// ListHelpers returns helper pods only; ListManaged returns branch pods only.
+func TestKubeListHelpers(t *testing.T) {
+	d, cs := fakeKubeDriver(t)
+	ctx := context.Background()
+	helper := buildHelperPod("default", d.storage, HelperSpec{Image: "alpine:3.21"})
+	helper.Name = "pgoverlay-helper-a"
+	branch := buildBranchPod("default", d.storage, BranchSpec{Name: "pgoverlay-br-x", Image: "postgres:17",
+		Labels: map[string]string{"pgoverlay.managed": "true", "pgoverlay.role": "branch"}})
+	for _, p := range []*corev1.Pod{helper, branch} {
+		if _, err := cs.CoreV1().Pods("default").Create(ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	helpers, err := d.ListHelpers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(helpers) != 1 || helpers[0].ID != "pgoverlay-helper-a" {
+		t.Errorf("ListHelpers = %+v, want only the helper pod", helpers)
+	}
+	branches, err := d.ListManaged(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(branches) != 1 || branches[0].ID != "pgoverlay-br-x" {
+		t.Errorf("ListManaged = %+v, want only the branch pod", branches)
+	}
+}
+
 // TestHostPathHelperArgvIsExecSafe is the regression test for
 // "exec /bin/sh: invalid argument", which took out every hostPath reconcile
 // pass while looking like a broken helper image.
@@ -480,7 +568,8 @@ func TestListVolumesRoundTripsThroughRealShell(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("pgoverlay-src-main", map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst-1"})
+	created := time.Unix(1700000000, 0)
+	write("pgoverlay-src-main", withCreatedLabel(map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst-1"}, created))
 	write("pgoverlay-br-pr-1-rw", map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst-1"})
 	write("pgoverlay-src-other", map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst-2"})
 	write("someone-elses-data", nil)
@@ -489,11 +578,25 @@ func TestListVolumesRoundTripsThroughRealShell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("running the helper script through /bin/sh: %v", err)
 	}
-	got := parseVolumeList(string(out), "inst-1")
+	vols := parseVolumeList(string(out), "inst-1")
+	got := make([]string, 0, len(vols))
+	createdAt := map[string]time.Time{}
+	for _, v := range vols {
+		got = append(got, v.Name)
+		createdAt[v.Name] = v.Created
+	}
 	sort.Strings(got)
 	want := []string{"pgoverlay-br-pr-1-rw", "pgoverlay-src-main"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("listVolumes = %v, want %v (foreign and unlabelled dirs must be skipped)", got, want)
+	}
+	// the creation time recorded at create round-trips; a volume created
+	// before the label existed reports none (reconcile treats it as old)
+	if !createdAt["pgoverlay-src-main"].Equal(created) {
+		t.Errorf("created = %v, want %v", createdAt["pgoverlay-src-main"], created)
+	}
+	if !createdAt["pgoverlay-br-pr-1-rw"].IsZero() {
+		t.Errorf("unlabelled volume created = %v, want zero", createdAt["pgoverlay-br-pr-1-rw"])
 	}
 }
 

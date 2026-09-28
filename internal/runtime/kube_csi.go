@@ -157,15 +157,15 @@ func (s *csiStorage) cloneVolume(ctx context.Context, src, dst string, labels ma
 
 // listVolumes returns the names of every pgoverlay-managed PVC in the namespace
 // owned by instanceID.
-func (s *csiStorage) listVolumes(ctx context.Context, instanceID string) ([]string, error) {
+func (s *csiStorage) listVolumes(ctx context.Context, instanceID string) ([]VolumeInfo, error) {
 	list, err := s.d.cs.CoreV1().PersistentVolumeClaims(s.d.namespace).List(ctx,
 		metav1.ListOptions{LabelSelector: "pgoverlay.managed=true," + LabelInstance + "=" + instanceID})
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(list.Items))
+	out := make([]VolumeInfo, 0, len(list.Items))
 	for _, pvc := range list.Items {
-		out = append(out, pvc.Name)
+		out = append(out, VolumeInfo{Name: pvc.Name, Created: pvc.CreationTimestamp.Time})
 	}
 	return out, nil
 }

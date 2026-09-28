@@ -120,7 +120,7 @@ func volumeExists(t *testing.T, ctx context.Context, d runtime.Driver, instanceI
 		t.Fatal(err)
 	}
 	for _, v := range vols {
-		if v == name {
+		if v.Name == name {
 			return true
 		}
 	}
