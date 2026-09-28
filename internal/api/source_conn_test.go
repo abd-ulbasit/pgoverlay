@@ -1,10 +1,13 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
@@ -39,5 +42,20 @@ func TestCreateSourceUnusableConnectionRejected(t *testing.T) {
 	}
 	if len(d.volumes) != 0 {
 		t.Fatalf("rejected creates provisioned volumes: %v", d.volumes)
+	}
+}
+
+// A seed whose data turns out to be a different major than the declared
+// pg_version is the caller's input error: 400 with the fix in the message,
+// not an opaque 500.
+func TestSeedVersionMismatchIsBadRequest(t *testing.T) {
+	rec := httptest.NewRecorder()
+	msg := "the source at db:5432 is PostgreSQL 15 but the branch image postgres:17 runs PostgreSQL 17"
+	writeEngineError(rec, nil, fmt.Errorf("seed source %q: %w: %s", "main", pgctl.ErrVersionMismatch, msg))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "PostgreSQL 15") {
+		t.Errorf("body %s should carry the mismatch detail", rec.Body.String())
 	}
 }
