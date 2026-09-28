@@ -29,9 +29,18 @@ import (
 )
 
 // genericRouteRefusal is the single client-facing message for every routing
-// failure (unknown branch, not-ready branch, any resolver error). It is
-// deliberately uniform so an UNAUTHENTICATED client cannot enumerate branch
-// names or distinguish branch state; the real reason is logged server-side.
+// failure (unknown branch, not-ready branch, unreachable backend, any resolver
+// error), so an UNAUTHENTICATED client cannot tell those states apart; the
+// real reason is logged server-side.
+//
+// This narrows branch-name enumeration, it does not remove it. For a READY
+// branch the proxy relays the backend's authentication challenge before any
+// credential is checked, so a client can still confirm that a ready branch
+// name exists (Postgres itself authenticates before it looks at the database;
+// the proxy cannot do that without taking part in authentication). A branch
+// that resolves but whose backend silently drops packets is refused only after
+// DialTimeout, which is also observable. MaxStartupsPerIP bounds how many such
+// probes one address can run at once; it does not rate-limit them.
 const genericRouteRefusal = "pgoverlay: database not available"
 
 // BranchResolver maps a branch name to the "host:port" address of its
