@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -23,7 +23,7 @@ func TestReconcileGCEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	host, port, network, _ := pgctl.StartSourcePG(t, ctx)
+	host, port, network, _ := pgctltest.StartSourcePG(t, ctx)
 
 	d, err := runtime.NewDockerDriver()
 	if err != nil {

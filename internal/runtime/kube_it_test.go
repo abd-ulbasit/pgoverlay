@@ -118,7 +118,7 @@ func TestKubeVolumeAndHelperRoundtrip(t *testing.T) {
 }
 
 // startSourcePod runs a vanilla "production" postgres pod the engine will
-// seed from (the kube equivalent of pgctl.StartSourcePG): wal_level=replica,
+// seed from (the kube equivalent of pgctltest.StartSourcePG): wal_level=replica,
 // replication pg_hba entry appended + reloaded after startup.
 func startSourcePod(t *testing.T, ctx context.Context, drv *rt.KubeDriver, cs *kubernetes.Clientset) (podIP string) {
 	t.Helper()

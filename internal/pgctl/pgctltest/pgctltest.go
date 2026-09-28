@@ -1,4 +1,9 @@
-package pgctl
+// Package pgctltest starts throwaway source Postgres containers for the
+// integration tests (testcontainers-go). It is imported only from _test.go
+// files, which keeps testcontainers, its Moby dependencies and the testing
+// package out of the shipped binaries; internal/pgctl's deps test enforces
+// that.
+package pgctltest
 
 import (
 	"context"
@@ -17,8 +22,7 @@ import (
 
 // StartSourcePG starts a "production" postgres:17 on a dedicated docker
 // network and returns its in-network host, port, network name, and a host
-// connection string. It is a shared integration-test helper (lives in a
-// non-test file so other packages' tests can import it).
+// connection string.
 func StartSourcePG(t *testing.T, ctx context.Context) (host string, port int, networkName string, hostConn string) {
 	t.Helper()
 	return StartSourcePGVersion(t, ctx, "17")

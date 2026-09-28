@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -51,7 +51,7 @@ func TestEndToEndBranching(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	mustExec(t, ctx, hostConn, `CREATE TABLE accounts(id int primary key, balance int);
 		INSERT INTO accounts SELECT i, 100 FROM generate_series(1,10000) i`)
 
@@ -132,7 +132,7 @@ func TestMaskingAppliedToBranchNotSource(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	mustExec(t, ctx, hostConn, `CREATE TABLE accounts(id int primary key, email text);
 		INSERT INTO accounts SELECT i, 'user' || i || '@corp.example' FROM generate_series(1,1000) i`)
 
