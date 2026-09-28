@@ -25,7 +25,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
+	writeJSON(w, code, ErrorResponse{Error: msg})
 }
 
 // writeEngineError maps engine/registry failures to HTTP statuses: invalid
@@ -440,7 +440,7 @@ func (s *Server) branchUsage(w http.ResponseWriter, r *http.Request) {
 		writeEngineError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int64{"bytes": n})
+	writeJSON(w, http.StatusOK, Usage{Bytes: n})
 }
 
 // branchDiff reports what changed in a branch relative to its base: a

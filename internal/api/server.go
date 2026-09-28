@@ -121,6 +121,17 @@ type Transition struct {
 	At        string `json:"at"`
 }
 
+// Usage is the body of GET /v1/branches/{name}/usage: the branch's rw-layer
+// disk usage in bytes.
+type Usage struct {
+	Bytes int64 `json:"bytes"`
+}
+
+// ErrorResponse is the body of every non-2xx /v1 response.
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
 // Ready reports whether branchd can serve traffic: the registry is reachable
 // and the container driver responds. Returns nil when ready, an error
 // otherwise. branchd supplies a closure; tests inject a fake.
