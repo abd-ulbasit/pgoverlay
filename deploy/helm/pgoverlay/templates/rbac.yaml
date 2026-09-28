@@ -33,6 +33,10 @@ rules:
     verbs: ["get", "create", "update", "watch", "list"]
   # The leader labels its own pod pgoverlay.leader=true (the API Service
   # selects it) and strips a stale label from a previous leader's pod.
+  # RBAC cannot limit this to the release's own pods (their names are
+  # generated and resourceNames cannot match labels), so the Role can patch
+  # any pod in the namespace. That is no wider than the pod create/delete
+  # granted above; branchd only ever patches the pgoverlay.leader label.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["patch"]
