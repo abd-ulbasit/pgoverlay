@@ -468,6 +468,25 @@ func TestCreateBranchQuotaReturns403(t *testing.T) {
 	}
 }
 
+// TestDiffQuotaReturns403: a diff provisions a throwaway branch, so at the
+// --max-branches cap it is refused with 403 like a create, and starts nothing.
+func TestDiffQuotaReturns403(t *testing.T) {
+	ts, d := newTestServer(t, engine.WithMaxBranches(1))
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches",
+		CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create: code=%d body=%s", code, body)
+	}
+	starts := d.starts
+	code, body := do(t, ts, testToken, "GET", "/v1/branches/pr-1/diff", nil)
+	if code != http.StatusForbidden || !strings.Contains(string(body), "quota") {
+		t.Fatalf("diff at the cap: code=%d body=%s, want 403 naming the quota", code, body)
+	}
+	if d.starts != starts {
+		t.Fatalf("diff at the cap started %d instance(s)", d.starts-starts)
+	}
+}
+
 func TestResetBranchEndpoint(t *testing.T) {
 	ts, d := newTestServer(t)
 	addSource(t, ts)
