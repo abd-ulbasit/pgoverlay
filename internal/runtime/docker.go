@@ -3,13 +3,9 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -26,11 +22,34 @@ import (
 
 type DockerDriver struct{ cli *client.Client }
 
+// NewDockerDriver builds a client for the Docker endpoint the docker CLI would
+// use: DOCKER_HOST (with DOCKER_CERT_PATH / DOCKER_TLS_VERIFY), else the
+// current CLI context, including its TLS material. Endpoints the SDK cannot
+// dial (ssh://) are rejected with an explanation instead of failing later
+// with a misleading HTTP error.
 func NewDockerDriver() (*DockerDriver, error) {
 	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
-	if os.Getenv("DOCKER_HOST") == "" {
-		if host := DockerHostFromCLIContext(); host != "" {
-			opts = append(opts, client.WithHost(host))
+	if host := os.Getenv("DOCKER_HOST"); host != "" {
+		if err := checkDockerHost(host, "DOCKER_HOST"); err != nil {
+			return nil, err
+		}
+	} else {
+		c, err := currentCLIContext()
+		if err != nil {
+			return nil, err
+		}
+		if c.Host != "" {
+			if err := checkDockerHost(c.Host, fmt.Sprintf("docker context %q", c.Name)); err != nil {
+				return nil, err
+			}
+			tlsOpt, err := contextTLSOpt(c)
+			if err != nil {
+				return nil, err
+			}
+			if tlsOpt != nil {
+				opts = append(opts, tlsOpt) // before WithHost, which configures this transport
+			}
+			opts = append(opts, client.WithHost(c.Host))
 		}
 	}
 	cli, err := client.NewClientWithOpts(opts...)
@@ -38,41 +57,6 @@ func NewDockerDriver() (*DockerDriver, error) {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
 	return &DockerDriver{cli: cli}, nil
-}
-
-// DockerHostFromCLIContext resolves the docker endpoint from the CLI's
-// current context (~/.docker/config.json + contexts/meta). The Go SDK's
-// FromEnv only honors DOCKER_HOST, so without this, setups like Colima
-// (where /var/run/docker.sock is absent or stale) fail. Returns "" when
-// unresolvable. Exported so integration helpers can prime DOCKER_HOST for
-// libraries (e.g. testcontainers) that don't read docker CLI contexts.
-func DockerHostFromCLIContext() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	cfg := struct {
-		CurrentContext string `json:"currentContext"`
-	}{}
-	raw, err := os.ReadFile(filepath.Join(home, ".docker", "config.json"))
-	if err != nil || json.Unmarshal(raw, &cfg) != nil {
-		return ""
-	}
-	if cfg.CurrentContext == "" || cfg.CurrentContext == "default" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(cfg.CurrentContext))
-	metaPath := filepath.Join(home, ".docker", "contexts", "meta", hex.EncodeToString(sum[:]), "meta.json")
-	meta := struct {
-		Endpoints map[string]struct {
-			Host string `json:"Host"`
-		} `json:"Endpoints"`
-	}{}
-	raw, err = os.ReadFile(metaPath)
-	if err != nil || json.Unmarshal(raw, &meta) != nil {
-		return ""
-	}
-	return meta.Endpoints["docker"].Host
 }
 
 func (d *DockerDriver) EnsureImage(ctx context.Context, ref string) error {
