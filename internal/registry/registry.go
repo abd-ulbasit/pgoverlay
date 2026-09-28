@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,6 +32,40 @@ const (
 )
 
 var ErrNotFound = errors.New("not found")
+
+// ErrAlreadyExists reports a create whose name is held by another live row.
+// The error text names the row and its state; the API maps it to 409.
+var ErrAlreadyExists = errors.New("already exists")
+
+// ErrIllegalTransition reports a state change the state machine forbids (or
+// a compare-and-swap that lost a race). Its text keeps the historical
+// "illegal branch transition <from> -> <to>" form for branches.
+var ErrIllegalTransition = errors.New("illegal transition")
+
+// notFound names the missing row: `branch "x" not found`. It still matches
+// errors.Is(err, ErrNotFound).
+func notFound(kind, name string) error {
+	return fmt.Errorf("%s %q %w", kind, name, ErrNotFound)
+}
+
+// illegalTransition renders the illegal-transition error for kind.
+func illegalTransition(kind, from, to string) error {
+	return &transitionError{kind: kind, from: from, to: to}
+}
+
+type transitionError struct{ kind, from, to string }
+
+func (e *transitionError) Error() string {
+	return fmt.Sprintf("illegal %s transition %s -> %s", e.kind, e.from, e.to)
+}
+
+func (e *transitionError) Is(target error) bool { return target == ErrIllegalTransition }
+
+// isUniqueViolation reports a UNIQUE constraint failure (a live-name index).
+func isUniqueViolation(err error) bool {
+	var serr *sqlite.Error
+	return errors.As(err, &serr) && serr.Code() == sqlitelib.SQLITE_CONSTRAINT_UNIQUE
+}
 
 // ErrUnsupportedPGVersion rejects sources whose pg_version is outside the
 // supported matrix. Majors 14-18 only: branch startup relies on
@@ -121,8 +156,17 @@ const (
 	walRetryDelay  = 20 * time.Millisecond
 )
 
+// dsnParams configures every registry connection. _txlock=immediate makes
+// database/sql's BEGIN a BEGIN IMMEDIATE: the read-then-write transactions
+// (TransitionBranch's compare-and-swap, CommitFreeze) take the write lock up
+// front and wait under busy_timeout. A deferred BEGIN starts read-only, and in
+// WAL mode upgrading it after another process (a second HA replica, or local
+// pgb next to branchd) committed fails at once with SQLITE_BUSY_SNAPSHOT —
+// the busy handler is never consulted for that upgrade.
+const dsnParams = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate"
+
 func Open(path string) (*Registry, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
+	db, err := sql.Open("sqlite", path+dsnParams)
 	if err != nil {
 		return nil, err
 	}
@@ -357,6 +401,12 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// CreateSource inserts a new source row (state seeding) and journals its
+// creation in the same transaction. A name whose earlier attempts failed is
+// reusable: those failed rows are deleted here, so retries never pile up
+// same-named failed rows (a failed source never has branches or layers — a
+// branch needs a ready source). A name held by a live (seeding/ready) source
+// is refused with ErrAlreadyExists.
 func (r *Registry) CreateSource(s *Source) error {
 	if err := validatePGVersion(s.PGVersion); err != nil {
 		return err
@@ -365,37 +415,112 @@ func (r *Registry) CreateSource(s *Source) error {
 		s.SeedVia = SeedViaBasebackup
 	}
 	s.ID, s.State = newID(), SourceSeeding
-	_, err := r.db.Exec(`INSERT INTO sources
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := deleteFailedSources(tx, s.Name); err != nil {
+		return fmt.Errorf("create source %q: %w", s.Name, err)
+	}
+	_, err = tx.Exec(`INSERT INTO sources
 		(id,name,pg_version,volume,conn_host,conn_port,conn_user,conn_db,network,seed_via,dump_schemas,state)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		s.ID, s.Name, s.PGVersion, s.Volume, s.ConnHost, s.ConnPort, s.ConnUser, s.ConnDB, s.Network,
 		s.SeedVia, strings.Join(s.DumpSchemas, ","), s.State)
+	if isUniqueViolation(err) {
+		var state string
+		if qerr := tx.QueryRow(`SELECT state FROM sources WHERE name=? AND state!='failed'`, s.Name).Scan(&state); qerr != nil {
+			state = "unknown"
+		}
+		return fmt.Errorf("source %q %w (state %s): remove it first or choose another name", s.Name, ErrAlreadyExists, state)
+	}
 	if err != nil {
 		return fmt.Errorf("create source %q: %w", s.Name, err)
 	}
-	return r.journal(context.Background(), "source", s.ID, "", string(SourceSeeding), "created")
+	if err := journalTx(context.Background(), tx, "source", s.ID, "", string(SourceSeeding), "created"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
+// DeleteFailedSources removes every failed source row named name (and their
+// masking scripts) and returns how many went. Failed rows own no branches,
+// layers or volumes: the failed seed already removed its layer, and the
+// volume name may now belong to a live row of the same name — so callers must
+// never remove volumes on their behalf.
+func (r *Registry) DeleteFailedSources(name string) (int, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	n, err := deleteFailedSources(tx, name)
+	if err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
+}
+
+func deleteFailedSources(tx *sql.Tx, name string) (int, error) {
+	if _, err := tx.Exec(`DELETE FROM mask_scripts WHERE source_id IN
+		(SELECT id FROM sources WHERE name=? AND state='failed')`, name); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`DELETE FROM sources WHERE name=? AND state='failed'`, name)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+// legalSource is the source state machine. A source is seeded exactly once:
+// seeding ends ready or failed, and a failed seed is terminal (a retry
+// creates a fresh row, see CreateSource). Refresh re-seeds into a new
+// generation volume without leaving ready.
+var legalSource = map[SourceState][]SourceState{
+	SourceSeeding: {SourceReady, SourceFailed},
+}
+
+// SetSourceState moves a source into `to` if the state machine allows it,
+// as a compare-and-swap with the journal row written in the same transaction
+// (mirroring TransitionBranch).
 func (r *Registry) SetSourceState(id string, to SourceState, reason string) error {
-	return r.setState("sources", "source", id, string(to), reason)
-}
-
-func (r *Registry) setState(table, entity, id, to, reason string) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	var from string
-	if err := r.db.QueryRow(`SELECT state FROM `+table+` WHERE id=?`, id).Scan(&from); err != nil {
+	if err := tx.QueryRow(`SELECT state FROM sources WHERE id=?`, id).Scan(&from); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return err
 	}
-	if _, err := r.db.Exec(`UPDATE `+table+` SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, to, id); err != nil {
+	if !slices.Contains(legalSource[SourceState(from)], to) {
+		return illegalTransition("source", from, string(to))
+	}
+	res, err := tx.Exec(`UPDATE sources SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=?`, string(to), id, from)
+	if err != nil {
 		return err
 	}
-	return r.journal(context.Background(), entity, id, from, to, reason)
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return illegalTransition("source", from, string(to))
+	}
+	if err := journalTx(context.Background(), tx, "source", id, from, string(to), reason); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (r *Registry) journal(ctx context.Context, entity, id, from, to, reason string) error {
-	_, err := r.db.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+// journalTx writes one transitions row inside tx, with the actor from ctx.
+func journalTx(ctx context.Context, tx *sql.Tx, entity, id, from, to, reason string) error {
+	_, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
 		entity, id, from, to, reason, actorString(ctx))
 	return err
 }
@@ -418,19 +543,37 @@ const sourceCols = `id,name,pg_version,volume,conn_host,conn_port,conn_user,conn
 
 func (r *Registry) GetSourceByName(name string) (*Source, error) {
 	// failed rows may share a name with a live retry; prefer the live one
-	return scanSource(r.db.QueryRow(`SELECT `+sourceCols+` FROM sources WHERE name=?
+	s, err := scanSource(r.db.QueryRow(`SELECT `+sourceCols+` FROM sources WHERE name=?
 		ORDER BY (state='failed') ASC, created_at DESC LIMIT 1`, name))
+	if errors.Is(err, ErrNotFound) {
+		return nil, notFound("source", name)
+	}
+	return s, err
 }
 
 func (r *Registry) GetSourceByID(id string) (*Source, error) {
 	return scanSource(r.db.QueryRow(`SELECT `+sourceCols+` FROM sources WHERE id=?`, id))
 }
 
+// legalBranch is the branch state machine.
+//
+//	creating   -> ready | failed
+//	ready      -> resetting (reset, freeze/clone quiesce) | destroying
+//	resetting  -> ready | failed
+//	failed     -> resetting (reset, or recover onto the existing data) | destroying
+//	destroying -> destroyed
+//
+// failed -> resetting keeps a failed branch recoverable: a branch failed by
+// crash recovery (a freeze parent interrupted mid-freeze keeps its data) can
+// be restarted on that data or reset, instead of only being destroyed.
+// destroying has no way back, but DestroyBranch re-runs its idempotent
+// teardown on a row already in destroying, so a failed destroy is retried
+// rather than wedged.
 var legalBranch = map[BranchState][]BranchState{
 	BranchCreating:   {BranchReady, BranchFailed},
 	BranchReady:      {BranchDestroying, BranchResetting},
 	BranchResetting:  {BranchReady, BranchFailed},
-	BranchFailed:     {BranchDestroying},
+	BranchFailed:     {BranchResetting, BranchDestroying},
 	BranchDestroying: {BranchDestroyed},
 }
 
@@ -451,14 +594,33 @@ func (r *Registry) CreateBranch(b *Branch) error {
 
 // CreateBranchCtx is CreateBranch with the actor read from ctx (see WithActor)
 // stamped onto the initial "created" transition.
+//
+// The row and its journal entry commit together. A name held by a live
+// (non-destroyed) branch is refused with ErrAlreadyExists, naming the holder's
+// state so a failed leftover is recognisable.
 func (r *Registry) CreateBranchCtx(ctx context.Context, b *Branch) error {
 	b.ID, b.State = newID(), BranchCreating
-	_, err := r.db.Exec(`INSERT INTO branches (id,name,source_id,state,rw_volume,source_volume,expires_at,base_layer_id,parent_branch_name) VALUES (?,?,?,?,?,?,?,?,?)`,
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO branches (id,name,source_id,state,rw_volume,source_volume,expires_at,base_layer_id,parent_branch_name) VALUES (?,?,?,?,?,?,?,?,?)`,
 		b.ID, b.Name, b.SourceID, b.State, b.RWVolume, b.SourceVolume, b.ExpiresAt, nullable(b.BaseLayerID), b.ParentBranchName)
+	if isUniqueViolation(err) {
+		var state string
+		if qerr := tx.QueryRow(`SELECT state FROM branches WHERE name=? AND state!='destroyed'`, b.Name).Scan(&state); qerr != nil {
+			state = "unknown"
+		}
+		return fmt.Errorf("branch %q %w (state %s): destroy it first or choose another name", b.Name, ErrAlreadyExists, state)
+	}
 	if err != nil {
 		return fmt.Errorf("create branch %q: %w", b.Name, err)
 	}
-	return r.journal(ctx, "branch", b.ID, "", string(BranchCreating), "created")
+	if err := journalTx(ctx, tx, "branch", b.ID, "", string(BranchCreating), "created"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // TransitionBranch atomically moves a branch into `to`, but only from a legal
@@ -481,6 +643,14 @@ func (r *Registry) TransitionBranch(id string, to BranchState, reason string) er
 // daemon-initiated transitions (reconcile, GC) pass a context with no actor and
 // record SystemActor.
 func (r *Registry) TransitionBranchCtx(ctx context.Context, id string, to BranchState, reason string) error {
+	return r.transitionBranch(ctx, id, to, reason, "")
+}
+
+// transitionBranch is the compare-and-swap behind TransitionBranchCtx and
+// MarkBranchReadyCtx. set is an optional extra SET clause ("col=?, …") whose
+// args precede the WHERE args; it is applied by the same guarded UPDATE, so a
+// transition that loses the race leaves those columns untouched too.
+func (r *Registry) transitionBranch(ctx context.Context, id string, to BranchState, reason, set string, setArgs ...any) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
@@ -495,17 +665,21 @@ func (r *Registry) TransitionBranchCtx(ctx context.Context, id string, to Branch
 		return err
 	}
 	if !legalBranchTransition(BranchState(from), to) {
-		return fmt.Errorf("illegal branch transition %s -> %s", from, to)
+		return illegalTransition("branch", from, string(to))
 	}
 
 	// Conditional UPDATE: the `state=?` guard makes this a compare-and-swap.
 	// It only fires while the row is STILL in the from-state we read above; a
 	// concurrent winner that moved the row out from under us makes
 	// RowsAffected()==0, so we never clobber its transition. (Under
-	// SetMaxOpenConns(1) the SELECT+UPDATE in this tx are already serialized,
-	// but the guard keeps the CAS correct regardless of connection pooling.)
-	res, err := tx.Exec(`UPDATE branches SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		WHERE id=? AND state=?`, string(to), id, from)
+	// SetMaxOpenConns(1) and BEGIN IMMEDIATE the SELECT+UPDATE in this tx are
+	// already serialized, but the guard keeps the CAS correct regardless.)
+	if set != "" {
+		set += ", "
+	}
+	args := append(append([]any{}, setArgs...), string(to), id, from)
+	res, err := tx.Exec(`UPDATE branches SET `+set+`state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=?`, args...)
 	if err != nil {
 		return err
 	}
@@ -524,13 +698,12 @@ func (r *Registry) TransitionBranchCtx(ctx context.Context, id string, to Branch
 			}
 			return err
 		}
-		return fmt.Errorf("illegal branch transition %s -> %s", cur, to)
+		return illegalTransition("branch", cur, string(to))
 	}
 
 	// CAS won: journal the transition in the same tx, with the exact prior
-	// state, the actor from ctx, and identical columns/values to setState's journal.
-	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
-		"branch", id, from, string(to), reason, actorString(ctx)); err != nil {
+	// state and the actor from ctx.
+	if err := journalTx(ctx, tx, "branch", id, from, string(to), reason); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -600,11 +773,13 @@ func (r *Registry) MarkBranchReady(id, containerID, host string, port int) error
 
 // MarkBranchReadyCtx is MarkBranchReady with the actor read from ctx recorded
 // on the creating/resetting -> ready transition.
+//
+// The container/host/port columns are written by the same compare-and-swap as
+// the state, so a branch that was failed or destroyed concurrently never
+// advertises a container its failing path did not see.
 func (r *Registry) MarkBranchReadyCtx(ctx context.Context, id, containerID, host string, port int) error {
-	if _, err := r.db.Exec(`UPDATE branches SET container_id=?, host=?, port=? WHERE id=?`, containerID, host, port, id); err != nil {
-		return err
-	}
-	return r.TransitionBranchCtx(ctx, id, BranchReady, "instance running")
+	return r.transitionBranch(ctx, id, BranchReady, "instance running",
+		"container_id=?, host=?, port=?", containerID, host, port)
 }
 
 const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume,expires_at,host,base_layer_id,parent_branch_name,password,port,created_at`
@@ -638,8 +813,46 @@ func (r *Registry) getBranch(where string, args ...any) (*Branch, error) {
 	return r.scanBranch(r.db.QueryRow(`SELECT `+branchCols+` FROM branches WHERE `+where, args...))
 }
 
+// GetBranchByName returns the live (non-destroyed) branch named name, or an
+// error matching ErrNotFound that names it.
 func (r *Registry) GetBranchByName(name string) (*Branch, error) {
-	return r.getBranch(`name=? AND state!='destroyed'`, name)
+	b, err := r.getBranch(`name=? AND state!='destroyed'`, name)
+	if errors.Is(err, ErrNotFound) {
+		return nil, notFound("branch", name)
+	}
+	return b, err
+}
+
+// GetBranchByID returns a branch row by id, destroyed tombstones included.
+func (r *Registry) GetBranchByID(id string) (*Branch, error) {
+	return r.getBranch(`id=?`, id)
+}
+
+// NoteBranchCtx journals an event on a branch without changing its state (a
+// transitions row with from_state = to_state = the current state) and bumps
+// updated_at. DestroyBranch uses it to record why a teardown attempt failed,
+// so `pgb history` shows the cause, and so a periodic retry backs off by one
+// stuck-timeout per failed attempt.
+func (r *Registry) NoteBranchCtx(ctx context.Context, id, reason string) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var state string
+	if err := tx.QueryRow(`SELECT state FROM branches WHERE id=?`, id).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE branches SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, id); err != nil {
+		return err
+	}
+	if err := journalTx(ctx, tx, "branch", id, state, state, reason); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *Registry) ListLiveBranches() ([]*Branch, error) {
@@ -684,7 +897,7 @@ func (r *Registry) BranchHistory(name string) ([]Transition, error) {
 		return nil, err
 	}
 	if len(out) == 0 {
-		return nil, ErrNotFound
+		return nil, notFound("branch", name)
 	}
 	return out, nil
 }
@@ -717,6 +930,32 @@ func (r *Registry) ListStuckBranches(before string) ([]*Branch, error) {
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+// ListDestroyingBranches returns branches left in destroying — a destroy
+// whose teardown failed or was interrupted (branchd crash, shutdown) — whose
+// last update predates before (RFC3339 UTC). DestroyBranch accepts such a row
+// and re-runs its idempotent teardown, so a periodic pass (reconcile) can
+// retry them; every failed attempt bumps updated_at (NoteBranchCtx), so the
+// retries back off by the cutoff's age.
+func (r *Registry) ListDestroyingBranches(before string) ([]*Branch, error) {
+	return r.listBranches(`state='destroying' AND updated_at < ?`, before)
+}
+
+// VolumeNameUsed reports whether any registry row has ever used volume: as a
+// branch's writable or source volume (destroyed tombstones included), as a
+// frozen layer, or as a source generation. Branch creation picks writable
+// volume names this reports unused, so a recreated branch name can never
+// adopt a volume that still holds another branch's data — above all a frozen
+// layer that live children mount read-only.
+func (r *Registry) VolumeNameUsed(volume string) (bool, error) {
+	var used bool
+	err := r.db.QueryRow(`SELECT
+		EXISTS (SELECT 1 FROM branches WHERE rw_volume=?1)
+		OR EXISTS (SELECT 1 FROM branches WHERE source_volume=?1)
+		OR EXISTS (SELECT 1 FROM layers WHERE volume=?1)
+		OR EXISTS (SELECT 1 FROM sources WHERE volume=?1)`, volume).Scan(&used)
+	return used, err
 }
 
 // LiveVolumeSet returns the set of every volume name a live branch or a live
@@ -871,19 +1110,44 @@ func (r *Registry) CountLiveBranchesByRWVolume(volume string) (int, error) {
 
 // CountLiveBranchesReferencingRW counts live branches (other than the named
 // branch itself) that still depend on the given branch's writable volume — the
-// guard the stuck-fail path uses to never delete a freeze/clone parent's live
-// data while a child is mid-provision. A child references the parent's rw
-// volume either directly, as its source_volume (csi/zfs clone the parent's
-// PVC/dataset), or — in the overlay freeze, where the child's source_volume is
-// the source and the parent's old rw volume only becomes a layer at
-// CommitFreeze — by naming the parent in parent_branch_name. Either link
-// counts: while it holds, the volume is live data, not a removable orphan.
+// guard the stuck-fail and destroy paths use to never delete a parent's data
+// while a child needs it. A child references the parent's rw volume either
+// directly, as its source_volume (csi/zfs clone the parent's PVC/dataset), or
+// — in the overlay freeze, where the child's source_volume is the source and
+// the parent's old rw volume only becomes a layer at CommitFreeze — by naming
+// the parent in parent_branch_name while it has no base layer yet (the freeze
+// has not committed). A committed overlay child bases on a frozen layer, not
+// on the parent's current rw volume, so it does not count: the guard is
+// precise in every state, including a destroy retried from destroying.
 func (r *Registry) CountLiveBranchesReferencingRW(branchName, rwVolume string) (int, error) {
 	var n int
 	err := r.db.QueryRow(`SELECT count(*) FROM branches
-		WHERE state!='destroyed' AND name!=? AND (source_volume=? OR parent_branch_name=?)`,
+		WHERE state!='destroyed' AND name!=?
+		AND (source_volume=? OR (parent_branch_name=? AND base_layer_id IS NULL))`,
 		branchName, rwVolume, branchName).Scan(&n)
 	return n, err
+}
+
+// InFlightChildren returns the names of branches still being created from the
+// named branch (state creating, parent_branch_name = name). While one exists
+// the parent's volumes may be mid-freeze or mid-clone, so reset and recover
+// refuse to touch the parent.
+func (r *Registry) InFlightChildren(name string) ([]string, error) {
+	rows, err := r.db.Query(`SELECT name FROM branches
+		WHERE state='creating' AND parent_branch_name=? ORDER BY created_at`, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 // CreateLayer records a frozen layer (assigns its ID).
@@ -1027,7 +1291,7 @@ func (r *Registry) CommitFreezeCtx(ctx context.Context, parentID, childID, layer
 		return nil, err
 	}
 	if BranchState(state) != BranchResetting {
-		return nil, fmt.Errorf("illegal branch transition %s -> %s (freeze commit requires a resetting parent)", state, BranchReady)
+		return nil, fmt.Errorf("%w (freeze commit requires a resetting parent)", illegalTransition("branch", state, string(BranchReady)))
 	}
 	l := &Layer{ID: newID(), SourceID: sourceID, Volume: layerVolume, ParentLayerID: prevBase.String}
 	if _, err := tx.Exec(`INSERT INTO layers (id,source_id,volume,parent_layer_id) VALUES (?,?,?,?)`,

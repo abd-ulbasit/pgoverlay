@@ -42,7 +42,9 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusNotFound, msg)
 	case errors.Is(err, engine.ErrQuotaExceeded):
 		writeError(w, http.StatusForbidden, msg)
-	case strings.Contains(msg, "UNIQUE constraint"),
+	case errors.Is(err, registry.ErrAlreadyExists),
+		errors.Is(err, registry.ErrIllegalTransition),
+		strings.Contains(msg, "UNIQUE constraint"),
 		strings.Contains(msg, "live branch"),
 		strings.Contains(msg, "child branch"),
 		strings.Contains(msg, "illegal branch transition"),

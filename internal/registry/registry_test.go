@@ -449,7 +449,7 @@ func TestDeleteSource(t *testing.T) {
 	if err := r.DeleteSource(s.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.GetSourceByName("main"); err != ErrNotFound {
+	if _, err := r.GetSourceByName("main"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	// mask scripts go with the source
