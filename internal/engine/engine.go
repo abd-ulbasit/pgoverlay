@@ -41,6 +41,9 @@ type Engine struct {
 	// heartbeatEvery is how often a running saga bumps its branch rows'
 	// updated_at (see keepAlive). 0 = defaultHeartbeat.
 	heartbeatEvery time.Duration
+	// maxLayerDepth caps an overlay branch's frozen layer chain (see
+	// checkLayerDepth). 0 = DefaultMaxLayerDepth.
+	maxLayerDepth int
 }
 
 // parentStepTimeout bounds a parent-affecting step (stopping a freeze or
@@ -96,6 +99,25 @@ func WithHeartbeatInterval(d time.Duration) Option {
 	return func(e *Engine) {
 		if d > 0 {
 			e.heartbeatEvery = d
+		}
+	}
+}
+
+// DefaultMaxLayerDepth is the default cap on an overlay branch's frozen layer
+// chain. Every branch-from-branch freezes the parent's writes into one more
+// layer, and the parent keeps its whole chain until it is destroyed (reset
+// keeps it too), so a parent forked N times stacks N layers. Each is an
+// overlay lowerdir: lookups walk them all, and the mount option string must
+// fit in one page (about 160 lowerdirs); the kernel stops at 500.
+const DefaultMaxLayerDepth = 100
+
+// WithMaxLayerDepth caps overlay layer chains at n frozen layers: branching
+// from a branch whose chain is already that deep is refused with
+// ErrQuotaExceeded. branchd --max-layer-depth. n <= 0 keeps the default.
+func WithMaxLayerDepth(n int) Option {
+	return func(e *Engine) {
+		if n > 0 {
+			e.maxLayerDepth = n
 		}
 	}
 }
@@ -179,6 +201,22 @@ func (e *Engine) checkQuota() error {
 	}
 	if n >= e.maxBranches {
 		return fmt.Errorf("%w: %d live branch(es) at the --max-branches=%d cap", ErrQuotaExceeded, n, e.maxBranches)
+	}
+	return nil
+}
+
+// checkLayerDepth refuses an overlay freeze that would push a chain past the
+// configured depth. There is no compaction yet, so the way out is a branch
+// with a shorter history: recreate the parent from its source (or from a
+// branch with a shorter chain) and replay its setup.
+func (e *Engine) checkLayerDepth(parent *registry.Branch, chain []registry.Layer) error {
+	limit := e.maxLayerDepth
+	if limit <= 0 {
+		limit = DefaultMaxLayerDepth
+	}
+	if len(chain) >= limit {
+		return fmt.Errorf("%w: branch %q already stacks %d frozen layers (--max-layer-depth=%d); branching from it again would exceed the limit. Branch from a branch with a shorter history, or recreate %q from its source",
+			ErrQuotaExceeded, parent.Name, len(chain), limit, parent.Name)
 	}
 	return nil
 }

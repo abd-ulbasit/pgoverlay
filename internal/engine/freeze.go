@@ -47,6 +47,16 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	if parent.State != registry.BranchReady {
 		return nil, fmt.Errorf("parent branch %q is %s, not ready", parentName, parent.State)
 	}
+	if !e.zfs() && !e.csi() {
+		// the freeze adds one layer to the parent's chain (and the child's)
+		chain, err := e.reg.LayerChain(parent.ID)
+		if err != nil {
+			return nil, err
+		}
+		if err := e.checkLayerDepth(parent, chain); err != nil {
+			return nil, err
+		}
+	}
 	src, err := e.reg.GetSourceByID(parent.SourceID)
 	if err != nil {
 		return nil, err
