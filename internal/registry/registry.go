@@ -82,6 +82,13 @@ type Branch struct {
 	Port                                      int
 	State                                     BranchState
 	CreatedAt                                 string
+
+	// PasswordUnavailable is set when the branch has a stored rotated password
+	// that none of the configured secret keys can decrypt (the at-rest key
+	// changed, or a legacy row was encrypted under an earlier PGOVERLAY_TOKEN).
+	// Password is then "". The branch is otherwise fully usable: list, reset
+	// (which mints and stores a fresh password) and destroy all work.
+	PasswordUnavailable bool
 }
 
 // Layer is a frozen branch rw volume: an immutable overlay layer between the
@@ -97,15 +104,22 @@ type Registry struct {
 	secrets    *secretBox // at-rest encryption for branch passwords; nil = plaintext (no key configured)
 }
 
-// SetSecretKey enables at-rest encryption of branch passwords with the given
-// 32-byte key (derive it from PGOVERLAY_TOKEN via DeriveSecretKey). Call it once
-// right after Open, before serving. A nil/empty key is a no-op, leaving the
-// registry in plaintext mode (inherit-mode setups and tests need no key). A
-// wrong-length key is a configuration error and is returned. Once set,
-// SetBranchPassword encrypts before write and every read path decrypts, while
-// legacy plaintext rows still read back unchanged.
+// SetSecretKey enables at-rest encryption of branch passwords under the given
+// dedicated 32-byte key; it is SetSecretKeys with no legacy keys.
 func (r *Registry) SetSecretKey(key []byte) error {
-	box, err := newSecretBox(key)
+	return r.SetSecretKeys(SecretKeys{Primary: key})
+}
+
+// SetSecretKeys configures at-rest encryption of branch passwords. Call it once
+// right after Open, before serving. No keys at all leaves the registry in
+// plaintext mode (inherit-mode setups and tests need no key). A wrong-length
+// key is a configuration error and is returned. With a primary key,
+// SetBranchPassword encrypts before write; every read path decrypts with
+// whichever configured key the row names, and legacy plaintext rows still read
+// back unchanged. Call ReencryptSecrets afterwards to move older rows under
+// the primary key.
+func (r *Registry) SetSecretKeys(k SecretKeys) error {
+	box, err := newSecretBox(k)
 	if err != nil {
 		return err
 	}
@@ -629,6 +643,11 @@ const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume
 // so callers (API, engine) always see plaintext. It is a *Registry method
 // because decryption needs the registry's secret key; the stored value carries
 // the enc: prefix iff it was encrypted, so legacy plaintext rows pass through.
+//
+// A password no configured key can decrypt does NOT fail the read: every list,
+// reconcile, reset and destroy path goes through here and none of them needs
+// the plaintext, so one such row must not take them all down. The branch comes
+// back with Password "" and PasswordUnavailable set; a reset re-mints it.
 func (r *Registry) scanBranch(row interface{ Scan(...any) error }) (*Branch, error) {
 	b := &Branch{}
 	var baseLayer sql.NullString
@@ -642,11 +661,11 @@ func (r *Registry) scanBranch(row interface{ Scan(...any) error }) (*Branch, err
 		return nil, err
 	}
 	b.BaseLayerID = baseLayer.String
-	pw, derr := decryptColumn(r.secrets, storedPassword)
-	if derr != nil {
-		return nil, derr
+	if pw, derr := r.secrets.decrypt(storedPassword); derr != nil {
+		b.PasswordUnavailable = true
+	} else {
+		b.Password = pw
 	}
-	b.Password = pw
 	return b, nil
 }
 

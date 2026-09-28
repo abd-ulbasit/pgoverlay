@@ -194,6 +194,41 @@ func storageRoot(runtimeName, kubeStorage, kubeDataRoot, home string) string {
 	return home // docker / overlay
 }
 
+// configureSecrets sets up at-rest encryption of rotated branch passwords. The
+// key is a dedicated random key, independent of PGOVERLAY_TOKEN, so the admin
+// token can be rotated freely: $PGOVERLAY_SECRET_KEY, else --secret-key-file,
+// else <state dir>/secret.key (generated 0600 on first start). The legacy key
+// sha256(PGOVERLAY_TOKEN), which encrypted passwords before the dedicated key
+// existed, is kept as a decrypt-only fallback, and every row not yet under the
+// dedicated key (legacy ciphertext, or plaintext written without a key) is
+// re-encrypted under it before serving. Rows no key can open are reported and
+// left alone: they read as password-unavailable, and a reset re-mints them.
+func configureSecrets(reg *registry.Registry, cfg *config.Config, keyFile, token string) error {
+	key, origin, err := cfg.LoadSecretKey(keyFile, true)
+	if err != nil {
+		return err
+	}
+	if err := reg.SetSecretKeys(registry.SecretKeys{
+		Primary: key,
+		Legacy:  [][]byte{registry.LegacyTokenKey(token)},
+	}); err != nil {
+		return err
+	}
+	log.Printf("branch passwords are encrypted at rest under key %s (from %s)", registry.KeyID(key), origin)
+	rep, err := reg.ReencryptSecrets()
+	if err != nil {
+		return fmt.Errorf("re-encrypt stored branch passwords: %w", err)
+	}
+	if rep.Reencrypted > 0 {
+		log.Printf("re-encrypted %d stored branch password(s) under key %s", rep.Reencrypted, registry.KeyID(key))
+	}
+	if len(rep.Unavailable) > 0 {
+		slog.Warn("stored branch passwords cannot be decrypted with the configured at-rest key (it changed, or they predate it and were encrypted under an earlier PGOVERLAY_TOKEN); these branches keep working but report password_unavailable until reset",
+			"branches", rep.Unavailable)
+	}
+	return nil
+}
+
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
@@ -212,6 +247,7 @@ func run() error {
 	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default), zfs (experimental, see docs/zfs.md) or csi (forced by --kube-storage csi)")
 	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgoverlay datasets, e.g. tank/pgoverlay (required with --cow zfs)")
 	rotateCreds := flag.Bool("rotate-branch-credentials", false, "give every branch its own generated password instead of inheriting the source's (returned as `password` in branch API responses; see docs/architecture.md)")
+	secretKeyFile := flag.String("secret-key-file", os.Getenv(config.SecretKeyFileEnv), "file holding the 32-byte at-rest key that encrypts rotated branch passwords, hex or base64 (default: $PGOVERLAY_SECRET_KEY, else <state dir>/secret.key, generated 0600 on first start; env PGOVERLAY_SECRET_KEY_FILE)")
 	maxBranches := flag.Int("max-branches", envInt("PGOVERLAY_MAX_BRANCHES", 0), "cap on live (non-destroyed) branches; creates past the cap return 403 (0 = unlimited; env PGOVERLAY_MAX_BRANCHES)")
 	defaultTTL := flag.Duration("default-ttl", envDuration("PGOVERLAY_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGOVERLAY_DEFAULT_TTL)")
 	maxTTL := flag.Duration("max-ttl", envDuration("PGOVERLAY_MAX_TTL", 0), "upper bound on any requested branch TTL; longer TTLs are capped to this, e.g. 168h (0 = no cap; env PGOVERLAY_MAX_TTL)")
@@ -255,13 +291,7 @@ func run() error {
 		return err
 	}
 	defer reg.Close()
-	// Encrypt branch passwords at rest with a key derived from PGOVERLAY_TOKEN
-	// (key = sha256(token)). The registry DB sits on a hostPath/PVC; without
-	// this a reader of the file gets every live branch's working credential.
-	// Trade-off: rotating PGOVERLAY_TOKEN makes existing encrypted passwords
-	// unrecoverable — re-run credential rotation after a token change. (token
-	// is non-empty here: branchd refused to start above otherwise.)
-	if err := reg.SetSecretKey(registry.DeriveSecretKey(token)); err != nil {
+	if err := configureSecrets(reg, cfg, *secretKeyFile, token); err != nil {
 		return err
 	}
 	cowSet := false
