@@ -289,6 +289,59 @@ func TestAcquireIPv6DirectHost(t *testing.T) {
 	}
 }
 
+func TestTTLSeconds(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want int
+	}{
+		{0, 0},
+		{time.Nanosecond, 1},
+		{500 * time.Millisecond, 1},
+		{time.Second, 1},
+		{1500 * time.Millisecond, 2},
+		{2 * time.Minute, 120},
+		{time.Hour, 3600},
+	}
+	for _, tt := range tests {
+		if got := ttlSeconds(tt.d); got != tt.want {
+			t.Errorf("ttlSeconds(%s) = %d, want %d", tt.d, got, tt.want)
+		}
+	}
+}
+
+// TestAcquireTTLEdges: a sub-second TTL keeps the safety net (rounded up to
+// 1s instead of truncated to 0 = never reaped), and a negative TTL fails
+// before any branch is created.
+func TestAcquireTTLEdges(t *testing.T) {
+	stub := newStub(t)
+	t.Setenv("PGOVERLAY_SERVER", stub.ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
+
+	t.Run("sub-second", func(t *testing.T) { Acquire(t, WithTTL(500*time.Millisecond)) })
+	if got := stub.lastCreate().TTLSeconds; got != 1 {
+		t.Errorf("ttl_seconds for 500ms = %d, want 1", got)
+	}
+
+	t.Run("zero", func(t *testing.T) { Acquire(t, WithTTL(0)) })
+	if got := stub.lastCreate().TTLSeconds; got != 0 {
+		t.Errorf("ttl_seconds for 0 = %d, want 0", got)
+	}
+
+	stub.mu.Lock()
+	creates := len(stub.creates)
+	stub.mu.Unlock()
+	f := &fakeTB{name: "TestAcquireTTLEdges"}
+	runWithFakeTB(f, func() { Acquire(f, WithTTL(-time.Second)) })
+	if !f.failed {
+		t.Fatal("Acquire accepted a negative TTL")
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.creates) != creates {
+		t.Errorf("a branch was created despite the negative TTL")
+	}
+}
+
 // TestAcquireWirePassword: a server that returns a per-branch password (rotate
 // mode, future) wins over the env fallback.
 func TestAcquireWirePassword(t *testing.T) {

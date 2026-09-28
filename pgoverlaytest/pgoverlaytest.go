@@ -67,6 +67,13 @@ func WithSource(name string) Option { return func(c *config) { c.source = name }
 // WithTTL sets the branch TTL — a server-side safety net in case the process
 // dies before t.Cleanup runs. Default 1h; explicit destroy on test end is the
 // primary cleanup.
+//
+// The TTL goes over the wire in whole seconds, rounded up, so any positive d
+// keeps the safety net. WithTTL(0) turns it off: the server then applies its
+// --default-ttl if one is configured and otherwise never reaps the branch,
+// so a branch leaked by a crashed test run lives until someone destroys it.
+// The server may also shorten a TTL to its --max-ttl. A negative d fails the
+// test.
 func WithTTL(d time.Duration) Option { return func(c *config) { c.ttl = d } }
 
 // pollInterval is how often Acquire re-checks a not-yet-ready branch
@@ -92,6 +99,9 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if cfg.ttl < 0 {
+		t.Fatalf("pgoverlaytest: WithTTL(%s): the TTL must not be negative", cfg.ttl)
+	}
 
 	c := &client{base: strings.TrimRight(server, "/"), token: os.Getenv("PGOVERLAY_TOKEN")}
 	name := branchName(t.Name(), randHex(6))
@@ -100,7 +110,7 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 	defer cancel()
 
 	b, err := c.createBranch(ctx, createBranchRequest{
-		Name: name, Source: cfg.source, TTLSeconds: int(cfg.ttl / time.Second),
+		Name: name, Source: cfg.source, TTLSeconds: ttlSeconds(cfg.ttl),
 	})
 	if err != nil {
 		t.Fatalf("pgoverlaytest: create branch %q from %q: %v", name, cfg.source, err)
@@ -143,6 +153,16 @@ func terminalState(s string) bool {
 		return true
 	}
 	return false
+}
+
+// ttlSeconds converts a TTL to the wire's whole seconds, rounding up so a
+// positive sub-second TTL never becomes 0 (which disables the TTL).
+func ttlSeconds(d time.Duration) int {
+	s := int(d / time.Second)
+	if d%time.Second > 0 {
+		s++
+	}
+	return s
 }
 
 // newBranch maps the wire shape to the public Branch, building DSNs. The
