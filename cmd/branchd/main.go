@@ -204,6 +204,7 @@ func run() error {
 	kubeNamespace := flag.String("kube-namespace", "", `namespace for branch/helper pods (default: POD_NAMESPACE when in-cluster, else "pgoverlay")`)
 	kubeNode := flag.String("kube-node", "", "storage node name (required with --runtime kube --kube-storage hostpath; all CoW data lives on this node)")
 	kubeDataRoot := flag.String("kube-data-root", "/var/lib/pgoverlay", "CoW data root on the storage node (hostpath storage only)")
+	kubeHelperImage := flag.String("kube-helper-image", "", "image for file-level helper pods, e.g. a mirror for private or air-gapped registries (default "+runtime.UtilityImage+")")
 	kubeconfig := flag.String("kubeconfig", "", "kubeconfig path (default: in-cluster config, then KUBECONFIG / ~/.kube/config)")
 	kubeStorage := flag.String("kube-storage", "hostpath", "kube storage mode: hostpath (single node, data under --kube-data-root) or csi (multi-node, PVC clones; see docs/kubernetes.md)")
 	csiStorageClass := flag.String("csi-storage-class", "", "StorageClass for pgoverlay PVCs (required with --kube-storage csi; its CSI driver must support PVC cloning, or snapshots with --csi-snapshot-class)")
@@ -295,12 +296,20 @@ func run() error {
 			ns = "pgoverlay"
 		}
 		kubeNS = ns
+		// Helper pods carry this registry's instance label and are owned by
+		// branchd's own pod (downward API, set by the chart) so a branchd that
+		// dies mid-seed does not leave them behind.
+		kopts := []runtime.KubeOption{
+			runtime.WithHelperImage(*kubeHelperImage),
+			runtime.WithInstanceID(reg.InstanceID()),
+			runtime.WithOwnerPod(os.Getenv("POD_NAMESPACE"), os.Getenv("PGOVERLAY_POD_NAME"), os.Getenv("PGOVERLAY_POD_UID")),
+		}
 		if backend == cow.BackendCSI {
 			drv, err = runtime.NewKubeDriverCSI(*kubeconfig, ns, runtime.CSIConfig{
 				StorageClass: *csiStorageClass, SnapshotClass: *csiSnapshotClass, VolumeSize: *csiVolumeSize,
-			})
+			}, kopts...)
 		} else {
-			drv, err = runtime.NewKubeDriver(*kubeconfig, ns, *kubeNode, *kubeDataRoot)
+			drv, err = runtime.NewKubeDriver(*kubeconfig, ns, *kubeNode, *kubeDataRoot, kopts...)
 		}
 	}
 	if err != nil {
