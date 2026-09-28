@@ -161,6 +161,12 @@ func TestBranchHistoryUnknownName(t *testing.T) {
 	if _, err := r.BranchHistory("nope"); err != ErrNotFound {
 		t.Fatalf("err=%v want ErrNotFound", err)
 	}
+	// rows whose entity still exists carry an empty entity_name; the empty
+	// name must not match them all
+	seedReadyBranch(t, r, "pr-x")
+	if _, err := r.BranchHistory(""); err != ErrNotFound {
+		t.Fatalf("BranchHistory(\"\") err=%v want ErrNotFound", err)
+	}
 }
 
 func TestLookupAPITokenActor(t *testing.T) {

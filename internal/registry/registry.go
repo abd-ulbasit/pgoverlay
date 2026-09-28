@@ -702,7 +702,8 @@ func (r *Registry) BranchHistory(name string) ([]Transition, error) {
 	rows, err := r.db.Query(`SELECT t.from_state, t.to_state, t.reason, t.actor, t.at
 		FROM transitions t
 		WHERE t.entity = 'branch'
-		  AND (t.entity_id IN (SELECT id FROM branches WHERE name = ?) OR t.entity_name = ?)
+		  AND (t.entity_id IN (SELECT id FROM branches WHERE name = ?)
+		       OR (t.entity_name != '' AND t.entity_name = ?))
 		ORDER BY t.id ASC`, name, name)
 	if err != nil {
 		return nil, err
