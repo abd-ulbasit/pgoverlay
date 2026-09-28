@@ -2,7 +2,7 @@
 
 [Architecture](architecture.md) and [design decisions](DESIGN-DECISIONS.md)
 cover what pgoverlay is and why it is shaped the way it is. This document covers
-the six hardest problems in the codebase — the ones where the obvious
+the seven hardest problems in the codebase — the ones where the obvious
 implementation was wrong, the bug was subtle enough to survive review, and the
 fix generalizes past this project.
 
@@ -118,6 +118,16 @@ bumps `updated_at`:
 So a healthy-but-slow freeze keeps re-arming the timer; only a *genuinely*
 wedged op crosses the threshold.
 
+*Update (v1.0).* Waypoint touches still left gaps: a single long step (a slow
+masking script, a large first recovery) could outlast the timeout between two
+waypoints. Every branch saga now runs a heartbeat, `Engine.keepAlive`
+(`internal/engine/engine.go`), that bumps the rows it works on every
+`min(--stuck-timeout/4, 30s)` until the saga returns, and seeds heartbeat their
+source row the same way. The stuck timeout now measures time without
+progress, not total time. The freeze also claims the parent's new volume on
+the parent row (`pending_volume`, schema v14) before creating it, so volume GC
+cannot mistake it for an orphan mid-freeze.
+
 **(b) Never let GC delete a volume that is still referenced.** Even a correctly
 detected stuck parent must not have its `rw_volume` deleted if a child depends on
 it. `ActionFailStuck` (`internal/engine/reconcile.go:applyAction`) now calls
@@ -127,12 +137,18 @@ the volume:
 
 ```sql
 SELECT count(*) FROM branches
-WHERE state!='destroyed' AND name!=? AND (source_volume=? OR parent_branch_name=?)
+WHERE state!='destroyed' AND name!=?
+AND (source_volume=? OR (parent_branch_name=? AND base_layer_id IS NULL))
 ```
 
-If any live branch references the volume (as its `source_volume`, or by naming
-the parent via `parent_branch_name`), reconcile **fails the row but keeps the
-volume**. The same guard protects the force-destroy path: `DestroyBranch`
+If any live branch references the volume (as its `source_volume`, or as a
+child of this parent whose freeze has not committed yet, which has no base
+layer), reconcile **fails the row but keeps the volume**. (The
+`base_layer_id IS NULL` refinement came later: a child whose freeze *did*
+commit depends on the frozen layer, not on the parent's current volume, and
+counting it kept the guard from ever releasing a failed parent's volume.)
+A parent failed this way keeps its data, and `pgb branch recover` restarts
+it on that data. The same guard protects the force-destroy path: `DestroyBranch`
 (`internal/engine/saga.go:DestroyBranch`) forces a branch out of
 `creating`/`resetting` to `failed` so an operator need not wait out the 10m
 timeout — and when it does that forced transition (`forcedFromTransient`), it
@@ -160,7 +176,8 @@ when it happens.
 
 Branch state is a small state machine (`internal/registry/registry.go`,
 `legalBranch`): `creating → {ready, failed}`, `ready → {destroying,
-resetting}`, `resetting → {ready, failed}`, and so on. Every transition must be
+resetting}`, `resetting → {ready, failed}`, `failed → {resetting,
+destroying}`, `destroying → destroyed`. Every transition must be
 **legal** (the edge exists) and **atomic** (two concurrent callers can't both
 fire the same edge).
 
@@ -219,6 +236,7 @@ stateDiagram-v2
     ready --> resetting
     resetting --> ready
     resetting --> failed
+    failed --> resetting: reset or recover
     failed --> destroying
     destroying --> destroyed
     destroyed --> [*]
@@ -343,9 +361,12 @@ ways it can go wrong:
 
 - `PlanReconcile` computes a `ReconcilePlan` of `Action`s *without mutating
   anything*: reap TTL-expired (`ListExpiredBranches`), fail stuck rows
-  (`ListStuckBranches`), remove orphan containers, GC zero-refcount layers
-  (`CountBranchesReferencingLayer`), GC volumes owned by no live branch/source
-  (`LiveVolumeSet`). This is the read-only half that backs `pgb doctor` and
+  (`ListStuckBranches`) and stuck seeding sources, retry destroys stuck in
+  `destroying`, restart ready branches whose container is gone and record
+  moved addresses, remove orphan containers and finished helpers, GC
+  zero-refcount layers (`CountBranchesReferencingLayer`), GC volumes owned by
+  no live branch/source (`LiveVolumeSet`) and older than the stuck timeout.
+  This is the read-only half that backs `pgb doctor` and
   `GET /v1/reconcile/plan`.
 - `ApplyReconcile` runs the plan but **re-validates every destructive action
   against the live registry immediately before acting** (`applyAction`). Each
@@ -397,9 +418,14 @@ The registry opens SQLite with three settings
 (`internal/registry/registry.go`, the `sql.Open` DSN + `SetMaxOpenConns(1)`):
 
 ```
-?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)
+?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate
 db.SetMaxOpenConns(1)
 ```
+
+(`_txlock=immediate` came later: it makes every transaction take SQLite's
+write lock at `BEGIN` and wait under `busy_timeout`, instead of upgrading a
+read transaction mid-way and failing with `SQLITE_BUSY_SNAPSHOT` when another
+process, such as a second HA replica, has written the file in between.)
 
 What this **guarantees**:
 
@@ -472,27 +498,37 @@ timer. The review re-derived that root cause from the outside.
   `internal/engine/engine.go`) so every backend and caller is covered.
 - **Cross-PR branch-reset vector in ghook.** An untrusted PR ref could collide
   with another branch's name (another PR, or a human-created branch), letting one
-  PR reset another's branch. Fixed by namespacing every webhook-created branch
-  under a reserved `gh-` prefix (`internal/ghook/service.go`, `branchPrefix` +
-  `branchName`): pr-number → `gh-pr-<n>`, git-branch → `gh-<sanitizedref>`, with
-  the ref sanitized *and* length-budgeted so `prefix+ref` still fits the name
-  regex.
+  PR reset another's branch. The first fix namespaced every webhook-created
+  branch under a `gh-` prefix. The v1 review found it incomplete: PR #7 of two
+  allow-listed repositories still shared `gh-pr-7`, a fork's branch name could
+  land on one of your own branches in `git-branch` mode, and truncated long
+  refs could collide. The rule now lives in `pgoverlayconnect/names.go`, shared
+  with the connect helpers: a six-hex repository key in every name
+  (`gh-<repo-key>-pr-<n>`, `gh-<repo-key>-<ref>`), fork PRs always named by
+  number, and long refs cut and suffixed with a hash of the full ref.
 - **Branch-password plaintext-at-rest.** The registry file lives on a
   hostPath/PVC; a plaintext `password` column hands every live branch's working
-  credential to anyone who can read the file. Fixed with **AES-256-GCM**
-  (`internal/registry/crypto.go`): the key is `sha256(PGOVERLAY_TOKEN)`
-  (`DeriveSecretKey`), encrypted values carry an `enc:` prefix over
-  `base64(nonce‖ciphertext)`, and the read path errors loudly if it finds an
-  `enc:` value but has no key — so a misconfigured/rotated key surfaces rather
-  than leaking ciphertext. Back-compat: un-prefixed values are treated as legacy
-  plaintext.
+  credential to anyone who can read the file. The first fix encrypted it with
+  **AES-256-GCM** (`internal/registry/crypto.go`) under `sha256(PGOVERLAY_TOKEN)`
+  and made the read path fail loudly on an undecryptable value. That turned out
+  to be the wrong coupling: rotating the admin token, the first thing you do
+  after an incident, made every row fail to read and took list, reset, destroy
+  and reconcile down with it (issue #9). Passwords are now encrypted under a
+  dedicated random key with a key id (`enc:v2:<kid>:...`), legacy `enc:v1` rows
+  are re-encrypted at startup, and an undecryptable row reads as
+  `password_unavailable` instead of failing (ADR-10).
 - **Proxy error-message enumeration.** The wire proxy authenticates *after*
   routing, so a distinctive error for "unknown branch" vs "branch not ready" vs
   "backend down" would let an **unauthenticated** client enumerate branch names
-  and states. Fixed with a single uniform refusal: every routing failure returns
-  the same `genericRouteRefusal = "pgoverlay: database not available"` with
-  SQLSTATE `3D000` (`internal/pgproxy/proxy.go`, the `route` method and the
-  `genericRouteRefusal` const); the real reason is logged server-side only.
+  and states. Mitigated with a single uniform refusal: every routing failure
+  returns the same `genericRouteRefusal = "pgoverlay: database not available"`
+  with SQLSTATE `3D000` (`internal/pgproxy/proxy.go`, the `route` method and
+  the `genericRouteRefusal` const); the real reason is logged server-side only.
+  The residual: a *ready* branch still answers with its auth challenge, so its
+  existence can be confirmed before authenticating, and a blackholed backend is
+  refused only after the dial timeout. `MaxStartupsPerIP` bounds concurrent
+  probes but is not a rate limit; a full fix needs the proxy to take part in
+  authentication.
 
 ### The lesson
 
@@ -502,8 +538,60 @@ starts from the code and works outward trips over the cases the author
 rationalized away. The common thread across these five fixes is
 **validate-at-the-boundary** (one anchored name gate covers every downstream
 runtime; one uniform refusal covers every routing failure) and **defence in
-depth** (encrypt at rest *and* error on misconfiguration; bump the timer *and*
-guard the delete).
+depth** (bump the timer *and* guard the delete). The second review's
+corrections to three of them are the other lesson: a fix is a new design, and
+it needs the same adversarial pass as the original. Failing loudly on an
+undecryptable password was defence in depth on paper and a fleet-wide outage
+after a token rotation.
+
+---
+
+## 7. A copy-on-write system that copies on read
+
+### The problem
+
+The whole premise is that a branch shares the seed and pays only for what it
+changes. The founding bug ([benchmarks](benchmarks.md#the-fix)) broke that at
+create time: Postgres's pre-recovery sync opened every file read-write, and on
+OverlayFS a read-write open of a lower-layer file copies the whole file up.
+`recovery_init_sync_method=syncfs` removed that pass, branch creation dropped
+to 33 MiB and two seconds, and the docs said a branch "stores only the blocks
+it actually changes".
+
+### Why it's subtle
+
+The fix was measured, and the measurement was right: a fresh branch really is
+33 MiB, and a 1-row `UPDATE` on a small table leaves it at 33.5 MiB. What was
+never measured was a *read*. The mental model said reads fall through to the
+lower layer, which is how OverlayFS is usually described. But OverlayFS
+decides on copy-up from the **open flags**, at `open()` time, and PostgreSQL's
+storage manager opens every relation segment `O_RDWR`, whatever the query
+(`src/backend/storage/smgr/md.c`; checked in `REL_14_STABLE` and
+`REL_17_STABLE`). The pre-recovery
+sync pass was not a special case; it was the first of many read-write opens.
+
+The v1 review measured it on a 489 MB table frozen on the source (so hint-bit
+writes could not explain anything): one `SELECT count(*)` took the branch from
+33.1 MiB to 523.1 MiB, and the new file in the rw layer was the whole table.
+
+### The fix
+
+There is no code fix on the overlay backend: the open flags are how stock
+Postgres reads, and changing them means patching Postgres. The fix is
+positioning. The README, [concepts](concepts.md), [benchmarks](benchmarks.md)
+and [observability](observability.md) now say that a branch grows by every
+table file it opens, and point read-heavy workloads at the backends that copy
+blocks instead of files: [zfs](zfs.md) and Kubernetes
+[csi](kubernetes.md#recommended-csi-mode).
+
+### The lesson
+
+**Measure the claim you publish, on the path your users take.** The
+benchmark tested creation and a write, because that is what the design was
+about, and the headline claim was about reads. And **copy-on-write is defined
+by the layer that decides when to copy**: the question is never "does the
+application write?", it is "what does the filesystem see the application ask
+for?".
 
 ---
 
