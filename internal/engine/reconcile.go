@@ -157,6 +157,7 @@ func (e *Engine) claimVolume(name string) (release func()) {
 // directions.
 func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout time.Duration) (ReconcilePlan, error) {
 	var plan ReconcilePlan
+	before := registry.TimeString(now.Add(-stuckTimeout))
 
 	// (a) TTL-expired branches → reap.
 	expired, err := e.reg.ListExpiredBranches(now.UTC().Format(time.RFC3339))
@@ -170,7 +171,7 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 	}
 
 	// (b) branches wedged in creating/resetting past the stuck timeout → fail.
-	stuck, err := e.reg.ListStuckBranches(now.Add(-stuckTimeout).UTC().Format(time.RFC3339))
+	stuck, err := e.reg.ListStuckBranches(before)
 	if err != nil {
 		return plan, err
 	}
@@ -208,7 +209,9 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 	// (d) runtime → registry: managed containers with no live registry row →
 	// remove.
 	known := map[string]bool{}
+	liveByID := make(map[string]*registry.Branch, len(live))
 	for _, b := range live {
+		liveByID[b.ID] = b
 		if b.ContainerID != "" {
 			known[b.ContainerID] = true
 		}
@@ -221,7 +224,7 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 		if c.Labels[runtime.LabelInstance] != instanceID {
 			continue
 		}
-		if !known[c.ID] {
+		if !known[c.ID] && !ownedInFlight(c, liveByID) {
 			plan.add(ActionRemoveOrphanContainer, c.ID, "managed container with no live branch row")
 		}
 	}
@@ -310,6 +313,35 @@ func shortID(id string) string {
 	return id
 }
 
+// ownedInFlight reports whether a container that no row names still belongs
+// to a live branch that may yet record it: its pgoverlay.branch.id label names
+// a row in creating or resetting (a saga started it and has not written
+// container_id yet) or ready (reconcile is restarting it). Failed and
+// destroying rows own nothing unrecorded — the operations that failed them
+// removed the containers they started — so those containers are orphans.
+func ownedInFlight(c runtime.ContainerInfo, liveByID map[string]*registry.Branch) bool {
+	b := liveByID[c.Labels[runtime.LabelBranchID]]
+	if b == nil {
+		return false
+	}
+	switch b.State {
+	case registry.BranchCreating, registry.BranchResetting, registry.BranchReady:
+		return true
+	}
+	return false
+}
+
+// reconcilePass carries a pass's clock into apply, so the apply-time
+// re-checks use the same cut-offs as the plan.
+type reconcilePass struct {
+	now          time.Time
+	stuckTimeout time.Duration
+}
+
+func (p reconcilePass) before() string {
+	return registry.TimeString(p.now.Add(-p.stuckTimeout))
+}
+
 // ApplyReconcile computes a plan and executes it, returning the actions taken.
 // It re-checks every destructive action against the live registry immediately
 // before acting (safety: a branch may have been provisioned, a layer
@@ -322,11 +354,12 @@ func (e *Engine) ApplyReconcile(ctx context.Context, now time.Time, stuckTimeout
 	if err != nil {
 		return ReconcilePlan{}, err
 	}
+	pass := reconcilePass{now: now, stuckTimeout: stuckTimeout}
 	var taken ReconcilePlan
 	var errs []error
 	reaped := 0
 	for _, a := range plan.Actions {
-		applied, err := e.applyAction(ctx, a)
+		applied, err := e.applyAction(ctx, a, pass)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s %s: %w", a.Kind, a.Target, err))
 			continue
@@ -354,7 +387,7 @@ func (e *Engine) ApplyReconcile(ctx context.Context, now time.Time, stuckTimeout
 // applyAction executes one planned action after re-validating it against the
 // live registry. Returns applied=false (no error) when the re-check shows the
 // drift is gone (the resource became legitimate since planning).
-func (e *Engine) applyAction(ctx context.Context, a Action) (applied bool, err error) {
+func (e *Engine) applyAction(ctx context.Context, a Action, p reconcilePass) (applied bool, err error) {
 	switch a.Kind {
 	case ActionReap:
 		b, err := e.reg.GetBranchByName(a.Target)
@@ -364,7 +397,11 @@ func (e *Engine) applyAction(ctx context.Context, a Action) (applied bool, err e
 			}
 			return false, err
 		}
-		if b.ExpiresAt == "" || b.State == registry.BranchDestroyed {
+		// re-check: still expiring, and still at rest. A reset or freeze that
+		// started since planning owns the branch now; destroying it would force
+		// it out of that transient state while the saga is still provisioning
+		// on the same volume names. The next pass reaps it once the saga ends.
+		if b.ExpiresAt == "" || (b.State != registry.BranchReady && b.State != registry.BranchFailed) {
 			return false, nil
 		}
 		slog.Info("reconcile: reaping expired branch", "branch", b.Name, "expires_at", b.ExpiresAt)
@@ -381,13 +418,24 @@ func (e *Engine) applyAction(ctx context.Context, a Action) (applied bool, err e
 			}
 			return false, err
 		}
-		// re-check: only act if it is STILL stuck in a transient state.
-		if b.State != registry.BranchCreating && b.State != registry.BranchResetting {
-			return false, nil
+		// Fail the row FIRST, as one compare-and-swap on the plan's stuck
+		// criterion. When the owning saga finished, failed or made progress
+		// since planning the swap does not happen and nothing is touched;
+		// tearing down first would leave a saga that won the race with a
+		// ready row whose container and volume were just deleted.
+		failed, err := e.reg.FailStuckBranch(ctx, b.ID, p.before(), "reconcile: stuck "+string(b.State))
+		if err != nil || !failed {
+			return false, err
 		}
-		slog.Warn("reconcile: failing stuck branch", "branch", b.Name, "state", b.State, "rw_volume", b.RWVolume)
+		// re-read: the saga may have recorded a container after the read above
+		if cur, err := e.reg.GetBranchByName(a.Target); err == nil && cur.ID == b.ID {
+			b.ContainerID = cur.ContainerID
+		}
+		slog.Warn("reconcile: failed stuck branch", "branch", b.Name, "state", b.State, "rw_volume", b.RWVolume)
 		if b.ContainerID != "" {
-			e.drv.StopRemove(ctx, b.ContainerID)
+			if err := e.drv.StopRemove(ctx, b.ContainerID); err != nil {
+				slog.Warn("reconcile: remove stuck branch container failed", "branch", b.Name, "container", b.ContainerID, "err", err)
+			}
 		}
 		// Never delete a volume that holds another live branch's data. A
 		// branch-from-branch freeze (overlay) or PVC clone (csi/zfs) parks the
@@ -400,16 +448,13 @@ func (e *Engine) applyAction(ctx context.Context, a Action) (applied bool, err e
 		// the GC paths, so a child provisioned since planning is respected.)
 		referenced, err := e.reg.CountLiveBranchesReferencingRW(b.Name, b.RWVolume)
 		if err != nil {
-			return false, err
+			return true, err
 		}
 		if referenced > 0 {
 			slog.Warn("reconcile: stuck branch rw volume is live data for another branch; failing the row but keeping the volume",
 				"branch", b.Name, "rw_volume", b.RWVolume, "referencing_branches", referenced)
 		} else if err := e.removeBranchLayer(ctx, b); err != nil {
 			slog.Warn("reconcile: remove stuck branch layer failed", "branch", b.Name, "rw_volume", b.RWVolume, "err", err)
-		}
-		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, "reconcile: stuck "+string(b.State)); err != nil {
-			return false, err
 		}
 		return true, nil
 
@@ -469,15 +514,28 @@ func (e *Engine) applyAction(ctx context.Context, a Action) (applied bool, err e
 		return e.reg.UpdateBranchEndpoint(b.ID, b.ContainerID, b.ContainerID, info.Host, info.Port)
 
 	case ActionRemoveOrphanContainer:
-		// re-check: the container must still have no live registry row.
+		// re-check: the container must still have no live registry row, and
+		// must not belong to a branch whose saga may still record it.
 		live, err := e.reg.ListLiveBranches()
 		if err != nil {
 			return false, err
 		}
+		liveByID := make(map[string]*registry.Branch, len(live))
 		for _, b := range live {
 			if b.ContainerID == a.Target {
 				return false, nil // a branch claimed it since planning
 			}
+			liveByID[b.ID] = b
+		}
+		info, err := e.drv.Inspect(ctx, a.Target)
+		if errors.Is(err, runtime.ErrNotFound) {
+			return false, nil // already gone
+		}
+		if err != nil {
+			return false, err
+		}
+		if ownedInFlight(info, liveByID) {
+			return false, nil
 		}
 		slog.Info("reconcile: removing orphan container", "container", a.Target)
 		if err := e.drv.StopRemove(ctx, a.Target); err != nil {

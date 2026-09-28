@@ -840,8 +840,108 @@ func TestReconcileSkipsClaimedVolume(t *testing.T) {
 	// claimed between plan and apply: the apply-time re-check keeps it
 	release = e.claimVolume("pgoverlay-br-x-rw-g2")
 	defer release()
-	applied, err := e.applyAction(context.Background(), Action{Kind: ActionGCVolume, Target: "pgoverlay-br-x-rw-g2"})
+	applied, err := e.applyAction(context.Background(), Action{Kind: ActionGCVolume, Target: "pgoverlay-br-x-rw-g2"}, reconcilePass{now: time.Now(), stuckTimeout: 10 * time.Minute})
 	if err != nil || applied || !d.volumes["pgoverlay-br-x-rw-g2"] {
 		t.Fatalf("apply on a claimed volume: applied=%v err=%v present=%v", applied, err, d.volumes["pgoverlay-br-x-rw-g2"])
+	}
+}
+
+// --- apply-time races ---
+
+// fail_stuck loses to a saga that finished between plan and apply: the row
+// stays ready and its container and volume are untouched (the compare-and-swap
+// to failed runs before any teardown).
+func TestFailStuckLosesToSagaThatFinished(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := &registry.Branch{Name: "slow", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-slow-rw"}
+	if err := r.CreateBranch(b); err != nil {
+		t.Fatal(err)
+	}
+	d.volumes[b.RWVolume] = true
+	if err := r.SetBranchContainer(b.ID, "cid-slow"); err != nil {
+		t.Fatal(err)
+	}
+	d.containers["cid-slow"] = true
+
+	now := time.Now().Add(time.Hour)
+	plan, err := e.PlanReconcile(context.Background(), now, 10*time.Minute)
+	if err != nil || !hasAction(plan, ActionFailStuck, "slow") {
+		t.Fatalf("plan = %+v, %v", plan.Actions, err)
+	}
+	// the saga wins the race
+	if err := r.MarkBranchReady(b.ID, "cid-slow", "127.0.0.1", 54321); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := e.applyAction(context.Background(), Action{Kind: ActionFailStuck, Target: "slow"}, reconcilePass{now: now, stuckTimeout: 10 * time.Minute})
+	if err != nil || applied {
+		t.Fatalf("applied=%v err=%v, want a silent skip", applied, err)
+	}
+	if got := mustBranch(t, r, "slow"); got.State != registry.BranchReady {
+		t.Fatalf("state = %q, want ready", got.State)
+	}
+	if !d.containers["cid-slow"] || !d.volumes[b.RWVolume] {
+		t.Fatal("fail_stuck tore down a branch whose saga had finished")
+	}
+}
+
+// A reap planned for an expired branch is skipped when a reset started after
+// planning: destroying it would force it out of resetting under the reset.
+func TestReapSkipsBranchThatStartedResetting(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "ttl", "main", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Add(time.Hour)
+	plan, err := e.PlanReconcile(context.Background(), now, 10*time.Minute)
+	if err != nil || !hasAction(plan, ActionReap, "ttl") {
+		t.Fatalf("plan = %+v, %v", plan.Actions, err)
+	}
+	b := mustBranch(t, r, "ttl")
+	if err := r.TransitionBranch(b.ID, registry.BranchResetting, "reset requested"); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := e.applyAction(context.Background(), Action{Kind: ActionReap, Target: "ttl"}, reconcilePass{now: now, stuckTimeout: 10 * time.Minute})
+	if err != nil || applied {
+		t.Fatalf("applied=%v err=%v, want the reap skipped", applied, err)
+	}
+	if got := mustBranch(t, r, "ttl"); got.State != registry.BranchResetting {
+		t.Fatalf("state = %q, want still resetting", got.State)
+	}
+}
+
+// A container a saga has started but not yet recorded carries its branch id
+// label; while that branch is in flight it is not an orphan. Once the branch
+// is failed, the leftover is reclaimed.
+func TestReconcileKeepsUnrecordedContainerOfInFlightBranch(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := &registry.Branch{Name: "inflight", SourceID: mustSource(t, r).ID, RWVolume: "pgoverlay-br-inflight-rw"}
+	if err := r.CreateBranch(b); err != nil { // creating, no container recorded yet
+		t.Fatal(err)
+	}
+	d.containers["cid-new"] = true
+	d.containerLbls["cid-new"] = e.branchLabels(b)
+
+	plan, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasAction(plan, ActionRemoveOrphanContainer, "cid-new") {
+		t.Fatalf("in-flight saga's unrecorded container planned as orphan: %+v", plan.Actions)
+	}
+	if err := r.TransitionBranch(b.ID, registry.BranchFailed, "saga died"); err != nil {
+		t.Fatal(err)
+	}
+	taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasAction(taken, ActionRemoveOrphanContainer, "cid-new") || d.containers["cid-new"] {
+		t.Fatalf("leftover of a failed branch not reclaimed: %+v", taken.Actions)
 	}
 }

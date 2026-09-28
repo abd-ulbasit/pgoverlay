@@ -1106,7 +1106,17 @@ func (r *Registry) ListSources() ([]*Source, error) {
 	return out, rows.Err()
 }
 
-// Reconcile support: registry -> runtime drift repair.
+// Reconcile support: registry -> runtime drift repair and stuck-row recovery.
+//
+// The `before` arguments below are compared with updated_at, which is stored
+// as strftime('%Y-%m-%dT%H:%M:%fZ') (UTC, millisecond precision); format them
+// with TimeString so the lexicographic comparison is exact.
+
+// TimeString renders t in the registry's timestamp format (UTC, milliseconds),
+// for the `before` cut-offs taken by the stuck-row queries below.
+func TimeString(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
 
 // UpdateBranchEndpoint re-points a ready branch at a container and address
 // without a state change: reconcile's repair for a branch whose container
@@ -1155,6 +1165,44 @@ func (r *Registry) FailReadyBranch(ctx context.Context, id, containerID, reason 
 			"branch", id, string(step[0]), string(step[1]), reason, actor); err != nil {
 			return false, err
 		}
+	}
+	return true, tx.Commit()
+}
+
+// FailStuckBranch moves a branch still in creating or resetting whose last
+// update is older than before to failed, journaling reason — one
+// compare-and-swap on the same criterion ListStuckBranches uses. It returns
+// false and changes nothing when the row has moved on (its saga finished or
+// failed) or made progress since, so reconcile tears down only a branch it
+// actually failed.
+func (r *Registry) FailStuckBranch(ctx context.Context, id, before, reason string) (failed bool, err error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var from string
+	if err := tx.QueryRow(`SELECT state FROM branches WHERE id=? AND state IN (?,?) AND updated_at < ?`,
+		id, string(BranchCreating), string(BranchResetting), before).Scan(&from); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !legalBranchTransition(BranchState(from), BranchFailed) {
+		return false, fmt.Errorf("illegal branch transition %s -> %s", from, BranchFailed)
+	}
+	res, err := tx.Exec(`UPDATE branches SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=? AND updated_at < ?`, string(BranchFailed), id, from, before)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+		"branch", id, from, string(BranchFailed), reason, actorString(ctx)); err != nil {
+		return false, err
 	}
 	return true, tx.Commit()
 }
