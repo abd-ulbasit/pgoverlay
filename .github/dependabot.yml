@@ -17,9 +17,10 @@ updates:
     commit-message:
       prefix: "deps"
 
-  # Workflow actions. Left ungrouped-by-default but batched the same way; this
-  # is also what will surface action majors going out of support (the Node 20
-  # deprecation warnings currently on every run).
+  # Workflow actions, batched the same way. The workflows pin every action to
+  # a commit SHA with the version in a trailing comment; Dependabot bumps both.
+  # Tool versions passed as inputs (helm, goreleaser) and the kind/kubectl
+  # checksums in ci.yml are not visible to it and are bumped by hand.
   - package-ecosystem: github-actions
     directory: /
     schedule:
