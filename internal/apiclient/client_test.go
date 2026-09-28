@@ -302,6 +302,42 @@ func TestNewWithCACertUsesPool(t *testing.T) {
 	}
 }
 
+// The custom-TLS transports keep http.DefaultTransport's behaviour (proxy
+// from the environment, handshake timeout), and a loaded CA wins over
+// PGOVERLAY_TLS_SKIP_VERIFY instead of being silently replaced by it.
+func TestCustomTLSTransportKeepsDefaults(t *testing.T) {
+	check := func(label string, c *Client) *http.Transport {
+		t.Helper()
+		tr, ok := c.HTTP.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("%s: transport = %T, want *http.Transport", label, c.HTTP.Transport)
+		}
+		if tr.Proxy == nil {
+			t.Errorf("%s: transport ignores HTTPS_PROXY (no Proxy func)", label)
+		}
+		if tr.TLSHandshakeTimeout <= 0 {
+			t.Errorf("%s: transport has no TLS handshake timeout", label)
+		}
+		return tr
+	}
+
+	t.Setenv("PGOVERLAY_TLS_SKIP_VERIFY", "1")
+	tr := check("skip-verify", New("https://branchd.example:7070", "tok"))
+	if !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Error("skip-verify alone did not disable verification")
+	}
+
+	t.Setenv("PGOVERLAY_CA_CERT", writeTestCACert(t))
+	tr = check("ca+skip-verify", New("https://branchd.example:7070", "tok"))
+	if tr.TLSClientConfig.InsecureSkipVerify || tr.TLSClientConfig.RootCAs == nil {
+		t.Errorf("with a loaded CA, verification must stay on against it: skip=%v roots=%v",
+			tr.TLSClientConfig.InsecureSkipVerify, tr.TLSClientConfig.RootCAs != nil)
+	}
+	if tr == http.DefaultTransport.(*http.Transport) {
+		t.Error("New modified http.DefaultTransport instead of a clone")
+	}
+}
+
 // writeTestCACert writes a fresh self-signed CA PEM to a temp file and returns
 // its path.
 func writeTestCACert(t *testing.T) string {

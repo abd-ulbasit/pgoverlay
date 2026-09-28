@@ -34,6 +34,12 @@ type Client struct {
 //     adding the PEM to the root pool (the right way to use a private CA).
 //   - PGOVERLAY_TLS_SKIP_VERIFY=1 disables certificate verification entirely;
 //     supported as an escape hatch but warned about loudly (MITM-exposed).
+//     It is ignored (with a warning) when PGOVERLAY_CA_CERT loaded, since the
+//     CA is the safer way to reach the same server.
+//
+// Either way the transport is a clone of http.DefaultTransport, so proxy
+// settings from the environment (HTTPS_PROXY/NO_PROXY), the dial and TLS
+// handshake timeouts and keep-alives still apply.
 //
 // It also warns once, to stderr, when the token would be sent over plaintext
 // http to a non-loopback host (cleartext bearer token on the wire). It does
@@ -42,18 +48,22 @@ func New(baseURL, token string) *Client {
 	baseURL = strings.TrimRight(baseURL, "/")
 	httpClient := http.DefaultClient
 
+	caLoaded := false
 	if caPath := os.Getenv("PGOVERLAY_CA_CERT"); caPath != "" {
 		if tlsCfg, err := tlsConfigWithCA(caPath); err != nil {
 			warnf("pgoverlay: PGOVERLAY_CA_CERT %q could not be loaded (%v); falling back to system roots", caPath, err)
 		} else {
-			httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+			httpClient = &http.Client{Transport: transportWithTLS(tlsCfg)}
+			caLoaded = true
 		}
 	}
 	if os.Getenv("PGOVERLAY_TLS_SKIP_VERIFY") == "1" {
-		warnf("pgoverlay: PGOVERLAY_TLS_SKIP_VERIFY=1 disables TLS certificate verification — the connection is exposed to man-in-the-middle attacks")
-		httpClient = &http.Client{Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}}
+		if caLoaded {
+			warnf("pgoverlay: PGOVERLAY_TLS_SKIP_VERIFY=1 ignored: PGOVERLAY_CA_CERT is set and certificates are verified against it")
+		} else {
+			warnf("pgoverlay: PGOVERLAY_TLS_SKIP_VERIFY=1 disables TLS certificate verification — the connection is exposed to man-in-the-middle attacks")
+			httpClient = &http.Client{Transport: transportWithTLS(&tls.Config{InsecureSkipVerify: true})}
+		}
 	}
 	if token != "" && plaintextTokenLeak(baseURL) {
 		warnf("pgoverlay: sending bearer token in cleartext over http to a non-loopback host (%s) — use https or PGOVERLAY_CA_CERT", baseURL)
@@ -96,6 +106,15 @@ func isLoopbackHost(host string) bool {
 // tlsConfigWithCA loads a PEM bundle from path into a fresh root pool and
 // returns a tls.Config that trusts exactly those roots (so a self-signed
 // branchd verifies properly, without disabling verification).
+// transportWithTLS clones http.DefaultTransport (proxy from environment, dial
+// and TLS-handshake timeouts, keep-alives, HTTP/2) and swaps in cfg; a bare
+// &http.Transport{} would silently drop all of those.
+func transportWithTLS(cfg *tls.Config) *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = cfg
+	return tr
+}
+
 func tlsConfigWithCA(path string) (*tls.Config, error) {
 	pem, err := os.ReadFile(path)
 	if err != nil {
