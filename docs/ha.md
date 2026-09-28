@@ -62,6 +62,29 @@ errors with backoff for about a lease duration.
 The Postgres proxy Service (`<release>-proxy`) still selects every replica:
 the wire-protocol router only reads the registry, so any replica can serve it.
 
+### Why `/readyz` does not depend on leadership
+
+There were two other ways to keep mutations off followers: fail `/readyz` on
+followers, or have followers forward mutations to the leader. Neither was
+chosen.
+
+- **A not-ready follower breaks rollouts.** The chart uses the `Recreate`
+  strategy, so every replica has to be Ready: `helm install --wait`,
+  `kubectl rollout status` and the Deployment's `Available` condition would
+  all stay stuck while one pod is a follower.
+- **It would also take followers out of the proxy Service.** Readiness
+  applies to the whole pod. The API and the Postgres proxy share one
+  container, so a not-ready follower would stop serving Postgres traffic too.
+- **Forwarding adds a hop that can fail.** Each follower would have to find
+  the leader's address and proxy authenticated, long-running requests (diffs
+  and seeds take minutes) to it. That is another place for timeouts and
+  errors, and during a failover the leader it forwards to may already be gone.
+
+So `/readyz` answers one question: can this process serve (registry
+reachable, driver responding)? Leadership is published separately, as the
+`pgoverlay.leader` label, and only the API Service selects on it. `/healthz`
+stays the liveness probe.
+
 ## Enabling it
 
 Set either knob in the chart:
@@ -83,6 +106,11 @@ When `replicaCount > 1` **or** `leaderElection.enabled=true`, the chart:
   (`get`, `create`, `update`, `watch`, `list`) and **`patch`** on `pods` (for
   the leader label) in the release namespace, and
 - adds `pgoverlay.leader: "true"` to the API Service's selector.
+
+RBAC cannot narrow `patch` to the release's own pods (their names are
+generated), so the Role can patch any pod in the namespace. That is the same
+scope as the pod `create`/`delete` branchd already has, and branchd only ever
+changes the `pgoverlay.leader` label.
 
 The single-replica default renders none of the above.
 
