@@ -20,7 +20,7 @@ func TestCommandTree(t *testing.T) {
 	for _, path := range [][]string{
 		{"source", "add"}, {"source", "ls"}, {"source", "rm"}, {"source", "refresh"},
 		{"source", "set-mask"}, {"source", "get-mask"}, {"source", "clear-mask"}, {"version"},
-		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"},
+		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"}, {"branch", "recover"},
 		{"connect"}, {"diff"}, {"history"}, {"doctor"}, {"gc"},
 		{"token", "create"}, {"token", "ls"}, {"token", "revoke"},
 	} {
@@ -43,6 +43,9 @@ func TestCommandTree(t *testing.T) {
 	}
 	if f, _, _ := root.Find([]string{"source", "add"}); f.Flags().Lookup("dump-schema") == nil {
 		t.Fatal("source add --dump-schema flag missing")
+	}
+	if f, _, _ := root.Find([]string{"source", "add"}); f.Flags().Lookup("image") == nil {
+		t.Fatal("source add --image flag missing")
 	}
 	// help renders without side effects
 	var buf bytes.Buffer

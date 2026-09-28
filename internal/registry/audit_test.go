@@ -2,6 +2,8 @@ package registry
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -157,7 +159,7 @@ func TestBranchHistory(t *testing.T) {
 
 func TestBranchHistoryUnknownName(t *testing.T) {
 	r := openTest(t)
-	if _, err := r.BranchHistory("nope"); err != ErrNotFound {
+	if _, err := r.BranchHistory("nope"); !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), `"nope"`) {
 		t.Fatalf("err=%v want ErrNotFound", err)
 	}
 }

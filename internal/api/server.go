@@ -30,6 +30,10 @@ type Source struct {
 	State       string   `json:"state"`
 	Generation  int      `json:"generation"`
 	CreatedAt   string   `json:"created_at"`
+
+	// Image is the source's image override for its branches and seed
+	// helpers; omitted when the default postgres:<pg_version> is used.
+	Image string `json:"image,omitempty"`
 }
 
 type Branch struct {
@@ -74,6 +78,10 @@ type CreateSourceRequest struct {
 	// DumpSchemas scopes a via=dump seed to the given schemas (empty = the
 	// whole database). Only valid with via=dump.
 	DumpSchemas []string `json:"dump_schemas,omitempty"`
+	// Image overrides the container image for the seed helpers and every
+	// branch (default postgres:<pg_version>), e.g. postgis/postgis:17-3.5.
+	// It must match the source's extensions, locales and libc.
+	Image string `json:"image,omitempty"`
 }
 
 // CreateBranchRequest creates a branch off a source (Source) or off another
@@ -187,6 +195,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("GET /v1/branches/{name}/history", s.requireRole(viewer, s.branchHistory))
 	v1.HandleFunc("DELETE /v1/branches/{name}", s.mutate(operator, s.destroyBranch))
 	v1.HandleFunc("POST /v1/branches/{name}/reset", s.mutate(operator, s.resetBranch))
+	v1.HandleFunc("POST /v1/branches/{name}/recover", s.mutate(operator, s.recoverBranch))
 	v1.HandleFunc("GET /v1/reconcile/plan", s.requireRole(viewer, s.reconcilePlan))
 	v1.HandleFunc("POST /v1/reconcile", s.mutate(operator, s.reconcileApply))
 	v1.HandleFunc("POST /v1/tokens", s.mutate(admin, s.createToken))

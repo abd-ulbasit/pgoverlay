@@ -36,13 +36,17 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	msg := err.Error()
 	switch {
 	case errors.Is(err, engine.ErrInvalidName),
-		errors.Is(err, registry.ErrUnsupportedPGVersion):
+		errors.Is(err, registry.ErrUnsupportedPGVersion),
+		errors.Is(err, registry.ErrInvalidImage):
 		writeError(w, http.StatusBadRequest, msg)
 	case errors.Is(err, registry.ErrNotFound):
 		writeError(w, http.StatusNotFound, msg)
 	case errors.Is(err, engine.ErrQuotaExceeded):
 		writeError(w, http.StatusForbidden, msg)
-	case strings.Contains(msg, "UNIQUE constraint"),
+	case errors.Is(err, registry.ErrAlreadyExists),
+		errors.Is(err, registry.ErrIllegalTransition),
+		errors.Is(err, engine.ErrNotRecoverable),
+		strings.Contains(msg, "UNIQUE constraint"),
 		strings.Contains(msg, "live branch"),
 		strings.Contains(msg, "child branch"),
 		strings.Contains(msg, "illegal branch transition"),
@@ -72,7 +76,7 @@ func sourceJSON(s *registry.Source) Source {
 	return Source{
 		Name: s.Name, PGVersion: s.PGVersion, Host: s.ConnHost, Port: s.ConnPort,
 		User: s.ConnUser, Database: s.ConnDB, Network: s.Network,
-		Via: s.SeedVia, DumpSchemas: s.DumpSchemas,
+		Via: s.SeedVia, DumpSchemas: s.DumpSchemas, Image: s.Image,
 		State: string(s.State), Generation: s.Generation, CreatedAt: s.CreatedAt,
 	}
 }
@@ -132,7 +136,7 @@ func (s *Server) createSource(w http.ResponseWriter, r *http.Request) {
 	src := &registry.Source{
 		Name: req.Name, PGVersion: req.PGVersion, ConnHost: req.Host,
 		ConnPort: req.Port, ConnUser: req.User, ConnDB: req.Database, Network: req.Network,
-		SeedVia: req.Via, DumpSchemas: req.DumpSchemas,
+		SeedVia: req.Via, DumpSchemas: req.DumpSchemas, Image: req.Image,
 	}
 	if err := s.eng.AddSource(r.Context(), src, req.Password); err != nil {
 		writeEngineError(w, r, err)
@@ -359,6 +363,18 @@ func (s *Server) destroyBranch(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resetBranch(w http.ResponseWriter, r *http.Request) {
 	b, err := s.eng.ResetBranch(r.Context(), r.PathValue("name"))
+	if err != nil {
+		writeEngineError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.branchJSON(b))
+}
+
+// recoverBranch restarts a failed branch on its existing data (no re-clone):
+// the way back for a branch failed by crash recovery with its data intact.
+// 409 when the branch is not failed or its volumes are gone.
+func (s *Server) recoverBranch(w http.ResponseWriter, r *http.Request) {
+	b, err := s.eng.RecoverBranch(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeEngineError(w, r, err)
 		return

@@ -228,30 +228,48 @@ func TestCSICreateBranchFromUnwindRestoresParent(t *testing.T) {
 	}
 }
 
-// A parent restart failure marks the parent failed (its PVC is intact) and
-// fails the child without a second restart attempt.
+// A parent restart failure fails the child and gets one more restart attempt
+// (after the clone is undone): a transient failure leaves the parent ready;
+// only when both attempts fail is the parent marked failed, its PVC intact.
 func TestCSICreateBranchFromParentRestartFailure(t *testing.T) {
-	d := newFake()
-	e, r := csiEngine(t, d)
-	readySource(t, r)
-	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
-		t.Fatal(err)
-	}
-	d.failStartAt = map[int]bool{2: true} // the parent restart
+	for _, tc := range []struct {
+		name      string
+		failStart map[int]bool
+		want      registry.BranchState
+	}{
+		{"transient", map[int]bool{2: true}, registry.BranchReady},            // first parent restart
+		{"persistent", map[int]bool{2: true, 3: true}, registry.BranchFailed}, // both attempts
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newFake()
+			e, r := csiEngine(t, d)
+			readySource(t, r)
+			if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+				t.Fatal(err)
+			}
+			d.failStartAt = tc.failStart
 
-	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err == nil {
-		t.Fatal("want error")
-	}
-	p, _ := r.GetBranchByName("pr-1")
-	if p.State != registry.BranchFailed {
-		t.Fatalf("parent state = %q, want failed", p.State)
-	}
-	// the parent's PVC must never be removed — it holds the data
-	if !d.volumes["pgoverlay-br-pr-1-rw"] {
-		t.Fatal("parent PVC removed")
-	}
-	if d.volumes["pgoverlay-br-pr-2-rw"] {
-		t.Fatal("child clone PVC not removed by compensation")
+			if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err == nil {
+				t.Fatal("want error")
+			}
+			p, _ := r.GetBranchByName("pr-1")
+			if p.State != tc.want {
+				t.Fatalf("parent state = %q, want %q", p.State, tc.want)
+			}
+			if tc.want == registry.BranchReady && !d.containers[p.ContainerID] {
+				t.Fatal("parent container not restored")
+			}
+			// the parent's PVC must never be removed — it holds the data
+			if !d.volumes["pgoverlay-br-pr-1-rw"] {
+				t.Fatal("parent PVC removed")
+			}
+			if d.volumes["pgoverlay-br-pr-2-rw"] {
+				t.Fatal("child clone PVC not removed by compensation")
+			}
+			if c, _ := r.GetBranchByName("pr-2"); c.State != registry.BranchFailed {
+				t.Fatalf("child state = %q, want failed", c.State)
+			}
+		})
 	}
 }
 

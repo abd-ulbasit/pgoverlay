@@ -16,7 +16,7 @@ import (
 
 func newBranchCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "branch", Short: "Manage branches"}
-	cmd.AddCommand(newBranchCreateCmd(), newBranchLsCmd(), newBranchDestroyCmd(), newBranchResetCmd())
+	cmd.AddCommand(newBranchCreateCmd(), newBranchLsCmd(), newBranchDestroyCmd(), newBranchResetCmd(), newBranchRecoverCmd())
 	return cmd
 }
 
@@ -213,6 +213,37 @@ func newBranchResetCmd() *cobra.Command {
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "branch %q reset in %s (new port %d)\n",
 				args[0], time.Since(start).Round(time.Millisecond), port)
+			return nil
+		},
+	}
+}
+
+func newBranchRecoverCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "recover NAME",
+		Short: "Restart a failed branch on its existing data (keeps its writes; reset discards them)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			port := 0
+			if c := serverClient(cmd); c != nil {
+				b, err := c.RecoverBranch(cmd.Context(), args[0])
+				if err != nil {
+					return err
+				}
+				port = b.Port
+			} else {
+				e, reg, err := open()
+				if err != nil {
+					return err
+				}
+				defer reg.Close()
+				b, err := e.RecoverBranch(cmd.Context(), args[0])
+				if err != nil {
+					return err
+				}
+				port = b.Port
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "branch %q recovered (port %d)\n", args[0], port)
 			return nil
 		},
 	}

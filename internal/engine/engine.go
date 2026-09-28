@@ -38,7 +38,17 @@ type Engine struct {
 	// Both come from branchd --default-ttl / --max-ttl.
 	defaultTTL time.Duration
 	maxTTL     time.Duration
+	// heartbeatEvery is how often a running saga bumps its branch rows'
+	// updated_at (see keepAlive). 0 = defaultHeartbeat.
+	heartbeatEvery time.Duration
+	// maxLayerDepth caps an overlay branch's frozen layer chain (see
+	// checkLayerDepth). 0 = DefaultMaxLayerDepth.
+	maxLayerDepth int
 }
+
+// parentStepTimeout bounds a parent-affecting step (stopping a freeze or
+// clone parent) that runs detached from the request context.
+const parentStepTimeout = 2 * time.Minute
 
 // ErrQuotaExceeded is returned by the create paths when --max-branches is set
 // and the live-branch count is already at the cap. The API maps it to 403.
@@ -77,6 +87,41 @@ func WithMetrics(m *metrics.Metrics) Option {
 	return func(e *Engine) { e.metrics = m }
 }
 
+// defaultHeartbeat is keepAlive's default period. It must stay well under
+// reconcile's stuck timeout (branchd --stuck-timeout, default 10m).
+const defaultHeartbeat = 30 * time.Second
+
+// WithHeartbeatInterval sets how often a running saga bumps its branch rows'
+// updated_at so reconcile never mistakes a slow-but-alive saga for an
+// abandoned one. Keep it well under the stuck timeout (branchd uses a quarter
+// of --stuck-timeout, capped at defaultHeartbeat). d <= 0 keeps the default.
+func WithHeartbeatInterval(d time.Duration) Option {
+	return func(e *Engine) {
+		if d > 0 {
+			e.heartbeatEvery = d
+		}
+	}
+}
+
+// DefaultMaxLayerDepth is the default cap on an overlay branch's frozen layer
+// chain. Every branch-from-branch freezes the parent's writes into one more
+// layer, and the parent keeps its whole chain until it is destroyed (reset
+// keeps it too), so a parent forked N times stacks N layers. Each is an
+// overlay lowerdir: lookups walk them all, and the mount option string must
+// fit in one page (about 160 lowerdirs); the kernel stops at 500.
+const DefaultMaxLayerDepth = 100
+
+// WithMaxLayerDepth caps overlay layer chains at n frozen layers: branching
+// from a branch whose chain is already that deep is refused with
+// ErrQuotaExceeded. branchd --max-layer-depth. n <= 0 keeps the default.
+func WithMaxLayerDepth(n int) Option {
+	return func(e *Engine) {
+		if n > 0 {
+			e.maxLayerDepth = n
+		}
+	}
+}
+
 // New builds an engine on the default OverlayFS backend.
 func New(reg *registry.Registry, drv runtime.Driver, defaultImage string, opts ...Option) *Engine {
 	return NewWithPlanner(reg, drv, defaultImage, cow.Planner{Backend: cow.BackendOverlay}, opts...)
@@ -108,6 +153,41 @@ func (e *Engine) logCompensationErr(kind, msg string, err error, attrs ...any) {
 	slog.Warn(msg, append(attrs, "kind", kind, "err", err)...)
 }
 
+// keepAlive bumps the given branch rows' updated_at every heartbeat until the
+// returned stop function is called (stop waits for the ticker goroutine, so no
+// touch lands after it returns). Sagas hold it for as long as they keep rows
+// in creating/resetting: reconcile fails rows whose updated_at is older than
+// the stuck timeout, and without a heartbeat a long readiness wait or masking
+// script (arbitrary user SQL) got a live branch — and, in a freeze, its
+// parent — failed and torn down mid-provision.
+func (e *Engine) keepAlive(ids ...string) (stop func()) {
+	every := e.heartbeatEvery
+	if every <= 0 {
+		every = defaultHeartbeat
+	}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				for _, id := range ids {
+					e.logCompensationErr("transition", "heartbeat: touch branch stuck-timer", e.reg.TouchBranch(id), "branch_id", id)
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
+}
+
 // checkQuota enforces --max-branches before a create provisions anything:
 // when the cap is set and the live (non-destroyed) branch count is already at
 // or over it, the create is refused with ErrQuotaExceeded. 0 = unlimited.
@@ -121,6 +201,22 @@ func (e *Engine) checkQuota() error {
 	}
 	if n >= e.maxBranches {
 		return fmt.Errorf("%w: %d live branch(es) at the --max-branches=%d cap", ErrQuotaExceeded, n, e.maxBranches)
+	}
+	return nil
+}
+
+// checkLayerDepth refuses an overlay freeze that would push a chain past the
+// configured depth. There is no compaction yet, so the way out is a branch
+// with a shorter history: recreate the parent from its source (or from a
+// branch with a shorter chain) and replay its setup.
+func (e *Engine) checkLayerDepth(parent *registry.Branch, chain []registry.Layer) error {
+	limit := e.maxLayerDepth
+	if limit <= 0 {
+		limit = DefaultMaxLayerDepth
+	}
+	if len(chain) >= limit {
+		return fmt.Errorf("%w: branch %q already stacks %d frozen layers (--max-layer-depth=%d); branching from it again would exceed the limit. Branch from a branch with a shorter history, or recreate %q from its source",
+			ErrQuotaExceeded, parent.Name, len(chain), limit, parent.Name)
 	}
 	return nil
 }
@@ -144,11 +240,17 @@ func (e *Engine) expiresAtFor(ttl time.Duration) string {
 	return time.Now().Add(ttl).UTC().Format(time.RFC3339)
 }
 
-func (e *Engine) image(pgVersion string) string {
-	if pgVersion == "" {
+// image is the container image for a source's seed helpers and branches: the
+// source's own image when it set one (extensions, locales, a matching libc),
+// else postgres:<pg_version>, else the engine default.
+func (e *Engine) image(src *registry.Source) string {
+	switch {
+	case src.Image != "":
+		return src.Image
+	case src.PGVersion == "":
 		return e.defaultImage
 	}
-	return "postgres:" + pgVersion
+	return "postgres:" + src.PGVersion
 }
 
 // seedSource runs the source's seeding method (pg_basebackup or pg_dump,
@@ -157,7 +259,7 @@ func (e *Engine) image(pgVersion string) string {
 func (e *Engine) seedSource(ctx context.Context, s *registry.Source, layer, password string) error {
 	seedVol, seedKind := e.seedTarget(layer)
 	spec := pgctl.SeedSpec{
-		Image: e.image(s.PGVersion), Volume: seedVol, MountKind: seedKind, Network: s.Network,
+		Image: e.image(s), Volume: seedVol, MountKind: seedKind, Network: s.Network,
 		Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser, Password: password,
 	}
 	if s.SeedVia == registry.SeedViaDump {
@@ -186,7 +288,7 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 		e.logCompensationErr("undo", "add source: remove source layer after seed failed",
 			e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume), "source", s.Name, "volume", s.Volume)
 		e.logCompensationErr("transition", "add source: mark source failed after seed failed",
-			e.reg.SetSourceState(s.ID, registry.SourceFailed, err.Error()), "source", s.Name)
+			e.reg.SetSourceState(s.ID, registry.SourceFailed, failureReason(err)), "source", s.Name)
 		return fmt.Errorf("seed source %q: %w", s.Name, err)
 	}
 	return e.reg.SetSourceState(s.ID, registry.SourceReady, "seed complete")
@@ -199,17 +301,30 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 func (e *Engine) RefreshSource(ctx context.Context, name, password string) error {
 	src, err := e.reg.GetSourceByName(name)
 	if err != nil {
-		return fmt.Errorf("source %q: %w", name, err)
+		return err
 	}
 	if src.State != registry.SourceReady {
 		return fmt.Errorf("source %q is %s, not ready", name, src.State)
 	}
 	newVol := e.planner.SourceLayerName(name, src.Generation+1)
+	// claim the next generation before creating it: nothing names it until
+	// BumpSourceGeneration, and reconcile's volume GC must not take it while
+	// it is being seeded
+	if err := e.reg.SetSourcePendingVolume(src.ID, newVol); err != nil {
+		return fmt.Errorf("refresh source %q: claim %s: %w", name, newVol, err)
+	}
+	release := func() {
+		e.logCompensationErr("undo", "refresh source: release new generation claim",
+			e.reg.SetSourcePendingVolume(src.ID, ""), "source", name, "volume", newVol)
+	}
 	if err := e.createSourceLayer(ctx, newVol, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": name})); err != nil {
+		release()
 		return err
 	}
 	if err := e.seedSource(ctx, src, newVol, password); err != nil {
-		e.removeSourceLayer(context.WithoutCancel(ctx), newVol)
+		e.logCompensationErr("undo", "refresh source: remove new generation layer after seed failed",
+			e.removeSourceLayer(context.WithoutCancel(ctx), newVol), "source", name, "volume", newVol)
+		release()
 		return fmt.Errorf("refresh source %q: %w", name, err)
 	}
 	oldVol := src.Volume
@@ -226,7 +341,7 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 	src, err := e.reg.GetSourceByName(name)
 	if err != nil {
-		return fmt.Errorf("source %q: %w", name, err)
+		return err
 	}
 	n, err := e.reg.CountLiveBranchesBySource(src.ID)
 	if err != nil {
@@ -258,7 +373,42 @@ func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 		return fmt.Errorf("remove source layer: %w", err)
 	}
 	// DeleteSource cascades the layer rows
-	return e.reg.DeleteSource(src.ID)
+	if err := e.reg.DeleteSource(src.ID); err != nil {
+		return err
+	}
+	// failed attempts of the same name (registries from before CreateSource
+	// replaced them could hold several) go too, or `source rm` would report
+	// success while `source ls` still lists the name. They own no volumes.
+	if _, err := e.reg.DeleteFailedSources(name); err != nil {
+		return fmt.Errorf("remove failed attempts of source %q: %w", name, err)
+	}
+	return nil
+}
+
+// maxFailureReason caps a failure reason stored in the registry.
+const maxFailureReason = 1024
+
+// failureReason renders err for the transitions journal, which lives at rest
+// in the registry file. Seed and masking failures embed the helper's or
+// psql's output, and Postgres prints offending row values in DETAIL and
+// CONTEXT lines (`DETAIL:  Key (email)=(…) already exists`, `CONTEXT:  COPY
+// customers, line 4213, column email: "…"`) — production data, and for a
+// failed masking script data that was never masked. Those lines are dropped
+// and the rest is capped; the caller still gets the full error.
+func failureReason(err error) string {
+	lines := strings.Split(err.Error(), "\n")
+	kept := lines[:0]
+	for _, l := range lines {
+		if strings.Contains(l, "DETAIL:") || strings.Contains(l, "CONTEXT:") {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	reason := strings.Join(kept, "\n")
+	if len(reason) > maxFailureReason {
+		reason = strings.ToValidUTF8(reason[:maxFailureReason], "") + " …(truncated)"
+	}
+	return reason
 }
 
 // BranchUsage measures a branch's copy-on-write layer in bytes (the branch's

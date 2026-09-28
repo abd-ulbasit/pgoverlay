@@ -217,6 +217,7 @@ func run() error {
 	maxBranches := flag.Int("max-branches", envInt("PGOVERLAY_MAX_BRANCHES", 0), "cap on live (non-destroyed) branches; creates past the cap return 403 (0 = unlimited; env PGOVERLAY_MAX_BRANCHES)")
 	defaultTTL := flag.Duration("default-ttl", envDuration("PGOVERLAY_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGOVERLAY_DEFAULT_TTL)")
 	maxTTL := flag.Duration("max-ttl", envDuration("PGOVERLAY_MAX_TTL", 0), "upper bound on any requested branch TTL; longer TTLs are capped to this, e.g. 168h (0 = no cap; env PGOVERLAY_MAX_TTL)")
+	maxLayerDepth := flag.Int("max-layer-depth", envInt("PGOVERLAY_MAX_LAYER_DEPTH", engine.DefaultMaxLayerDepth), "overlay backend: cap on a branch's frozen layer chain; branching from a branch at the cap returns 403 (env PGOVERLAY_MAX_LAYER_DEPTH)")
 	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
@@ -332,7 +333,9 @@ func run() error {
 	if diskRoot := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home); diskRoot != "" {
 		m.SetDiskRoot(diskRoot)
 	}
-	engOpts := []engine.Option{engine.WithMetrics(m)}
+	// running sagas bump their rows well inside the stuck timeout, so
+	// reconcile never fails a slow-but-alive create/reset/freeze
+	engOpts := []engine.Option{engine.WithMetrics(m), engine.WithHeartbeatInterval(min(*stuckTimeout/4, 30*time.Second))}
 	if *rotateCreds {
 		engOpts = append(engOpts, engine.WithCredentialRotation())
 	}
@@ -348,6 +351,10 @@ func run() error {
 	if *defaultTTL > 0 || *maxTTL > 0 {
 		engOpts = append(engOpts, engine.WithTTLPolicy(*defaultTTL, *maxTTL))
 	}
+	if *maxLayerDepth < 1 {
+		return errors.New("--max-layer-depth must be >= 1")
+	}
+	engOpts = append(engOpts, engine.WithMaxLayerDepth(*maxLayerDepth))
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
 		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")}, engOpts...)
 

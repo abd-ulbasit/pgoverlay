@@ -94,6 +94,8 @@ func TestPathsForNamedResources(t *testing.T) {
 			"DELETE", "/v1/branches/pr%2F1", http.StatusNoContent},
 		{func(c *Client) error { _, err := c.ResetBranch(context.Background(), "pr-1"); return err },
 			"POST", "/v1/branches/pr-1/reset", http.StatusOK},
+		{func(c *Client) error { _, err := c.RecoverBranch(context.Background(), "pr-1"); return err },
+			"POST", "/v1/branches/pr-1/recover", http.StatusOK},
 		{func(c *Client) error { _, err := c.GetBranch(context.Background(), "pr-1"); return err },
 			"GET", "/v1/branches/pr-1", http.StatusOK},
 		{func(c *Client) error { return c.RemoveSource(context.Background(), "main") },

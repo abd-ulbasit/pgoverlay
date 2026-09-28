@@ -166,8 +166,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 11 {
-		t.Fatalf("user_version=%d want 11", v)
+	if v != currentSchemaVersion() {
+		t.Fatalf("user_version=%d want %d", v, currentSchemaVersion())
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
@@ -449,7 +449,7 @@ func TestDeleteSource(t *testing.T) {
 	if err := r.DeleteSource(s.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.GetSourceByName("main"); err != ErrNotFound {
+	if _, err := r.GetSourceByName("main"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 	// mask scripts go with the source

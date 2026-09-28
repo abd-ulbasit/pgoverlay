@@ -468,6 +468,16 @@ func (c *Client) ResetBranch(ctx context.Context, name string) (*api.Branch, err
 	return &b, nil
 }
 
+// RecoverBranch restarts a failed branch on its existing data. Backs
+// `pgb branch recover` in server mode.
+func (c *Client) RecoverBranch(ctx context.Context, name string) (*api.Branch, error) {
+	var b api.Branch
+	if err := c.do(ctx, "POST", "/v1/branches/"+url.PathEscape(name)+"/recover", nil, &b); err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
 // ReconcilePlan fetches the read-only convergence plan (drift report) from the
 // server. Backs `pgb doctor` in server mode.
 func (c *Client) ReconcilePlan(ctx context.Context) (*engine.ReconcilePlan, error) {
