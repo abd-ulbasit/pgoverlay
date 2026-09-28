@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -109,6 +110,9 @@ type diffOptions struct {
 	// sample is the per-table cap on branch-only sample rows; 0 disables
 	// data sampling entirely.
 	sample int
+	// quiesceParent permits briefly stopping a csi child's parent around the
+	// base clone (see WithParentQuiesce).
+	quiesceParent bool
 }
 
 // DiffOption tunes DiffBranch.
@@ -136,6 +140,23 @@ func WithDataSample(n int) DiffOption {
 	}
 }
 
+// WithParentQuiesce lets DiffBranch briefly stop a csi branch's parent. On
+// the csi backend a branch created from another branch has its parent's live
+// PVC as its base, and cloning an in-use PVC is not crash-safe, so the diff's
+// base clone stops the parent around it (CHECKPOINT, stop, clone, restart),
+// exactly like a reset of the child does, dropping the parent's connections.
+// Without this option DiffBranch refuses such a diff with ErrParentQuiesce.
+// The API passes it for the operator role and above only, the role a reset
+// needs. It changes nothing on other backends or for branches of a source.
+func WithParentQuiesce() DiffOption {
+	return func(o *diffOptions) { o.quiesceParent = true }
+}
+
+// ErrParentQuiesce is returned by DiffBranch for a csi branch created from
+// another branch when the caller did not pass WithParentQuiesce: the diff
+// would have to stop that parent briefly. The API maps it to 403.
+var ErrParentQuiesce = errors.New("diff would stop the parent branch")
+
 // DiffBranch reports what changed in a ready branch relative to its base —
 // the state a reset would return it to. It provisions an internal throwaway
 // branch ("diff-<6 hex>") from the target's OWN base — the recorded source
@@ -148,9 +169,10 @@ func WithDataSample(n int) DiffOption {
 // seconds of wall time: a full branch provision plus two dumps.
 //
 // zfs and csi children base on their parent's live volume, so their diff
-// compares against the parent's CURRENT state (what a reset would re-clone),
-// and a csi child's diff briefly stops the parent around the clone exactly
-// like a reset does. A csi child whose parent is gone cannot be diffed.
+// compares against the parent's CURRENT state (what a reset would re-clone).
+// A csi child's diff briefly stops the parent around the clone exactly like a
+// reset does, so it needs WithParentQuiesce (ErrParentQuiesce otherwise). A
+// csi child whose parent is gone cannot be diffed (ErrBaseGone).
 func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption) (_ *DiffResult, err error) {
 	defer e.observeOp("diff", &err)()
 	var o diffOptions
@@ -166,6 +188,12 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 	}
 	if err := e.checkCSIChildBase(b); err != nil {
 		return nil, fmt.Errorf("diff %q: %w", name, err)
+	}
+	if e.csi() && b.ParentBranchName != "" && !o.quiesceParent {
+		// checkCSIChildBase confirmed the base is the parent's own PVC, so
+		// the clone below would stop the parent: refuse before touching it.
+		return nil, fmt.Errorf("diff %q: its base is the live volume of parent branch %q, which is stopped briefly around the clone (as for a reset of %q): %w",
+			name, b.ParentBranchName, name, ErrParentQuiesce)
 	}
 	src, err := e.reg.GetSourceByID(b.SourceID)
 	if err != nil {

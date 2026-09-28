@@ -806,7 +806,7 @@ func TestCSIDiffChildQuiescesParent(t *testing.T) {
 	}
 	mark := len(d.log)
 
-	if _, err := e.DiffBranch(context.Background(), "pr-2"); err != nil {
+	if _, err := e.DiffBranch(context.Background(), "pr-2", WithParentQuiesce()); err != nil {
 		t.Fatal(err)
 	}
 	idx := func(pred func(string) bool) int {
@@ -835,6 +835,51 @@ func TestCSIDiffChildQuiescesParent(t *testing.T) {
 	}
 	if names := liveDiffBranches(t, r); len(names) != 0 {
 		t.Errorf("throwaway rows left: %v", names)
+	}
+}
+
+// Stopping the parent is a reset-like effect on another branch, so a csi
+// child's diff needs WithParentQuiesce (the API grants it to operators only).
+// Without it the diff is refused up-front: nothing is created, the parent is
+// neither checkpointed nor stopped, and no clone is made. A csi branch of the
+// source clones the source PVC and needs no permission.
+func TestCSIDiffChildRefusesParentQuiesceUnlessAllowed(t *testing.T) {
+	d := newFake()
+	d.execOutFn = diffFake().exec
+	e, r := csiEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	before, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark, clones := len(d.log), len(d.clones)
+
+	_, err = e.DiffBranch(context.Background(), "pr-2", WithDataSample(5))
+	if !errors.Is(err, ErrParentQuiesce) || !strings.Contains(err.Error(), `parent branch "pr-1"`) {
+		t.Fatalf("err = %v, want ErrParentQuiesce naming the parent", err)
+	}
+	if len(d.clones) != clones || len(d.log) != mark {
+		t.Fatalf("a refused diff touched the runtime: clones=%v log=%v", d.clones[clones:], d.log[mark:])
+	}
+	after, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != registry.BranchReady || after.ContainerID != before.ContainerID || !d.containers[after.ContainerID] {
+		t.Fatalf("parent after a refused diff: %+v (was %+v)", after, before)
+	}
+	if names := liveDiffBranches(t, r); len(names) != 0 {
+		t.Errorf("throwaway rows left: %v", names)
+	}
+
+	if _, err := e.DiffBranch(context.Background(), "pr-1"); err != nil {
+		t.Fatalf("diff of a csi branch of the source: %v", err)
 	}
 }
 

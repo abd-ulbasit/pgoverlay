@@ -321,7 +321,19 @@ func (s *Server) branchDiff(w http.ResponseWriter, r *http.Request) {
 			opts = append(opts, engine.WithDataSample(n))
 		}
 	}
+	// On the csi backend, diffing a branch created from another branch stops
+	// that parent briefly around the base clone (engine.WithParentQuiesce):
+	// the same disruption as a reset, so it needs the role a reset needs. For
+	// a lower role the engine refuses before touching anything (403).
+	role, _ := r.Context().Value(roleKey).(string)
+	if roleRank[role] >= roleRank[registry.RoleOperator] {
+		opts = append(opts, engine.WithParentQuiesce())
+	}
 	res, err := s.eng.DiffBranch(r.Context(), r.PathValue("name"), opts...)
+	if errors.Is(err, engine.ErrParentQuiesce) {
+		writeError(w, http.StatusForbidden, "role "+role+" lacks the required "+registry.RoleOperator+" privilege: "+err.Error())
+		return
+	}
 	if err != nil {
 		writeEngineError(w, r, err)
 		return
