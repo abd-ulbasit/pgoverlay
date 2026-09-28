@@ -520,6 +520,22 @@ func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duratio
 	return lastErr
 }
 
+// destroyTimeout bounds a destroy's teardown. The teardown runs detached from
+// the caller's context — a client that disconnects, a ghook deadline or a
+// shutdown must not abandon it halfway — so it needs a bound of its own.
+const destroyTimeout = 5 * time.Minute
+
+// DestroyBranch tears a branch down: its container, its writable layer, the
+// destroyed tombstone, then GC of any frozen layers and old source
+// generations it was the last reference to.
+//
+// It is idempotent and retryable. A branch wedged in creating/resetting is
+// forced to failed first (fast-pathing reconcile's stuck handling); ready and
+// failed branches move to destroying; a row already in destroying — an
+// earlier destroy that failed or was interrupted — re-runs the teardown, every
+// step of which tolerates already-gone resources. A teardown failure leaves
+// the row in destroying with the cause journaled (pgb history) for the next
+// attempt: another destroy call, or reconcile (Registry.ListDestroyingBranches).
 func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	defer e.observeOp("destroy", &err)()
 	b, err := e.reg.GetBranchByName(name)
@@ -540,56 +556,87 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	if err != nil {
 		return err
 	}
-	// Force a branch wedged in a transient state (creating/resetting) to failed
-	// first, so it can be destroyed now instead of waiting out the 10m
-	// stuck-timeout reconcile. creating->failed and resetting->failed are both
-	// legal (the same edges reconcile's fail-stuck path uses), so this just
-	// fast-paths what reconcile would eventually do.
-	forcedFromTransient := b.State == registry.BranchCreating || b.State == registry.BranchResetting
-	if forcedFromTransient {
+	// guarded: keep the rw volume if another live branch still needs it (see
+	// teardownBranch). A retry cannot tell whether the first attempt was a
+	// forced one, so it errs on the side of keeping.
+	guarded := b.State != registry.BranchReady && b.State != registry.BranchFailed
+	switch b.State {
+	case registry.BranchCreating, registry.BranchResetting:
+		// Force a branch wedged in a transient state (creating/resetting) to
+		// failed first, so it can be destroyed now instead of waiting out the
+		// stuck-timeout reconcile. creating->failed and resetting->failed are
+		// the same edges reconcile's fail-stuck path uses.
 		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, "destroy requested: forcing stuck "+string(b.State)); err != nil {
 			return err
 		}
+		fallthrough
+	case registry.BranchReady, registry.BranchFailed:
+		if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
+			return err
+		}
+	case registry.BranchDestroying:
+		e.logCompensationErr("transition", "destroy: journal retry", e.reg.NoteBranchCtx(ctx, b.ID, "destroy retried"),
+			"branch", b.Name, "branch_id", b.ID)
 	}
-	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroying, "destroy requested"); err != nil {
+
+	td, cancel := context.WithTimeout(context.WithoutCancel(ctx), destroyTimeout)
+	defer cancel()
+	if err := e.teardownBranch(td, b, guarded); err != nil {
+		e.logCompensationErr("transition", "destroy: journal failed teardown",
+			e.reg.NoteBranchCtx(td, b.ID, "destroy failed, destroy again to retry: "+err.Error()),
+			"branch", b.Name, "branch_id", b.ID)
 		return err
 	}
+	if err := e.reg.TransitionBranchCtx(td, b.ID, registry.BranchDestroyed, ""); err != nil {
+		// a concurrent destroy of the same row (a retry racing reconcile)
+		// finished first: the branch is gone, which is what was asked
+		if errors.Is(err, registry.ErrIllegalTransition) {
+			if cur, gerr := e.reg.GetBranchByID(b.ID); gerr == nil && cur.State == registry.BranchDestroyed {
+				return nil
+			}
+		}
+		return err
+	}
+	// the destroyed branch may have been the last reference to its frozen
+	// layer chain and/or an old-generation source volume
+	e.gcLayers(td, chain)
+	e.gcSourceVolume(td, b.SourceID, b.SourceVolume)
+	return nil
+}
+
+// teardownBranch removes a destroying branch's container and writable layer.
+// Every step is idempotent (StopRemove and RemoveVolume treat gone as done),
+// so a retried destroy simply runs it again.
+//
+// When guarded, the writable layer is kept if it is still another live
+// branch's data. That is the case for a branch forced out of a transient
+// state: a freeze parent keeps its live data in its rw volume until
+// CommitFreeze while an in-flight child mounts it, and a csi/zfs clone parent
+// is quiesced while its child clones the volume — removing it would lose the
+// parent's data (the same guard as reconcile's fail-stuck path). A normally
+// destroyed ready/failed branch is not guarded: its rw volume is its own
+// (csi clones are independent PVCs). A kept volume is freed later by
+// gcSourceVolume (clone children) or reconcile's volume GC.
+func (e *Engine) teardownBranch(ctx context.Context, b *registry.Branch, guarded bool) error {
 	if b.ContainerID != "" {
 		if err := e.drv.StopRemove(ctx, b.ContainerID); err != nil {
 			return fmt.Errorf("remove container: %w", err)
 		}
 	}
-	// When we forced a branch out of a transient state, its rw volume may still
-	// be another live branch's data. A freeze parent forced out of 'resetting'
-	// keeps its live data in its rw volume until CommitFreeze; an in-flight child
-	// references that volume (as its source_volume, or by naming the parent).
-	// Removing it would be the A1 data-loss bug, so guard exactly like
-	// reconcile's ActionFailStuck. A normally-destroyed ready/failed branch is
-	// NOT guarded: a post-CommitFreeze parent has already swapped to a fresh rw
-	// volume (its old one is now a layer GC'd separately), and the
-	// parent_branch_name link would otherwise false-positive against that fresh
-	// volume.
-	if forcedFromTransient {
+	if guarded {
 		referenced, err := e.reg.CountLiveBranchesReferencingRW(b.Name, b.RWVolume)
 		if err != nil {
 			return err
 		}
 		if referenced > 0 {
-			slog.Warn("destroy: forced-stuck branch rw volume is live data for another branch; keeping the volume",
+			slog.Warn("destroy: branch rw volume is live data for another branch; keeping the volume",
 				"branch", b.Name, "rw_volume", b.RWVolume, "referencing_branches", referenced)
-		} else if err := e.removeBranchLayer(ctx, b); err != nil {
-			return fmt.Errorf("remove branch layer: %w", err)
+			return nil
 		}
-	} else if err := e.removeBranchLayer(ctx, b); err != nil {
+	}
+	if err := e.removeBranchLayer(ctx, b); err != nil {
 		return fmt.Errorf("remove branch layer: %w", err)
 	}
-	if err := e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchDestroyed, ""); err != nil {
-		return err
-	}
-	// the destroyed branch may have been the last reference to its frozen
-	// layer chain and/or an old-generation source volume
-	e.gcLayers(ctx, chain)
-	e.gcSourceVolume(ctx, b.SourceID, b.SourceVolume)
 	return nil
 }
 
