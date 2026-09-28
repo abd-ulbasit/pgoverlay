@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -15,20 +16,38 @@ import (
 func newSourceCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "source", Short: "Manage branch sources (seeded data dirs)"}
 	cmd.AddCommand(newSourceAddCmd(), newSourceLsCmd(), newSourceRmCmd(), newSourceRefreshCmd(),
-		newSourceSetMaskCmd(), newSourceGetMaskCmd())
+		newSourceSetMaskCmd(), newSourceGetMaskCmd(), newSourceClearMaskCmd())
 	return cmd
 }
 
-func passwordFromEnv(env string) (string, error) {
-	password := os.Getenv(env)
-	if password == "" {
-		return "", fmt.Errorf("password env %q is empty", env)
+// sourcePassword returns the password for the seed connection: none with
+// --no-password (trust, peer or certificate authentication), else the value
+// of the environment variable named by --password-env, which must be set.
+func sourcePassword(env string, noPassword bool) (string, error) {
+	if noPassword {
+		return "", nil
 	}
-	return password, nil
+	if strings.TrimSpace(env) == "" {
+		return "", fmt.Errorf("--password-env must name an environment variable (or pass --no-password)")
+	}
+	if password := os.Getenv(env); password != "" {
+		return password, nil
+	}
+	return "", fmt.Errorf("the source password is read from $%s, which is empty or unset: set it, "+
+		"point --password-env at the variable that holds the password, "+
+		"or pass --no-password for a source that needs none (trust, peer or certificate authentication)", env)
+}
+
+// passwordFlags registers --password-env and --no-password on cmd.
+func passwordFlags(cmd *cobra.Command, env *string, none *bool) {
+	cmd.Flags().StringVar(env, "password-env", "PGPASSWORD", "env var holding the source password")
+	cmd.Flags().BoolVar(none, "no-password", false, "connect to the source without a password (trust, peer or certificate authentication)")
+	cmd.MarkFlagsMutuallyExclusive("password-env", "no-password")
 }
 
 func newSourceAddCmd() *cobra.Command {
 	var host, user, db, network, pgVersion, passwordEnv, via string
+	var noPassword bool
 	var dumpSchemas []string
 	var port int
 	cmd := &cobra.Command{
@@ -71,7 +90,7 @@ Seeding methods (--via):
 			if len(dumpSchemas) > 0 && via != registry.SeedViaDump {
 				return fmt.Errorf("--dump-schema is only valid with --via dump")
 			}
-			password, err := passwordFromEnv(passwordEnv)
+			password, err := sourcePassword(passwordEnv, noPassword)
 			if err != nil {
 				return err
 			}
@@ -108,7 +127,7 @@ Seeding methods (--via):
 	cmd.Flags().StringVar(&db, "database", "postgres", "database name recorded for connection strings (and dumped with --via dump)")
 	cmd.Flags().StringVar(&network, "network", "", "docker network from which the source is reachable")
 	cmd.Flags().StringVar(&pgVersion, "pg-version", "17", "source Postgres major version, 14-18 (branch image must match; with --via dump it must be >= the remote major)")
-	cmd.Flags().StringVar(&passwordEnv, "password-env", "PGPASSWORD", "env var holding the source password")
+	passwordFlags(cmd, &passwordEnv, &noPassword)
 	cmd.Flags().StringVar(&via, "via", registry.SeedViaBasebackup, `seeding method: "basebackup" or "dump" (managed Postgres: Supabase/Neon/RDS)`)
 	cmd.Flags().StringArrayVar(&dumpSchemas, "dump-schema", nil, "schema to dump (repeatable; --via dump only; default: the whole database)")
 	cmd.MarkFlagRequired("host")
@@ -178,7 +197,9 @@ func newSourceSetMaskCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "set-mask NAME FILE...",
 		Short: "Replace a source's masking SQL (applied, in argument order, inside every new/reset branch)",
-		Args:  nonEmptyArgs(cobra.MinimumNArgs(2)),
+		Long: "Replace a source's masking SQL with the given files, applied in argument order inside every " +
+			"new or reset branch. Use `pgb source clear-mask NAME` to remove masking.",
+		Args: nonEmptyArgs(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			scripts := make([]api.MaskScript, 0, len(args)-1)
@@ -189,32 +210,55 @@ func newSourceSetMaskCmd() *cobra.Command {
 				}
 				scripts = append(scripts, api.MaskScript{Name: filepath.Base(file), SQL: string(sql)})
 			}
-			if c := serverClient(cmd); c != nil {
-				if _, err := c.SetMaskScripts(cmd.Context(), name, scripts); err != nil {
-					return err
-				}
-			} else {
-				reg, err := openRegistry()
-				if err != nil {
-					return err
-				}
-				defer reg.Close()
-				src, err := reg.GetSourceByName(name)
-				if err != nil {
-					return fmt.Errorf("source %q: %w", name, err)
-				}
-				rs := make([]registry.MaskScript, len(scripts))
-				for i, sc := range scripts {
-					rs[i] = registry.MaskScript{Name: sc.Name, SQL: sc.SQL}
-				}
-				if err := reg.SetMaskScripts(src.ID, rs); err != nil {
-					return err
-				}
+			if err := storeMaskScripts(cmd, name, scripts); err != nil {
+				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "source %q masking set (%d script(s))\n", name, len(scripts))
 			return nil
 		},
 	}
+}
+
+// newSourceClearMaskCmd removes a source's masking. It is a command of its
+// own, not `set-mask NAME` with no files, so a forgotten file argument can
+// never silently unmask new branches.
+func newSourceClearMaskCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "clear-mask NAME",
+		Short: "Remove a source's masking SQL (new and reset branches are no longer masked)",
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			if err := storeMaskScripts(cmd, name, []api.MaskScript{}); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "source %q masking cleared; new and reset branches are no longer masked\n", name)
+			return nil
+		},
+	}
+}
+
+// storeMaskScripts replaces the source's masking scripts (empty clears them)
+// through the API in server mode, else directly in the registry.
+func storeMaskScripts(cmd *cobra.Command, name string, scripts []api.MaskScript) error {
+	if c := serverClient(cmd); c != nil {
+		_, err := c.SetMaskScripts(cmd.Context(), name, scripts)
+		return err
+	}
+	reg, err := openRegistry()
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	src, err := reg.GetSourceByName(name)
+	if err != nil {
+		return fmt.Errorf("source %q: %w", name, err)
+	}
+	rs := make([]registry.MaskScript, len(scripts))
+	for i, sc := range scripts {
+		rs[i] = registry.MaskScript{Name: sc.Name, SQL: sc.SQL}
+	}
+	return reg.SetMaskScripts(src.ID, rs)
 }
 
 func newSourceGetMaskCmd() *cobra.Command {
@@ -261,12 +305,13 @@ func newSourceGetMaskCmd() *cobra.Command {
 
 func newSourceRefreshCmd() *cobra.Command {
 	var passwordEnv string
+	var noPassword bool
 	cmd := &cobra.Command{
 		Use:   "refresh NAME",
 		Short: "Re-seed a source into a new generation (existing branches keep their snapshot)",
 		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			password, err := passwordFromEnv(passwordEnv)
+			password, err := sourcePassword(passwordEnv, noPassword)
 			if err != nil {
 				return err
 			}
@@ -296,6 +341,6 @@ func newSourceRefreshCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&passwordEnv, "password-env", "PGPASSWORD", "env var holding the source password")
+	passwordFlags(cmd, &passwordEnv, &noPassword)
 	return cmd
 }

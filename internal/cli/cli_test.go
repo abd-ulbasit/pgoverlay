@@ -19,7 +19,7 @@ func TestCommandTree(t *testing.T) {
 	root := NewRootCmd()
 	for _, path := range [][]string{
 		{"source", "add"}, {"source", "ls"}, {"source", "rm"}, {"source", "refresh"},
-		{"source", "set-mask"}, {"source", "get-mask"},
+		{"source", "set-mask"}, {"source", "get-mask"}, {"source", "clear-mask"}, {"version"},
 		{"branch", "create"}, {"branch", "ls"}, {"branch", "destroy"}, {"branch", "reset"},
 		{"connect"}, {"diff"}, {"history"}, {"doctor"}, {"gc"},
 		{"token", "create"}, {"token", "ls"}, {"token", "revoke"},
