@@ -25,11 +25,20 @@ A note that informs several patterns below — **credential modes**:
 - **rotation** (`--rotate-branch-credentials`) — every branch gets its own
   password. Safer for shared/long-lived branches, but a consumer must fetch
   the per-branch password (from the REST API) rather than hold a static one.
-  Rotated passwords are encrypted at rest in the registry DB with a key
-  derived from `PGOVERLAY_TOKEN` (AES-256-GCM). **Rotating `PGOVERLAY_TOKEN`
-  makes existing encrypted branch passwords unrecoverable** — re-run rotation
-  (reset the affected branches) after a token change. Acceptable for
-  pgoverlay's ephemeral branches.
+  Rotated passwords are encrypted at rest in the registry DB (AES-256-GCM)
+  under a dedicated key that is independent of `PGOVERLAY_TOKEN`:
+  `$PGOVERLAY_SECRET_KEY`, else `--secret-key-file`
+  (`$PGOVERLAY_SECRET_KEY_FILE`), else `<state dir>/secret.key`, which
+  branchd generates (mode 0600) on first start. **Rotating `PGOVERLAY_TOKEN`
+  does not touch stored passwords**: restart branchd with the new token and
+  every branch keeps working. Keep the key with the registry (back them up
+  together). If the key is lost or replaced, branches whose passwords it
+  encrypted keep working for list, routing, reset and destroy but report
+  `password_unavailable: true` with no `password`; reset them to mint a new
+  password. Registries from before the dedicated key (encrypted under
+  `sha256(PGOVERLAY_TOKEN)`) are re-encrypted automatically on the first
+  start with the same token. Local-mode `pgb` reads the same key from the
+  state dir (or the same variables).
 
 **Rotation *and* static config — the connect helper.** With rotation on, an
 app can't hold a fixed `PGPASSWORD`. The `pgoverlayconnect` helper resolves

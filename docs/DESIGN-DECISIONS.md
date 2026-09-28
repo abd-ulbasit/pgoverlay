@@ -275,28 +275,49 @@ credential — powerful, and rotating it has a side effect (ADR-10).
 
 ---
 
-## ADR-10: Secrets at rest — AES-256-GCM, key derived from the admin token
+## ADR-10: Secrets at rest — AES-256-GCM under a dedicated key
 
 **Context.** With per-branch credential rotation on (ADR-05 / `--rotate-branch-
 credentials`), each branch's generated password is persisted in the registry.
 Storing those passwords in plaintext in the SQLite file is a leak if the file is
-read.
+read. The first design derived the key from the admin token
+(`sha256(PGOVERLAY_TOKEN)`). That coupled password recoverability to the
+credential most likely to be rotated after an incident: rotating the token made
+every stored password undecryptable, and because a decrypt failure failed the
+whole row read, it took down listing, reconcile, reset and destroy fleet-wide
+(issue #9). It also made the registry file an offline oracle for a weak token.
 
-**Decision.** Encrypt branch passwords at rest with **AES-256-GCM**
-(`internal/registry/crypto.go`, `secretBox`): a random 12-byte nonce is
-prepended to the ciphertext, base64-encoded, and tagged with an `enc:v1:` prefix
-(the prefix versions the scheme so a future KDF/AEAD can coexist). The key is
-`sha256(PGOVERLAY_TOKEN)` (`DeriveSecretKey`). Encryption is **optional**: a nil
-box (no token) stores plaintext, and values without the `enc:` prefix are read
-back as legacy plaintext — back-compat for inherit-mode and pre-encryption rows.
+**Decision.** Encrypt branch passwords with **AES-256-GCM**
+(`internal/registry/crypto.go`) under a **dedicated random 32-byte key**,
+independent of the admin token. branchd takes it from `$PGOVERLAY_SECRET_KEY`,
+else `--secret-key-file` (`$PGOVERLAY_SECRET_KEY_FILE`), else
+`<state dir>/secret.key`, which it generates (0600, published atomically so HA
+replicas agree) on first start. Values are stored as
+`enc:v2:<kid>:base64(nonce || ciphertext)`; `kid` is a short domain-separated
+hash of the key, so a row names the key it needs. Legacy `enc:v1:` rows
+(encrypted under `sha256(PGOVERLAY_TOKEN)`) are read with the current token as a
+decrypt-only fallback, and at startup `ReencryptSecrets` moves every live row not
+yet under the dedicated key (legacy ciphertext and legacy plaintext) under it.
+**A row no configured key can open never fails a read**: the branch comes back
+with an empty password and `PasswordUnavailable` set (`password_unavailable` in
+the API), so list, routing, reconcile, reset (which mints and stores a new
+password) and destroy keep working. A destroyed branch's password is cleared
+(schema v12 trigger). Encryption stays optional in the registry package (no key
+= plaintext) for tests and embedded use; branchd always configures a key.
+Local-mode `pgb` loads the same key (never generates one) plus the legacy token
+key, so it can read what branchd wrote.
 
-**Alternatives considered.** A separate KMS/keyfile (more moving parts for a
-single-binary tool); no encryption (plaintext-at-rest leak).
+**Alternatives considered.** Keep deriving the key from the token, with a KDF
+and a previous-token list (still couples rotation of two unrelated secrets); an
+external KMS (more moving parts for a single-binary tool); no encryption
+(plaintext-at-rest leak).
 
-**Consequences / trade-offs.** Branch passwords are unreadable from the raw DB
-file without the token, with no new dependency. Cost: because the key is derived
-from `PGOVERLAY_TOKEN`, **rotating the token orphans every existing encrypted
-password** (decrypt fails with the wrong key). This is deliberate and acceptable
-for ephemeral branches — re-run rotation (reset the branch) after a token change
-to re-encrypt under the new key; `decrypt` returns a loud, actionable error
-rather than leaking ciphertext, and it is documented in `docs/usage.md`.
+**Consequences / trade-offs.** The admin token rotates freely. A copy of the
+registry file alone (a backup, a snapshot, a support bundle) reveals no branch
+password. The default key file sits next to the registry, so an attacker who
+can read the whole state directory can read both; operators who want the key
+elsewhere set `PGOVERLAY_SECRET_KEY` from a secret manager (for example a
+Kubernetes Secret). Losing the key does not lose branches, only their stored
+passwords, and resetting a branch recovers it. Rotating the at-rest key itself
+has no in-place re-encryption path yet (the key id leaves room for one):
+replacing the key marks existing passwords unavailable until reset.
