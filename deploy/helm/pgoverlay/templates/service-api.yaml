@@ -8,6 +8,13 @@ spec:
   type: {{ .Values.api.service.type }}
   selector:
     {{- include "pgoverlay.selectorLabels" . | nindent 4 }}
+    {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
+    # HA: only the leader accepts mutations, and it labels its own pod
+    # pgoverlay.leader=true for its whole term, so the API Service routes to
+    # the leader alone. Followers stay Ready (rollouts and helm --wait are
+    # unaffected) but get no API traffic. See docs/ha.md.
+    pgoverlay.leader: "true"
+    {{- end }}
   ports:
     - name: api
       port: {{ .Values.api.port }}

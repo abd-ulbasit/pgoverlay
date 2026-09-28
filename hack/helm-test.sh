@@ -31,6 +31,20 @@ has "$out" 'value: /var/lib/pgoverlay/state' default # PGOVERLAY_HOME
 has "$out" 'name: pgoverlay-token' default           # secretKeyRef + rendered Secret
 has "$out" 'kind: Secret' default
 has "$out" 'pods/exec' default
+# graceful drain: the kubelet waits longer than branchd's --shutdown-timeout
+has "$out" '--shutdown-timeout=60s' default
+has "$out" 'terminationGracePeriodSeconds: 90' default
+# single replica: no leader election, so the API Service selects the pod as is
+hasnt "$out" '--leader-elect' default
+hasnt "$out" 'pgoverlay.leader: "true"' default
+
+# HA (replicaCount>1): --leader-elect, and the API Service selects only the
+# pod the leader labels, which needs pods/patch
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret --set replicaCount=2)
+has "$out" '--leader-elect' ha
+has "$out" 'pgoverlay.leader: "true"' ha
+has "$out" 'verbs: ["patch"]' ha
+has "$out" 'name: POD_NAME' ha
 has "$out" "ghcr.io/abd-ulbasit/pgoverlay-branchd:$APPVERSION" default
 hasnt "$out" 'pgoverlay-branchd:dev' default # `dev` was never pushed anywhere
 # The chart deploys only branchd; SYS_ADMIN belongs to the branch pods branchd
