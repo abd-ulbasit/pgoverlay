@@ -14,6 +14,9 @@ import (
 type recordingDriver struct {
 	helpers   []runtime.HelperSpec
 	helperErr error
+	failFrom  int // helperErr applies from this RunHelper call index on (0 = every call)
+	// respond, when set, supplies each helper's output and error instead.
+	respond func(i int, s runtime.HelperSpec) (string, error)
 }
 
 func (f *recordingDriver) EnsureImage(ctx context.Context, image string) error { return nil }
@@ -25,7 +28,14 @@ func (f *recordingDriver) CloneVolume(ctx context.Context, src, dst string, l ma
 	return nil
 }
 func (f *recordingDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
+	i := len(f.helpers)
 	f.helpers = append(f.helpers, s)
+	if f.respond != nil {
+		return f.respond(i, s)
+	}
+	if i < f.failFrom {
+		return "", nil
+	}
 	return "", f.helperErr
 }
 func (f *recordingDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
@@ -47,6 +57,7 @@ func (f *recordingDriver) ListManagedVolumes(ctx context.Context, instanceID str
 }
 
 func TestSeedDumpHelperSpec(t *testing.T) {
+	t.Setenv(SSLModeEnv, "")
 	d := &recordingDriver{}
 	err := SeedDump(context.Background(), d, SeedDumpSpec{
 		SeedSpec: SeedSpec{
@@ -89,6 +100,9 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 	for _, want := range []string{
 		"PGB_USER=appuser", "PGB_PASSWORD=s3cret", "PGB_DB=appdb",
 		"PGB_REMOTE_HOST=db.proj.supabase.co", "PGB_REMOTE_PORT=6543",
+		// remote leg: libpq's default sslmode unless configured, and a
+		// bounded connect time
+		"PGB_SSLMODE=prefer", "PGB_CONNECT_TIMEOUT=10",
 	} {
 		if !strings.Contains(env, want) {
 			t.Errorf("env missing %q: %v", want, dump.Env)
@@ -114,6 +128,7 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 		// the initdb-created one must be dropped first
 		"DROP SCHEMA public CASCADE",
 		"pg_dump --no-owner --no-acl -n 'public' -n 'audit'",
+		`PGSSLMODE="$PGB_SSLMODE" PGCONNECT_TIMEOUT="$PGB_CONNECT_TIMEOUT"`,
 		"ON_ERROR_STOP=1",
 		"pg_ctl -D /seed/data -w stop -m fast",
 	} {

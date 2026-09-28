@@ -3,8 +3,10 @@ package pgctl
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -16,6 +18,24 @@ type SeedDumpSpec struct {
 	SeedSpec
 	Database string   // remote database to dump ("" = postgres)
 	Schemas  []string // schemas to dump (empty = the whole database)
+}
+
+// Validate checks the connection settings and the schema patterns. A pattern
+// must not contain a comma: the registry stores the list comma-joined, so a
+// refresh would split it into two patterns.
+func (s SeedDumpSpec) Validate() error {
+	if err := s.SeedSpec.Validate(); err != nil {
+		return err
+	}
+	for _, schema := range s.Schemas {
+		if strings.TrimSpace(schema) == "" {
+			return fmt.Errorf("%w: empty dump schema pattern", ErrInvalidSpec)
+		}
+		if strings.Contains(schema, ",") {
+			return fmt.Errorf("%w: dump schema pattern %q contains a comma, which cannot be stored; match that character with the ? wildcard outside double quotes", ErrInvalidSpec, schema)
+		}
+	}
+	return nil
 }
 
 // shellQuote single-quotes a value for safe embedding in the helper script.
@@ -51,7 +71,8 @@ echo "host all all all scram-sha-256" >> /seed/data/pg_hba.conf
 echo "listen_addresses = '*'" >> /seed/data/postgresql.conf
 pg_ctl -D /seed/data -o "-c listen_addresses='' -c unix_socket_directories=/tmp" -w start
 if [ "$PGB_DB" != postgres ]; then createdb -h /tmp -U "$PGB_USER" "$PGB_DB"; fi
-%sPGPASSWORD="$PGB_PASSWORD" pg_dump --no-owner --no-acl%s \
+%sPGPASSWORD="$PGB_PASSWORD" PGSSLMODE="$PGB_SSLMODE" PGCONNECT_TIMEOUT="$PGB_CONNECT_TIMEOUT" \
+  pg_dump --no-owner --no-acl%s \
   -h "$PGB_REMOTE_HOST" -p "$PGB_REMOTE_PORT" -U "$PGB_USER" -d "$PGB_DB" \
   | psql -h /tmp -U "$PGB_USER" -d "$PGB_DB" -v ON_ERROR_STOP=1 -q
 pg_ctl -D /seed/data -w stop -m fast
@@ -66,6 +87,9 @@ pg_ctl -D /seed/data -w stop -m fast
 // the remote server's (pg_dump cannot dump newer servers) and branches run
 // the cluster initdb produced, i.e. the helper image's version.
 func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
+	if err := s.Validate(); err != nil {
+		return err
+	}
 	seedMount := runtime.Mount{Kind: s.MountKind, Volume: s.Volume, Target: "/seed"}
 	if _, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image:  "alpine:3.21",
@@ -86,6 +110,7 @@ func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 			dropPublic = `psql -h /tmp -U "$PGB_USER" -d "$PGB_DB" -q -c 'DROP SCHEMA public CASCADE'` + "\n"
 		}
 	}
+	slog.Info("seed: running pg_dump against the source", "addr", s.addr(), "user", s.User, "database", db, "sslmode", s.sslMode())
 	_, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image: s.Image,
 		User:  "postgres",
@@ -96,12 +121,16 @@ func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 			"PGB_DB=" + db,
 			"PGB_REMOTE_HOST=" + s.Host,
 			"PGB_REMOTE_PORT=" + strconv.Itoa(s.Port),
+			// libpq settings for the remote leg only (the local socket leg
+			// needs neither)
+			"PGB_SSLMODE=" + s.sslMode(),
+			"PGB_CONNECT_TIMEOUT=" + strconv.Itoa(int(ConnectTimeout/time.Second)),
 		},
 		Mounts:  []runtime.Mount{seedMount},
 		Network: s.Network,
 	})
 	if err != nil {
-		return fmt.Errorf("pg_dump seed: %w", err)
+		return fmt.Errorf("pg_dump seed from %s: %w", s.addr(), err)
 	}
 	return nil
 }
