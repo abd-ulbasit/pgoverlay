@@ -306,7 +306,7 @@ func newAPIHTTPServer(addr string, h http.Handler) *http.Server {
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
-	advertiseProxyAddr := flag.String("advertise-proxy-addr", "", "host:port where clients reach the Postgres router, returned as proxy_host/proxy_port in branch API responses and used by `pgb connect` (default: --pg-addr's port; clients use the API host)")
+	advertiseProxyAddr := flag.String("advertise-proxy-addr", "", "host:port where clients reach the Postgres router, returned as proxy_host/proxy_port in branch API responses and used by pgb connect (default: --pg-addr's port; clients use the API host)")
 	reconcileInterval := flag.Duration("reconcile-interval", 60*time.Second, "reconcile loop tick interval (TTL reap + leak GC + drift convergence)")
 	reapInterval := flag.Duration("reap-interval", 0, "DEPRECATED alias for --reconcile-interval (folded into the unified reconcile loop)")
 	stuckTimeout := flag.Duration("stuck-timeout", 10*time.Minute, "age past which reconcile treats a row as abandoned: a creating/resetting branch or seeding source is failed, a destroying branch is retried (live sagas and seeds heartbeat well inside it); also the longest a branch operation through the API may run (it is then rolled back with 504), and the grace before an unclaimed volume or a finished helper is removed")
@@ -322,7 +322,7 @@ func run() error {
 	csiVolumeSize := flag.String("csi-volume-size", "", "size of every pgoverlay PVC, e.g. 50Gi (default 10Gi; --kube-storage csi only)")
 	cowBackend := flag.String("cow", string(cow.BackendOverlay), "copy-on-write backend: overlay (default), zfs (experimental, see docs/zfs.md) or csi (forced by --kube-storage csi)")
 	zfsDataset := flag.String("zfs-dataset", "", "dataset prefix holding all pgoverlay datasets, e.g. tank/pgoverlay (required with --cow zfs)")
-	rotateCreds := flag.Bool("rotate-branch-credentials", false, "give every branch its own generated password instead of inheriting the source's (returned as `password` in branch API responses; see docs/architecture.md)")
+	rotateCreds := flag.Bool("rotate-branch-credentials", false, "give every branch its own generated password instead of inheriting the source's (returned as the password field in branch API responses; see docs/architecture.md)")
 	secretKeyFile := flag.String("secret-key-file", os.Getenv(config.SecretKeyFileEnv), "file holding the 32-byte at-rest key that encrypts rotated branch passwords, hex or base64 (default: $PGOVERLAY_SECRET_KEY, else <state dir>/secret.key, generated 0600 on first start; env PGOVERLAY_SECRET_KEY_FILE)")
 	maxBranches := flag.Int("max-branches", envInt("PGOVERLAY_MAX_BRANCHES", 0), "cap on live (non-destroyed) branches; creates past the cap return 403 (0 = unlimited; env PGOVERLAY_MAX_BRANCHES)")
 	defaultTTL := flag.Duration("default-ttl", envDuration("PGOVERLAY_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGOVERLAY_DEFAULT_TTL)")

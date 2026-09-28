@@ -280,23 +280,30 @@ func (s *Service) enqueue(branch string, job func()) {
 }
 
 // drain runs the branch's queued jobs one by one and retires the queue once
-// it is empty.
+// it is empty. The queue is retired before the last job is marked done, so
+// once Wait returns no queue is left behind; a job enqueued after the
+// retirement starts a new drain.
 func (s *Service) drain(branch string) {
 	for {
 		s.mu.Lock()
 		q := s.queues[branch]
-		if len(q) == 0 {
-			delete(s.queues, branch)
-			s.mu.Unlock()
-			return
-		}
-		job := q[0]
+		job := q[0] // enqueue starts drain only after appending a job
 		q[0] = nil
 		s.queues[branch] = q[1:]
 		s.mu.Unlock()
 
 		job()
+
+		s.mu.Lock()
+		last := len(s.queues[branch]) == 0
+		if last {
+			delete(s.queues, branch)
+		}
+		s.mu.Unlock()
 		s.wg.Done()
+		if last {
+			return
+		}
 	}
 }
 

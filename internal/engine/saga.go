@@ -517,6 +517,9 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 	if err := e.checkCSIChildBase(b); err != nil {
 		return nil, fmt.Errorf("reset %q: %w", name, err)
 	}
+	if err := e.checkChildCommitted(b); err != nil {
+		return nil, err
+	}
 	src, err := e.reg.GetSourceByID(b.SourceID)
 	if err != nil {
 		return nil, err

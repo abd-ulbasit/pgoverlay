@@ -95,6 +95,62 @@ func TestRecoverCrashFailedFreezeParent(t *testing.T) {
 	}
 }
 
+// An overlay child whose freeze never committed (crashedFreeze: c names p but
+// has no base layer) is refused by both reset and recover, changing nothing.
+// Its empty layer chain would bring it up on the bare source, without p's
+// data, while it is still listed as p's child. Destroy and branch again is
+// the way forward, and a committed child resets as before.
+func TestResetAndRecoverRefuseUncommittedChild(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	crashedFreeze(t, e, r, d)
+	c, err := r.GetBranchByName("c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.State != registry.BranchFailed || c.BaseLayerID != "" {
+		t.Fatalf("setup: child %+v; want failed with no base layer", c)
+	}
+	// refused even with its writable layer still on disk
+	d.addOrphanVolume("pgoverlay-br-c-rw", r.InstanceID())
+	startsBefore, logBefore := d.starts, len(d.log)
+	for _, op := range []struct {
+		name string
+		run  func() error
+	}{
+		{"reset", func() error { _, err := e.ResetBranch(context.Background(), "c"); return err }},
+		{"recover", func() error { _, err := e.RecoverBranch(context.Background(), "c"); return err }},
+	} {
+		err := op.run()
+		if !errors.Is(err, ErrNotRecoverable) || !strings.Contains(err.Error(), `never created from "p"`) {
+			t.Fatalf("%s of an uncommitted child: err=%v, want ErrNotRecoverable naming the parent", op.name, err)
+		}
+	}
+	if got, _ := r.GetBranchByName("c"); got.State != registry.BranchFailed {
+		t.Fatalf("refused reset/recover moved the child to %s", got.State)
+	}
+	if d.starts != startsBefore || len(d.log) != logBefore {
+		t.Fatalf("refused reset/recover touched the runtime: %v", d.log[logBefore:])
+	}
+
+	if err := e.DestroyBranch(context.Background(), "c"); err != nil {
+		t.Fatalf("destroy the uncommitted child: %v", err)
+	}
+	if _, err := e.RecoverBranch(context.Background(), "p"); err != nil {
+		t.Fatalf("recover the parent: %v", err)
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "c", "p", 0); err != nil {
+		t.Fatalf("branch c from p again: %v", err)
+	}
+	if _, err := e.ResetBranch(context.Background(), "c"); err != nil {
+		t.Fatalf("reset of a committed child: %v", err)
+	}
+	last := d.branches[len(d.branches)-1]
+	if len(last.Mounts) < 3 {
+		t.Fatalf("reset child mounts %+v; want the source, p's frozen layer and its own rw", last.Mounts)
+	}
+}
+
 func TestRecoverRefusesNonFailedBranch(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)

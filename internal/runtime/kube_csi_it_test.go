@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -159,8 +160,24 @@ func TestKubeCSIEndToEndBranching(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// No added capabilities (no SYS_ADMIN, unlike hostPath's in-pod
+	// overlay mount) and not privileged; the context only hardens the pod
+	// (RuntimeDefault seccomp, no privilege escalation).
 	if sc := pod.Spec.Containers[0].SecurityContext; sc != nil {
-		t.Errorf("branch pod SecurityContext = %+v, want none (no SYS_ADMIN)", sc)
+		if sc.Capabilities != nil && len(sc.Capabilities.Add) > 0 {
+			t.Errorf("branch pod adds capabilities %v, want none (no SYS_ADMIN)", sc.Capabilities.Add)
+		}
+		if sc.Privileged != nil && *sc.Privileged {
+			t.Error("branch pod is privileged")
+		}
+		if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			t.Errorf("branch pod allows privilege escalation: %+v", sc)
+		}
+		if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+			t.Errorf("branch pod seccomp profile = %+v, want RuntimeDefault", sc.SeccompProfile)
+		}
+	} else {
+		t.Error("branch pod has no SecurityContext, want RuntimeDefault seccomp and no privilege escalation")
 	}
 	if len(pod.Spec.NodeSelector) != 0 || pod.Spec.Affinity != nil {
 		t.Errorf("branch pod has placement constraints: selector=%v affinity=%v", pod.Spec.NodeSelector, pod.Spec.Affinity)
