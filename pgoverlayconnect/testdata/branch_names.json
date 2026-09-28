@@ -1,0 +1,40 @@
+{
+  "about": "Golden table for pull-request branch names. pgoverlay-github (internal/ghook) creates these names, and the connect helpers (pgoverlayconnect in Go, sdk/js-connect in JavaScript) derive them. The Go tests of both packages and the JavaScript tests read this file, so the three cannot drift apart. names: the branch for a pull request of repo with head branch ref and number pr; a non-empty ref is used unless it has no ASCII letter or digit, then pr is used (pgoverlay-github in git-branch mode for a non-fork pull request; in pr-number mode it always uses pr).",
+  "repo_keys": [
+    { "repo": "acme/widgets", "key": "d782c8" },
+    { "repo": "Acme/Widgets", "key": "d782c8" },
+    { "repo": "acme/gadgets", "key": "9c2435" },
+    { "repo": "abd-ulbasit/pgoverlay-demo", "key": "d40e0f" }
+  ],
+  "names": [
+    { "repo": "acme/widgets", "pr": 7, "ref": "", "want": "gh-d782c8-pr-7" },
+    { "repo": "Acme/Widgets", "pr": 7, "ref": "", "want": "gh-d782c8-pr-7" },
+    { "repo": "acme/gadgets", "pr": 7, "ref": "", "want": "gh-9c2435-pr-7" },
+    { "repo": "acme/widgets", "pr": 123456, "ref": "", "want": "gh-d782c8-pr-123456" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "feat/Login", "want": "gh-d782c8-feat-login" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "feat/Health_Endpoint", "want": "gh-d782c8-feat-health-endpoint" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "FIX--weird///chars!!", "want": "gh-d782c8-fix-weird-chars" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "release/v1.2.3", "want": "gh-d782c8-release-v1-2-3" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "main", "want": "gh-d782c8-main" },
+    { "repo": "acme/widgets", "pr": 9, "ref": "-/-", "want": "gh-d782c8-pr-9" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "feat/ümlaut-Ärger", "want": "gh-d782c8-feat-mlaut-rger" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "İx", "want": "gh-d782c8-x" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "Kelvin", "want": "gh-d782c8-elvin" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "want": "gh-d782c8-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "want": "gh-d782c8-aaaaaaaaaaaaaaaaaaaaaaaa-3ba3f5" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/b", "want": "gh-d782c8-aaaaaaaaaaaaaaaaaaaaaaaa-82a379" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "aaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbb", "want": "gh-d782c8-aaaaaaaaaaaaaaaaaaaaaaa-56228d" },
+    { "repo": "acme/widgets", "pr": 7, "ref": "dependabot/npm_and_yarn/lodash-4.17.21", "want": "gh-d782c8-dependabot-npm-and-yarn-b7180b" },
+    { "repo": "acme/widgets", "pr": 8, "ref": "dependabot/npm_and_yarn/lodash-4.17.20", "want": "gh-d782c8-dependabot-npm-and-yarn-c24859" },
+    { "repo": "acme/gadgets", "pr": 7, "ref": "dependabot/npm_and_yarn/lodash-4.17.21", "want": "gh-9c2435-dependabot-npm-and-yarn-b7180b" }
+  ],
+  "sanitize": [
+    { "ref": "feat/Login", "want": "feat-login" },
+    { "ref": "FIX--x//y!", "want": "fix-x-y" },
+    { "ref": "-/-", "want": "" },
+    { "ref": "", "want": "" },
+    { "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "want": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/b", "want": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "ref": "Kelvin/İx", "want": "elvin-x" }
+  ]
+}

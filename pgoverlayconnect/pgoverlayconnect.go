@@ -9,14 +9,18 @@
 // password is fetched at startup:
 //
 //	res, err := pgoverlayconnect.Resolve(ctx, pgoverlayconnect.Options{
-//		Server: os.Getenv("PGOVERLAY_API"),    // https://branchd:7070
-//		Token:  os.Getenv("PGOVERLAY_TOKEN"),  // a viewer token is enough
-//		Ref:    os.Getenv("GIT_REF"),         // e.g. "feat/login" -> feat-login
+//		Server: os.Getenv("PGOVERLAY_API"),     // https://branchd:7070
+//		Token:  os.Getenv("PGOVERLAY_TOKEN"),   // a viewer token is enough
+//		Repo:   os.Getenv("GITHUB_REPOSITORY"), // "acme/widgets"
+//		PR:     prNumber,                       // 7 -> gh-<key>-pr-7
 //	})
 //	db, _ := sql.Open("pgx", res.ProxyDSN)
 //
-// The package is self-contained (stdlib only) and never imports pgoverlay
-// internals: it speaks the branchd REST API directly.
+// Repo with PR (or with Ref, for git-branch naming) derives the name that
+// pgoverlay-github, the GitHub App webhook service, gives the pull request's
+// branch; see PRBranchName and RefBranchName. The package is self-contained
+// (stdlib only) and never imports pgoverlay internals: it speaks the branchd
+// REST API directly.
 package pgoverlayconnect
 
 import (
@@ -33,18 +37,49 @@ import (
 	"time"
 )
 
-// Options configures Resolve. Exactly one of Branch or Ref identifies the
-// branch; Ref is sanitized the same way pgoverlay's ghook names branches from a
-// git ref (lowercase, non-alphanumerics collapse to single dashes, trimmed,
-// ≤41 chars), so an app and the webhook agree on the name with no coordination.
+// Options configures Resolve. Branch names the branch exactly. Without it,
+// the name is derived the way pgoverlay-github names pull-request branches,
+// so an app and the webhook agree on it with no coordination: Repo plus PR
+// gives the pr-number name (the service default), Repo plus Ref the
+// git-branch name. With both Ref and PR set, Ref is used unless it has no
+// ASCII letter or digit, the same fallback the service applies. Pull requests
+// from forks are always named by number.
 type Options struct {
-	Server    string // branchd base URL (PGOVERLAY_API), required
-	Token     string // API bearer token (a viewer token suffices), required
-	Branch    string // exact branch name; or set Ref
-	Ref       string // git ref, sanitized to a branch name; used when Branch == ""
+	Server string // branchd base URL (PGOVERLAY_API), required
+	Token  string // API bearer token (a viewer token suffices), required
+	Branch string // exact branch name; or set Repo with PR and/or Ref
+	// Repo is the GitHub repository the pull request belongs to, "owner/name"
+	// (GITHUB_REPOSITORY in Actions; VERCEL_GIT_REPO_OWNER + "/" +
+	// VERCEL_GIT_REPO_SLUG on Vercel). Required with PR or Ref.
+	Repo string
+	PR   int // pull request number (pr-number naming)
+	// Ref is the pull request's head branch, e.g. "feat/login"
+	// (GITHUB_HEAD_REF, VERCEL_GIT_COMMIT_REF), for git-branch naming. Not
+	// a full ref such as "refs/heads/feat/login".
+	Ref       string
 	ProxyHost string // host[:port] of the pgoverlay router for ProxyDSN; "" => server host + :6432
 	Password  string // fallback password for inherit-mode branches (else PGPASSWORD)
 	HTTP      *http.Client
+}
+
+// branchName returns the branch Resolve looks up (see Options).
+func (opts Options) branchName() (string, error) {
+	if opts.Branch != "" {
+		return opts.Branch, nil
+	}
+	if opts.Ref == "" && opts.PR <= 0 {
+		return "", fmt.Errorf("pgoverlayconnect: a Branch, or a Repo with a PR or Ref, is required")
+	}
+	if opts.Repo == "" {
+		return "", fmt.Errorf("pgoverlayconnect: Repo (owner/name, e.g. $GITHUB_REPOSITORY) is required to derive the branch name from a PR or Ref")
+	}
+	if n := RefBranchName(opts.Repo, opts.Ref); n != "" {
+		return n, nil
+	}
+	if opts.PR > 0 {
+		return PRBranchName(opts.Repo, opts.PR), nil
+	}
+	return "", fmt.Errorf("pgoverlayconnect: Ref %q has no letters or digits to name a branch after; set PR", opts.Ref)
 }
 
 // Result is the resolved connection info. DSN targets the branch's Postgres
@@ -84,12 +119,15 @@ func Resolve(ctx context.Context, opts Options) (Result, error) {
 	if opts.Token == "" {
 		return Result{}, fmt.Errorf("pgoverlayconnect: Token is required")
 	}
-	name := opts.Branch
-	if name == "" {
-		name = SanitizeRef(opts.Ref)
+	name, err := opts.branchName()
+	if err != nil {
+		return Result{}, err
 	}
-	if name == "" {
-		return Result{}, fmt.Errorf("pgoverlayconnect: a Branch or Ref is required")
+	proxyHost, proxyPort := "", defaultProxyPort
+	if opts.ProxyHost != "" {
+		if proxyHost, proxyPort, err = splitProxyHost(opts.ProxyHost); err != nil {
+			return Result{}, err
+		}
 	}
 
 	w, err := getBranch(ctx, opts, name)
@@ -125,16 +163,8 @@ func Resolve(ctx context.Context, opts Options) (Result, error) {
 		}
 	}
 
-	proxyHost, proxyPort := serverHost, 6432
-	if opts.ProxyHost != "" {
-		if h, p, err := net.SplitHostPort(opts.ProxyHost); err == nil {
-			proxyHost = h
-			if n, err := strconv.Atoi(p); err == nil {
-				proxyPort = n
-			}
-		} else {
-			proxyHost = opts.ProxyHost
-		}
+	if proxyHost == "" {
+		proxyHost = serverHost
 	}
 	proxyDB := w.ProxyDatabase
 	if proxyDB == "" {
@@ -175,6 +205,24 @@ func getBranch(ctx context.Context, opts Options, name string) (*wireBranch, err
 	return &w, nil
 }
 
+// defaultProxyPort is the pgoverlay router's port when ProxyHost names none.
+const defaultProxyPort = 6432
+
+// splitProxyHost parses Options.ProxyHost: "host", "host:port", "[v6]:port",
+// "[v6]" or a bare IPv6 address. A port that is present must be a number in
+// 1-65535.
+func splitProxyHost(hp string) (string, int, error) {
+	h, p, err := net.SplitHostPort(hp)
+	if err != nil { // no port
+		return strings.TrimSuffix(strings.TrimPrefix(hp, "["), "]"), defaultProxyPort, nil
+	}
+	n, err := strconv.Atoi(p)
+	if err != nil || n < 1 || n > 65535 {
+		return "", 0, fmt.Errorf("pgoverlayconnect: ProxyHost %q: invalid port %q", hp, p)
+	}
+	return h, n, nil
+}
+
 // dsn builds postgres://user[:password]@host:port/db. db may contain '@'
 // (proxy routing) — legal in a URL path, kept literal.
 func dsn(user, password, host string, port int, db string) string {
@@ -183,28 +231,4 @@ func dsn(user, password, host string, port int, db string) string {
 		auth += ":" + url.QueryEscape(password)
 	}
 	return fmt.Sprintf("postgres://%s@%s/%s", auth, net.JoinHostPort(host, strconv.Itoa(port)), db)
-}
-
-// SanitizeRef maps a git ref to a pgoverlay branch name (^[a-z0-9][a-z0-9-]{0,40}$),
-// matching ghook's git-branch naming: lowercase, runs of other characters
-// collapse to single dashes, edges trimmed, truncated to 41 chars.
-func SanitizeRef(ref string) string {
-	var b strings.Builder
-	dash := false
-	for _, r := range strings.ToLower(ref) {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
-			if dash && b.Len() > 0 {
-				b.WriteByte('-')
-			}
-			dash = false
-			b.WriteRune(r)
-		default:
-			dash = true
-		}
-		if b.Len() >= 41 {
-			break
-		}
-	}
-	return strings.Trim(b.String(), "-")
 }
