@@ -80,9 +80,15 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	case r != nil && r.Context().Err() != nil && interruptedStatus(r.Context()) != 0:
 		// The mutation's context was ended from outside the saga (leadership
 		// lost, shutdown, stuck timeout): the failure is that interruption, and
-		// the saga has already compensated. Tell the client it can retry.
+		// the saga has already compensated. Tell the client it can retry, and
+		// for the stuck timeout what bounds the run.
 		cause := context.Cause(r.Context())
 		slog.Warn("api: operation cancelled", "cause", cause, "error", err, "method", r.Method, "path", r.URL.Path)
+		var timeout *mutationTimeoutError
+		if errors.As(cause, &timeout) {
+			writeError(w, http.StatusGatewayTimeout, timeout.message())
+			return
+		}
 		writeError(w, interruptedStatus(r.Context()), cause.Error()+"; the operation was cancelled and its partial work rolled back, retry it")
 	case errors.Is(err, engine.ErrSeedFailed), errors.Is(err, engine.ErrMaskingFailed):
 		// Caused by the source's configuration or its masking SQL; checked

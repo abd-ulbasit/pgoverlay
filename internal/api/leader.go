@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -114,7 +115,7 @@ func (m *mutations) begin(r *http.Request, term context.Context, timeout time.Du
 	base := context.WithoutCancel(r.Context())
 	cancelTimeout := context.CancelFunc(func() {})
 	if timeout > 0 {
-		base, cancelTimeout = context.WithTimeoutCause(base, timeout, errMutationTimeout)
+		base, cancelTimeout = context.WithTimeoutCause(base, timeout, &mutationTimeoutError{limit: timeout, start: time.Now()})
 	}
 	ctx, cancel := context.WithCancelCause(base)
 	stopTerm := context.AfterFunc(term, func() { cancel(errLeadershipLost) })
@@ -129,12 +130,46 @@ func (m *mutations) begin(r *http.Request, term context.Context, timeout time.Du
 }
 
 // Causes recorded on a mutation's context when something other than the saga
-// itself ends it; writeEngineError turns them into a retryable status.
+// itself ends it; writeEngineError turns them into a retryable status. A
+// timed-out mutation's cause is a *mutationTimeoutError, which matches
+// errMutationTimeout.
 var (
 	errLeadershipLost  = errors.New("leadership moved to another replica while the operation ran")
 	errShuttingDown    = errors.New("branchd is shutting down")
 	errMutationTimeout = errors.New("operation exceeded the stuck timeout")
 )
+
+// mutationTimeoutError is the cause recorded when a branch mutation runs past
+// the stuck timeout. It carries the limit and the start, so the 504 can say
+// how long the operation ran and which setting bounds it.
+type mutationTimeoutError struct {
+	limit time.Duration
+	start time.Time
+}
+
+func (e *mutationTimeoutError) Error() string {
+	return fmt.Sprintf("%s (%s)", errMutationTimeout, e.limit)
+}
+
+func (e *mutationTimeoutError) Is(target error) bool { return target == errMutationTimeout }
+
+// message is the 504 body: what happened, the elapsed time against the limit,
+// and what to change when the operation is legitimately that slow.
+func (e *mutationTimeoutError) message() string {
+	return fmt.Sprintf("the operation ran %s, past branchd's stuck timeout of %s, and was cancelled; its partial work was rolled back. "+
+		"If it is legitimately this slow (a long masking script, a slow image pull), raise branchd's --stuck-timeout "+
+		"(Helm value stuckTimeout) above its run time, then retry",
+		roundElapsed(time.Since(e.start)), e.limit)
+}
+
+// roundElapsed rounds a duration for a message: whole seconds from a second
+// up, milliseconds below.
+func roundElapsed(d time.Duration) time.Duration {
+	if d >= time.Second {
+		return d.Round(time.Second)
+	}
+	return d.Round(time.Millisecond)
+}
 
 // stopAdmitting makes every later begin fail; in-flight mutations continue.
 func (m *mutations) stopAdmitting() {

@@ -70,6 +70,30 @@ reason: `restart_branch` names the lost container and the new one,
 actor is `system:reconcile` for the reconcile loop and the router, or the
 token or local user that ran `pgb gc`.
 
+## An operation ends in `504`
+
+A branch operation through the REST API (create, reset, recover, destroy,
+diff) is bounded by branchd's `--stuck-timeout` (default `10m`) in total.
+Past it, the operation is cancelled, its partial work is rolled back, and the
+client gets a `504` such as:
+
+```
+the operation ran 10m0s, past branchd's stuck timeout of 10m0s, and was
+cancelled; its partial work was rolled back. If it is legitimately this slow
+(a long masking script, a slow image pull), raise branchd's --stuck-timeout
+(Helm value stuckTimeout) above its run time, then retry
+```
+
+Retrying unchanged runs into the same limit. If the operation is slow for a
+reason you expect (masking scripts that rewrite large tables are the usual
+one), raise `--stuck-timeout` above its run time: the flag on `branchd`, or
+`stuckTimeout` in the Helm chart's values. There is no environment variable
+for it. The same value is also how long reconcile waits before it fails a row
+that has stopped making progress, so a larger value delays that cleanup, but
+it never fails a slow operation that is still running (running operations
+heartbeat). If the operation should have been fast, `pgb history NAME` and
+branchd's log show where it stalled. In local mode `pgb` has no such bound.
+
 ## Seeding
 
 **The source must be reachable from containers.** The seed runs in a helper

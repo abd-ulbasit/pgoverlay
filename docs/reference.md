@@ -172,7 +172,12 @@ as abandoned:
   containers older than this are removed.
 
 Separately, a branch operation started through the REST API is cancelled and
-rolled back (`504`) if it runs longer than `--stuck-timeout` in total.
+rolled back (`504`) if it runs longer than `--stuck-timeout` in total. The
+`504` names the elapsed time and the limit. When a create or reset is
+legitimately that slow (a long masking script is the usual case), raise
+`--stuck-timeout` (Helm value `stuckTimeout`) above its run time; there is no
+environment variable for it. Operations `pgb` runs in local mode have no such
+bound.
 
 #### The at-rest key
 

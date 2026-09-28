@@ -183,7 +183,7 @@ Every non-2xx response has the body `{"error": "<message>"}`.
 | `500` | an internal error; the body says only `internal server error` and the detail is logged. A failed destroy is the exception (see below) |
 | `502` | a destroy could not reach the container runtime (the Docker daemon or the Kubernetes API server) |
 | `503` | `not leader`, `shutting down`, or the leader lost its Lease mid-operation. The operation was rolled back; retry, ideally against the Service that routes to the leader |
-| `504` | a branch operation ran past `--stuck-timeout` and was rolled back |
+| `504` | a branch operation ran past `--stuck-timeout` and was rolled back. The message gives how long it ran and the limit; if the operation is legitimately that slow, raise `--stuck-timeout` ([Troubleshooting](troubleshooting.md#an-operation-ends-in-504)) |
 
 **A failed destroy** (`DELETE /v1/branches/{name}`) answers with the cause of
 the failure, the same text `GET /v1/branches/{name}/history` records:
