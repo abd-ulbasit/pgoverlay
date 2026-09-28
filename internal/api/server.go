@@ -52,6 +52,12 @@ type Branch struct {
 	ProxyDatabase string `json:"proxy_database"`
 	ExpiresAt     string `json:"expires_at,omitempty"`
 	CreatedAt     string `json:"created_at"`
+	// ProxyHost and ProxyPort locate the wire-protocol router, as advertised
+	// by branchd's --advertise-proxy-addr (the port defaults to --pg-addr's).
+	// ProxyHost is omitted when branchd knows no client-reachable name:
+	// clients then use the API host. Both are absent from older servers.
+	ProxyHost string `json:"proxy_host,omitempty"`
+	ProxyPort int    `json:"proxy_port,omitempty"`
 }
 
 type CreateSourceRequest struct {
@@ -134,6 +140,7 @@ type Server struct {
 	ready        Ready
 	stuckTimeout time.Duration
 	leader       *LeaderGate
+	proxy        proxyEndpoint // advertised router address (SetProxyEndpoint)
 }
 
 // New builds the API server. metricsHandler serves /metrics (promhttp over the
