@@ -6,6 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+	"github.com/jackc/pgx/v5"
+
 	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
@@ -108,6 +112,155 @@ func TestReconcileGCEndToEnd(t *testing.T) {
 	}
 	if !volumeExists(t, ctx, d, r.InstanceID(), src.Volume) {
 		t.Fatalf("source volume %q was GC'd", src.Volume)
+	}
+}
+
+// itDockerClient is a raw docker client for the IT to act on containers
+// behind pgoverlay's back (docker restart / rm -f / stop).
+func itDockerClient(t *testing.T) *client.Client {
+	t.Helper()
+	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
+	if os.Getenv("DOCKER_HOST") == "" {
+		if h := runtime.DockerHostFromCLIContext(); h != "" {
+			opts = append(opts, client.WithHost(h))
+		}
+	}
+	cli, err := client.NewClientWithOpts(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
+
+// eventuallyInt retries a query until the branch accepts connections again
+// (postgres restarting after a docker restart) and returns the result.
+func eventuallyInt(t *testing.T, ctx context.Context, conn, q string) int {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		c, err := pgx.Connect(ctx, conn)
+		if err == nil {
+			var n int
+			err = c.QueryRow(ctx, q).Scan(&n)
+			c.Close(ctx)
+			if err == nil {
+				return n
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never answered %q: %v", conn, q, err)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// TestReconcileRepairsDockerDrift is the live counterpart of issue #8 on a
+// real docker daemon:
+//   - `docker restart` keeps the branch's pinned host port, so there is no
+//     drift and the recorded address still works;
+//   - `docker rm -f` of a ready branch's container is repaired by reconcile:
+//     a new container on the branch's volumes, writes intact;
+//   - `docker stop` (which the unless-stopped policy does not undo) likewise.
+func TestReconcileRepairsDockerDrift(t *testing.T) {
+	if os.Getenv("PGOVERLAY_IT") != "1" {
+		t.Skip("set PGOVERLAY_IT=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	host, port, network, _ := pgctl.StartSourcePG(t, ctx)
+	d, err := runtime.NewDockerDriver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := registry.Open(t.TempDir() + "/it.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	e := New(r, d, "postgres:17")
+	src := &registry.Source{Name: "drift-main", PGVersion: "17", ConnHost: host, ConnPort: port, ConnUser: "postgres", Network: network}
+	if err := e.AddSource(ctx, src, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.RemoveVolume(context.Background(), src.Volume) })
+	b, err := e.CreateBranch(ctx, "drift-pr", "drift-main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := e.DestroyBranch(context.Background(), "drift-pr"); err != nil {
+			t.Errorf("destroy drift-pr: %v", err)
+		}
+	})
+	mustExec(t, ctx, branchConn(b), `CREATE TABLE kept(x int); INSERT INTO kept VALUES (42); CHECKPOINT`)
+	cli := itDockerClient(t)
+	driftFor := func(plan ReconcilePlan) []Action {
+		var out []Action
+		for _, a := range plan.Actions {
+			if a.Target == "drift-pr" {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
+
+	// 1. docker restart: same host port, nothing to repair
+	timeout := 10
+	if err := cli.ContainerRestart(ctx, b.ContainerID, container.StopOptions{Timeout: &timeout}); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := d.Inspect(ctx, b.ContainerID); err != nil || info.Port != b.Port {
+		t.Fatalf("after docker restart: %+v, %v; want host port %d kept", info, err, b.Port)
+	}
+	if n := eventuallyInt(t, ctx, branchConn(b), `SELECT x FROM kept`); n != 42 {
+		t.Fatalf("kept = %d after docker restart", n)
+	}
+	plan, err := e.PlanReconcile(ctx, time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := driftFor(plan); len(a) != 0 {
+		t.Fatalf("drift after a plain docker restart: %+v", a)
+	}
+
+	// 2. docker rm -f: reconcile starts a new container on the same volumes
+	if err := cli.ContainerRemove(ctx, b.ContainerID, container.RemoveOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if plan, _ := e.PlanReconcile(ctx, time.Now(), 10*time.Minute); !hasAction(plan, ActionRestartBranch, "drift-pr") {
+		t.Fatalf("doctor misses the removed container: %+v", plan.Actions)
+	}
+	taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute)
+	if err != nil || !hasAction(taken, ActionRestartBranch, "drift-pr") {
+		t.Fatalf("reconcile after rm -f: %+v, %v", taken.Actions, err)
+	}
+	b2, err := r.GetBranchByName("drift-pr")
+	if err != nil || b2.State != registry.BranchReady || b2.ContainerID == b.ContainerID {
+		t.Fatalf("after restart: %+v, %v", b2, err)
+	}
+	if n := mustQueryInt(t, ctx, branchConn(b2), `SELECT x FROM kept`); n != 42 {
+		t.Fatalf("kept = %d after the restart: the branch's writes were lost", n)
+	}
+
+	// 3. docker stop: not restarted by the policy; reconcile does it
+	if err := cli.ContainerStop(ctx, b2.ContainerID, container.StopOptions{Timeout: &timeout}); err != nil {
+		t.Fatal(err)
+	}
+	taken, err = e.ApplyReconcile(ctx, time.Now(), 10*time.Minute)
+	if err != nil || !hasAction(taken, ActionRestartBranch, "drift-pr") {
+		t.Fatalf("reconcile after docker stop: %+v, %v", taken.Actions, err)
+	}
+	b3, err := r.GetBranchByName("drift-pr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := mustQueryInt(t, ctx, branchConn(b3), `SELECT x FROM kept`); n != 42 {
+		t.Fatalf("kept = %d after the stop/restart", n)
+	}
+	if plan, _ := e.PlanReconcile(ctx, time.Now(), 10*time.Minute); len(driftFor(plan)) != 0 {
+		t.Fatalf("drift remains: %+v", driftFor(plan))
 	}
 }
 
