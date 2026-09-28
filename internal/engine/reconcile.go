@@ -32,11 +32,13 @@ const (
 	// (a destroy that failed or was interrupted part-way).
 	ActionRetryDestroy ActionKind = "retry_destroy"
 	// ActionRestartBranch recreates the container/pod of a ready branch that
-	// is gone or stopped for good, on the branch's existing volumes. If it does
+	// is gone or stopped for good, on the branch's existing volumes, and
+	// journals the repair (ready -> ready) in the branch's history. If it does
 	// not become ready the branch is failed; its volumes are kept.
 	ActionRestartBranch ActionKind = "restart_branch"
-	// ActionUpdateEndpoint records the address a ready branch's running
-	// container/pod now has (a new pod IP, a re-published port).
+	// ActionUpdateEndpoint records, and journals, the address a ready
+	// branch's running container/pod now has (a new pod IP, a re-published
+	// port).
 	ActionUpdateEndpoint ActionKind = "update_endpoint"
 	// ActionRemoveOrphanContainer removes a managed container/pod with no live
 	// registry row.
@@ -615,7 +617,7 @@ func (e *Engine) applyAction(ctx context.Context, a Action, p reconcilePass) (ap
 				return false, nil // back up, or the runtime is bringing it back
 			}
 		}
-		if err := e.restartBranch(ctx, b); err != nil {
+		if err := e.restartBranch(ctx, b, a.Reason); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -641,9 +643,10 @@ func (e *Engine) applyAction(ctx context.Context, a Action, p reconcilePass) (ap
 		if !info.Running || info.Host == "" || info.Port == 0 || (info.Host == b.Host && info.Port == b.Port) {
 			return false, nil
 		}
-		slog.Info("reconcile: branch address moved", "branch", b.Name,
-			"from", net.JoinHostPort(b.Host, strconv.Itoa(b.Port)), "to", net.JoinHostPort(info.Host, strconv.Itoa(info.Port)))
-		return e.reg.UpdateBranchEndpoint(b.ID, b.ContainerID, b.ContainerID, info.Host, info.Port)
+		from, to := net.JoinHostPort(b.Host, strconv.Itoa(b.Port)), net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
+		slog.Info("reconcile: branch address moved", "branch", b.Name, "from", from, "to", to)
+		return e.reg.UpdateBranchEndpointCtx(ctx, b.ID, b.ContainerID, b.ContainerID, info.Host, info.Port,
+			fmt.Sprintf("reconcile: container %s moved from %s to %s; recorded the new address", shortID(b.ContainerID), from, to))
 
 	case ActionRemoveOrphanContainer:
 		// re-check: the container must still have no live registry row, and
@@ -764,11 +767,12 @@ var errBranchMoved = errors.New("branch changed while it was being restarted; le
 //
 // The row stays ready throughout; its address was dead anyway. The new
 // container is recorded before the readiness wait so no other pass reaps it,
-// and its address once it is ready. A branch that does not come back within
+// and its address once it is ready, journaled with why (the plan's reason) so
+// `pgb history` shows the repair. A branch that does not come back within
 // restartReadyTimeout is failed, keeping its volumes, so `pgb branch recover`
 // can try again later. A failure to start the container at all is returned
 // without failing the row, so the next pass tries again.
-func (e *Engine) restartBranch(ctx context.Context, b *registry.Branch) error {
+func (e *Engine) restartBranch(ctx context.Context, b *registry.Branch, why string) error {
 	bg := context.WithoutCancel(ctx)
 	src, err := e.reg.GetSourceByID(b.SourceID)
 	if err != nil {
@@ -827,7 +831,12 @@ func (e *Engine) restartBranch(ctx context.Context, b *registry.Branch) error {
 	if err != nil {
 		return notReady(err)
 	}
-	if ok, err := e.reg.UpdateBranchEndpoint(b.ID, cid, cid, info.Host, info.Port); err != nil {
+	addr := net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
+	if why == "" {
+		why = fmt.Sprintf("container %s of the ready branch is gone or stopped", shortID(b.ContainerID))
+	}
+	if ok, err := e.reg.UpdateBranchEndpointCtx(ctx, b.ID, cid, cid, info.Host, info.Port,
+		fmt.Sprintf("reconcile: %s; restarted the branch on its volumes as container %s at %s", why, shortID(cid), addr)); err != nil {
 		return err
 	} else if !ok {
 		return errBranchMoved
@@ -865,12 +874,13 @@ func (e *Engine) removeStrayBranchContainer(ctx context.Context, b *registry.Bra
 const endpointRefreshInterval = 5 * time.Second
 
 // RefreshBranchEndpoint re-reads a ready branch's address from the runtime,
-// records it when it moved, and returns the current "host:port". The Postgres
-// router calls it after a dial to the recorded address fails, so a branch
-// whose pod came back with a new IP (or container on a new port) is reachable
-// at once instead of after the next reconcile pass. Within
-// endpointRefreshInterval of the previous check for the same branch it
-// returns the recorded address without asking the runtime.
+// records it when it moved (journaled, like reconcile's update_endpoint), and
+// returns the current "host:port". The Postgres router calls it after a dial
+// to the recorded address fails, so a branch whose pod came back with a new
+// IP (or container on a new port) is reachable at once instead of after the
+// next reconcile pass. Within endpointRefreshInterval of the previous check
+// for the same branch it returns the recorded address without asking the
+// runtime.
 func (e *Engine) RefreshBranchEndpoint(ctx context.Context, name string) (string, error) {
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
@@ -890,11 +900,12 @@ func (e *Engine) RefreshBranchEndpoint(ctx context.Context, name string) (string
 	if !info.Running || info.Host == "" || info.Port == 0 || (info.Host == b.Host && info.Port == b.Port) {
 		return addr, nil
 	}
-	ok, err := e.reg.UpdateBranchEndpoint(b.ID, b.ContainerID, b.ContainerID, info.Host, info.Port)
+	moved := net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
+	ok, err := e.reg.UpdateBranchEndpointCtx(ctx, b.ID, b.ContainerID, b.ContainerID, info.Host, info.Port,
+		fmt.Sprintf("router: container %s moved from %s to %s (found after a failed connection); recorded the new address", shortID(b.ContainerID), addr, moved))
 	if err != nil || !ok {
 		return addr, err
 	}
-	moved := net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
 	slog.Info("branch address moved; recorded the new one", "branch", name, "from", addr, "to", moved)
 	return moved, nil
 }

@@ -73,6 +73,60 @@ func TestUpdateBranchEndpointIsCompareAndSwap(t *testing.T) {
 	}
 }
 
+// UpdateBranchEndpointCtx is the same compare-and-swap, and journals the
+// repair (ready -> ready, the reason, the actor from ctx) only when the swap
+// happens, so `pgb history` explains a changed container or address.
+func TestUpdateBranchEndpointCtxJournalsTheRepair(t *testing.T) {
+	r := openTest(t)
+	b := reconcileBranch(t, r, BranchReady)
+	var before string
+	if err := r.db.QueryRow(`SELECT updated_at FROM branches WHERE id=?`, b.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond) // updated_at has millisecond resolution
+
+	ok, err := r.UpdateBranchEndpointCtx(context.Background(), b.ID, "c1", "c2", "127.0.0.1", 40002, "reconcile: address moved")
+	if err != nil || !ok {
+		t.Fatalf("update = %v, %v", ok, err)
+	}
+	got, _ := r.GetBranchByName("pr-1")
+	if got.ContainerID != "c2" || got.Host != "127.0.0.1" || got.Port != 40002 || got.State != BranchReady {
+		t.Fatalf("row = %+v", got)
+	}
+	var after string
+	if err := r.db.QueryRow(`SELECT updated_at FROM branches WHERE id=?`, b.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after <= before {
+		t.Fatalf("updated_at %q not bumped past %q", after, before)
+	}
+	hist, err := r.BranchHistory("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := hist[len(hist)-1]
+	if last.FromState != "ready" || last.ToState != "ready" || last.Reason != "reconcile: address moved" || last.Actor != SystemActor {
+		t.Fatalf("journal entry = %+v, want ready -> ready by %s", last, SystemActor)
+	}
+
+	// a lost swap changes nothing and journals nothing
+	n := len(hist)
+	if ok, err := r.UpdateBranchEndpointCtx(context.Background(), b.ID, "c1", "c3", "127.0.0.1", 40003, "stale"); err != nil || ok {
+		t.Fatalf("stale container id updated the row: %v, %v", ok, err)
+	}
+	if hist, _ := r.BranchHistory("pr-1"); len(hist) != n {
+		t.Fatalf("a lost swap was journaled: %+v", hist[n:])
+	}
+	// the request actor is recorded when there is one
+	ctx := WithActor(context.Background(), Actor{Name: "ci", Role: RoleAdmin})
+	if ok, err := r.UpdateBranchEndpointCtx(ctx, b.ID, "c2", "c2", "127.0.0.1", 40004, "gc"); err != nil || !ok {
+		t.Fatalf("update = %v, %v", ok, err)
+	}
+	if hist, _ := r.BranchHistory("pr-1"); hist[len(hist)-1].Actor != "ci (admin)" {
+		t.Fatalf("actor = %q, want the request actor", hist[len(hist)-1].Actor)
+	}
+}
+
 // FailReadyBranch fails a ready branch in one transaction through the legal
 // edges, journaling both, and only while the expected container is recorded.
 func TestFailReadyBranch(t *testing.T) {

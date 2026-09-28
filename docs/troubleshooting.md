@@ -11,7 +11,8 @@ stateDiagram-v2
     [*] --> creating
     creating --> ready
     creating --> failed
-    ready --> resetting: reset, fork of a child, reconcile restart
+    ready --> ready: reconcile restart or new address
+    ready --> resetting: reset, fork of a child, failed reconcile restart
     ready --> destroying
     resetting --> ready
     resetting --> failed
@@ -62,6 +63,12 @@ policy, so Docker, daemon and host restarts keep the port. A `docker stop` or
 `docker rm` of a branch container is undone by the next reconcile pass. When a
 connection through the router fails to reach a branch, the router re-reads
 the branch's address (at most once per branch every 5 s) before refusing.
+
+Each such repair is a `ready -> ready` entry in `pgb history NAME`, with the
+reason: `restart_branch` names the lost container and the new one,
+`update_endpoint` and the router's re-read name the old and new address. The
+actor is `system:reconcile` for the reconcile loop and the router, or the
+token or local user that ran `pgb gc`.
 
 ## Seeding
 
