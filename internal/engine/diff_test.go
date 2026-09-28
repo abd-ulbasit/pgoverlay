@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/diffutil"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
@@ -786,6 +787,127 @@ func TestDiffBranchClonesTargetLayerChain(t *testing.T) {
 	}
 	if names := liveDiffBranches(t, r); len(names) != 0 {
 		t.Errorf("throwaway rows left: %v", names)
+	}
+}
+
+// DIFF-04a: a csi child's base is its parent's live PVC, so the diff's clone
+// quiesces the parent exactly like a child reset: CHECKPOINT, stop, clone,
+// restart — and the parent ends up ready again.
+func TestCSIDiffChildQuiescesParent(t *testing.T) {
+	d := newFake()
+	d.execOutFn = diffFake().exec
+	e, r := csiEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	mark := len(d.log)
+
+	if _, err := e.DiffBranch(context.Background(), "pr-2"); err != nil {
+		t.Fatal(err)
+	}
+	idx := func(pred func(string) bool) int {
+		for i := mark; i < len(d.log); i++ {
+			if pred(d.log[i]) {
+				return i
+			}
+		}
+		return -1
+	}
+	ckpt := idx(func(s string) bool { return s == "exec:psql:cid-pgoverlay-br-pr-1" })
+	stop := idx(func(s string) bool { return s == "stop:cid-pgoverlay-br-pr-1" })
+	clone := idx(func(s string) bool {
+		return strings.HasPrefix(s, "clone:pgoverlay-br-pr-1-rw>pgoverlay-br-diff-")
+	})
+	restart := idx(func(s string) bool { return s == "start:pgoverlay-br-pr-1" })
+	if !(ckpt >= 0 && ckpt < stop && stop < clone && clone < restart) {
+		t.Fatalf("order ckpt=%d stop=%d clone=%d restart=%d; log=%v", ckpt, stop, clone, restart, d.log[mark:])
+	}
+	p, err := r.GetBranchByName("pr-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.State != registry.BranchReady || !d.containers[p.ContainerID] {
+		t.Fatalf("parent after the child's diff: %+v", p)
+	}
+	if names := liveDiffBranches(t, r); len(names) != 0 {
+		t.Errorf("throwaway rows left: %v", names)
+	}
+}
+
+// DIFF-04b: a csi parent may be destroyed while its children live, but a
+// child's reset and diff re-clone the parent's PVC — both are refused
+// up-front, before the child's own PVC is touched.
+func TestCSIChildOfDestroyedParentRefusesResetAndDiff(t *testing.T) {
+	d := newFake()
+	d.execOutFn = diffFake().exec
+	e, r := csiEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
+		t.Fatal(err)
+	}
+	clones := len(d.clones)
+
+	if _, err := e.DiffBranch(context.Background(), "pr-2"); err == nil || !strings.Contains(err.Error(), "destroyed") {
+		t.Fatalf("diff err = %v, want a refusal naming the destroyed parent", err)
+	}
+	if _, err := e.ResetBranch(context.Background(), "pr-2"); err == nil || !strings.Contains(err.Error(), "destroyed") {
+		t.Fatalf("reset err = %v, want a refusal naming the destroyed parent", err)
+	}
+	if len(d.clones) != clones {
+		t.Fatalf("a clone was attempted: %v", d.clones[clones:])
+	}
+	c, err := r.GetBranchByName("pr-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.State != registry.BranchReady || !d.volumes["pgoverlay-br-pr-2-rw"] || !d.containers[c.ContainerID] {
+		t.Fatalf("child after refused reset: %+v (volume kept=%v)", c, d.volumes["pgoverlay-br-pr-2-rw"])
+	}
+}
+
+// A new branch reusing the destroyed parent's name (and so its PVC name) is
+// not the child's base: reset and diff are still refused.
+func TestCSIChildRefusesResetWhenParentNameReused(t *testing.T) {
+	d := newFake()
+	d.execOutFn = diffFake().exec
+	e, r := csiEngine(t, d)
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "pr-2", "pr-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DestroyBranch(context.Background(), "pr-1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond) // created_at has millisecond resolution
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.ResetBranch(context.Background(), "pr-2"); err == nil || !strings.Contains(err.Error(), "destroyed") {
+		t.Fatalf("reset err = %v, want a refusal: the new pr-1 is not pr-2's base", err)
+	}
+	if _, err := e.DiffBranch(context.Background(), "pr-2"); err == nil {
+		t.Fatal("diff against a reused parent name succeeded")
+	}
+	// the live parent path still works
+	if _, err := e.CreateBranchFrom(context.Background(), "pr-3", "pr-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.ResetBranch(context.Background(), "pr-3"); err != nil {
+		t.Fatalf("reset of a child with a live parent: %v", err)
 	}
 }
 

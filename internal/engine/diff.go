@@ -146,6 +146,11 @@ func WithDataSample(n int) DiffOption {
 // is a normal registry row (TTL'd, so the reaper cleans strays if branchd dies
 // mid-diff) and is destroyed before returning, success or not. Expect a few
 // seconds of wall time: a full branch provision plus two dumps.
+//
+// zfs and csi children base on their parent's live volume, so their diff
+// compares against the parent's CURRENT state (what a reset would re-clone),
+// and a csi child's diff briefly stops the parent around the clone exactly
+// like a reset does. A csi child whose parent is gone cannot be diffed.
 func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption) (_ *DiffResult, err error) {
 	defer e.observeOp("diff", &err)()
 	var o diffOptions
@@ -158,6 +163,9 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 	}
 	if b.State != registry.BranchReady {
 		return nil, fmt.Errorf("branch %q is %s, not ready", name, b.State)
+	}
+	if err := e.checkCSIChildBase(b); err != nil {
+		return nil, fmt.Errorf("diff %q: %w", name, err)
 	}
 	src, err := e.reg.GetSourceByID(b.SourceID)
 	if err != nil {
@@ -179,6 +187,13 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 		SourceVolume: b.SourceVolume,
 		BaseLayerID:  b.BaseLayerID,
 		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}
+	if e.csi() {
+		// A csi child's base is its parent's live PVC, and cloning an in-use
+		// PVC is not crash-safe: naming the parent makes provisionCSI quiesce
+		// it around the clone (CHECKPOINT, stop, clone, restart), the same as
+		// a child reset. (zfs snapshots are atomic and need no quiesce.)
+		tw.ParentBranchName = b.ParentBranchName
 	}
 	if err := e.reg.CreateBranchCtx(ctx, tw); err != nil {
 		return nil, fmt.Errorf("diff %q: %w", name, err)

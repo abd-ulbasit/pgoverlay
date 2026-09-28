@@ -138,6 +138,29 @@ func (e *Engine) csiQuiesceTarget(b *registry.Branch) (*registry.Branch, error) 
 	return p, nil
 }
 
+// checkCSIChildBase refuses up-front to re-clone a csi child whose base is
+// gone. A csi child's base is its parent's PVC (SourceVolume), and a csi
+// parent may be destroyed while children live — their own PVCs are
+// independent — but reset and diff clone that base again. Without this check a
+// reset would remove the child's PVC first and then fail the clone, leaving
+// the child failed with its data gone. A live branch now carrying the
+// parent's name but created after the child is a different branch that
+// reuses the name (and so the PVC name), never the child's base.
+func (e *Engine) checkCSIChildBase(b *registry.Branch) error {
+	if !e.csi() || b.ParentBranchName == "" {
+		return nil
+	}
+	p, err := e.reg.GetBranchByName(b.ParentBranchName)
+	if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return err
+	}
+	if err != nil || p.RWVolume != b.SourceVolume || p.CreatedAt > b.CreatedAt {
+		return fmt.Errorf("branch %q was cloned from parent %q, which has been destroyed: its base volume %s is gone, so it can no longer be reset or diffed (the branch itself still works; destroy it and branch again to start over)",
+			b.Name, b.ParentBranchName, b.SourceVolume)
+	}
+	return nil
+}
+
 // restartCSIBranch starts a stopped csi branch's pod back on its own PVC,
 // waits for readiness and records the new container/address. On failure the
 // branch is marked failed (cause, when non-nil, is the saga error that
