@@ -531,13 +531,18 @@ func (s *Service) requireReady(ctx context.Context, branch string, b *api.Branch
 // on it (creating, resetting, destroying) until it settles or ctx ends. A
 // missing branch returns an error apiclient.IsNotFound recognizes.
 func (s *Service) settledBranch(ctx context.Context, branch string) (*api.Branch, error) {
+	waiting := "" // the busy state seen on the previous read
 	for {
 		b, err := s.pg.GetBranch(ctx, branch)
 		if err != nil {
+			if waiting != "" && ctx.Err() != nil { // the deadline hit mid-read
+				return nil, &stateError{branch: branch, state: waiting, timedOut: true}
+			}
 			return nil, &opError{op: "get branch " + branch, err: err}
 		}
 		switch b.State {
 		case stateCreating, stateResetting, stateDestroying:
+			waiting = b.State
 		default:
 			return b, nil
 		}
