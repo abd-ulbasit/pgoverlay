@@ -25,9 +25,7 @@ func TestHotQueriesUseIndexes(t *testing.T) {
 			[]any{"2030-01-01T00:00:00Z"}, []string{"branches"}},
 		{"destroying branches", `SELECT id FROM branches WHERE state='destroying' AND updated_at < ?`,
 			[]any{"2030-01-01T00:00:00Z"}, []string{"branches"}},
-		{"volume name used", `SELECT EXISTS (SELECT 1 FROM branches WHERE rw_volume=?1)
-			OR EXISTS (SELECT 1 FROM branches WHERE source_volume=?1)
-			OR EXISTS (SELECT 1 FROM layers WHERE volume=?1)`, []any{"v"}, []string{"branches", "layers"}},
+		{"volume name used", volumeNameUsedQuery, []any{"v"}, []string{"branches", "layers"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rows, err := r.db.Query(`EXPLAIN QUERY PLAN `+tc.query, tc.args...)

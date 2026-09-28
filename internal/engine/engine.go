@@ -307,12 +307,24 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 		return fmt.Errorf("source %q is %s, not ready", name, src.State)
 	}
 	newVol := e.planner.SourceLayerName(name, src.Generation+1)
+	// claim the next generation before creating it: nothing names it until
+	// BumpSourceGeneration, and reconcile's volume GC must not take it while
+	// it is being seeded
+	if err := e.reg.SetSourcePendingVolume(src.ID, newVol); err != nil {
+		return fmt.Errorf("refresh source %q: claim %s: %w", name, newVol, err)
+	}
+	release := func() {
+		e.logCompensationErr("undo", "refresh source: release new generation claim",
+			e.reg.SetSourcePendingVolume(src.ID, ""), "source", name, "volume", newVol)
+	}
 	if err := e.createSourceLayer(ctx, newVol, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": name})); err != nil {
+		release()
 		return err
 	}
 	if err := e.seedSource(ctx, src, newVol, password); err != nil {
 		e.logCompensationErr("undo", "refresh source: remove new generation layer after seed failed",
 			e.removeSourceLayer(context.WithoutCancel(ctx), newVol), "source", name, "volume", newVol)
+		release()
 		return fmt.Errorf("refresh source %q: %w", name, err)
 	}
 	oldVol := src.Volume

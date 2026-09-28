@@ -160,7 +160,16 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 		return stepErr
 	}
 
-	// 3. fresh rw volume for the parent (the swap), with the entrypoint
+	// 3. fresh rw volume for the parent (the swap), with the entrypoint.
+	// Claimed on the parent row first: no column names it until
+	// CommitFreeze, and reconcile's volume GC must not take it meanwhile.
+	if err := e.reg.SetBranchPendingVolume(parent.ID, newRW); err != nil {
+		return fail(fmt.Errorf("claim parent rw volume: %w", err))
+	}
+	undo = append(undo, func() {
+		e.logCompensationErr("undo", "freeze: release parent rw volume claim", e.reg.SetBranchPendingVolume(parent.ID, ""),
+			"branch", parent.Name, "volume", newRW)
+	})
 	if err := e.drv.CreateVolume(ctx, newRW, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.branch.id": parent.ID})); err != nil {
 		return fail(fmt.Errorf("create parent rw volume: %w", err))
 	}

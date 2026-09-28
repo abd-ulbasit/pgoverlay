@@ -980,13 +980,17 @@ func (r *Registry) ListDestroyingBranches(before string) ([]*Branch, error) {
 // layer that live children mount read-only.
 func (r *Registry) VolumeNameUsed(volume string) (bool, error) {
 	var used bool
-	err := r.db.QueryRow(`SELECT
-		EXISTS (SELECT 1 FROM branches WHERE rw_volume=?1)
-		OR EXISTS (SELECT 1 FROM branches WHERE source_volume=?1)
-		OR EXISTS (SELECT 1 FROM layers WHERE volume=?1)
-		OR EXISTS (SELECT 1 FROM sources WHERE volume=?1)`, volume).Scan(&used)
+	err := r.db.QueryRow(volumeNameUsedQuery, volume).Scan(&used)
 	return used, err
 }
+
+const volumeNameUsedQuery = `SELECT
+	EXISTS (SELECT 1 FROM branches WHERE rw_volume=?1)
+	OR EXISTS (SELECT 1 FROM branches WHERE source_volume=?1)
+	OR EXISTS (SELECT 1 FROM branches WHERE pending_volume=?1)
+	OR EXISTS (SELECT 1 FROM layers WHERE volume=?1)
+	OR EXISTS (SELECT 1 FROM sources WHERE volume=?1)
+	OR EXISTS (SELECT 1 FROM sources WHERE pending_volume=?1)`
 
 // LiveVolumeSet returns the set of every volume name a live branch or a live
 // source still depends on: every live branch's rw volume and source volume,
@@ -1026,7 +1030,45 @@ func (r *Registry) LiveVolumeSet() (map[string]bool, error) {
 	if err := add(`SELECT volume FROM layers`); err != nil {
 		return nil, err
 	}
+	// volumes an in-flight saga created before any row names them: a freeze
+	// parent's swap volume (claimed while the parent is mid-freeze; a crash
+	// leaves the row failed and the claim, now dead, releases the volume to
+	// GC) and a refresh's next generation
+	if err := add(`SELECT pending_volume FROM branches WHERE state IN ('creating','resetting')`); err != nil {
+		return nil, err
+	}
+	if err := add(`SELECT pending_volume FROM sources`); err != nil {
+		return nil, err
+	}
 	return live, nil
+}
+
+// SetBranchPendingVolume records (volume != "") or clears (volume == "") the
+// volume an in-flight saga is creating for a branch before any column names
+// it — the freeze parent's swap volume. While the branch is creating or
+// resetting, LiveVolumeSet counts it, so reconcile's volume GC leaves it
+// alone. CommitFreeze clears it.
+func (r *Registry) SetBranchPendingVolume(id, volume string) error {
+	return r.setPending(`UPDATE branches SET pending_volume=? WHERE id=?`, id, volume)
+}
+
+// SetSourcePendingVolume is SetBranchPendingVolume for a source refresh's
+// next-generation volume. BumpSourceGeneration clears it.
+func (r *Registry) SetSourcePendingVolume(id, volume string) error {
+	return r.setPending(`UPDATE sources SET pending_volume=? WHERE id=?`, id, volume)
+}
+
+func (r *Registry) setPending(query, id, volume string) error {
+	res, err := r.db.Exec(query, volume, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (r *Registry) listBranches(where string, args ...any) ([]*Branch, error) {
@@ -1094,7 +1136,7 @@ func (r *Registry) GetMaskScripts(sourceID string) ([]MaskScript, error) {
 // BumpSourceGeneration advances a source to its next generation volume after
 // a successful refresh seed.
 func (r *Registry) BumpSourceGeneration(id, newVolume string) error {
-	res, err := r.db.Exec(`UPDATE sources SET generation=generation+1, volume=?,
+	res, err := r.db.Exec(`UPDATE sources SET generation=generation+1, volume=?, pending_volume='',
 		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, newVolume, id)
 	if err != nil {
 		return err
@@ -1329,7 +1371,7 @@ func (r *Registry) CommitFreezeCtx(ctx context.Context, parentID, childID, layer
 		return nil, err
 	}
 	if _, err := tx.Exec(`UPDATE branches SET rw_volume=?, base_layer_id=?, container_id=?, host=?, port=?, state=?,
-		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
+		pending_volume='', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
 		newParentRW, l.ID, containerID, host, port, BranchReady, parentID); err != nil {
 		return nil, err
 	}

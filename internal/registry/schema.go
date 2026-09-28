@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11, migrateV12, migrateV13}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11, migrateV12, migrateV13, migrateV14}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -202,4 +202,17 @@ CREATE INDEX IF NOT EXISTS layers_volume ON layers(volume);
 // libc records its own image here (empty = the default).
 const migrateV13 = `
 ALTER TABLE sources ADD COLUMN image TEXT NOT NULL DEFAULT '';
+`
+
+// v14: volumes a saga creates before any row names them. A freeze creates the
+// parent's fresh rw volume minutes before CommitFreeze records it, and a
+// source refresh seeds its next-generation volume before the generation bump;
+// reconcile's volume GC saw both as orphans. The saga now claims the volume
+// on its owner row first (branches.pending_volume on the freeze parent,
+// sources.pending_volume on the refreshed source), LiveVolumeSet counts the
+// claim, and the commit or the undo clears it.
+const migrateV14 = `
+ALTER TABLE branches ADD COLUMN pending_volume TEXT NOT NULL DEFAULT '';
+ALTER TABLE sources ADD COLUMN pending_volume TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS branches_pending_volume ON branches(pending_volume);
 `
