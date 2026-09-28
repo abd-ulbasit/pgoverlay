@@ -23,6 +23,11 @@ nav:
   - Home: index.md
   - Quickstart: quickstart.md
   - Ways to use it: usage.md
+  - Reference:
+      - Commands and configuration: reference.md
+      - REST API: api.md
+      - Troubleshooting: troubleshooting.md
+      - Upgrading to v1.0: upgrading.md
   - How it works:
       - Core concepts: concepts.md
       - Architecture: architecture.md
@@ -36,10 +41,16 @@ nav:
   - GitHub App: github-app.md
   - Observability: observability.md
   - High availability: ha.md
+  - Security: security.md
   - ZFS backend (experimental): zfs.md
-  - API stability: api.md
 
 markdown_extensions:
   - admonition
   - tables
-  - pymdownx.superfences
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format

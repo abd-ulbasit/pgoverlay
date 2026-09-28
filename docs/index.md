@@ -3,58 +3,77 @@
 `git branch` for Postgres: seed once from any running database, then spin up
 isolated, writable copies that never write back to it.
 
-Branches are **OverlayFS copy-on-write** mounts over `PGDATA`. Every branch
-shares one read-only copy of the seeded source and stores only the blocks it
-actually changes, so creating one is a mount rather than a copy. Each branch is
-its own live Postgres container, so branches run concurrently, and a branch can
-itself be branched.
+Each branch is its own Postgres container whose data directory is an
+**OverlayFS copy-on-write** mount over one shared, read-only seed of the
+source. Creating a branch mounts that seed instead of copying it, so branches
+start in about two seconds whatever the database size, run side by side, can
+be reset, diffed against their base, and branched again.
 
 ```
 $ pgb branch create pr-1 --from main
-branch "pr-1" ready in 2.533s (port 32774)
+branch "pr-1" ready in 2.482s (port 34467)
 ```
 
-**Measured:** pgoverlay branches a 1 GiB database in ~1.9 s and a 5 GiB
-database in ~1.9 s (p50 of 5 runs) — creation time is independent of database
-size, and a fresh branch costs ~33 MiB of disk, not a copy of the dataset.
-Full results and methodology in [Benchmarks](benchmarks.md).
+**Measured:** a 1 GiB and a 5 GiB database both branch in ~1.9 s (p50 of 5
+runs), and a fresh branch holds 33.1 MiB of its own data, not a copy of the
+dataset. Full results and methodology in [Benchmarks](benchmarks.md).
+
+!!! warning "Honest limits"
+    - **A dev/test tool.** Branches are disposable Postgres instances for
+      development, CI, review apps and migration rehearsal: no backups, no
+      replication of branches, no merge-back, and a branch never follows its
+      source after seeding.
+    - **Branch containers are privileged.** On Docker and in Kubernetes
+      hostpath mode every branch container gets `CAP_SYS_ADMIN` with AppArmor
+      unconfined, for its overlay mount. Kubernetes csi mode adds no
+      capabilities. See [Security](security.md).
+    - **Reads copy data too.** Postgres opens table files read-write even to
+      read them, and OverlayFS copies a file whole into the branch the first
+      time that happens: branches grow toward the size of the tables they
+      touch ([measurement](benchmarks.md#reads-copy-up-too)). For read-heavy
+      branches of large databases, use the [zfs](zfs.md) or
+      [csi](kubernetes.md) backend.
+    - **Postgres 14 to 18**, Linux containers; one `branchd` writes the
+      registry (more replicas are failover, not scale-out).
 
 ## The problem
 
 Every team wants production-like databases for development, CI, and PR review
-apps. The options today:
+apps. A `pg_dump`/`pg_restore` or `createdb -T` is a full copy every time:
+minutes to hours for real datasets, and N copies cost N times the disk.
+Copy-on-write branching fixes both, and there are several ways to get it:
+hosted platforms (Neon, Supabase branching), self-hosted systems built on ZFS
+or LVM (DBLab Engine) or on Kubernetes storage (Xata), and PostgreSQL 18's
+in-instance database cloning on reflink filesystems. The README
+[compares them](https://github.com/abd-ulbasit/pgoverlay#how-it-compares).
 
-- **`pg_dump`/`pg_restore` or `createdb -T`** — a full physical copy every
-  time. Minutes to hours for real datasets, N copies cost N× the disk.
-- **Neon / Supabase branching** — genuinely instant, but cloud-only; you
-  can't point them at the Postgres you already run.
-- **DBLab (Database Lab Engine)** — self-hosted thin clones, but built around
-  ZFS (or LVM) pools you must provision and operate.
-
-pgoverlay takes the middle path: plain Docker, plain Postgres images, and
-OverlayFS copy-on-write — the same mechanism container images use — applied
-to `PGDATA`. No special filesystem, no cloud, no fork of Postgres. (If you
-*do* run ZFS, an [experimental zfs backend](zfs.md) does block-level CoW.)
+pgoverlay takes the middle path: plain Docker, stock Postgres images, and
+OverlayFS copy-on-write (the mechanism container images use) applied to
+`PGDATA`, against the Postgres you already run. No special filesystem, no
+cloud, no fork of Postgres. If you *do* run ZFS, the
+[experimental zfs backend](zfs.md) does block-level copy-on-write, and on
+Kubernetes the [csi mode](kubernetes.md) clones volumes.
 
 ## Where to go
 
-- [Quickstart](quickstart.md) — Docker on a laptop, CLI and `branchd` server.
-- [Kubernetes](kubernetes.md) — branch pods on a storage node, Helm chart.
-- [GitHub App](github-app.md) — a database branch per pull request.
-- [Benchmarks](benchmarks.md) — real measured numbers, and the OverlayFS
-  copy-up diagnosis behind them.
-- [Core concepts](concepts.md) — copy-on-write and OverlayFS from first
+- [Quickstart](quickstart.md): Docker on a laptop, the CLI, and the `branchd`
+  server.
+- [Ways to use it](usage.md): local dev, a database per test, a branch per
+  PR, preview environments, reviewing migrations.
+- [Reference](reference.md) and [REST API](api.md): every command, flag,
+  variable and endpoint.
+- [Troubleshooting](troubleshooting.md): failed branches, recovery,
+  reachability.
+- [Security](security.md): threat model and hardening checklist.
+- [Kubernetes](kubernetes.md): branch pods on a storage node or as CSI
+  clones, and the Helm chart.
+- [GitHub App](github-app.md): a database branch per pull request.
+- [Benchmarks](benchmarks.md): measured numbers, and the OverlayFS copy-up
+  diagnosis behind them.
+- [Core concepts](concepts.md): copy-on-write and OverlayFS from first
   principles.
-- [Architecture](architecture.md) — how it actually works, as built.
-- [Code tour](code-tour.md) — the codebase package by package.
-- [Design decisions](DESIGN-DECISIONS.md) — ten ADRs and their trade-offs.
-- [Deep dives](deep-dives.md) — the places where the obvious implementation
-  was wrong.
-
-## Scope
-
-pgoverlay is a **dev/test tool**: disposable Postgres instances for
-development, CI, PR review apps, and migration rehearsal. It is not a
-production database platform — no HA, no backups, and branch containers need
-`CAP_SYS_ADMIN` for their overlay mount. A branch is a point-in-time
-snapshot; it does not follow the source after seeding.
+- [Architecture](architecture.md), [Code tour](code-tour.md),
+  [Design decisions](DESIGN-DECISIONS.md) and [Deep dives](deep-dives.md):
+  how it works, as built, and where the obvious implementation was wrong.
+- [Upgrading to v1.0](upgrading.md): what changed since the release
+  candidates.

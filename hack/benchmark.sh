@@ -132,7 +132,13 @@ docker exec "$SRC_CONTAINER" pg_isready -U postgres >/dev/null
 docker exec "$SRC_CONTAINER" sh -c \
     'echo "host replication all all scram-sha-256" >> "$PGDATA/pg_hba.conf"'
 psql_src -c "SELECT pg_reload_conf();" >/dev/null
+# Per-network lookup: Docker Engine 29 (API 1.52) dropped the top-level
+# .NetworkSettings.IPAddress, which now fails the template.
 SRC_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$SRC_CONTAINER")
+if [ -z "$SRC_IP" ]; then
+    log "could not read the IP address of $SRC_CONTAINER"
+    exit 1
+fi
 
 # ----------------------------------------------------------- calibration ----
 log "calibrating pgbench bytes-per-scale (scale 10)"

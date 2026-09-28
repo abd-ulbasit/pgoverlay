@@ -9,12 +9,15 @@
 
 ## Why a second backend
 
-OverlayFS copies up **whole files** on first write, and Postgres heap/index
-segments are files of up to 1 GiB — a branch that writes broadly converges on
-a full copy of the dataset ([benchmarks](benchmarks.md)). ZFS does
-copy-on-write at the **block** level: a clone shares blocks with its origin
-snapshot and pays only for the blocks it actually changes, no matter which
-file they live in. If you already run ZFS, the trade is usually worth it.
+OverlayFS copies up **whole files**, and it does so when a file is first
+opened read-write, which Postgres does for every table and index segment
+(files of up to 1 GiB) even to read it. A branch on the overlay backend
+therefore grows toward the size of every table it touches, reads included
+([benchmarks](benchmarks.md#reads-copy-up-too)). ZFS does copy-on-write at
+the **block** level: a clone shares blocks with its origin snapshot and pays
+only for the blocks it actually changes, no matter which file they live in or
+how Postgres opens them. If you already run ZFS, and especially if your
+branches read large tables, the trade is usually worth it.
 
 Two consequences worth knowing:
 
@@ -51,7 +54,10 @@ under `<prefix>` instead of docker/kube volumes:
   host's zfs kernel module.
 - **Branch containers** bind-mount the clone's mountpoint at `/pgoverlay/rw`
   and run with `PGDATA=/pgoverlay/rw/data`. No overlay assembly; WAL crash
-  recovery on first boot, exactly as the overlay backend.
+  recovery on first boot, exactly as the overlay backend. They still run with
+  `CAP_SYS_ADMIN` and AppArmor unconfined: the runtime drivers give every
+  branch container those settings, whatever the backend (see
+  [Security](security.md)).
 - **Destroys are idempotent**: an already-absent dataset/snapshot doesn't
   fail the destroy (so a half-created, failed branch stays destroyable), but
   a destroy that fails with the target still present — e.g. a busy clone —
@@ -96,7 +102,7 @@ $ docker exec demo-src psql -U postgres \
 $ docker exec demo-src sh -c \
     'echo "host replication all all scram-sha-256" >> "$PGDATA/pg_hba.conf"'
 $ docker exec demo-src psql -U postgres -c "SELECT pg_reload_conf();"
-$ SRC_IP=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' demo-src)
+$ SRC_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' demo-src)
 
 $ export PGOVERLAY_TOKEN=$(openssl rand -hex 16)
 $ ./bin/branchd --cow zfs --zfs-dataset tank/pgoverlay
@@ -179,6 +185,9 @@ manual Deployment edit if you want to try it in-cluster.
   alpine package vs host kernel-module compatibility is on you).
 - `--cow` is a branchd flag; local-mode `pgb` (no `--server`) is overlay-only.
 - One backend per `PGOVERLAY_HOME` — don't mix.
+- A parent with live children cannot be destroyed or reset (their clones
+  depend on snapshots of its dataset); both are refused up front.
+
 Branch-from-branch is **not** a limitation here — it is the backend's best
 feature. `CreateBranchFrom` snapshots the parent's clone and clones that
 (`zfs snapshot <parent>@br-<child>` + `zfs clone`), so unlike the overlay
@@ -186,3 +195,9 @@ backend there is no freeze: the parent is never checkpointed, stopped or
 restarted, and no layer rows are written. Covered by
 `TestZFSCreateBranchFromSnapshotsParentClone` against the fake driver; like
 everything else on this page, unverified on real ZFS.
+
+One consequence to know: a child's recorded base is the parent's *live*
+dataset, not the snapshot taken at the fork. Resetting the child, or running
+`pgb diff` on it, snapshots the parent again, so the reset returns the child
+to the parent's **current** state and the diff compares against it: changes
+the parent made after the fork show up reversed in the child's diff.

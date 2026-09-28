@@ -9,6 +9,11 @@ service that gives every pull request its own Postgres branch:
 | synchronize (push) | ensure the branch exists; reset it to the source snapshot only when `GHOOK_RESET_ON_PUSH=true` |
 | closed (incl. merged) | destroy the branch (already-gone is fine) |
 
+So anyone who can open a pull request in an allowed repository can cause a
+branch of your source to be created, with the router address and the
+branch's database name posted on the PR (never a password). On a public
+repository, mask the source and read [Security](security.md) first.
+
 With GitHub credentials configured, the service also reports back to the PR:
 
 - **Commit status** (context `pgoverlay/branch`) on the PR head SHA:
@@ -229,8 +234,22 @@ helm upgrade --install pgoverlay deploy/helm/pgoverlay \
 `--set ghook.githubToken=$GITHUB_TOKEN`. The chart refuses to render with
 both set.)
 
-It talks to branchd over the in-cluster `…-api` Service and reuses the
-chart's API token Secret. Secrets can come from a pre-created Secret
-instead (`ghook.existingSecret`, keys `webhook-secret` and optionally
-`github-token` / `app-private-key`). See `ghook.*` in `values.yaml` for
-TTL, reset-on-push, diff-on-push, branch naming and service type.
+It talks to branchd over the in-cluster `…-api` Service (which, with leader
+election, routes to the leader). Give it an **operator-role token** rather
+than branchd's admin token: mint one with
+`pgb token create ghook --role operator`, store it in a Secret, and set
+`ghook.apiTokenSecret` (and `ghook.apiTokenKey`, default `token`). Until you
+do, the chart falls back to the admin token and its NOTES warn about it; the
+full commands are in [Kubernetes](kubernetes.md#branch-per-pull-request).
+The webhook's own secrets can come from a pre-created Secret instead of
+values (`ghook.existingSecret`, keys `webhook-secret` and optionally
+`github-token` / `app-private-key`).
+
+The ghook pod runs as a non-root user with a read-only root filesystem and
+mounts no ServiceAccount token (it never talks to the Kubernetes API). To
+expose it through a cloud load balancer, set `ghook.service.type` to
+`LoadBalancer` and restrict it with `ghook.service.loadBalancerSourceRanges`
+to GitHub's webhook ranges (the `hooks` list of `https://api.github.com/meta`),
+or add provider annotations with `ghook.service.annotations`; the
+[EKS walkthrough](eks.md#deploy) does both. See `ghook.*` in `values.yaml`
+for TTL, reset-on-push, diff-on-push, branch naming and service type.

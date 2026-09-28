@@ -137,13 +137,14 @@ other drivers, and they need no escaping. If your code wants a single
 `DATABASE_URL` instead, build `postgres://user:password@host:port/db@branch`
 from the same outputs and percent-encode the password.
 
-**Pinning.** `@v1` is a floating tag: it was published with
-`v1.0.0-rc.4` and moves to the newest compatible release, the Actions
-convention (see
+**Pinning.** `@v1` is a floating tag, the Actions convention: the release
+workflow points it at the newest stable v1.x.y release each time one is
+published, so `action@v1` runs different code over time (see
 [SECURITY.md](https://github.com/abd-ulbasit/pgoverlay/blob/main/SECURITY.md)).
-Never use `@main`, which runs whatever was pushed last. For an immutable
-reference, pin a full release tag (for example `action@v1.0.0-rc.4`) or,
-stricter still, a commit SHA, since tags can be moved.
+Until v1.0.0 is released it points at `v1.0.0-rc.4`, which predates the
+`proxy_*` outputs used above. Never use `@main`, which runs whatever was
+pushed last. For an immutable reference, pin a full release tag (for example
+`action@v1.0.0`) or, stricter still, a commit SHA, since tags can be moved.
 
 The action is a composite action that only talks to the `/v1` REST API — it
 ships no binary and is not tied to the `branchd` version you run.
@@ -198,6 +199,8 @@ point `PGOVERLAY_PASSWORD` (or your workflow secret) at the source password.
 When branchd runs with `--rotate-branch-credentials`, every branch gets its
 own generated password instead, returned by the API. Both SDKs prefer that
 server-returned password, and the Action exposes it as its masked `password`
-output, which the workflow above falls back from. Applications that keep
+output, which the workflow above falls back from. (If branchd reports a
+branch as `password_unavailable`, its at-rest key changed; the branch needs a
+reset before a rotated password can be used again.) Applications that keep
 static configuration can fetch it at startup with
 [`pgoverlayconnect`](https://github.com/abd-ulbasit/pgoverlay/tree/main/pgoverlayconnect).

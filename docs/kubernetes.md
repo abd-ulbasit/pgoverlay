@@ -1,8 +1,5 @@
 # Kubernetes
 
-> Adapted from the [README](https://github.com/abd-ulbasit/pgoverlay); the
-> README stays the canonical copy of this walkthrough.
-
 branchd can run in-cluster with branches as pods (`--runtime kube`). A Helm
 chart deploys the whole thing, in one of two storage modes: **csi** —
 branches as PVC clones, schedulable on any node, the recommended
@@ -55,9 +52,13 @@ postgres directly on the clone — no overlay, no node pin, no extra
 capabilities. Branch-from-branch clones the parent's PVC after a CHECKPOINT
 and a brief parent stop (CSI drivers don't guarantee crash-consistent clones
 of in-use volumes); the parent pod restarts as soon as the clone is
-provisioned, and the wire router re-resolves it transparently. Every clone
-is an independent volume: destroying a parent never breaks its children
-(resetting a child does need its parent alive, since reset re-clones).
+provisioned, and the wire router re-resolves it transparently. The same
+brief stop happens whenever such a child is **reset or diffed**: its base is
+the parent's live PVC, so the reset or diff clones the parent again (and
+compares against the parent's *current* state, not the fork point). Every
+clone is an independent volume: destroying a parent never breaks its running
+children, but once the parent is gone they can no longer be reset or diffed;
+`pgb branch reset` and `pgb diff` refuse them up front with a clear error.
 
 Two csi-mode caveats: branch disk usage (`pgb branch ls` SIZE) reports the
 full clone size as the filesystem sees it, not the CoW delta — what a delta
@@ -96,7 +97,12 @@ helm install pgoverlay deploy/helm/pgoverlay \
 (`deploy/helm/pgoverlay/Chart.yaml`) — a tag published to
 `ghcr.io/abd-ulbasit/pgoverlay-branchd`. So a plain `helm install` pulls a
 real image and there is nothing to build first. `ghook.image.tag` follows the
-same appVersion for `ghcr.io/abd-ulbasit/pgoverlay-ghook`.
+same appVersion for `ghcr.io/abd-ulbasit/pgoverlay-ghook`. The release
+workflow publishes both images for every release tag, with an SBOM and build
+provenance, and refuses to release unless `appVersion` equals the tag. From
+v1.0.0 they are multi-arch (linux/amd64, linux/arm64), so an arm64 cluster
+(kind on Apple Silicon, Graviton nodes) pulls them directly; the earlier `-rc`
+images were linux/amd64 only.
 
 To deploy a locally built image instead, build it, get it onto the node, and
 say so explicitly:
@@ -209,8 +215,9 @@ silently falls back to plaintext, so do not rely on it.
 ## What the chart creates
 
 A Deployment for branchd (`replicaCount`, default 1: the registry is SQLite,
-a single writer; more than one replica is an HA standby set with leader
-election, see [High availability](ha.md)), `Recreate` strategy, state in
+a single writer; more than one replica turns on leader election and gives a
+standby set on the same node as the state volume, not more throughput, see
+[High availability](ha.md)), `Recreate` strategy, state in
 `hostPath <dataRoot>/state` on the storage node — or in a PVC when
 `persistence` is on, which is automatic in csi mode. A namespace-scoped Role
 for branchd, which manages resources only in its own namespace:
@@ -224,10 +231,24 @@ for branchd, which manages resources only in its own namespace:
   `replicaCount > 1` or `leaderElection.enabled`.
 
 And two Services: `pgoverlay-api` (REST, :7070) and `pgoverlay-proxy`
-(Postgres router, :6432). The branchd container runs as root for write
-access to its hostPath state dir; in hostpath mode branch pods get
-`CAP_SYS_ADMIN` for their in-container overlay mount, same as on Docker
-(csi branch pods need nothing).
+(Postgres router, :6432). With leader election on, `pgoverlay-api` selects
+only the leader's pod (`pgoverlay.leader=true`); `pgoverlay-proxy` selects
+every replica. The branchd container runs as root for write access to its
+hostPath state dir; in hostpath mode branch pods get `CAP_SYS_ADMIN` for their
+in-container overlay mount, same as on Docker (csi branch pods need nothing).
+
+**The state volume.** `<dataRoot>/state` (or the persistence PVC) holds the
+SQLite registry and `secret.key`, the at-rest key for rotated branch
+passwords, which branchd generates (mode `0600`, directory `0700`) on first
+start. Back them up together: a registry restored without its key keeps
+working, but every rotated password reads as `password_unavailable` until
+that branch is reset. The chart does not yet have a value for supplying the
+key from a Secret (`PGOVERLAY_SECRET_KEY`).
+
+**Shutdown.** `shutdownTimeout` (default 60 seconds) is how long branchd lets
+in-flight operations finish on `SIGTERM` before rolling them back; the chart
+sets `terminationGracePeriodSeconds` to `shutdownTimeout + 30` so the kubelet
+does not kill it mid-drain.
 
 The chart wires the OverlayFS (hostpath) and csi backends; the experimental
 [zfs backend](zfs.md) needs a zpool on the storage node and privileged
@@ -385,11 +406,32 @@ kubectl -n pgoverlay-system port-forward svc/pgoverlay-proxy 6432 &
 psql "host=localhost port=6432 dbname=postgres@pr-42 user=postgres"
 ```
 
+A few things to know when driving it:
+
+- `kubectl port-forward svc/pgoverlay-api` pins one pod for the life of the
+  forward. With leader election that is the leader at the time; restart the
+  forward after a failover. Clients that go through the Service (in-cluster,
+  or through an Ingress or LoadBalancer) follow the leader automatically, and
+  the Go client retries the `503`s of a failover.
+- `pgb connect` prints the direct pod-IP URL (in-cluster only) and a router
+  URL. The chart does not pass `--advertise-proxy-addr` yet, so outside the
+  cluster give the router address yourself:
+  `pgb connect pr-42 --proxy-host pg.example.com --proxy-port 6432`.
+- The chart serves the REST API over plain HTTP inside the cluster. If you
+  put TLS in front of it with a private CA, point the CLI at the CA with
+  `PGOVERLAY_CA_CERT=<pem file>` (it wins over the insecure
+  `PGOVERLAY_TLS_SKIP_VERIFY=1`).
+- With `replicaCount > 1`, a query cancel (`Ctrl-C`) only works when the
+  cancel request reaches the replica carrying the session. Give the
+  `pgoverlay-proxy` Service `sessionAffinity: ClientIP` (the chart does not
+  set it yet).
+
 ## Branch per pull request
 
 The chart ships `pgoverlay-github` as an optional sub-deployment
 (`--set ghook.enabled=true ...`): a signed GitHub webhook creates
-`gh-pr-<number>` when a PR opens, optionally resets it on every push,
+`gh-<repo-key>-pr-<number>` when a PR opens (see
+[branch names](github-app.md#branch-names)), optionally resets it on every push,
 destroys it on close, and keeps one live connect-info comment on the PR
 (updated in place as the branch changes) plus a `pgoverlay/branch` commit
 status. Setup, permissions, and the full `GHOOK_*` environment reference
