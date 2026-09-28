@@ -1105,3 +1105,56 @@ func (r *Registry) ListSources() ([]*Source, error) {
 	}
 	return out, rows.Err()
 }
+
+// Reconcile support: registry -> runtime drift repair.
+
+// UpdateBranchEndpoint re-points a ready branch at a container and address
+// without a state change: reconcile's repair for a branch whose container
+// came back on a different address or had to be recreated. It is a
+// compare-and-swap on state='ready' AND container_id=fromContainerID, so it
+// never overwrites a branch that a concurrent reset, freeze or destroy has
+// taken over; updated reports whether the row changed.
+func (r *Registry) UpdateBranchEndpoint(id, fromContainerID, containerID, host string, port int) (updated bool, err error) {
+	res, err := r.db.Exec(`UPDATE branches SET container_id=?, host=?, port=?
+		WHERE id=? AND state=? AND container_id=?`,
+		containerID, host, port, id, string(BranchReady), fromContainerID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// FailReadyBranch marks a ready branch failed when reconcile could not bring
+// its container back. The state machine has no direct ready -> failed edge,
+// so the row takes the two legal edges ready -> resetting -> failed, both
+// journaled, in ONE transaction: a crash can never leave it parked in
+// resetting, where the stuck-row recovery would treat its writable layer as
+// a half-built reset and delete it. Compare-and-swap on state='ready' AND
+// container_id=containerID; failed reports whether the row changed.
+func (r *Registry) FailReadyBranch(ctx context.Context, id, containerID, reason string) (failed bool, err error) {
+	if !legalBranchTransition(BranchReady, BranchResetting) || !legalBranchTransition(BranchResetting, BranchFailed) {
+		return false, fmt.Errorf("illegal branch transition %s -> %s", BranchReady, BranchFailed)
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE branches SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=? AND container_id=?`, string(BranchFailed), id, string(BranchReady), containerID)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, err
+	}
+	actor := actorString(ctx)
+	for _, step := range [][2]BranchState{{BranchReady, BranchResetting}, {BranchResetting, BranchFailed}} {
+		if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+			"branch", id, string(step[0]), string(step[1]), reason, actor); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
+}
