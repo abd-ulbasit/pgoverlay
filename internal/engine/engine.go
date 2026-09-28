@@ -38,6 +38,9 @@ type Engine struct {
 	// Both come from branchd --default-ttl / --max-ttl.
 	defaultTTL time.Duration
 	maxTTL     time.Duration
+	// rs is reconcile's in-process bookkeeping: resources running sagas have
+	// claimed but not yet recorded in the registry (see reconcile.go).
+	rs reconcileState
 }
 
 // ErrQuotaExceeded is returned by the create paths when --max-branches is set
@@ -205,6 +208,9 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 		return fmt.Errorf("source %q is %s, not ready", name, src.State)
 	}
 	newVol := e.planner.SourceLayerName(name, src.Generation+1)
+	// no registry row names newVol until BumpSourceGeneration: claim it for
+	// reconcile's volume GC until the refresh returns
+	defer e.claimVolume(newVol)()
 	if err := e.createSourceLayer(ctx, newVol, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": name})); err != nil {
 		return err
 	}

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
+	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
 // seedReady marks a freshly-created creating branch ready so it counts as live
@@ -426,5 +427,156 @@ func TestReconcileStuckResettingParentKeepsRWReferencedBySourceVolume(t *testing
 	}
 	if !d.volumes["pgoverlay-br-parent-rw"] {
 		t.Fatal("DATA LOSS: reconcile deleted the csi/zfs freeze parent's rw volume")
+	}
+}
+
+// readyBranch provisions a branch through the engine (fake driver) and returns
+// its row.
+func readyBranch(t *testing.T, e *Engine, name string) *registry.Branch {
+	t.Helper()
+	b, err := e.CreateBranch(context.Background(), name, "main", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func mustBranch(t *testing.T, r *registry.Registry, name string) *registry.Branch {
+	t.Helper()
+	b, err := r.GetBranchByName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// --- in-flight volumes and volume GC grace (issue #11) ---
+
+// Reconcile running while a freeze is between creating the parent's fresh rw
+// volume and CommitFreeze must not GC that volume: no row names it yet.
+func TestReconcileMidFreezeKeepsParentsNewRWVolume(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	readyBranch(t, e, "p")
+	newRW := "pgoverlay-br-p-rw-g2"
+
+	var mid ReconcilePlan
+	ran := false
+	d.onStartBranch = func(s runtime.BranchSpec) {
+		if s.Name != "pgoverlay-br-p" || ran {
+			return
+		}
+		ran = true // the parent's restart over the frozen chain: newRW exists, unrecorded
+		taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+		if err != nil {
+			t.Errorf("mid-freeze reconcile: %v", err)
+		}
+		mid = taken
+	}
+	if _, err := e.CreateBranchFrom(context.Background(), "c", "p", 0); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("hook never ran")
+	}
+	if hasAction(mid, ActionGCVolume, newRW) {
+		t.Fatalf("DATA LOSS: mid-freeze reconcile GC'd the parent's new rw volume: %+v", mid.Actions)
+	}
+	if !d.volumes[newRW] {
+		t.Fatal("DATA LOSS: the parent's new rw volume is gone")
+	}
+	if got := mustBranch(t, r, "p"); got.RWVolume != newRW || got.State != registry.BranchReady {
+		t.Fatalf("parent after freeze: %+v", got)
+	}
+}
+
+// Reconcile running while a source refresh is seeding the next generation
+// must not GC that volume: BumpSourceGeneration has not recorded it yet.
+func TestReconcileMidRefreshKeepsNextGenerationVolume(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	next := "pgoverlay-src-main-g2"
+
+	var mid ReconcilePlan
+	ran := false
+	d.onRunHelper = func(runtime.HelperSpec) {
+		if ran || !d.volumes[next] {
+			return
+		}
+		ran = true // seeding into the unrecorded next generation
+		taken, err := e.ApplyReconcile(context.Background(), time.Now(), 10*time.Minute)
+		if err != nil {
+			t.Errorf("mid-refresh reconcile: %v", err)
+		}
+		mid = taken
+	}
+	if err := e.RefreshSource(context.Background(), "main", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("hook never ran")
+	}
+	if hasAction(mid, ActionGCVolume, next) || !d.volumes[next] {
+		t.Fatalf("DATA LOSS: mid-refresh reconcile GC'd the new generation: %+v", mid.Actions)
+	}
+	if src := mustSource(t, r); src.Volume != next {
+		t.Fatalf("source volume = %q, want %q", src.Volume, next)
+	}
+}
+
+// An unrecorded volume younger than the stuck timeout may belong to an
+// operation in another process; it is only GC'd once it is older.
+func TestReconcileVolumeGCGracePeriod(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	now := time.Now()
+	d.addOrphanVolume("pgoverlay-br-young-rw", r.InstanceID())
+	d.volumeCreated["pgoverlay-br-young-rw"] = now.Add(-time.Minute)
+	d.addOrphanVolume("pgoverlay-br-old-rw", r.InstanceID())
+	d.volumeCreated["pgoverlay-br-old-rw"] = now.Add(-time.Hour)
+
+	plan, err := e.PlanReconcile(context.Background(), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasAction(plan, ActionGCVolume, "pgoverlay-br-young-rw") {
+		t.Fatalf("volume younger than the stuck timeout planned for GC: %+v", plan.Actions)
+	}
+	if !hasAction(plan, ActionGCVolume, "pgoverlay-br-old-rw") {
+		t.Fatalf("old orphan volume not planned: %+v", plan.Actions)
+	}
+}
+
+// A volume claimed by an operation in this process is skipped at plan time
+// and re-checked at apply time.
+func TestReconcileSkipsClaimedVolume(t *testing.T) {
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	d.addOrphanVolume("pgoverlay-br-x-rw-g2", r.InstanceID())
+
+	release := e.claimVolume("pgoverlay-br-x-rw-g2")
+	plan, err := e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasAction(plan, ActionGCVolume, "pgoverlay-br-x-rw-g2") {
+		t.Fatalf("claimed volume planned for GC: %+v", plan.Actions)
+	}
+	release()
+
+	plan, err = e.PlanReconcile(context.Background(), time.Now(), 10*time.Minute)
+	if err != nil || !hasAction(plan, ActionGCVolume, "pgoverlay-br-x-rw-g2") {
+		t.Fatalf("released volume not planned: %+v, %v", plan.Actions, err)
+	}
+	// claimed between plan and apply: the apply-time re-check keeps it
+	release = e.claimVolume("pgoverlay-br-x-rw-g2")
+	defer release()
+	applied, err := e.applyAction(context.Background(), Action{Kind: ActionGCVolume, Target: "pgoverlay-br-x-rw-g2"})
+	if err != nil || applied || !d.volumes["pgoverlay-br-x-rw-g2"] {
+		t.Fatalf("apply on a claimed volume: applied=%v err=%v present=%v", applied, err, d.volumes["pgoverlay-br-x-rw-g2"])
 	}
 }

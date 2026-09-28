@@ -133,7 +133,10 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 		return stepErr
 	}
 
-	// 3. fresh rw volume for the parent (the swap), with the entrypoint
+	// 3. fresh rw volume for the parent (the swap), with the entrypoint. No
+	// registry row names it until CommitFreeze, so claim it for reconcile's
+	// volume GC until this saga returns (committed or compensated).
+	defer e.claimVolume(newRW)()
 	if err := e.drv.CreateVolume(ctx, newRW, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.branch.id": parent.ID})); err != nil {
 		return fail(fmt.Errorf("create parent rw volume: %w", err))
 	}

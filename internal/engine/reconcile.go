@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
@@ -52,6 +53,60 @@ func (p ReconcilePlan) Drift() bool { return len(p.Actions) > 0 }
 
 func (p *ReconcilePlan) add(kind ActionKind, target, reason string) {
 	p.Actions = append(p.Actions, Action{Kind: kind, Target: target, Reason: reason})
+}
+
+// reconcileState is the engine's in-process reconcile bookkeeping.
+//
+// claims counts resources that a running operation has created, or is about
+// to create, before the registry records them: a freeze's fresh parent rw
+// volume until CommitFreeze, a refresh's next-generation volume until
+// BumpSourceGeneration. PlanReconcile and applyAction consult it, so those
+// resources are never taken for orphans while they are in use.
+//
+// Claims only cover operations in this process. Volume GC additionally skips
+// any volume younger than the stuck timeout, which covers another process (a
+// CLI next to branchd, a previous leader) that has just created one.
+type reconcileState struct {
+	mu     sync.Mutex
+	claims map[string]int
+}
+
+func (s *reconcileState) claim(key string) (release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claims == nil {
+		s.claims = map[string]int{}
+	}
+	s.claims[key]++
+	return s.releaser(key)
+}
+
+func (s *reconcileState) releaser(key string) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.claims[key]--; s.claims[key] <= 0 {
+				delete(s.claims, key)
+			}
+		})
+	}
+}
+
+func (s *reconcileState) claimed(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.claims[key] > 0
+}
+
+func volumeClaim(name string) string { return "volume:" + name }
+
+// claimVolume marks a volume the caller is about to create as in flight until
+// release is called: after the registry records the volume, or after the
+// caller's compensation removed it. Claim BEFORE creating the volume.
+func (e *Engine) claimVolume(name string) (release func()) {
+	return e.rs.claim(volumeClaim(name))
 }
 
 // PlanReconcile computes the convergence plan WITHOUT mutating anything: it is
@@ -144,9 +199,17 @@ func (e *Engine) PlanReconcile(ctx context.Context, now time.Time, stuckTimeout 
 			}
 		}
 		for _, v := range vols {
-			if !liveVols[v.Name] && !planned[v.Name] {
-				plan.add(ActionGCVolume, v.Name, "managed volume owned by no live branch or source")
+			if liveVols[v.Name] || planned[v.Name] || e.rs.claimed(volumeClaim(v.Name)) {
+				continue
 			}
+			// A volume the registry does not name yet may belong to an
+			// operation in another process that has just created it (a freeze
+			// before CommitFreeze, a refresh before BumpSourceGeneration). Give
+			// it the stuck timeout before calling it an orphan.
+			if !v.Created.IsZero() && now.Sub(v.Created) < stuckTimeout {
+				continue
+			}
+			plan.add(ActionGCVolume, v.Name, "managed volume owned by no live branch or source")
 		}
 	}
 
@@ -309,7 +372,11 @@ func (e *Engine) applyAction(ctx context.Context, a Action) (applied bool, err e
 
 	case ActionGCVolume:
 		// re-check ownership immediately before deleting: never remove a volume
-		// that any live branch's layer chain / rw / source volume now references.
+		// that any live branch's layer chain / rw / source volume now
+		// references, or that an operation in this process has claimed.
+		if e.rs.claimed(volumeClaim(a.Target)) {
+			return false, nil
+		}
 		liveVols, err := e.reg.LiveVolumeSet()
 		if err != nil {
 			return false, err
