@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -283,6 +284,37 @@ func TestWaitPodDoneRewatchesAfterErrorEvent(t *testing.T) {
 	phase, err := d.waitPodDone(ctx, "pgoverlay-helper-e", nil)
 	if err != nil || phase != corev1.PodFailed {
 		t.Fatalf("waitPodDone = %q, %v; want Failed after re-watching", phase, err)
+	}
+}
+
+// A transient API error (an apiserver restart during an EKS upgrade) is
+// retried; an RBAC error is reported at once.
+func TestWaitPodDoneAPIErrors(t *testing.T) {
+	d, cs := fakeKubeDriver(t)
+	createPendingPod(t, cs, "pgoverlay-helper-t", corev1.PodStatus{Phase: corev1.PodSucceeded})
+	var gets atomic.Int32
+	cs.PrependReactor("get", "pods", func(ktesting.Action) (bool, kruntime.Object, error) {
+		if gets.Add(1) == 1 {
+			return true, nil, apierrors.NewServiceUnavailable("apiserver restarting")
+		}
+		return false, nil, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if phase, err := d.waitPodDone(ctx, "pgoverlay-helper-t", nil); err != nil || phase != corev1.PodSucceeded {
+		t.Fatalf("waitPodDone = %q, %v; want Succeeded after retrying a 503", phase, err)
+	}
+
+	d, cs = fakeKubeDriver(t)
+	cs.PrependWatchReactor("pods", func(ktesting.Action) (bool, watch.Interface, error) {
+		return true, nil, apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("RBAC: watch denied"))
+	})
+	start := time.Now()
+	if _, err := d.waitPodDone(ctx, "pgoverlay-helper-t", nil); err == nil || !apierrors.IsForbidden(err) {
+		t.Fatalf("waitPodDone = %v, want the Forbidden error", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("a Forbidden watch was retried for %s", time.Since(start))
 	}
 }
 

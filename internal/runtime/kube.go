@@ -588,26 +588,33 @@ func (d *KubeDriver) waitPodDone(ctx context.Context, name string, started func(
 		}
 		return nil
 	}
-	failures := 0
-	// retry backs off after a failed API call; it gives up after
-	// maxWatchFailures in a row, or when the wait itself times out.
-	retry := func(err error) error {
-		failures++
-		if failures >= maxWatchFailures {
-			return err
-		}
+	// pause waits for d, unless the context ends or the wait times out first.
+	pause := func(d time.Duration) error {
 		select {
 		case <-ctx.Done():
 			return p.ctxErr(ctx.Err())
 		case <-timeout():
 			return p.check(time.Now())
-		case <-time.After(min(time.Duration(1<<(failures-1))*time.Second, 16*time.Second)):
+		case <-time.After(d):
 			return nil
 		}
+	}
+	failures := 0
+	// retry backs off after a failed API call; it gives up after
+	// maxWatchFailures in a row, or when the wait itself times out. Errors
+	// that retrying cannot fix (RBAC, a bad request) end the wait at once.
+	retry := func(err error) error {
+		failures++
+		if failures >= maxWatchFailures || apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) ||
+			apierrors.IsBadRequest(err) || apierrors.IsInvalid(err) {
+			return err
+		}
+		return pause(min(time.Duration(1<<(failures-1))*time.Second, 16*time.Second))
 	}
 	for {
 		// Watch first, then read: a transition between the two shows up in
 		// the watch rather than falling in a gap.
+		watchStart := time.Now()
 		w, err := pods.Watch(ctx, metav1.ListOptions{FieldSelector: selector, TimeoutSeconds: &watchTimeout})
 		if err != nil {
 			if ctx.Err() != nil {
@@ -642,6 +649,13 @@ func (d *KubeDriver) waitPodDone(ctx context.Context, name string, started func(
 		w.Stop()
 		if done {
 			return phase, err
+		}
+		// A watch that ends right away (an error event, a proxy cutting
+		// streams) must not turn this into a hot Get/Watch loop.
+		if time.Since(watchStart) < time.Second {
+			if err := pause(time.Second); err != nil {
+				return "", err
+			}
 		}
 	}
 }
