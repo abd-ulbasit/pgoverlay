@@ -210,7 +210,7 @@ func TestAcquireBranchFields(t *testing.T) {
 	if b.Password != "s3cr:t/pw" {
 		t.Errorf("password = %q, want env fallback", b.Password)
 	}
-	wantDSN := fmt.Sprintf("postgres://appuser:%s@10.0.0.7:31234/appdb", url.QueryEscape("s3cr:t/pw"))
+	wantDSN := "postgres://appuser:s3cr%3At%2Fpw@10.0.0.7:31234/appdb"
 	if b.DSN != wantDSN {
 		t.Errorf("DSN = %q, want %q", b.DSN, wantDSN)
 	}
@@ -218,9 +218,65 @@ func TestAcquireBranchFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantProxy := fmt.Sprintf("postgres://appuser:%s@%s:6432/appdb@%s", url.QueryEscape("s3cr:t/pw"), u.Hostname(), b.Name)
+	wantProxy := fmt.Sprintf("postgres://appuser:s3cr%%3At%%2Fpw@%s:6432/appdb@%s", u.Hostname(), b.Name)
 	if b.ProxyDSN != wantProxy {
 		t.Errorf("ProxyDSN = %q, want %q", b.ProxyDSN, wantProxy)
+	}
+}
+
+// TestDSNRoundTrip: whatever the credentials, the DSN must parse back (as pgx
+// parses postgres:// URLs, via net/url) to exactly the same user, password,
+// host and database. url.QueryEscape got this wrong: it encodes a space as
+// '+', which userinfo parsing keeps as a literal '+'.
+func TestDSNRoundTrip(t *testing.T) {
+	tests := []struct {
+		user, password, host, db string
+	}{
+		{"postgres", "pass word", "10.0.0.7", "postgres"},
+		{"app user", `p@ss:w/rd?#+%&= "x"`, "db.example.com", "appdb"},
+		{"postgres", "", "127.0.0.1", "postgres@t-foo-abc123"},
+		{"postgres", "pw", "fd00::7", "appdb@t-bar"},
+		{"postgres", "pw", "::1", "postgres"},
+	}
+	for _, tt := range tests {
+		got := dsn(tt.user, tt.password, tt.host, 5432, tt.db)
+		u, err := url.Parse(got)
+		if err != nil {
+			t.Errorf("dsn(%q, %q, %q) = %q: does not parse: %v", tt.user, tt.password, tt.host, got, err)
+			continue
+		}
+		if strings.Contains(got, "+") && !strings.Contains(tt.password, "+") {
+			t.Errorf("dsn = %q: a '+' is not a space in URL userinfo", got)
+		}
+		if u.User.Username() != tt.user {
+			t.Errorf("dsn = %q: user parses as %q, want %q", got, u.User.Username(), tt.user)
+		}
+		pw, set := u.User.Password()
+		if pw != tt.password || set != (tt.password != "") {
+			t.Errorf("dsn = %q: password parses as %q (set=%v), want %q", got, pw, set, tt.password)
+		}
+		if u.Hostname() != tt.host || u.Port() != "5432" {
+			t.Errorf("dsn = %q: host parses as %q port %q, want %q 5432", got, u.Hostname(), u.Port(), tt.host)
+		}
+		if strings.TrimPrefix(u.Path, "/") != tt.db {
+			t.Errorf("dsn = %q: database parses as %q, want %q", got, u.Path, tt.db)
+		}
+	}
+}
+
+// TestAcquireIPv6DirectHost: a server reporting an IPv6 branch host yields a
+// bracketed, parseable DSN.
+func TestAcquireIPv6DirectHost(t *testing.T) {
+	stub := newStub(t)
+	stub.branch.Host = "fd00::7"
+	t.Setenv("PGOVERLAY_SERVER", stub.ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
+	t.Setenv("PGOVERLAY_PASSWORD", "pw")
+
+	var b *Branch
+	t.Run("inner", func(t *testing.T) { b = Acquire(t) })
+	if want := "postgres://appuser:pw@[fd00::7]:31234/appdb"; b.DSN != want {
+		t.Errorf("DSN = %q, want %q", b.DSN, want)
 	}
 }
 

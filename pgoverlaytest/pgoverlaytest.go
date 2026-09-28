@@ -160,14 +160,16 @@ func newBranch(w *wireBranch, baseURL string) *Branch {
 	return b
 }
 
-// dsn builds postgres://user[:password]@host:port/db. The db may contain '@'
+// dsn builds postgres://user[:password]@host:port/db. The userinfo is
+// percent-encoded the way URL parsers (pgx, libpq) decode it — a space is
+// %20, never '+' — and IPv6 hosts are bracketed. The db may contain '@'
 // (proxy routing) — legal in a URL path, kept literal.
 func dsn(user, password, host string, port int, db string) string {
-	auth := url.QueryEscape(user)
+	auth := url.User(user)
 	if password != "" {
-		auth += ":" + url.QueryEscape(password)
+		auth = url.UserPassword(user, password)
 	}
-	return fmt.Sprintf("postgres://%s@%s/%s", auth, net.JoinHostPort(host, strconv.Itoa(port)), db)
+	return fmt.Sprintf("postgres://%s@%s/%s", auth.String(), net.JoinHostPort(host, strconv.Itoa(port)), db)
 }
 
 // branchName builds t-<sanitized test name>-<suffix>, ≤41 chars (the server's

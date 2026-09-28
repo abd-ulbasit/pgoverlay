@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -68,6 +69,33 @@ func TestResolveInheritModeRequiresPassword(t *testing.T) {
 	}
 	if !strings.Contains(res.DSN, ":fromenv@") {
 		t.Errorf("DSN = %q, want supplied password", res.DSN)
+	}
+}
+
+// TestResolveDSNEscaping: the DSNs must parse back (as pgx parses them, via
+// net/url) to the exact password. url.QueryEscape encoded a space as '+',
+// which userinfo parsing keeps as a literal '+'.
+func TestResolveDSNEscaping(t *testing.T) {
+	const pw = "pass word@:/?#+%"
+	srv, _, _ := stub(t, wireBranch{
+		Name: "feat-login", Host: "10.0.0.5", Port: 5432, User: "app user",
+		Password: pw, Database: "appdb", ProxyDatabase: "appdb@feat-login",
+	})
+	res, err := Resolve(context.Background(), Options{Server: srv.URL, Token: "tok", Branch: "feat-login"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{res.DSN, res.ProxyDSN} {
+		u, err := url.Parse(d)
+		if err != nil {
+			t.Fatalf("%q: %v", d, err)
+		}
+		if got, _ := u.User.Password(); got != pw {
+			t.Errorf("%q: password parses as %q, want %q", d, got, pw)
+		}
+		if u.User.Username() != "app user" {
+			t.Errorf("%q: user parses as %q", d, u.User.Username())
+		}
 	}
 }
 
