@@ -84,18 +84,19 @@ func (f *fakeDriver) ExecOutput(ctx context.Context, id string, cmd []string) (s
 	switch {
 	case strings.Contains(joined, "reltuples"):
 		if isBase {
-			return "users|100\n", nil
+			return `[{"schema":"public","table":"users","rows":100,"bytes":8192}]`, nil
 		}
-		return "added|7\nusers|100\n", nil
+		return `[{"schema":"public","table":"added","rows":7,"bytes":8192},{"schema":"public","table":"users","rows":100,"bytes":8192}]`, nil
 	case strings.Contains(joined, "indisprimary"):
 		if strings.Contains(joined, "'added'") {
-			return "x\n", nil // added has PK x
+			return `[["x","integer"]]`, nil // added has PK x
 		}
-		return "", nil
+		return "[]", nil
+	case strings.Contains(joined, "jsonb_build_object"):
+		// the new table's keys, highest first (it is absent on the base, so
+		// every row is branch-only)
+		return `{"x": 2}` + "\n" + `{"x": 1}` + "\n", nil
 	case strings.Contains(joined, "to_jsonb"):
-		if isBase {
-			return "", nil // base has no rows in the new table
-		}
 		return `{"x": 1}` + "\n" + `{"x": 2}` + "\n", nil
 	}
 	return "", nil

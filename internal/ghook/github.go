@@ -267,7 +267,8 @@ func diffCommentBody(branch string, res *engine.DiffResult) string {
 	}
 	sb.WriteString("\n| TABLE | BASE | BRANCH | DELTA |\n|---|---|---|---|\n")
 	for _, t := range changed {
-		fmt.Fprintf(&sb, "| `%s` | %d | %d | %+d |\n", t.Table, t.BaseRows, t.BranchRows, t.Delta)
+		base, branch, delta := t.Cells()
+		fmt.Fprintf(&sb, "| `%s` | %s | %s | %s |\n", t.Name(), base, branch, delta)
 	}
 	sb.WriteString("\n_(row counts are planner estimates)_\n")
 	return sb.String()

@@ -61,8 +61,9 @@ func TestV1WireCompat(t *testing.T) {
 		SchemaDiff: "diff", Tables: []engine.TableDelta{{Table: "t"}},
 	}, "schema_diff", "tables")
 	assertKeys(t, "TableDelta", engine.TableDelta{
-		Table: "t", BaseRows: 1, BranchRows: 2, Delta: 1, SampleRows: []map[string]any{{"id": 1}},
-	}, "table", "base_rows", "branch_rows", "delta", "sample_rows")
+		Schema: "public", Table: "t", BaseRows: 1, BranchRows: 2, Delta: 1, RowsUnknown: true,
+		SampleRows: []map[string]any{{"id": 1}},
+	}, "schema", "table", "base_rows", "branch_rows", "delta", "rows_unknown", "sample_rows")
 
 	assertKeys(t, "ReconcilePlan", engine.ReconcilePlan{
 		Actions: []engine.Action{{Kind: "gc_volume", Target: "v", Reason: "r"}},
