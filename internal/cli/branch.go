@@ -416,7 +416,7 @@ func requireReady(name, state string) error {
 	case registry.BranchCreating, registry.BranchResetting:
 		hint = "; wait until `pgb branch ls` shows it ready"
 	case registry.BranchFailed:
-		hint = fmt.Sprintf("; see `pgb history %s` for the cause, then reset or destroy it", name)
+		hint = fmt.Sprintf("; see `pgb history %s` for the cause, then `pgb branch recover %s` (keeps its data), reset or destroy it", name, name)
 	}
 	return fmt.Errorf("branch %q is %s, not ready%s", name, state, hint)
 }
