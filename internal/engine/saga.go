@@ -557,7 +557,21 @@ func psqlCmd(src *registry.Source, sql string) []string {
 	return []string{"psql", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", db, "-c", sql}
 }
 
+// containerDiagnoser is an optional runtime driver capability: explain why a
+// container is not serving yet (image pull back-off, unschedulable pod, crash
+// loop), and whether waiting can still help. The kube driver implements it;
+// readiness is otherwise only visible as exec errors.
+type containerDiagnoser interface {
+	DiagnoseContainer(ctx context.Context, id string) (reason string, fatal bool)
+}
+
+// waitReady polls pg_isready in the container until it answers or timeout
+// passes. With a diagnosing driver it stops early on a state waiting cannot
+// fix, and the returned error carries the driver's explanation — captured
+// before the caller's compensation removes the container and with it the
+// evidence (kubectl describe on a deleted pod shows nothing).
 func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duration) error {
+	diag, _ := e.drv.(containerDiagnoser)
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -565,10 +579,20 @@ func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duratio
 		if lastErr == nil {
 			return nil
 		}
+		if diag != nil {
+			if reason, fatal := diag.DiagnoseContainer(ctx, cid); fatal {
+				return fmt.Errorf("%s (last readiness probe: %w)", reason, lastErr)
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
+		}
+	}
+	if diag != nil {
+		if reason, _ := diag.DiagnoseContainer(ctx, cid); reason != "" {
+			return fmt.Errorf("%w; %s", lastErr, reason)
 		}
 	}
 	return lastErr
