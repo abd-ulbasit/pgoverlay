@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -288,12 +289,27 @@ func (d *DockerDriver) Exec(ctx context.Context, id string, cmd []string) error 
 	return err
 }
 
-// ExecOutput runs cmd in the container and returns its stdout. The exec API
-// multiplexes stdout/stderr over one attached stream (stdcopy); stderr is
-// kept separate so captured output (e.g. a pg_dump) stays clean, and is
-// embedded in the error on non-zero exit.
+// execUser is the OS user in-container commands run as. Every engine exec is
+// a Postgres client (psql, pg_dump, pg_isready) talking to the branch over its
+// local socket, and a source whose pg_hba.conf authenticates local
+// connections with `peer` (the Debian/Ubuntu packaging default) only lets the
+// OS user postgres in as the postgres role. Docker's default exec user is the
+// container's (root, for the postgres images), which peer auth rejects.
+const execUser = "postgres"
+
+// ExecOutput runs cmd in the container as execUser and returns its stdout.
+// The exec API multiplexes stdout/stderr over one attached stream (stdcopy);
+// stderr is kept separate so captured output (e.g. a pg_dump) stays clean,
+// and is embedded in the error on non-zero exit.
+//
+// Success needs both a complete stream and a finished command with exit code
+// 0. A stream that breaks early (a dropped connection to the daemon) is an
+// error rather than truncated output, and the exit code is read only once the
+// daemon reports the exec is no longer running: ExecInspect's ExitCode is 0
+// until then, which would pass a command that has not finished (or that will
+// fail) as a success.
 func (d *DockerDriver) ExecOutput(ctx context.Context, id string, cmd []string) (string, error) {
-	ex, err := d.cli.ContainerExecCreate(ctx, id, container.ExecOptions{Cmd: cmd, AttachStdout: true, AttachStderr: true})
+	ex, err := d.cli.ContainerExecCreate(ctx, id, container.ExecOptions{User: execUser, Cmd: cmd, AttachStdout: true, AttachStderr: true})
 	if err != nil {
 		return "", err
 	}
@@ -303,15 +319,86 @@ func (d *DockerDriver) ExecOutput(ctx context.Context, id string, cmd []string) 
 	}
 	defer att.Close()
 	var stdout, stderr bytes.Buffer
-	stdcopy.StdCopy(&stdout, &stderr, att.Reader)
-	insp, err := d.cli.ContainerExecInspect(ctx, ex.ID)
-	if err != nil {
-		return stdout.String(), err
+	if err := demuxExecStream(&stdout, &stderr, att.Reader); err != nil {
+		return stdout.String(), fmt.Errorf("exec %v: reading output: %w", cmd, err)
 	}
-	if insp.ExitCode != 0 {
-		return stdout.String(), fmt.Errorf("exec %v exited %d: %s%s", cmd, insp.ExitCode, stderr.String(), stdout.String())
+	code, err := d.execExitCode(ctx, ex.ID)
+	if err != nil {
+		return stdout.String(), fmt.Errorf("exec %v: %w", cmd, err)
+	}
+	if code != 0 {
+		return stdout.String(), fmt.Errorf("exec %v exited %d: %s%s", cmd, code, stderr.String(), stdout.String())
 	}
 	return stdout.String(), nil
+}
+
+// demuxExecStream splits docker's multiplexed attach stream (8-byte header:
+// stream id, 3 zero bytes, big-endian payload length; then the payload) into
+// stdout and stderr. Unlike stdcopy.StdCopy, which returns success when the
+// stream ends in the middle of a frame, a partial header or payload is
+// io.ErrUnexpectedEOF: truncated output must not pass for complete output.
+// EOF on a frame boundary is the normal end of the stream.
+func demuxExecStream(stdout, stderr io.Writer, r io.Reader) error {
+	var hdr [8]byte
+	for {
+		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		size := int64(binary.BigEndian.Uint32(hdr[4:]))
+		var dst io.Writer
+		switch stdcopy.StdType(hdr[0]) {
+		case stdcopy.Stdin, stdcopy.Stdout:
+			dst = stdout
+		case stdcopy.Stderr:
+			dst = stderr
+		case stdcopy.Systemerr:
+			var msg bytes.Buffer
+			if _, err := io.CopyN(&msg, r, size); err != nil {
+				return unexpectedEOF(err)
+			}
+			return fmt.Errorf("daemon: %s", msg.String())
+		default:
+			return fmt.Errorf("unrecognized stream header %d", hdr[0])
+		}
+		if _, err := io.CopyN(dst, r, size); err != nil {
+			return unexpectedEOF(err)
+		}
+	}
+}
+
+func unexpectedEOF(err error) error {
+	if err == io.EOF {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+// execExitCode waits until the daemon reports the exec finished and returns
+// its exit code. The attached stream ending and the exec being marked done are
+// separate events on the daemon side, so the first inspect can still see it
+// running; poll (bounded by ctx) instead of trusting a single read.
+func (d *DockerDriver) execExitCode(ctx context.Context, execID string) (int, error) {
+	delay := 10 * time.Millisecond
+	for {
+		insp, err := d.cli.ContainerExecInspect(ctx, execID)
+		if err != nil {
+			return 0, err
+		}
+		if !insp.Running {
+			return insp.ExitCode, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("waiting for exec to finish: %w", ctx.Err())
+		case <-time.After(delay):
+		}
+		if delay < 250*time.Millisecond {
+			delay *= 2
+		}
+	}
 }
 
 func (d *DockerDriver) Inspect(ctx context.Context, id string) (ContainerInfo, error) {

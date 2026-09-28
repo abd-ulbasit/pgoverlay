@@ -1,8 +1,10 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 )
 
@@ -238,6 +241,87 @@ func TestIsPortRace(t *testing.T) {
 	}
 	if isPortRace(nil) {
 		t.Error("isPortRace(nil) = true")
+	}
+}
+
+func execFake(t *testing.T) (*fakeDockerAPI, *DockerDriver, context.Context) {
+	t.Helper()
+	f, d := newFakeDockerAPI(t)
+	f.containers["c1"] = &fakeContainer{id: "c1", state: container.StateRunning}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	return f, d, ctx
+}
+
+// The first inspect after the stream ends can still report the exec running
+// with the default exit code 0. The result must be the exit code the command
+// actually finished with, or masking and credential rotation would pass on a
+// failed psql.
+func TestExecOutputWaitsForExitCode(t *testing.T) {
+	f, d, ctx := execFake(t)
+	f.execOut = "partial output\n"
+	f.execInspects = []container.ExecInspect{{Running: true, ExitCode: 0}, {Running: true, ExitCode: 0}, {Running: false, ExitCode: 3}}
+	_, err := d.ExecOutput(ctx, "c1", []string{"psql", "-c", "select 1"})
+	if err == nil || !strings.Contains(err.Error(), "exited 3") {
+		t.Fatalf("ExecOutput = %v, want the real exit code 3", err)
+	}
+	if f.execInspectN < 3 {
+		t.Errorf("exec inspected %d times, want polling until it stopped running", f.execInspectN)
+	}
+}
+
+// A stream that breaks mid-frame is an error, not truncated success (a
+// truncated pg_dump would otherwise become a diff's base schema).
+func TestExecOutputBrokenStreamIsError(t *testing.T) {
+	f, d, ctx := execFake(t)
+	f.execTruncate = true
+	f.execInspects = []container.ExecInspect{{Running: false, ExitCode: 0}}
+	_, err := d.ExecOutput(ctx, "c1", []string{"pg_dump"})
+	if err == nil || !strings.Contains(err.Error(), "reading output") {
+		t.Fatalf("ExecOutput = %v, want a stream read error", err)
+	}
+}
+
+func TestDemuxExecStream(t *testing.T) {
+	var in bytes.Buffer
+	stdcopy.NewStdWriter(&in, stdcopy.Stdout).Write([]byte("out1 "))
+	stdcopy.NewStdWriter(&in, stdcopy.Stderr).Write([]byte("err1"))
+	stdcopy.NewStdWriter(&in, stdcopy.Stdout).Write([]byte("out2"))
+	whole := in.Bytes()
+
+	var out, errOut bytes.Buffer
+	if err := demuxExecStream(&out, &errOut, bytes.NewReader(whole)); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "out1 out2" || errOut.String() != "err1" {
+		t.Errorf("stdout=%q stderr=%q", out.String(), errOut.String())
+	}
+	// cut inside the last header, and inside the last payload
+	for _, cut := range []int{len(whole) - 4 - 8 + 3, len(whole) - 2} {
+		err := demuxExecStream(io.Discard, io.Discard, bytes.NewReader(whole[:cut]))
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("cut at %d/%d: err = %v, want io.ErrUnexpectedEOF", cut, len(whole), err)
+		}
+	}
+	var sys bytes.Buffer
+	stdcopy.NewStdWriter(&sys, stdcopy.Systemerr).Write([]byte("exec failed"))
+	if err := demuxExecStream(io.Discard, io.Discard, &sys); err == nil || !strings.Contains(err.Error(), "exec failed") {
+		t.Errorf("systemerr frame: err = %v", err)
+	}
+}
+
+// Engine commands run as the postgres OS user so `local ... peer` auth
+// (the distro-packaged default copied in by pg_basebackup) accepts them.
+func TestExecOutputRunsAsPostgres(t *testing.T) {
+	f, d, ctx := execFake(t)
+	f.execOut = "ok\n"
+	f.execInspects = []container.ExecInspect{{Running: false, ExitCode: 0}}
+	out, err := d.ExecOutput(ctx, "c1", []string{"pg_isready"})
+	if err != nil || out != "ok\n" {
+		t.Fatalf("ExecOutput = %q, %v", out, err)
+	}
+	if len(f.execCreates) != 1 || f.execCreates[0].User != "postgres" {
+		t.Fatalf("exec create = %+v, want User postgres", f.execCreates)
 	}
 }
 
