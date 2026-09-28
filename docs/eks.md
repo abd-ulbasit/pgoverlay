@@ -16,7 +16,7 @@ sources) dump-based seeding. In-cluster, all of that disappears:
 |---|---|---|
 | webhook delivery | smee/tunnel forwarder | ghook behind a LoadBalancer, GitHub posts directly |
 | proxy reachability | tunnel (expiring, random address) | stable LoadBalancer DNS |
-| seeding | `--via dump` (managed clouds block basebackup) | `pg_basebackup` from the in-cluster replica/primary |
+| seeding | `--via dump` (managed clouds block basebackup) | `pg_basebackup` from the in-cluster standby (recommended) or primary |
 | endpoints in CI/Vercel | re-wired on every tunnel restart | set once |
 
 ## Provision
@@ -44,13 +44,16 @@ aws eks describe-cluster-versions \
 
 The Helm chart defaults to `ghcr.io/abd-ulbasit/pgoverlay-branchd` at the
 chart's `appVersion` (`image.tag` is empty, meaning "follow the chart"), so a
-plain `helm install` pulls a published image. To run your own build — a fork, a
-patch, or an image mirrored into a registry inside the VPC — override both
-halves as the `helm install` below does, and note two practical traps:
+plain `helm install` pulls a published image (multi-arch from v1.0.0, so
+Graviton nodes work too). To run your own build — a fork, a patch, or an image
+mirrored into a registry inside the VPC — override both halves as the
+`helm install` below does, and note the practical traps:
 
-- **Cross-compile on the host** (`GOOS=linux GOARCH=amd64 CGO_ENABLED=0`,
-  pure-Go thanks to modernc.org/sqlite) and build a copy-only image.
-  Running the Go toolchain under qemu emulation on Apple Silicon segfaults.
+- **Building on Apple Silicon for x86 nodes** works with
+  `docker buildx build --platform linux/amd64 -t <image> .` (and
+  `-f Dockerfile.ghook` for the webhook image): the Dockerfiles run the Go
+  toolchain on the build machine's own platform and cross-compile, so nothing
+  runs under qemu emulation.
 - **Nodes without Docker Hub access** (private subnets without NAT, a
   registry allow-list) also need the images branchd starts at runtime: set
   `helperImage` to a mirror of the utility helper image (see
@@ -183,7 +186,8 @@ certificate against the CA:
 
 ```bash
 kubectl -n pgoverlay get secret pgoverlay-ca -o jsonpath='{.data.ca\.crt}' | base64 -d > pgoverlay-ca.crt
-psql "host=pg.preview.example.com port=6432 dbname=app@gh-pr-42 user=app sslmode=verify-full sslrootcert=pgoverlay-ca.crt"
+psql "host=pg.preview.example.com port=6432 dbname=app@gh-d782c8-pr-42 user=app sslmode=verify-full sslrootcert=pgoverlay-ca.crt"
+# gh-<repo-key>-pr-<number>; see docs/github-app.md#branch-names
 ```
 
 **Give ghook its own token.** The install above hands ghook branchd's admin
@@ -265,5 +269,7 @@ running on EKS — they are why "works in kind" is not "works in production":
 
 3. **CI raced async branch creation.** With the instant ack, a fast runner
    reaches `psql` before the branch pod is ready. Consumers should wait for
-   connectivity — see the retry loop in the
-   [demo repo's workflow](https://github.com/abd-ulbasit/pgoverlay-demo/blob/main/.github/workflows/pr-db-check.yml).
+   the branch — gate the job on the `pgoverlay/branch` commit status, which
+   turns `success` only once the branch is ready, or retry the connection as
+   the [demo repo's workflow](https://github.com/abd-ulbasit/pgoverlay-demo/blob/main/.github/workflows/pr-db-check.yml)
+   does.

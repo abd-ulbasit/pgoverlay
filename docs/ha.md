@@ -57,10 +57,22 @@ Talking to a pod directly (pod IP, `port-forward pod/...`) bypasses this: a
 follower answers mutations with `503 not leader`. During a failover there is
 briefly no labelled pod (the Service has no endpoints) and a request can also
 hit the old leader as it steps down; clients should retry `503` and connection
-errors with backoff for about a lease duration.
+errors with backoff for about a lease duration. The Go client that `pgb` and
+the webhook service use does this for you, within a bound: it retries `503`
+for any request, `502`, `504` and connection resets for idempotent ones, and
+dial failures, with jittered backoff over about eight seconds, closing idle
+connections between tries so the Service can pick a new endpoint. A failover
+that takes longer than that (a crashed leader's Lease runs 15 s) still
+surfaces as an error; retry the command.
 
 The Postgres proxy Service (`<release>-proxy`) still selects every replica:
 the wire-protocol router only reads the registry, so any replica can serve it.
+One exception: a query cancel request (`Ctrl-C` in psql) is a separate
+connection, and only the replica that carries the session knows where to
+forward it. With several replicas behind the Service, set
+`sessionAffinity: ClientIP` on `<release>-proxy` so a client's cancel reaches
+the same replica (the chart does not set it yet); otherwise a cancel may be
+dropped.
 
 ### Why `/readyz` does not depend on leadership
 
@@ -121,12 +133,19 @@ and select `pgoverlay.leader=true` in whatever Service fronts the API.
 
 ## The RWO-PVC co-scheduling caveat
 
-branchd's state (the SQLite registry) lives on a **ReadWriteOnce** volume — a
-hostPath on the storage node, or a PVC when `persistence.enabled`. An RWO volume
-can only be attached to one node at a time, so **all replicas must schedule onto
-that node.** The chart already pins branchd to `node` with `nodeName`, so the
-default 2-replica layout co-schedules correctly: two pods on the storage node,
-sharing the volume, only the leader writing.
+branchd's state (the SQLite registry and the at-rest key) lives on a
+**ReadWriteOnce** volume — a hostPath on the storage node, or a PVC when
+`persistence` is on (the default in csi mode). An RWO volume can only be
+attached to one node at a time, so **all replicas must schedule onto that
+node.** The chart handles both layouts:
+
+- **hostpath mode, or `persistence.enabled=false`**: branchd is pinned to
+  `node` with `nodeName`, so every replica lands on the storage node.
+- **csi mode with persistence**: branchd is not pinned and `node` is not
+  needed. With more than one replica the chart adds a required pod affinity
+  (replicas co-locate on one node, wherever the scheduler puts the first), so
+  they share the PVC's node. Setting `affinity` replaces that rule; keep an
+  equivalent one.
 
 If you want replicas spread across nodes (to survive losing the storage node
 itself), put the registry on a **ReadWriteMany** volume — a CSI driver / storage
