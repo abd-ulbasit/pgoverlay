@@ -50,7 +50,11 @@ type Branch struct {
 	// branchd runs with --rotate-branch-credentials; otherwise the branch
 	// inherits the source's credentials and the field is omitted.
 	Password string `json:"password,omitempty"`
-	Database string `json:"database"`
+	// PasswordUnavailable is true when the branch has a rotated password that
+	// branchd's at-rest key cannot decrypt (the key changed since it was
+	// stored); password is then omitted. Reset the branch to mint a new one.
+	PasswordUnavailable bool   `json:"password_unavailable,omitempty"`
+	Database            string `json:"database"`
 	// ProxyDatabase is the database param to use when connecting through the
 	// wire-protocol router: dbname@branch.
 	ProxyDatabase string `json:"proxy_database"`

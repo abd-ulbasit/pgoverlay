@@ -42,9 +42,9 @@ func TestV1WireCompat(t *testing.T) {
 	// fully-populated instances so omitempty fields are present too
 	assertKeys(t, "Branch", Branch{
 		Name: "pr-1", Source: "main", Parent: "p", State: "ready", Host: "h", Port: 5432,
-		User: "postgres", Password: "x", Database: "postgres", ProxyDatabase: "postgres@pr-1",
+		User: "postgres", Password: "x", PasswordUnavailable: true, Database: "postgres", ProxyDatabase: "postgres@pr-1",
 		ExpiresAt: "t", CreatedAt: "t",
-	}, "name", "source", "parent", "state", "host", "port", "user", "password",
+	}, "name", "source", "parent", "state", "host", "port", "user", "password", "password_unavailable",
 		"database", "proxy_database", "expires_at", "created_at")
 
 	assertKeys(t, "Source", Source{

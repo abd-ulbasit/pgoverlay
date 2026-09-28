@@ -287,7 +287,7 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 		return err
 	}
 	s.Volume = e.planner.SourceLayerName(s.Name, 1)
-	if err := e.reg.CreateSource(s); err != nil {
+	if err := e.reg.CreateSourceCtx(ctx, s); err != nil {
 		return err
 	}
 	// heartbeat the seeding row so reconcile can tell a long seed from one
@@ -295,17 +295,17 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 	defer e.trackSeeding(s.ID)()
 	if err := e.createSourceLayer(ctx, s.Volume, e.instanceLabels(map[string]string{"pgoverlay.managed": "true", "pgoverlay.source.name": s.Name})); err != nil {
 		e.logCompensationErr("transition", "add source: mark source failed after layer create failed",
-			e.reg.SetSourceState(s.ID, registry.SourceFailed, "source layer create failed"), "source", s.Name)
+			e.reg.SetSourceStateCtx(ctx, s.ID, registry.SourceFailed, "source layer create failed"), "source", s.Name)
 		return err
 	}
 	if err := e.seedSource(ctx, s, s.Volume, password); err != nil {
 		e.logCompensationErr("undo", "add source: remove source layer after seed failed",
 			e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume), "source", s.Name, "volume", s.Volume)
 		e.logCompensationErr("transition", "add source: mark source failed after seed failed",
-			e.reg.SetSourceState(s.ID, registry.SourceFailed, failureReason(err)), "source", s.Name)
+			e.reg.SetSourceStateCtx(ctx, s.ID, registry.SourceFailed, failureReason(err)), "source", s.Name)
 		return fmt.Errorf("seed source %q: %w", s.Name, err)
 	}
-	return e.reg.SetSourceState(s.ID, registry.SourceReady, "seed complete")
+	return e.reg.SetSourceStateCtx(ctx, s.ID, registry.SourceReady, "seed complete")
 }
 
 // RefreshSource re-seeds a source into a fresh generation volume. Existing
@@ -343,7 +343,7 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 		return fmt.Errorf("refresh source %q: %w", name, err)
 	}
 	oldVol := src.Volume
-	if err := e.reg.BumpSourceGeneration(src.ID, newVol); err != nil {
+	if err := e.reg.BumpSourceGenerationCtx(ctx, src.ID, newVol); err != nil {
 		return err
 	}
 	e.gcSourceVolume(ctx, src.ID, oldVol)
@@ -388,7 +388,7 @@ func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 		return fmt.Errorf("remove source layer: %w", err)
 	}
 	// DeleteSource cascades the layer rows
-	if err := e.reg.DeleteSource(src.ID); err != nil {
+	if err := e.reg.DeleteSourceCtx(ctx, src.ID); err != nil {
 		return err
 	}
 	// failed attempts of the same name (registries from before CreateSource

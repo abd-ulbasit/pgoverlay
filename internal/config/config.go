@@ -1,6 +1,9 @@
 package config
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -27,5 +30,44 @@ func Load() (*Config, error) {
 	}, nil
 }
 
-// EnsureHome creates the state directory.
-func (c *Config) EnsureHome() error { return os.MkdirAll(c.Home, 0o755) }
+// EnsureHome creates the state directory owner-only (0700) and makes sure the
+// registry file exists owner-only (0600) before SQLite opens it. The registry
+// holds API-token digests, source connection details, masking SQL and branch
+// passwords, and the directory holds the at-rest key, so neither may be
+// readable by other local users. SQLite creates its -wal/-shm files with the
+// database file's mode, so pre-creating the file 0600 covers them too.
+//
+// Existing installs created with the old 0755/0644 modes are tightened
+// best-effort: a chmod the process is not allowed to make (a state dir owned
+// by another user, some volume mounts) is not an error.
+func (c *Config) EnsureHome() error {
+	if err := os.MkdirAll(c.Home, 0o700); err != nil {
+		return err
+	}
+	tighten(c.Home, 0o700)
+	f, err := os.OpenFile(c.RegistryPath, os.O_RDONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	switch {
+	case err == nil:
+		if err := f.Close(); err != nil {
+			return err
+		}
+	case !errors.Is(err, fs.ErrExist):
+		return fmt.Errorf("create registry file: %w", err)
+	}
+	for _, p := range []string{c.RegistryPath, c.RegistryPath + "-wal", c.RegistryPath + "-shm"} {
+		tighten(p, 0o600)
+	}
+	return nil
+}
+
+// tighten drops any permission bits on path beyond max (best-effort; a
+// missing file or a refused chmod is ignored).
+func tighten(path string, max fs.FileMode) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if mode := fi.Mode().Perm(); mode&^max != 0 {
+		_ = os.Chmod(path, mode&max)
+	}
+}

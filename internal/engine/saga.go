@@ -391,6 +391,14 @@ func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *regi
 // keeps its existing password.
 func (e *Engine) rotateBranchCredentials(ctx context.Context, cid string, b *registry.Branch, src *registry.Source) error {
 	if !e.rotateCredentials {
+		// Inherit mode: the fresh clone carries the source's credentials, so
+		// a password left on the row by an earlier rotating run (readable or
+		// not) is stale. Clear it rather than hand it out.
+		if b.Password != "" || b.PasswordUnavailable {
+			if err := e.reg.SetBranchPassword(b.ID, ""); err != nil {
+				return fmt.Errorf("clear stale password for branch %q: %w", b.Name, err)
+			}
+		}
 		return nil
 	}
 	buf := make([]byte, 16)
@@ -413,13 +421,39 @@ func (e *Engine) rotateBranchCredentials(ctx context.Context, cid string, b *reg
 	// a bounded leak. The exposure is bounded: this same password is also stored
 	// (now encrypted at rest), is re-rotated on every reset, and belongs to an
 	// ephemeral branch. Left as-is deliberately; revisit if a stdin exec lands.
+	//
+	// Both drivers format the argv into their exec errors, so a failed ALTER
+	// ROLE error carries the new password. That error becomes the failed
+	// transition's reason (stored in plaintext, returned by the history
+	// endpoint) and is logged, so the password is redacted from it here.
 	if err := e.drv.Exec(ctx, cid, psqlCmd(src, stmt)); err != nil {
-		return fmt.Errorf("rotate credentials for branch %q: %w", b.Name, err)
+		return fmt.Errorf("rotate credentials for branch %q: %w", b.Name, redactSecret(err, pw))
 	}
 	if err := e.reg.SetBranchPassword(b.ID, pw); err != nil {
 		return fmt.Errorf("persist rotated password for branch %q: %w", b.Name, err)
 	}
 	return nil
+}
+
+// redactedError is an error whose text has a secret masked out. It
+// deliberately does not unwrap to the original (whose text still holds the
+// secret), but still matches it under errors.Is, so callers can test for
+// context.Canceled and the like.
+type redactedError struct {
+	msg   string
+	cause error
+}
+
+func (e *redactedError) Error() string        { return e.msg }
+func (e *redactedError) Is(target error) bool { return errors.Is(e.cause, target) }
+
+// redactSecret returns err with every occurrence of secret in its text
+// replaced by "[REDACTED]" (err unchanged when the secret does not appear).
+func redactSecret(err error, secret string) error {
+	if err == nil || secret == "" || !strings.Contains(err.Error(), secret) {
+		return err
+	}
+	return &redactedError{msg: strings.ReplaceAll(err.Error(), secret, "[REDACTED]"), cause: err}
 }
 
 // inspectAddr inspects cid until the runtime reports a routable address.

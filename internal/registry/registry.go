@@ -143,6 +143,13 @@ type Branch struct {
 	Port                                      int
 	State                                     BranchState
 	CreatedAt                                 string
+
+	// PasswordUnavailable is set when the branch has a stored rotated password
+	// that none of the configured secret keys can decrypt (the at-rest key
+	// changed, or a legacy row was encrypted under an earlier PGOVERLAY_TOKEN).
+	// Password is then "". The branch is otherwise fully usable: list, reset
+	// (which mints and stores a fresh password) and destroy all work.
+	PasswordUnavailable bool
 }
 
 // Layer is a frozen branch rw volume: an immutable overlay layer between the
@@ -158,15 +165,22 @@ type Registry struct {
 	secrets    *secretBox // at-rest encryption for branch passwords; nil = plaintext (no key configured)
 }
 
-// SetSecretKey enables at-rest encryption of branch passwords with the given
-// 32-byte key (derive it from PGOVERLAY_TOKEN via DeriveSecretKey). Call it once
-// right after Open, before serving. A nil/empty key is a no-op, leaving the
-// registry in plaintext mode (inherit-mode setups and tests need no key). A
-// wrong-length key is a configuration error and is returned. Once set,
-// SetBranchPassword encrypts before write and every read path decrypts, while
-// legacy plaintext rows still read back unchanged.
+// SetSecretKey enables at-rest encryption of branch passwords under the given
+// dedicated 32-byte key; it is SetSecretKeys with no legacy keys.
 func (r *Registry) SetSecretKey(key []byte) error {
-	box, err := newSecretBox(key)
+	return r.SetSecretKeys(SecretKeys{Primary: key})
+}
+
+// SetSecretKeys configures at-rest encryption of branch passwords. Call it once
+// right after Open, before serving. No keys at all leaves the registry in
+// plaintext mode (inherit-mode setups and tests need no key). A wrong-length
+// key is a configuration error and is returned. With a primary key,
+// SetBranchPassword encrypts before write; every read path decrypts with
+// whichever configured key the row names, and legacy plaintext rows still read
+// back unchanged. Call ReencryptSecrets afterwards to move older rows under
+// the primary key.
+func (r *Registry) SetSecretKeys(k SecretKeys) error {
+	box, err := newSecretBox(k)
 	if err != nil {
 		return err
 	}
@@ -428,12 +442,19 @@ func newID() string {
 }
 
 // CreateSource inserts a new source row (state seeding) and journals its
-// creation in the same transaction. A name whose earlier attempts failed is
+// creation in the same transaction, with the system actor; CreateSourceCtx
+// records the request actor. A name whose earlier attempts failed is
 // reusable: those failed rows are deleted here, so retries never pile up
 // same-named failed rows (a failed source never has branches or layers — a
 // branch needs a ready source). A name held by a live (seeding/ready) source
 // is refused with ErrAlreadyExists.
 func (r *Registry) CreateSource(s *Source) error {
+	return r.CreateSourceCtx(context.Background(), s)
+}
+
+// CreateSourceCtx is CreateSource with the actor read from ctx (see WithActor)
+// stamped onto the "created" transition.
+func (r *Registry) CreateSourceCtx(ctx context.Context, s *Source) error {
 	if err := validatePGVersion(s.PGVersion); err != nil {
 		return err
 	}
@@ -467,7 +488,7 @@ func (r *Registry) CreateSource(s *Source) error {
 	if err != nil {
 		return fmt.Errorf("create source %q: %w", s.Name, err)
 	}
-	if err := journalTx(context.Background(), tx, "source", s.ID, "", string(SourceSeeding), "created"); err != nil {
+	if err := journalTx(ctx, tx, "source", s.ID, "", string(SourceSeeding), "created"); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -514,8 +535,15 @@ var legalSource = map[SourceState][]SourceState{
 
 // SetSourceState moves a source into `to` if the state machine allows it,
 // as a compare-and-swap with the journal row written in the same transaction
-// (mirroring TransitionBranch).
+// (mirroring TransitionBranch), journaled with the system actor. Use
+// SetSourceStateCtx to record the request actor.
 func (r *Registry) SetSourceState(id string, to SourceState, reason string) error {
+	return r.SetSourceStateCtx(context.Background(), id, to, reason)
+}
+
+// SetSourceStateCtx is SetSourceState with the actor read from ctx recorded on
+// the transition.
+func (r *Registry) SetSourceStateCtx(ctx context.Context, id string, to SourceState, reason string) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
@@ -541,7 +569,7 @@ func (r *Registry) SetSourceState(id string, to SourceState, reason string) erro
 	} else if n == 0 {
 		return illegalTransition("source", from, string(to))
 	}
-	if err := journalTx(context.Background(), tx, "source", id, from, string(to), reason); err != nil {
+	if err := journalTx(ctx, tx, "source", id, from, string(to), reason); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -818,6 +846,11 @@ const branchCols = `id,name,source_id,state,container_id,rw_volume,source_volume
 // so callers (API, engine) always see plaintext. It is a *Registry method
 // because decryption needs the registry's secret key; the stored value carries
 // the enc: prefix iff it was encrypted, so legacy plaintext rows pass through.
+//
+// A password no configured key can decrypt does NOT fail the read: every list,
+// reconcile, reset and destroy path goes through here and none of them needs
+// the plaintext, so one such row must not take them all down. The branch comes
+// back with Password "" and PasswordUnavailable set; a reset re-mints it.
 func (r *Registry) scanBranch(row interface{ Scan(...any) error }) (*Branch, error) {
 	b := &Branch{}
 	var baseLayer sql.NullString
@@ -831,11 +864,11 @@ func (r *Registry) scanBranch(row interface{ Scan(...any) error }) (*Branch, err
 		return nil, err
 	}
 	b.BaseLayerID = baseLayer.String
-	pw, derr := decryptColumn(r.secrets, storedPassword)
-	if derr != nil {
-		return nil, derr
+	if pw, derr := r.secrets.decrypt(storedPassword); derr != nil {
+		b.PasswordUnavailable = true
+	} else {
+		b.Password = pw
 	}
-	b.Password = pw
 	return b, nil
 }
 
@@ -901,16 +934,18 @@ type Transition struct {
 }
 
 // BranchHistory returns the audit trail for every branch that has ever borne
-// the given name, oldest first. It joins transitions to the branch rows by
+// the given name, oldest first. It matches transitions to the branch rows by
 // id (a destroyed-then-recreated name maps to multiple ids), so an incident on
-// a since-recreated name is still recoverable. ErrNotFound when the name was
-// never used.
+// a since-recreated name is still recoverable, and also by the entity_name
+// DeleteSource stamps on the rows of branches it removes, so the trail
+// outlives the source. ErrNotFound when the name was never used.
 func (r *Registry) BranchHistory(name string) ([]Transition, error) {
 	rows, err := r.db.Query(`SELECT t.from_state, t.to_state, t.reason, t.actor, t.at
 		FROM transitions t
-		JOIN branches b ON b.id = t.entity_id AND t.entity = 'branch'
-		WHERE b.name = ?
-		ORDER BY t.id ASC`, name)
+		WHERE t.entity = 'branch'
+		  AND (t.entity_id IN (SELECT id FROM branches WHERE name = ?)
+		       OR (t.entity_name != '' AND t.entity_name = ?))
+		ORDER BY t.id ASC`, name, name)
 	if err != nil {
 		return nil, err
 	}
@@ -1137,9 +1172,24 @@ func (r *Registry) GetMaskScripts(sourceID string) ([]MaskScript, error) {
 }
 
 // BumpSourceGeneration advances a source to its next generation volume after
-// a successful refresh seed.
+// a successful refresh seed, journaled with the system actor. Use
+// BumpSourceGenerationCtx to record the request actor.
 func (r *Registry) BumpSourceGeneration(id, newVolume string) error {
-	res, err := r.db.Exec(`UPDATE sources SET generation=generation+1, volume=?, pending_volume='',
+	return r.BumpSourceGenerationCtx(context.Background(), id, newVolume)
+}
+
+// BumpSourceGenerationCtx is BumpSourceGeneration with a transitions row
+// (state unchanged, reason naming the new generation) recording the actor read
+// from ctx, so a refresh, which changes what every new branch sees, is
+// attributable like any other source mutation. It also clears the source's
+// pending_volume claim on the new generation (see SetSourcePendingVolume).
+func (r *Registry) BumpSourceGenerationCtx(ctx context.Context, id, newVolume string) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE sources SET generation=generation+1, volume=?, pending_volume='',
 		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, newVolume, id)
 	if err != nil {
 		return err
@@ -1149,7 +1199,15 @@ func (r *Registry) BumpSourceGeneration(id, newVolume string) error {
 	} else if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	var state string
+	var gen int
+	if err := tx.QueryRow(`SELECT state, generation FROM sources WHERE id=?`, id).Scan(&state, &gen); err != nil {
+		return err
+	}
+	if err := journalTx(ctx, tx, "source", id, state, state, fmt.Sprintf("refreshed to generation %d (%s)", gen, newVolume)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CountLiveBranches counts every branch that is not destroyed (creating,
@@ -1394,14 +1452,48 @@ func (r *Registry) CommitFreezeCtx(ctx context.Context, parentID, childID, layer
 	return l, tx.Commit()
 }
 
-// DeleteSource removes a source row and its (destroyed) branch history rows.
-// Callers must ensure no live branches reference the source first.
+// sourceDeleted is the to_state journaled when a source row is removed. It is
+// a journal-only marker: no source row ever carries it.
+const sourceDeleted = "deleted"
+
+// DeleteSource removes a source row and its (destroyed) branch rows, journaled
+// with the system actor. Use DeleteSourceCtx to record the request actor.
 func (r *Registry) DeleteSource(id string) error {
+	return r.DeleteSourceCtx(context.Background(), id)
+}
+
+// DeleteSourceCtx removes a source row, its layers, masking scripts and
+// (destroyed) branch rows. Callers must ensure no live branches reference the
+// source first. The audit trail survives: before the rows go, every
+// transitions row of the source and of its branches is stamped with the
+// entity's name (so BranchHistory still resolves it by name), and a
+// "<state> -> deleted" row records who removed the source, all in one
+// transaction.
+func (r *Registry) DeleteSourceCtx(ctx context.Context, id string) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var name, state string
+	if err := tx.QueryRow(`SELECT name, state FROM sources WHERE id=?`, id).Scan(&name, &state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE transitions
+		SET entity_name = (SELECT b.name FROM branches b WHERE b.id = transitions.entity_id)
+		WHERE entity = 'branch' AND entity_id IN (SELECT id FROM branches WHERE source_id = ?)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE transitions SET entity_name = ? WHERE entity = 'source' AND entity_id = ?`, name, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor,entity_name) VALUES (?,?,?,?,?,?,?)`,
+		"source", id, state, sourceDeleted, "source removed", actorString(ctx), name); err != nil {
+		return err
+	}
 	// layers self-reference via parent_layer_id; defer FK checks so the whole
 	// chain can go in one statement
 	if _, err := tx.Exec(`PRAGMA defer_foreign_keys=ON`); err != nil {

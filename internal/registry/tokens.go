@@ -4,7 +4,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"regexp"
 )
 
 // Roles, highest to lowest privilege. admin can do everything (incl. token and
@@ -38,10 +40,42 @@ func hashToken(plaintext string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// ErrInvalidTokenName rejects an API token name that could not be told apart
+// from another identity in the audit log (see ValidateTokenName).
+var ErrInvalidTokenName = errors.New("invalid token name")
+
+// EnvTokenActor is the audit name recorded for the built-in PGOVERLAY_TOKEN,
+// which is admin but has no stored name. It is reserved: a stored token with
+// this name would be indistinguishable from the env token in the audit log.
+const EnvTokenActor = "root"
+
+// tokenNameRE is the shape of a stored token name. It excludes ':' (so names
+// cannot collide with SystemActor or the local: prefix), spaces and parentheses
+// (so the rendered "name (role)" actor is unambiguous), and the empty string
+// (which renders as SystemActor).
+var tokenNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
+
+// ValidateTokenName checks a new API token name: 1-63 characters of lowercase
+// letters, digits, '.', '_' and '-', starting with a letter or digit, and not
+// the reserved env-token name "root". The error wraps ErrInvalidTokenName.
+func ValidateTokenName(name string) error {
+	if !tokenNameRE.MatchString(name) {
+		return fmt.Errorf("%w %q: use 1-63 lowercase letters, digits, '.', '_' or '-', starting with a letter or digit", ErrInvalidTokenName, name)
+	}
+	if name == EnvTokenActor {
+		return fmt.Errorf("%w %q: reserved for the built-in PGOVERLAY_TOKEN in the audit log", ErrInvalidTokenName, name)
+	}
+	return nil
+}
+
 // CreateAPIToken mints a token for the given name/role: it generates a 32-hex
 // crypto/rand secret, stores only its sha256 hex digest, and returns the
-// plaintext ONCE (it is never recoverable afterwards). The name must be unique.
+// plaintext ONCE (it is never recoverable afterwards). The name must be unique
+// and pass ValidateTokenName.
 func (r *Registry) CreateAPIToken(name, role string) (string, error) {
+	if err := ValidateTokenName(name); err != nil {
+		return "", err
+	}
 	if !ValidRole(role) {
 		return "", fmt.Errorf("invalid role %q: want admin, operator or viewer", role)
 	}

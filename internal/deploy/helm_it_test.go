@@ -34,7 +34,7 @@ const (
 	storageNode = "pgoverlay-test-control-plane"
 	helmNS      = "pgoverlay-system"
 	release     = "pgoverlay" // fullname collapses to "pgoverlay" -> svc pgoverlay-api
-	apiToken    = "helm-it-token"
+	apiToken    = "helm-it-token-0123456789"
 	sourcePod   = "pgoverlay-it-helm-source"
 	// chartPath is spelled once: both suites install from it and chartImage
 	// renders it to learn which image to build.

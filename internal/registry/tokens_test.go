@@ -3,6 +3,8 @@ package registry
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -125,5 +127,25 @@ func TestCreateAPITokenRejectsBadRoleAndDupName(t *testing.T) {
 	}
 	if _, err := r.CreateAPIToken("dup", RoleAdmin); err == nil {
 		t.Fatal("CreateAPIToken accepted a duplicate name")
+	}
+}
+
+// SECRETS-08: a stored token must not be able to impersonate the env token
+// ("root (admin)") or the daemon ("system:reconcile", which the empty name
+// renders as) in the audit log, nor make "name (role)" ambiguous.
+func TestCreateAPITokenValidatesName(t *testing.T) {
+	r := openTest(t)
+	for _, bad := range []string{
+		"", "root", "system:reconcile", "local:alice", "x (admin)", "Upper", "-lead",
+		"has space", strings.Repeat("a", 64),
+	} {
+		if _, err := r.CreateAPIToken(bad, RoleAdmin); !errors.Is(err, ErrInvalidTokenName) {
+			t.Errorf("CreateAPIToken(%q) err=%v, want ErrInvalidTokenName", bad, err)
+		}
+	}
+	for _, good := range []string{"ci", "deploy-bot", "gh_actions.prod", "0ps", strings.Repeat("a", 63)} {
+		if _, err := r.CreateAPIToken(good, RoleViewer); err != nil {
+			t.Errorf("CreateAPIToken(%q): %v", good, err)
+		}
 	}
 }

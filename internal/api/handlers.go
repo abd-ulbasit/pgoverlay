@@ -37,7 +37,8 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, engine.ErrInvalidName),
 		errors.Is(err, registry.ErrUnsupportedPGVersion),
-		errors.Is(err, registry.ErrInvalidImage):
+		errors.Is(err, registry.ErrInvalidImage),
+		errors.Is(err, registry.ErrInvalidTokenName):
 		writeError(w, http.StatusBadRequest, msg)
 	case errors.Is(err, registry.ErrNotFound):
 		writeError(w, http.StatusNotFound, msg)
@@ -97,7 +98,8 @@ func (s *Server) branchJSON(b *registry.Branch) Branch {
 	}
 	return Branch{
 		Name: b.Name, Source: srcName, Parent: b.ParentBranchName, State: string(b.State), Host: b.Host, Port: b.Port,
-		User: user, Password: b.Password, Database: db, ProxyDatabase: db + "@" + b.Name,
+		User: user, Password: b.Password, PasswordUnavailable: b.PasswordUnavailable,
+		Database: db, ProxyDatabase: db + "@" + b.Name,
 		ExpiresAt: b.ExpiresAt, CreatedAt: b.CreatedAt,
 		ProxyHost: s.proxy.host, ProxyPort: s.proxy.port,
 	}

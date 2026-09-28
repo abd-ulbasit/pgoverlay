@@ -24,7 +24,7 @@ import (
 const (
 	haNS      = "pgoverlay-ha"
 	haRelease = "pgoverlay"
-	haToken   = "ha-it-token"
+	haToken   = "ha-it-token-0123456789"
 	haSrcPod  = "pgoverlay-ha-source"
 	leaseName = "pgoverlay-branchd"
 	// failover budget: the lease duration is 15s, so a survivor can acquire

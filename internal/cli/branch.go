@@ -333,6 +333,9 @@ A branch that is not ready (creating, resetting, failed) is refused.`,
 				if err := requireReady(name, b.State); err != nil {
 					return err
 				}
+				if b.PasswordUnavailable {
+					return errPasswordUnavailable(b.Name, false)
+				}
 				u, err := url.Parse(c.BaseURL)
 				if err != nil {
 					return err
@@ -373,6 +376,9 @@ A branch that is not ready (creating, resetting, failed) is refused.`,
 			if err := requireReady(name, string(b.State)); err != nil {
 				return err
 			}
+			if b.PasswordUnavailable {
+				return errPasswordUnavailable(b.Name, true)
+			}
 			s, err := reg.GetSourceByID(b.SourceID)
 			if err != nil {
 				return err
@@ -384,6 +390,18 @@ A branch that is not ready (creating, resetting, failed) is refused.`,
 	cmd.Flags().StringVar(&proxyHost, "proxy-host", "", "host of branchd's Postgres router for the proxy URL (default: what branchd advertises, else the --server host)")
 	cmd.Flags().IntVar(&proxyPort, "proxy-port", 0, "port of branchd's Postgres router for the proxy URL (default: what branchd advertises, else 6432)")
 	return cmd
+}
+
+// errPasswordUnavailable explains a branch whose rotated password cannot be
+// decrypted: printing a DSN without it would silently fall back to the
+// source's credentials, which the branch no longer accepts.
+func errPasswordUnavailable(name string, local bool) error {
+	where := "branchd's at-rest key changed since it was stored"
+	if local {
+		where = "local mode reads the key from $PGOVERLAY_SECRET_KEY, $PGOVERLAY_SECRET_KEY_FILE or <state dir>/secret.key"
+	}
+	return fmt.Errorf("branch %q has a rotated password that cannot be decrypted with the configured at-rest key (%s); "+
+		"reset it (pgb branch reset %s) to mint a new one", name, where, name)
 }
 
 // requireReady refuses to print a DSN for a branch that is not ready: before

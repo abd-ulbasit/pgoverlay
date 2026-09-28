@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11, migrateV12, migrateV13, migrateV14}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11, migrateV12, migrateV13, migrateV14, migrateV15}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -215,4 +215,28 @@ const migrateV14 = `
 ALTER TABLE branches ADD COLUMN pending_volume TEXT NOT NULL DEFAULT '';
 ALTER TABLE sources ADD COLUMN pending_volume TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS branches_pending_volume ON branches(pending_volume);
+`
+
+// v15: the audit trail outlives the rows it describes, and
+// destroyed branches stop carrying credentials.
+//
+//   - transitions.entity_name: DeleteSource removes a source's destroyed branch
+//     rows (the branches.source_id foreign key forbids keeping them), which
+//     used to orphan their transitions: BranchHistory joined by id and found
+//     nothing. DeleteSource now stamps each entity's name on its transitions
+//     rows first, and BranchHistory also matches on it. Empty means the
+//     entity row still exists (resolve the name through it).
+//   - A destroyed branch's password is dead weight at best and a live secret
+//     at worst (the tombstone is kept for history forever). Existing
+//     tombstones are cleared here, and a trigger clears the column whenever a
+//     branch enters 'destroyed', whichever code path moves it there.
+const migrateV15 = `
+ALTER TABLE transitions ADD COLUMN entity_name TEXT NOT NULL DEFAULT '';
+UPDATE branches SET password = '' WHERE state = 'destroyed' AND password != '';
+CREATE TRIGGER branches_destroyed_forget_password
+  AFTER UPDATE OF state ON branches
+  WHEN NEW.state = 'destroyed' AND NEW.password != ''
+BEGIN
+  UPDATE branches SET password = '' WHERE id = NEW.id;
+END;
 `
