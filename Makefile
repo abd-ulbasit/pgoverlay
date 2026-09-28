@@ -52,10 +52,13 @@ docker-build-ghook:
 helm-test:
 	hack/helm-test.sh
 
-# JS test-suite SDK (sdk/js, npm package pgoverlay-test). Needs Node 18+;
-# override with `make js-sdk-test NODE=/path/to/node NPM=/path/to/npm`.
+# JS SDKs (sdk/js, npm package pgoverlay-test; sdk/js-connect, npm package
+# pgoverlay-connect). Needs Node 18+; override with
+# `make js-sdk-test NODE=/path/to/node NPM=/path/to/npm`.
 NODE ?= node
 NPM ?= npm
 js-sdk-test:
 	cd sdk/js && $(NODE) --test test/*.test.mjs
 	cd sdk/js && $(NPM) pack --dry-run
+	cd sdk/js-connect && $(NODE) --test test/*.test.mjs
+	cd sdk/js-connect && $(NPM) pack --dry-run
