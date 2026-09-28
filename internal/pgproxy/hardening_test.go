@@ -2,6 +2,7 @@ package pgproxy
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -12,6 +13,68 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
+
+// A connection that sends nothing is dropped at FirstByteTimeout, well before
+// the full StartupTimeout, so idle sockets cannot hold slots for long.
+func TestFirstByteTimeoutDropsSilentClientEarly(t *testing.T) {
+	p := New(fakeResolver{})
+	p.FirstByteTimeout = 100 * time.Millisecond
+	p.StartupTimeout = 5 * time.Second
+	addr := startProxyWith(t, p)
+
+	conn := dialProxy(t, addr)
+	expectClosedWithin(t, conn, time.Second, "silent client")
+}
+
+// The first-byte deadline only covers the first byte: a client that starts
+// promptly still gets the whole StartupTimeout for the rest of its packets.
+func TestFirstByteTimeoutDoesNotCutSlowStartup(t *testing.T) {
+	p := New(fakeResolver{})
+	p.FirstByteTimeout = 100 * time.Millisecond
+	p.StartupTimeout = 5 * time.Second
+	addr := startProxyWith(t, p)
+
+	conn := dialProxy(t, addr)
+	ssl := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 8), sslRequestCode)
+	if _, err := conn.Write(ssl[:2]); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // past FirstByteTimeout, within StartupTimeout
+	if _, err := conn.Write(ssl[2:]); err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := io.ReadFull(conn, b[:]); err != nil || b[0] != 'N' {
+		t.Fatalf("SSLRequest answer = (%q, %v), want 'N'", b[0], err)
+	}
+}
+
+// MaxStartupsPerIP caps one address's connections that have not finished
+// startup. Authenticated sessions do not count against it, and a slot is
+// released when its connection ends.
+func TestPerIPStartupCap(t *testing.T) {
+	srv := startPGServer(t, keyedSession(1, []byte{1, 2, 3, 4}))
+	p := New(fakeResolver{"pr-1": srv.addr})
+	p.MaxStartupsPerIP = 1
+	p.FirstByteTimeout = 5 * time.Second
+	addr := startProxyWith(t, p)
+
+	// An authenticated session gives its startup slot back at ReadyForQuery.
+	openSession(t, dialProxy(t, addr), "pr-1")
+
+	// A connection still in startup holds the IP's only slot...
+	pending := dialProxy(t, addr)
+	waitFor(t, 2*time.Second, "pending connection counted", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.startups["127.0.0.1"] == 1
+	})
+	// ...so the next one from the same IP is refused fast.
+	expectClosedWithin(t, dialProxy(t, addr), time.Second, "connection over the per-IP startup cap")
+
+	pending.Close()
+	waitFor(t, 3*time.Second, "slot released after the pending connection closed", func() bool { return slotFree(addr) })
+}
 
 // The authentication phase is bounded by AuthTimeout, not IdleTimeout: a
 // client that stalls after the backend's auth challenge is dropped, and both
@@ -245,6 +308,7 @@ func TestZeroValueProxyUsesDefaults(t *testing.T) {
 		got, want time.Duration
 	}{
 		{"DialTimeout", p.dialTimeout(), defaultDialTimeout},
+		{"FirstByteTimeout", p.firstByteTimeout(), defaultFirstByteTimeout},
 		{"StartupTimeout", p.startupTimeout(), defaultStartupTimeout},
 		{"AuthTimeout", p.authTimeout(), defaultAuthTimeout},
 		{"IdleTimeout", p.idleTimeout(), defaultIdleTimeout},
@@ -256,9 +320,12 @@ func TestZeroValueProxyUsesDefaults(t *testing.T) {
 	if got := p.maxConns(); got != defaultMaxConns {
 		t.Errorf("zero MaxConns -> %d, want %d", got, defaultMaxConns)
 	}
-	p.MaxConns = -1
-	if p.maxConns() != 0 {
-		t.Errorf("negative MaxConns -> %d, want 0 = disabled", p.maxConns())
+	if got := p.maxStartupsPerIP(); got != defaultMaxStartupsPerIP {
+		t.Errorf("zero MaxStartupsPerIP -> %d, want %d", got, defaultMaxStartupsPerIP)
+	}
+	p.MaxConns, p.MaxStartupsPerIP = -1, -1
+	if p.maxConns() != 0 || p.maxStartupsPerIP() != 0 {
+		t.Errorf("negative caps -> (%d, %d), want (0, 0) = disabled", p.maxConns(), p.maxStartupsPerIP())
 	}
 
 	// And it routes like one built by New.

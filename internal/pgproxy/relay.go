@@ -25,6 +25,7 @@ type session struct {
 	idle      time.Duration
 	grace     time.Duration
 	cancels   *cancelMap
+	onReady   func() // runs once, when the backend first sends ReadyForQuery
 
 	ready atomic.Bool
 	// cancelKey is the BackendKeyData body registered in cancels. Written only
@@ -148,8 +149,8 @@ func (s *session) relayStartup(src *bufio.Reader) error {
 			return err
 		}
 		if hdr[0] == 'Z' {
-			// Authenticated: switch to idle deadlines before the client can
-			// see ReadyForQuery and act on it.
+			// Authenticated. Switch to idle deadlines and release the startup
+			// slot before the client can see ReadyForQuery and act on it.
 			s.markReady()
 			return w.Flush()
 		}
@@ -167,10 +168,14 @@ func (s *session) registerCancelKey(body []byte) {
 }
 
 // markReady ends the startup phase: switch both connections from the
-// AuthTimeout deadline to idle deadlines.
+// AuthTimeout deadline to idle deadlines and release the client IP's startup
+// slot.
 func (s *session) markReady() {
 	s.ready.Store(true)
 	s.bump()
+	if s.onReady != nil {
+		s.onReady()
+	}
 }
 
 // bump pushes both connections' read and write deadlines idle into the

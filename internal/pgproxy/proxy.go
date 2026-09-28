@@ -10,13 +10,16 @@
 package pgproxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -57,14 +60,16 @@ func (r *RegistryResolver) ResolveBranch(name string) (string, error) {
 // DoS-hardening defaults. New() seeds the Proxy fields with these, and every
 // field is also read through a use-site helper, so a zero field falls back to
 // the default and a bare &Proxy{Resolver: r} is exactly as protected as New(r).
-// Only the cap can be switched off, and only with a negative value.
+// Only the two caps can be switched off, and only with a negative value.
 const (
-	defaultDialTimeout    = 5 * time.Second
-	defaultStartupTimeout = 10 * time.Second // client must finish the startup packets within this
-	defaultAuthTimeout    = 30 * time.Second // backend must reach ReadyForQuery within this
-	defaultMaxConns       = 256              // cap on concurrently-handled connections
-	defaultIdleTimeout    = 15 * time.Minute // relay closes after this long with no bytes either way
-	defaultCloseGrace     = 5 * time.Second  // once one relay direction ends, the other gets this long
+	defaultDialTimeout      = 5 * time.Second
+	defaultFirstByteTimeout = 2 * time.Second  // client must send its first byte within this
+	defaultStartupTimeout   = 10 * time.Second // client must finish the startup packets within this
+	defaultAuthTimeout      = 30 * time.Second // backend must reach ReadyForQuery within this
+	defaultMaxConns         = 256              // cap on concurrently-handled connections
+	defaultMaxStartupsPerIP = 64               // cap on one client IP's connections still in startup
+	defaultIdleTimeout      = 15 * time.Minute // relay closes after this long with no bytes either way
+	defaultCloseGrace       = 5 * time.Second  // once one relay direction ends, the other gets this long
 )
 
 type Proxy struct {
@@ -72,10 +77,14 @@ type Proxy struct {
 	// DialTimeout bounds the backend dial (and a forwarded cancel request's
 	// exchange with the backend). Defaults to 5s.
 	DialTimeout time.Duration
+	// FirstByteTimeout bounds how long a new connection may stay silent before
+	// sending its first byte. Real clients write immediately after connecting,
+	// so this is short: it keeps idle sockets from holding a connection slot
+	// for the whole StartupTimeout. Defaults to 2s.
+	FirstByteTimeout time.Duration
 	// StartupTimeout bounds the client's startup packets (SSL/GSS negotiation,
 	// the TLS handshake and the StartupMessage), measured from accept. A client
-	// that connects and dribbles bytes — or sends nothing — is dropped after
-	// this, freeing the goroutine+fd it pins. Defaults to 10s.
+	// that dribbles bytes is dropped after this. Defaults to 10s.
 	StartupTimeout time.Duration
 	// AuthTimeout bounds the rest of the startup exchange: from routing the
 	// StartupMessage until the backend sends its first ReadyForQuery, which
@@ -88,6 +97,14 @@ type Proxy struct {
 	// rather than queued unbounded. Defaults to 256; a negative value disables
 	// the cap.
 	MaxConns int
+	// MaxStartupsPerIP caps how many connections from one client IP may be in
+	// the startup phase at once (anything before the backend's first
+	// ReadyForQuery: TLS, StartupMessage, authentication, and cancel
+	// requests). Authenticated sessions do not count, so one host running many
+	// real sessions is not limited, but one address cannot fill MaxConns with
+	// connections that never authenticate. Over the cap, new connections are
+	// refused fast. Defaults to 64; a negative value disables the cap.
+	MaxStartupsPerIP int
 	// IdleTimeout closes an authenticated session that has seen no bytes in
 	// either direction for this long, reclaiming abandoned-but-open
 	// connections. It bounds reads and writes, so a peer that stops reading
@@ -105,16 +122,21 @@ type Proxy struct {
 
 	// cancels maps live sessions' cancel keys to their backend addresses.
 	cancels cancelMap
+
+	mu       sync.Mutex
+	startups map[string]int // client IP -> connections still in startup
 }
 
 func New(r BranchResolver) *Proxy {
 	return &Proxy{
-		Resolver:       r,
-		DialTimeout:    defaultDialTimeout,
-		StartupTimeout: defaultStartupTimeout,
-		AuthTimeout:    defaultAuthTimeout,
-		MaxConns:       defaultMaxConns,
-		IdleTimeout:    defaultIdleTimeout,
+		Resolver:         r,
+		DialTimeout:      defaultDialTimeout,
+		FirstByteTimeout: defaultFirstByteTimeout,
+		StartupTimeout:   defaultStartupTimeout,
+		AuthTimeout:      defaultAuthTimeout,
+		MaxConns:         defaultMaxConns,
+		MaxStartupsPerIP: defaultMaxStartupsPerIP,
+		IdleTimeout:      defaultIdleTimeout,
 	}
 }
 
@@ -142,6 +164,10 @@ func (p *Proxy) dialTimeout() time.Duration {
 	return durationOr(p.DialTimeout, defaultDialTimeout)
 }
 
+func (p *Proxy) firstByteTimeout() time.Duration {
+	return durationOr(p.FirstByteTimeout, defaultFirstByteTimeout)
+}
+
 func (p *Proxy) startupTimeout() time.Duration {
 	return durationOr(p.StartupTimeout, defaultStartupTimeout)
 }
@@ -159,6 +185,8 @@ func (p *Proxy) graceTimeout() time.Duration {
 }
 
 func (p *Proxy) maxConns() int { return capOr(p.MaxConns, defaultMaxConns) }
+
+func (p *Proxy) maxStartupsPerIP() int { return capOr(p.MaxStartupsPerIP, defaultMaxStartupsPerIP) }
 
 // Accept-retry backoff bounds, the same as net/http.Server's.
 const (
@@ -216,11 +244,22 @@ func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 				continue
 			}
 		}
+		startupDone, ok := p.acquireStartupSlot(conn.RemoteAddr())
+		if !ok {
+			slog.Warn("pgproxy: per-IP startup cap reached, refusing",
+				"client", conn.RemoteAddr().String(), "max", p.maxStartupsPerIP())
+			conn.Close()
+			if sem != nil {
+				<-sem
+			}
+			continue
+		}
 		go func() {
 			if sem != nil {
 				defer func() { <-sem }()
 			}
-			p.handleConn(conn)
+			defer startupDone()
+			p.handleConn(conn, startupDone)
 		}()
 	}
 }
@@ -241,21 +280,62 @@ func isTemporaryAcceptError(err error) bool {
 	return errors.As(err, &t) && t.Temporary()
 }
 
+// acquireStartupSlot takes one of the client IP's startup slots. The returned
+// release func is idempotent; it runs when the session reaches ReadyForQuery
+// or, at the latest, when the connection ends. ok is false when the IP is at
+// MaxStartupsPerIP.
+func (p *Proxy) acquireStartupSlot(addr net.Addr) (release func(), ok bool) {
+	limit := p.maxStartupsPerIP()
+	tcp, isTCP := addr.(*net.TCPAddr)
+	if limit <= 0 || !isTCP {
+		return func() {}, true
+	}
+	ip := tcp.IP.String()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.startups[ip] >= limit {
+		return nil, false
+	}
+	if p.startups == nil {
+		p.startups = make(map[string]int)
+	}
+	p.startups[ip]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.startups[ip]--; p.startups[ip] <= 0 {
+				delete(p.startups, ip)
+			}
+		})
+	}, true
+}
+
 // handleConn drives the startup phase: answer SSLRequest ('S' + TLS upgrade
 // when TLSConfig is set, else 'N'), forward a CancelRequest whose key belongs
-// to a live session, then route the StartupMessage.
-func (p *Proxy) handleConn(client net.Conn) {
+// to a live session, then route the StartupMessage. startupDone releases the
+// client IP's startup slot once the session authenticates.
+func (p *Proxy) handleConn(client net.Conn, startupDone func()) {
 	raw := client
 	defer func() { client.Close() }() // closure: client may be re-bound to the TLS conn
-	// Bound the client's startup packets: a client that connects and then
-	// sends nothing (or dribbles) is dropped at this deadline, freeing the
-	// goroutine+fd it would otherwise pin. It covers writes too, so a client
-	// that stops reading cannot block our 'S'/'N' answers or the TLS
-	// handshake. route() replaces it.
-	client.SetDeadline(time.Now().Add(p.startupTimeout()))
+	// A client gets FirstByteTimeout to say anything at all, then the rest of
+	// StartupTimeout (measured from accept) to finish its startup packets.
+	// Both deadlines cover writes too, so a client that stops reading cannot
+	// block our 'S'/'N' answers or the TLS handshake. route() replaces them.
+	startDeadline := time.Now().Add(p.startupTimeout())
+	client.SetDeadline(earliest(time.Now().Add(p.firstByteTimeout()), startDeadline))
+	var first [1]byte
+	if _, err := io.ReadFull(client, first[:]); err != nil {
+		return
+	}
+	client.SetDeadline(startDeadline)
+	// The first frame's leading byte is already consumed; readStartupFrame
+	// never reads past a frame, so after that frame `in` reads client directly.
+	in := io.MultiReader(bytes.NewReader(first[:]), client)
 	inTLS := false
 	for {
-		code, payload, err := readStartupFrame(client)
+		code, payload, err := readStartupFrame(in)
 		if err != nil {
 			return
 		}
@@ -288,6 +368,7 @@ func (p *Proxy) handleConn(client net.Conn) {
 				return
 			}
 			client = tlsConn
+			in = tlsConn
 			inTLS = true
 			continue
 		case gssEncRequestCode:
@@ -302,15 +383,22 @@ func (p *Proxy) handleConn(client net.Conn) {
 			writeRefusal(client, "08P01", "pgoverlay: "+err.Error()) // protocol_violation
 			return
 		}
-		p.route(client, raw, &startup)
+		p.route(client, raw, &startup, startupDone)
 		return
 	}
+}
+
+func earliest(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 // route resolves the branch from the database param, rewrites the startup
 // message, dials the backend, and relays. raw is the client's underlying TCP
 // connection (the same as client unless TLS is in use).
-func (p *Proxy) route(client, raw net.Conn, startup *pgproto3.StartupMessage) {
+func (p *Proxy) route(client, raw net.Conn, startup *pgproto3.StartupMessage, startupDone func()) {
 	// The client's startup packets are in. From here until the backend's
 	// first ReadyForQuery (routing, the backend dial, authentication) both
 	// sides must finish by authDeadline.
@@ -358,6 +446,7 @@ func (p *Proxy) route(client, raw net.Conn, startup *pgproto3.StartupMessage) {
 		idle:      p.idleTimeout(),
 		grace:     p.graceTimeout(),
 		cancels:   &p.cancels,
+		onReady:   startupDone,
 	}
 	s.relay()
 }
