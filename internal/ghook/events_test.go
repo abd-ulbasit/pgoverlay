@@ -631,3 +631,19 @@ func TestDeliveryCacheIsBounded(t *testing.T) {
 		t.Fatalf("cache holds %d ids, want 2", len(c.ids))
 	}
 }
+
+// Wait returns only after a branch's drained queue is retired, so a caller
+// (or a test) that waits never observes an empty queue entry left behind.
+func TestQueueRetiredWhenWaitReturns(t *testing.T) {
+	svc := newService(Config{}, "http://127.0.0.1:1", nil)
+	for i := 0; i < 2000; i++ {
+		svc.enqueue("gh-d782c8-pr-7", func() {})
+		svc.Wait()
+		svc.mu.Lock()
+		n := len(svc.queues)
+		svc.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("iteration %d: %d queue(s) left after Wait returned", i, n)
+		}
+	}
+}
