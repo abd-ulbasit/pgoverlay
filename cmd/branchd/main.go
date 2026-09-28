@@ -504,7 +504,12 @@ func run() error {
 	// reconcileLoop is the leader-only work: with --leader-elect off it runs for
 	// the whole process (the API gate defaults to leader=true). With it on, the
 	// election callbacks start it on gaining leadership and cancel it on losing.
+	// Either way it stops as soon as shutdown begins: the leader keeps the
+	// Lease while the API drains, but must not start new reap/GC passes then.
 	reconcileLoop := func(loopCtx context.Context) {
+		loopCtx, cancel := context.WithCancel(loopCtx)
+		defer cancel()
+		defer context.AfterFunc(ctx, cancel)()
 		eng.RunReconcile(loopCtx, *reconcileInterval, *stuckTimeout, log.Printf)
 	}
 	if *leaderElect {
