@@ -227,8 +227,11 @@ func TestReconcileRepairsDockerDrift(t *testing.T) {
 		t.Fatalf("drift after a plain docker restart: %+v", a)
 	}
 
-	// 2. docker rm -f: reconcile starts a new container on the same volumes
-	if err := cli.ContainerRemove(ctx, b.ContainerID, container.RemoveOptions{Force: true}); err != nil {
+	// 2. docker rm -f -v: reconcile starts a new container on the same
+	// volumes. -v (RemoveVolumes) drops the anonymous volume the postgres
+	// image's VOLUME declaration gave the container, as StopRemove does;
+	// without it every run leaks one. The branch's named volumes stay.
+	if err := cli.ContainerRemove(ctx, b.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
 		t.Fatal(err)
 	}
 	if plan, _ := e.PlanReconcile(ctx, time.Now(), 10*time.Minute); !hasAction(plan, ActionRestartBranch, "drift-pr") {

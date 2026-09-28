@@ -60,8 +60,8 @@ cleanup() {
     log "cleaning up (exit status $status)"
     "$PGB" branch destroy "$BRANCH" >/dev/null 2>&1
     "$PGB" source rm "$SOURCE" >/dev/null 2>&1
-    docker rm -f "pgoverlay-br-$BRANCH" >/dev/null 2>&1
-    docker rm -f "$SRC_CONTAINER" >/dev/null 2>&1
+    docker rm -f -v "pgoverlay-br-$BRANCH" >/dev/null 2>&1
+    docker rm -f -v "$SRC_CONTAINER" >/dev/null 2>&1
     # a recreated branch name gets a new rw volume generation
     # (pgoverlay-br-<name>-rw, then -rw-g2, -rw-g3, ...)
     docker volume ls -q | grep -E "^(pgoverlay-br-$BRANCH-rw|pgoverlay-src-$SOURCE)" | while read -r v; do

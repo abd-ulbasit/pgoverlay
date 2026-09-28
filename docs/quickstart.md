@@ -68,7 +68,7 @@ psql "$(pgb connect pr-1-child)" -c "SELECT count(*) FROM t"   # 50000
 pgb branch destroy pr-1-child
 pgb branch destroy pr-1
 pgb source rm main
-docker rm -f demo-src
+docker rm -f -v demo-src
 ```
 
 Where the source must be reachable from: **containers**, since the seed runs
