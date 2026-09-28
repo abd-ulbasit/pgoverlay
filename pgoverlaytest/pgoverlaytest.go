@@ -5,16 +5,24 @@
 //
 //	func TestOrders(t *testing.T) {
 //		b := pgoverlaytest.Acquire(t)
-//		db, _ := sql.Open("pgx", b.DSN)
+//		db, _ := sql.Open("pgx", b.ProxyDSN)
 //		// full production-shaped data, isolated writes
 //	}
 //
 // Configuration comes from the environment: PGOVERLAY_SERVER (base URL of
 // branchd; tests are skipped when unset — the SDK is integration-only by
 // nature), PGOVERLAY_TOKEN (API bearer token), PGOVERLAY_TEST_SOURCE (default
-// source name, else "main"), and PGOVERLAY_PASSWORD (database password used in
-// the returned DSNs; branch credentials are inherited from the source unless
-// the server rotates them per branch and returns one).
+// source name, else "main"), PGOVERLAY_PROXY_HOST (host[:port] of the
+// pgoverlay router for ProxyDSN, else the PGOVERLAY_SERVER host and port
+// 6432), and PGOVERLAY_PASSWORD (database password used in the returned DSNs
+// when the server does not return a per-branch one: branchd run with
+// --rotate-branch-credentials returns it, otherwise branches inherit the
+// source's credentials).
+//
+// Prefer ProxyDSN: it is one stable endpoint that works wherever the router
+// is reachable. DSN points at the branch's own Postgres, which is reachable
+// only from the branchd host (the Docker runtime publishes branch ports on
+// 127.0.0.1) or from inside the cluster (the kube runtime reports pod IPs).
 //
 // The package is intentionally self-contained (stdlib only): it speaks the
 // branchd REST API directly and never imports pgoverlay internals.
@@ -38,9 +46,11 @@ import (
 	"time"
 )
 
-// Branch is an acquired database branch. DSN targets the branch's Postgres
-// directly; ProxyDSN goes through the pgoverlay wire-protocol router on the
-// server host (port 6432, database "db@branch").
+// Branch is an acquired database branch. ProxyDSN goes through the pgoverlay
+// wire-protocol router (WithProxyHost / PGOVERLAY_PROXY_HOST, else the server
+// host on port 6432; database "db@branch") and is what tests usually want.
+// DSN targets the branch's Postgres directly (Host:Port), which only the
+// branchd host (Docker) or pods in the cluster (kube) can reach.
 type Branch struct {
 	Name     string
 	Host     string
@@ -53,8 +63,9 @@ type Branch struct {
 }
 
 type config struct {
-	source string
-	ttl    time.Duration
+	source    string
+	ttl       time.Duration
+	proxyHost string
 }
 
 // Option customizes Acquire.
@@ -76,6 +87,18 @@ func WithSource(name string) Option { return func(c *config) { c.source = name }
 // test.
 func WithTTL(d time.Duration) Option { return func(c *config) { c.ttl = d } }
 
+// WithProxyHost sets the host[:port] of the pgoverlay wire-protocol router
+// that Branch.ProxyDSN connects to; the port defaults to 6432 and an IPv6
+// literal with a port is bracketed ("[fd00::1]:6432"). Default:
+// PGOVERLAY_PROXY_HOST, else the PGOVERLAY_SERVER host. That default is only
+// right when the router listens on the same host as the REST API (a single
+// branchd); the Helm chart exposes them as two Services, so there use e.g.
+// WithProxyHost("pgoverlay-proxy.pgoverlay-system:6432").
+func WithProxyHost(hostport string) Option { return func(c *config) { c.proxyHost = hostport } }
+
+// defaultProxyPort is the router's default listen port (branchd --pg-addr).
+const defaultProxyPort = 6432
+
 // pollInterval is how often Acquire re-checks a not-yet-ready branch
 // (variable so unit tests can speed it up).
 var pollInterval = time.Second
@@ -92,7 +115,11 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 	if server == "" {
 		t.Skip("pgoverlaytest: PGOVERLAY_SERVER not set, skipping")
 	}
-	cfg := config{source: os.Getenv("PGOVERLAY_TEST_SOURCE"), ttl: time.Hour}
+	cfg := config{
+		source:    os.Getenv("PGOVERLAY_TEST_SOURCE"),
+		ttl:       time.Hour,
+		proxyHost: os.Getenv("PGOVERLAY_PROXY_HOST"),
+	}
 	if cfg.source == "" {
 		cfg.source = "main"
 	}
@@ -104,6 +131,13 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 	}
 
 	c := &client{base: strings.TrimRight(server, "/"), token: os.Getenv("PGOVERLAY_TOKEN")}
+	proxyHost, proxyPort := hostname(c.base), defaultProxyPort
+	if cfg.proxyHost != "" {
+		var err error
+		if proxyHost, proxyPort, err = splitProxyHost(cfg.proxyHost); err != nil {
+			t.Fatalf("pgoverlaytest: proxy host: %v", err)
+		}
+	}
 	name := branchName(t.Name(), randHex(6))
 
 	ctx, cancel := context.WithTimeout(context.Background(), acquireTimeout)
@@ -141,7 +175,7 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 			t.Fatalf("pgoverlaytest: wait for branch %q: %v", name, err)
 		}
 	}
-	return newBranch(b, c.base)
+	return newBranch(b, c.base, proxyHost, proxyPort)
 }
 
 // terminalState reports whether a branch in state s can never become ready:
@@ -165,15 +199,38 @@ func ttlSeconds(d time.Duration) int {
 	return s
 }
 
+// hostname returns the host part of a base URL without brackets or port.
+func hostname(baseURL string) string {
+	if u, err := url.Parse(baseURL); err == nil {
+		return u.Hostname()
+	}
+	return ""
+}
+
+// splitProxyHost parses host[:port]. The port defaults to 6432; an IPv6
+// literal is accepted bare ("fd00::1"), bracketed ("[fd00::1]"), or with a
+// port ("[fd00::1]:6432").
+func splitProxyHost(hostport string) (string, int, error) {
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 || h == "" {
+			return "", 0, fmt.Errorf("invalid host[:port] %q", hostport)
+		}
+		return h, n, nil
+	}
+	h := strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
+	if h == "" || strings.ContainsAny(h, "[]/@ ") {
+		return "", 0, fmt.Errorf("invalid host[:port] %q", hostport)
+	}
+	return h, defaultProxyPort, nil
+}
+
 // newBranch maps the wire shape to the public Branch, building DSNs. The
 // direct host falls back to the server's hostname for older servers that
 // don't send one; the password prefers a server-returned per-branch secret
 // (credential-rotation mode) over the PGOVERLAY_PASSWORD fallback.
-func newBranch(w *wireBranch, baseURL string) *Branch {
-	serverHost := ""
-	if u, err := url.Parse(baseURL); err == nil {
-		serverHost = u.Hostname()
-	}
+func newBranch(w *wireBranch, baseURL, proxyHost string, proxyPort int) *Branch {
+	serverHost := hostname(baseURL)
 	b := &Branch{
 		Name: w.Name, Host: w.Host, Port: w.Port,
 		User: w.User, Password: w.Password, Database: w.Database,
@@ -190,8 +247,12 @@ func newBranch(w *wireBranch, baseURL string) *Branch {
 	if b.Password == "" {
 		b.Password = os.Getenv("PGOVERLAY_PASSWORD")
 	}
+	proxyDB := w.ProxyDatabase
+	if proxyDB == "" {
+		proxyDB = b.Database + "@" + b.Name
+	}
 	b.DSN = dsn(b.User, b.Password, b.Host, b.Port, b.Database)
-	b.ProxyDSN = dsn(b.User, b.Password, serverHost, 6432, w.ProxyDatabase)
+	b.ProxyDSN = dsn(b.User, b.Password, proxyHost, proxyPort, proxyDB)
 	return b
 }
 

@@ -273,6 +273,91 @@ func TestDSNRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSplitProxyHost(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantHost string
+		wantPort int
+		wantErr  bool
+	}{
+		{"pgoverlay-proxy.pgoverlay-system", "pgoverlay-proxy.pgoverlay-system", 6432, false},
+		{"proxy.example.com:30432", "proxy.example.com", 30432, false},
+		{"10.0.0.9:6433", "10.0.0.9", 6433, false},
+		{"fd00::1", "fd00::1", 6432, false},
+		{"[fd00::1]", "fd00::1", 6432, false},
+		{"[fd00::1]:7432", "fd00::1", 7432, false},
+		{"proxy:", "", 0, true},
+		{"proxy:notaport", "", 0, true},
+		{"proxy:70000", "", 0, true},
+		{":6432", "", 0, true},
+		{"[]", "", 0, true},
+		{"http://proxy", "", 0, true},
+	}
+	for _, tt := range tests {
+		h, p, err := splitProxyHost(tt.in)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("splitProxyHost(%q) error = %v, wantErr %v", tt.in, err, tt.wantErr)
+			continue
+		}
+		if h != tt.wantHost || p != tt.wantPort {
+			t.Errorf("splitProxyHost(%q) = %q, %d; want %q, %d", tt.in, h, p, tt.wantHost, tt.wantPort)
+		}
+	}
+}
+
+// TestAcquireProxyHost: ProxyDSN targets PGOVERLAY_PROXY_HOST / WithProxyHost
+// when set (the Helm chart's separate proxy Service), not the API host.
+func TestAcquireProxyHost(t *testing.T) {
+	stub := newStub(t)
+	t.Setenv("PGOVERLAY_SERVER", stub.ts.URL)
+	t.Setenv("PGOVERLAY_TOKEN", "tok-1")
+	t.Setenv("PGOVERLAY_PASSWORD", "pw")
+
+	proxyAddr := func(b *Branch) string {
+		t.Helper()
+		u, err := url.Parse(b.ProxyDSN)
+		if err != nil {
+			t.Fatalf("ProxyDSN %q: %v", b.ProxyDSN, err)
+		}
+		if want := "/appdb@" + b.Name; u.Path != want {
+			t.Errorf("ProxyDSN path = %q, want %q", u.Path, want)
+		}
+		return u.Host
+	}
+
+	t.Setenv("PGOVERLAY_PROXY_HOST", "pgoverlay-proxy.pgoverlay-system:7432")
+	var b *Branch
+	t.Run("env", func(t *testing.T) { b = Acquire(t) })
+	if got := proxyAddr(b); got != "pgoverlay-proxy.pgoverlay-system:7432" {
+		t.Errorf("env proxy host: ProxyDSN host = %q", got)
+	}
+
+	t.Run("option wins, default port", func(t *testing.T) { b = Acquire(t, WithProxyHost("proxy.internal")) })
+	if got := proxyAddr(b); got != "proxy.internal:6432" {
+		t.Errorf("WithProxyHost: ProxyDSN host = %q, want proxy.internal:6432", got)
+	}
+
+	t.Run("ipv6", func(t *testing.T) { b = Acquire(t, WithProxyHost("[fd00::1]:6433")) })
+	if got := proxyAddr(b); got != "[fd00::1]:6433" {
+		t.Errorf("IPv6 proxy host: ProxyDSN host = %q, want [fd00::1]:6433", got)
+	}
+
+	// a malformed override fails before any branch is created
+	stub.mu.Lock()
+	creates := len(stub.creates)
+	stub.mu.Unlock()
+	f := &fakeTB{name: "TestAcquireProxyHost"}
+	runWithFakeTB(f, func() { Acquire(f, WithProxyHost("proxy:notaport")) })
+	if !f.failed || !strings.Contains(f.msg, "proxy:notaport") {
+		t.Fatalf("Acquire with a bad proxy host: failed=%v msg=%q", f.failed, f.msg)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.creates) != creates {
+		t.Errorf("a branch was created despite the invalid proxy host")
+	}
+}
+
 // TestAcquireIPv6DirectHost: a server reporting an IPv6 branch host yields a
 // bracketed, parseable DSN.
 func TestAcquireIPv6DirectHost(t *testing.T) {
