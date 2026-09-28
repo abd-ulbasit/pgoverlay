@@ -1,5 +1,7 @@
-# pgoverlay README demo — recorded with vhs (https://github.com/charmbracelet/vhs)
+# pgoverlay README demo, recorded with vhs (https://github.com/charmbracelet/vhs)
 # against a REAL 1 GiB pgbench database (pgbench -i -s 68); timings are not staged.
+# Record on a Linux host with a local Docker engine (local-mode pgb runs the
+# branch containers there).
 #
 # Prep (outside the recording):
 #   docker run -d --name pgoverlay-demo-src -e POSTGRES_PASSWORD=secret postgres:17 \
@@ -8,10 +10,18 @@
 #     'echo "host replication all all scram-sha-256" >> "$PGDATA/pg_hba.conf"'
 #   docker exec pgoverlay-demo-src psql -U postgres -c "SELECT pg_reload_conf();"
 #   docker exec pgoverlay-demo-src pgbench -i -s 68 -U postgres postgres
+#   SRC_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+#     pgoverlay-demo-src)
 #   mkdir -p /tmp/pgoverlay-demo-home
 #   PGOVERLAY_HOME=/tmp/pgoverlay-demo-home PGPASSWORD=secret \
-#     ./bin/pgb source add main --host <container IP> --user postgres
-# Then, from the repo root:  vhs hack/demo.tape
+#     ./bin/pgb source add main --host "$SRC_IP" --user postgres
+# Then, from the repo root:  make build && vhs hack/demo.tape
+# (Ubuntu 24.04+ blocks Chromium's sandbox: run VHS_NO_SANDBOX=true vhs ...)
+#
+# Clean up afterwards:
+#   PGOVERLAY_HOME=/tmp/pgoverlay-demo-home ./bin/pgb branch destroy pr-42
+#   PGOVERLAY_HOME=/tmp/pgoverlay-demo-home ./bin/pgb source rm main
+#   docker rm -f -v pgoverlay-demo-src && rm -rf /tmp/pgoverlay-demo-home
 
 Output docs/demo.gif
 
@@ -53,7 +63,7 @@ Enter
 Wait
 Sleep 2.5s
 
-# The whole dataset is there, instantly.
+# The whole dataset is there.
 Type `docker exec pgoverlay-br-pr-42 psql -U postgres -tc "\dt+"`
 Enter
 Wait
@@ -72,7 +82,11 @@ Enter
 Wait
 Sleep 2s
 
-# Branch a running branch.
+# Branch a running branch. On the overlay backend this freezes the parent:
+# pr-42 is checkpointed and restarted (on a new port), so it takes longer
+# than a create from the source.
+Type "# branch a branch (the parent pr-42 is frozen and restarted):"
+Enter
 Type "pgb branch create pr-42-fix --from-branch pr-42"
 Enter
 Wait
