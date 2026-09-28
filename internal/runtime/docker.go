@@ -293,17 +293,32 @@ func (d *DockerDriver) StopRemove(ctx context.Context, id string) error {
 	// already be gone by the time we get here (the NotFound and
 	// already-in-progress paths above), and ContainerWait on a missing
 	// container is an error rather than an immediate success.
+	deadline := time.NewTimer(removeWait)
+	defer deadline.Stop()
 	for {
-		if _, err := d.cli.ContainerInspect(ctx, id); client.IsErrNotFound(err) {
+		_, err := d.cli.ContainerInspect(ctx, id)
+		if client.IsErrNotFound(err) {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("waiting for container %s to be removed: %w", id, ctx.Err())
+		case <-deadline.C:
+			if err != nil {
+				return fmt.Errorf("container %s: removal not confirmed within %s: %w", id, removeWait, err)
+			}
+			return fmt.Errorf("container %s still exists %s after its removal was requested", id, removeWait)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
+
+// removeWait bounds StopRemove's wait for the container to disappear,
+// independently of ctx: saga compensations run on context.WithoutCancel and
+// reconcile on the process-lifetime context, so a container that never goes
+// away (a concurrent removal that failed after answering "already in
+// progress", a daemon that stopped answering) must not hang them forever.
+var removeWait = 2 * time.Minute
 
 func (d *DockerDriver) ListManaged(ctx context.Context) ([]ContainerInfo, error) {
 	f := filters.NewArgs(filters.Arg("label", "pgoverlay.managed=true"), filters.Arg("label", "pgoverlay.role=branch"))
