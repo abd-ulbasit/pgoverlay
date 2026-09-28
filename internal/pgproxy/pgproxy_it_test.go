@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
@@ -186,4 +188,66 @@ func TestProxyIntegration(t *testing.T) {
 		t.Fatalf("plaintext query on TLS-enabled proxy: %v", err)
 	}
 	plainConn.Close(ctx)
+
+	// Cancellation through the router (#18): a CancelRequest sent to the proxy
+	// reaches the branch that runs the statement, whether the session and the
+	// cancel connection are plaintext or TLS (pgx encrypts the cancel
+	// connection like the session, as libpq 17+ does).
+	assertCancelThroughProxy(t, ctx, "plaintext",
+		fmt.Sprintf("postgres://postgres:secret@%s/postgres@proxy-pr-1?sslmode=disable", proxyAddr))
+	assertCancelThroughProxy(t, ctx, "tls",
+		fmt.Sprintf("postgres://postgres:secret@%s/postgres@proxy-pr-1?sslmode=require", tlsAddr))
+}
+
+// assertCancelThroughProxy runs a long statement through the proxy at url,
+// sends a CancelRequest through the proxy once the statement is running on the
+// branch, and requires the statement to fail with query_canceled promptly.
+func assertCancelThroughProxy(t *testing.T, ctx context.Context, name, url string) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("%s: connect through proxy: %v", name, err)
+	}
+	defer conn.Close(ctx)
+	watcher, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("%s: connect watcher through proxy: %v", name, err)
+	}
+	defer watcher.Close(ctx)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Exec(ctx, "SELECT pg_sleep(60)")
+		done <- err
+	}()
+	// Wait until the statement runs on the branch, so the cancel has a target.
+	pid := conn.PgConn().PID()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var active bool
+		if err := watcher.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+			WHERE pid = $1 AND state = 'active' AND query LIKE 'SELECT pg_sleep%')`, pid).Scan(&active); err != nil {
+			t.Fatalf("%s: poll pg_stat_activity: %v", name, err)
+		}
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: pg_sleep never showed up as active on the branch", name)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if err := conn.PgConn().CancelRequest(ctx); err != nil {
+		t.Fatalf("%s: send cancel request through proxy: %v", name, err)
+	}
+	select {
+	case err := <-done:
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "57014" {
+			t.Fatalf("%s: statement ended with %v, want query_canceled (57014)", name, err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("%s: statement still running 15s after the cancel request: the router did not forward it", name)
+	}
 }
