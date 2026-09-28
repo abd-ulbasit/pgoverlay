@@ -1,10 +1,14 @@
 // Package ghook is a small GitHub webhook receiver that maps pull-request
 // lifecycle events to pgoverlay branches (branch-per-PR): opened/reopened →
-// ensure branch pr-<number> exists, synchronize → ensure (and optionally
-// reset), closed → destroy. It talks to branchd through internal/apiclient
-// and, when GitHub credentials are configured (App or PAT), reports back to
-// the PR: a pgoverlay/branch commit status around every branch operation and
-// a live connect-info comment kept current in place.
+// ensure branch gh-<repo-key>-pr-<number> exists, synchronize → ensure (and
+// optionally reset), closed → destroy. It talks to branchd through
+// internal/apiclient and, when GitHub credentials are configured (App or PAT),
+// reports back to the PR: a pgoverlay/branch commit status around every
+// branch operation and a live connect-info comment kept current in place.
+//
+// Branch names come from pgoverlayconnect (PRBranchName, RefBranchName), the
+// same functions the connect helpers use, so an app derives the name this
+// service creates without asking it.
 package ghook
 
 import (
@@ -23,6 +27,7 @@ import (
 
 	"github.com/abd-ulbasit/pgoverlay/internal/api"
 	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
+	"github.com/abd-ulbasit/pgoverlay/pgoverlayconnect"
 )
 
 // Config is the static service configuration (see cmd/pgoverlay-github for
@@ -38,9 +43,13 @@ type Config struct {
 	// synchronize after the branch is ready (opt-in, GHOOK_DIFF_ON_PUSH).
 	// Only takes effect when a GitHub client is configured.
 	DiffOnPush bool
-	// BranchNaming picks the pgoverlay branch name for a pull request:
-	//   "pr-number" (default): pr-<number>
-	//   "git-branch": the PR's head ref, sanitized (e.g. feat/login -> feat-login).
+	// BranchNaming picks the pgoverlay branch name for a pull request. Both
+	// modes carry the repository key (pgoverlayconnect.RepoKey), so pull
+	// requests of different repositories never share a branch:
+	//   "pr-number" (default): gh-<key>-pr-<number>
+	//   "git-branch": gh-<key>-<sanitized head ref> (feat/login -> gh-<key>-feat-login),
+	//     falling back to the pr-number name for pull requests from forks and
+	//     for refs with no letters or digits.
 	// git-branch lets preview platforms derive the name from the git ref
 	// they already know (Vercel's VERCEL_GIT_COMMIT_REF is present from the
 	// very first build, before the PR association exists).
@@ -82,6 +91,12 @@ type payload struct {
 		Head struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
+			// Repo is the repository the head branch lives in: this
+			// repository, or a fork. GitHub sends null once a fork is
+			// deleted.
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
 		} `json:"head"`
 	} `json:"pull_request"`
 	Repository struct {
@@ -94,23 +109,21 @@ type payload struct {
 	} `json:"installation"`
 }
 
+// fromFork reports whether the pull request's head branch lives in another
+// repository. A fork's branch name is chosen by whoever owns the fork, so in
+// git-branch mode it could be picked to equal a branch of this repository
+// and take over that pull request's database; fork pull requests are named
+// by number instead. A head repository GitHub no longer reports (a deleted
+// fork) counts as a fork.
+func (p *payload) fromFork() bool {
+	h := p.PullRequest.Head.Repo
+	return h == nil || !strings.EqualFold(h.FullName, p.Repository.FullName)
+}
+
 // maxWebhookBody caps the request body read BEFORE signature verification so
 // an unauthenticated multi-GB POST can't exhaust memory. GitHub payloads are
 // well under 1 MiB.
 const maxWebhookBody = 1 << 20
-
-// branchPrefix namespaces every App-created branch so a webhook-derived name
-// can never collide with a differently-sourced branch (another PR, or a
-// human-created branch). Without it, in git-branch mode an untrusted external
-// PR head ref, after sanitization, could land on an existing branch and — with
-// ResetOnPush — wipe someone else's data. Both naming modes live under this
-// reserved prefix: pr-number -> "gh-pr-<n>", git-branch -> "gh-<sanitizedref>".
-const branchPrefix = "gh-"
-
-// maxBranchNameLen is the engine's branch-name limit (^[a-z0-9][a-z0-9-]{0,40}$
-// => 41 chars). The sanitized git ref is truncated so prefix+ref stays within
-// it, keeping the reserved namespace inside the engine's budget.
-const maxBranchNameLen = 41
 
 func (s *Service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// Limit before reading and before HMAC verification: the read itself is
@@ -209,46 +222,21 @@ func (s *Service) dispatch(w http.ResponseWriter, r *http.Request, p *payload) {
 	json.NewEncoder(w).Encode(map[string]string{"branch": branch, "status": "accepted"})
 }
 
-// branchName derives the pgoverlay branch name for a pull request according to
-// Config.BranchNaming. Every name lives under the reserved branchPrefix so a
-// webhook-created branch can never collide with a differently-sourced one
-// (cross-PR or human): pr-number -> "gh-pr-<n>", git-branch -> "gh-<ref>".
-// git-branch mode falls back to gh-pr-<number> when the sanitized ref comes up
-// empty.
+// branchName derives the pgoverlay branch name for a pull request according
+// to Config.BranchNaming, with the functions the connect helpers use:
+// pr-number -> "gh-<key>-pr-<n>", git-branch -> "gh-<key>-<ref>". The key is
+// derived from the repository, so pull request #7 of two allow-listed
+// repositories gets two branches, and a close in one can never destroy the
+// other's. git-branch mode falls back to the pr-number name for fork pull
+// requests and when the sanitized ref comes up empty.
 func (s *Service) branchName(p *payload) string {
-	if s.cfg.BranchNaming == "git-branch" {
-		// Budget the sanitized ref so branchPrefix+ref stays within the engine's
-		// limit; the prefix is part of the reserved namespace, not free length.
-		if n := sanitizeBranchName(p.PullRequest.Head.Ref, maxBranchNameLen-len(branchPrefix)); n != "" {
-			return branchPrefix + n
+	repo := p.Repository.FullName
+	if s.cfg.BranchNaming == "git-branch" && !p.fromFork() {
+		if n := pgoverlayconnect.RefBranchName(repo, p.PullRequest.Head.Ref); n != "" {
+			return n
 		}
 	}
-	return fmt.Sprintf("%spr-%d", branchPrefix, p.Number)
-}
-
-// sanitizeBranchName maps a git ref to a valid pgoverlay branch-name fragment:
-// lowercase, runs of other characters collapse to single dashes, edges
-// trimmed, truncated to maxLen chars. maxLen is the budget left after the
-// caller's prefix so the final prefix+fragment fits ^[a-z0-9][a-z0-9-]{0,40}$.
-func sanitizeBranchName(ref string, maxLen int) string {
-	var b strings.Builder
-	dash := false
-	for _, r := range strings.ToLower(ref) {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
-			if dash && b.Len() > 0 {
-				b.WriteByte('-')
-			}
-			dash = false
-			b.WriteRune(r)
-		default:
-			dash = true
-		}
-		if b.Len() >= maxLen {
-			break
-		}
-	}
-	return strings.TrimRight(b.String()[:min(b.Len(), maxLen)], "-")
+	return pgoverlayconnect.PRBranchName(repo, p.Number)
 }
 
 // handleEnsure brackets the branch operation with commit statuses on the PR
