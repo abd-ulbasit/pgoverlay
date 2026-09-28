@@ -267,6 +267,54 @@ func TestDiffBranchRequiresReadyTarget(t *testing.T) {
 	}
 }
 
+// TestDiffBranchQuotaExceeded: the diff throwaway is a real branch (registry
+// row, volume, running instance), so it is subject to --max-branches like
+// every other create. At the cap the diff is refused with ErrQuotaExceeded
+// before anything is written or provisioned; with one free slot it runs.
+func TestDiffBranchQuotaExceeded(t *testing.T) {
+	d := newFake()
+	d.execOutFn = diffFake()
+	e, r := testEngine(t, d, WithMaxBranches(1))
+	readySource(t, r)
+	if _, err := e.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := e.DiffBranch(context.Background(), "pr-1")
+	if !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("diff at the cap: err = %v, want ErrQuotaExceeded", err)
+	}
+	if !strings.Contains(err.Error(), `diff "pr-1"`) {
+		t.Errorf("err = %q, want it to name the diff", err)
+	}
+	if d.starts != 1 {
+		t.Errorf("starts = %d, want 1 (no throwaway provisioned at the cap)", d.starts)
+	}
+	for v := range d.volumes {
+		if strings.Contains(v, "diff-") {
+			t.Errorf("throwaway volume created at the cap: %s", v)
+		}
+	}
+	if n, err := r.CountLiveBranches(); err != nil || n != 1 {
+		t.Errorf("live branches = %d (%v), want 1: no throwaway row at the cap", n, err)
+	}
+
+	// One free slot is enough for the throwaway, which is released again.
+	d2 := newFake()
+	d2.execOutFn = diffFake()
+	e2, r2 := testEngine(t, d2, WithMaxBranches(2))
+	readySource(t, r2)
+	if _, err := e2.CreateBranch(context.Background(), "pr-1", "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e2.DiffBranch(context.Background(), "pr-1"); err != nil {
+		t.Fatalf("diff with a free slot: %v", err)
+	}
+	if n, err := r2.CountLiveBranches(); err != nil || n != 1 {
+		t.Errorf("live branches after diff = %d (%v), want 1", n, err)
+	}
+}
+
 // TestDiffBranchNoDataSampleByDefault: without WithDataSample, no table
 // carries SampleRows and no PK/jsonb queries are issued.
 func TestDiffBranchNoDataSampleByDefault(t *testing.T) {
@@ -409,6 +457,20 @@ func TestWithDataSampleDefaultCap(t *testing.T) {
 		if strings.Contains(j, "to_jsonb") && !strings.Contains(j, fmt.Sprintf("LIMIT %d", defaultSampleRows)) {
 			t.Errorf("WithDataSample(0) did not use default cap: %q", j)
 		}
+	}
+}
+
+// WithDataSample clamps an oversized n to MaxSampleRows: the sample is
+// buffered in memory, so the cap is what bounds it.
+func TestWithDataSampleClampsToMax(t *testing.T) {
+	var o diffOptions
+	WithDataSample(2_000_000_000)(&o)
+	if o.sample != MaxSampleRows {
+		t.Fatalf("sample = %d, want the %d cap", o.sample, MaxSampleRows)
+	}
+	WithDataSample(MaxSampleRows - 1)(&o)
+	if o.sample != MaxSampleRows-1 {
+		t.Fatalf("sample = %d, want %d", o.sample, MaxSampleRows-1)
 	}
 }
 

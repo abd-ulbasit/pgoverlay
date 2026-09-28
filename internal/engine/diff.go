@@ -57,17 +57,23 @@ type DiffOption func(*diffOptions)
 // requested with a non-positive n.
 const defaultSampleRows = 20
 
+// MaxSampleRows is the largest per-table sample WithDataSample honours. The
+// sample is buffered in memory (psql output, then JSON), so an unbounded n
+// against a grown table could exhaust branchd's memory; the API rejects a
+// larger ?data= with 400.
+const MaxSampleRows = 500
+
 // WithDataSample turns on bounded data sampling: for each table whose branch
 // row-estimate exceeds its base estimate, DiffBranch returns up to n
 // branch-only rows (matched by primary key) in TableDelta.SampleRows. A
-// non-positive n uses the default cap (20). Tables without a primary key are
-// skipped. Off by default.
+// non-positive n uses the default cap (20); n above MaxSampleRows is clamped
+// to it. Tables without a primary key are skipped. Off by default.
 func WithDataSample(n int) DiffOption {
 	return func(o *diffOptions) {
 		if n <= 0 {
 			n = defaultSampleRows
 		}
-		o.sample = n
+		o.sample = min(n, MaxSampleRows)
 	}
 }
 
@@ -79,8 +85,9 @@ func WithDataSample(n int) DiffOption {
 // credentials involved, so rotated branch passwords don't matter) and diffs
 // host-side. The throwaway is a normal registry row (TTL'd, so the reaper
 // cleans strays if branchd dies mid-diff) and is destroyed before returning,
-// success or not. Expect a few seconds of wall time: a full branch provision
-// plus two dumps.
+// success or not. It counts toward --max-branches, so at the cap DiffBranch
+// returns ErrQuotaExceeded. Expect a few seconds of wall time: a full branch
+// provision plus two dumps.
 func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption) (_ *DiffResult, err error) {
 	defer e.observeOp("diff", &err)()
 	var o diffOptions
@@ -93,6 +100,12 @@ func (e *Engine) DiffBranch(ctx context.Context, name string, opts ...DiffOption
 	}
 	if b.State != registry.BranchReady {
 		return nil, fmt.Errorf("branch %q is %s, not ready", name, b.State)
+	}
+	// The throwaway is a real branch (row, volume, running instance) for the
+	// diff's lifetime and counts toward --max-branches, so it is refused at
+	// the cap like any other create, before anything is written.
+	if err := e.checkQuota(); err != nil {
+		return nil, fmt.Errorf("diff %q needs a temporary branch: %w", name, err)
 	}
 	src, err := e.reg.GetSourceByID(b.SourceID)
 	if err != nil {

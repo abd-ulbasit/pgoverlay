@@ -87,6 +87,9 @@ func ValidateBaseURL(s string) error {
 //   - PGOVERLAY_TLS_SKIP_VERIFY=1 disables certificate verification entirely;
 //     supported as an escape hatch but warned about loudly (MITM-exposed).
 //
+// Either way proxy settings from the environment (HTTPS_PROXY/NO_PROXY), the
+// dial and TLS handshake timeouts and keep-alives still apply.
+//
 // It also warns once, to stderr, when the token would be sent over plaintext
 // http to a non-loopback host (cleartext bearer token on the wire). It does
 // not hard-fail: some deployments front branchd with a trusted TLS proxy.

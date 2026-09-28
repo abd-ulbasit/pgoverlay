@@ -41,6 +41,20 @@ const DefaultSSLMode = "prefer"
 // sslModes are the libpq sslmode values.
 var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 
+// ErrSeedFailed marks a failure of the seed command itself (pg_basebackup, or
+// the pg_dump | psql pipeline) as opposed to the runtime plumbing around it.
+// Such a failure is almost always caused by the source's configuration (wrong
+// password, no pg_hba entry, unreachable host, missing privilege) and its
+// message carries the tool's own output, which never includes the password
+// (it travels only in the helper's environment). Test with errors.Is.
+var ErrSeedFailed = errors.New("seed command failed")
+
+// seedError tags err with ErrSeedFailed without changing its message.
+type seedError struct{ err error }
+
+func (e seedError) Error() string   { return e.err.Error() }
+func (e seedError) Unwrap() []error { return []error{ErrSeedFailed, e.err} }
+
 type SeedSpec struct {
 	Image string // postgres image matching the source's major version
 	// Volume is the seed target: a volume name, or — with MountKind
@@ -209,7 +223,7 @@ func Seed(ctx context.Context, d runtime.Driver, s SeedSpec) error {
 		Network: s.Network,
 	})
 	if err != nil {
-		return fmt.Errorf("pg_basebackup from %s: %w", s.addr(), err)
+		return seedError{fmt.Errorf("pg_basebackup from %s: %w", s.addr(), err)}
 	}
 	out, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image:  s.Image,

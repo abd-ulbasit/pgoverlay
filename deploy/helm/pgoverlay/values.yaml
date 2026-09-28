@@ -126,6 +126,12 @@ reconcileInterval: 60s
 # by reconcile (branchd --stuck-timeout).
 stuckTimeout: 10m
 
+# Seconds branchd gives in-flight branch/source operations to finish on
+# SIGTERM (rollout, pod delete) before it cancels and rolls them back
+# (branchd --shutdown-timeout). The pod's terminationGracePeriodSeconds is
+# set to this plus 30s so the kubelet does not kill branchd mid-drain.
+shutdownTimeout: 60
+
 # Per-branch credential rotation (branchd --rotate-branch-credentials): every
 # branch gets its own generated password instead of inheriting the source's.
 # The API then returns it as `password` and `pgb connect` prints it. Leave

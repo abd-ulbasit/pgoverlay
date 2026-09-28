@@ -2,8 +2,11 @@
 // wire-protocol router (--pg-addr) over one shared engine/registry, plus a
 // TTL reaper. Auth is a single bearer token from PGOVERLAY_TOKEN (required).
 //
-// Shutdown (SIGINT/SIGTERM) is graceful: listeners close, in-flight requests
-// finish, and branch containers keep running — they are durable state.
+// Shutdown (SIGINT/SIGTERM) is graceful: listeners close and new mutations
+// are refused, in-flight requests get --shutdown-timeout to finish (sagas
+// still running after that are cancelled and roll back), only then is the HA
+// Lease released, and branch containers keep running — they are durable
+// state. A second signal exits immediately.
 package main
 
 import (
@@ -18,12 +21,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/api"
 	"github.com/abd-ulbasit/pgoverlay/internal/config"
@@ -180,17 +185,28 @@ func resolveStorage(o storageOptions) (cow.Backend, error) {
 	}
 }
 
-// storageRoot returns the on-disk path whose filesystem holds all branch CoW
-// data and the SQLite registry, for the disk-free gauge. docker/overlay use
-// cfg.Home (~/.pgoverlay); kube hostpath uses --kube-data-root on the storage
-// node. CSI has no single shared local root (one PVC per branch), so it returns
-// "" and the gauge is left unregistered.
-func storageRoot(runtimeName, kubeStorage, kubeDataRoot, home string) string {
+// storageRoot returns the path this process can statfs to measure the
+// filesystem holding all branch CoW data, for the disk-free gauges. An explicit
+// --disk-root wins. docker/overlay use cfg.Home (~/.pgoverlay). kube hostpath
+// keeps the data under --kube-data-root on the storage node; when the registry
+// home lives inside it (the chart's layout: <data-root>/state is the only part
+// of the data root mounted into the branchd pod, and <data-root> itself
+// resolves to the container's own root filesystem there) the mounted home is
+// measured, otherwise (branchd running directly on the storage node) the data
+// root itself. CSI has no single shared local root (one PVC per branch), so it
+// returns "" and the gauges are left unregistered.
+func storageRoot(runtimeName, kubeStorage, kubeDataRoot, home, override string) string {
+	if override != "" {
+		return override
+	}
 	if runtimeName == "kube" {
-		if kubeStorage == "hostpath" {
-			return kubeDataRoot
+		if kubeStorage != "hostpath" {
+			return "" // csi: no single shared root
 		}
-		return "" // csi: no single shared root
+		if pathWithin(home, kubeDataRoot) {
+			return home
+		}
+		return kubeDataRoot
 	}
 	return home // docker / overlay
 }
@@ -236,6 +252,57 @@ func configureSecrets(reg *registry.Registry, cfg *config.Config, keyFile, token
 	return nil
 }
 
+// pathWithin reports whether path is dir or lies below it (lexically).
+func pathWithin(path, dir string) bool {
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// Shutdown budget: on SIGTERM in-flight requests (and the sagas behind
+// mutations) get --shutdown-timeout to finish; what is left is then cancelled
+// so the sagas run their compensations, which get compensationGrace more.
+const (
+	defaultShutdownTimeout = 60 * time.Second
+	compensationGrace      = 15 * time.Second
+)
+
+// drainAPI shuts the REST server down without abandoning sagas: stop
+// accepting connections and new mutations, give in-flight requests up to
+// budget, then cancel whatever is left (the sagas roll back on detached
+// contexts), wait up to compensationGrace for that, and close the remaining
+// connections.
+func drainAPI(srv *http.Server, apiSrv *api.Server, budget time.Duration) {
+	apiSrv.StopAdmitting()
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err == nil {
+		return
+	}
+	log.Printf("shutdown: requests still in flight after %s; cancelling them so their sagas roll back", budget)
+	apiSrv.CancelMutations()
+	graceCtx, cancelGrace := context.WithTimeout(context.Background(), compensationGrace)
+	defer cancelGrace()
+	if err := apiSrv.WaitMutations(graceCtx); err != nil {
+		log.Printf("shutdown: sagas still running %s after cancellation; exiting anyway (reconcile fails their rows after --stuck-timeout)", compensationGrace)
+	}
+	srv.Close()
+}
+
+// newAPIHTTPServer wraps the API handler with connection-level limits: a
+// client must send its headers within 10s and its whole request within a
+// minute (bodies are small and capped by the API), and idle keep-alive
+// connections are closed after two minutes. There is deliberately no
+// WriteTimeout: diff and seed responses legitimately take minutes.
+func newAPIHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+}
+
 func run() error {
 	apiAddr := flag.String("api-addr", ":7070", "REST API listen address")
 	pgAddr := flag.String("pg-addr", ":6432", "Postgres router listen address")
@@ -265,6 +332,8 @@ func run() error {
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
 	pgTLSKey := flag.String("pg-tls-key", "", "PEM private key for the Postgres router (requires --pg-tls-cert)")
 	leaderElect := flag.Bool("leader-elect", false, "HA: contend for a coordination.k8s.io Lease (pgoverlay-branchd) so only the leader runs reconcile and accepts mutating /v1 requests (kube runtime only; off = single-instance, always leader)")
+	shutdownTimeout := flag.Duration("shutdown-timeout", envDuration("PGOVERLAY_SHUTDOWN_TIMEOUT", defaultShutdownTimeout), "on SIGINT/SIGTERM, how long in-flight requests and the sagas behind them get to finish before they are cancelled and rolled back (keep it below the pod's terminationGracePeriodSeconds minus ~20s; env PGOVERLAY_SHUTDOWN_TIMEOUT)")
+	diskRoot := flag.String("disk-root", "", "path whose filesystem the pgoverlay_disk_bytes_free/_total gauges measure (default: the filesystem holding the branch data, see docs/observability.md)")
 	showVersion := flag.Bool("version", false, "print the branchd version and exit")
 	flag.Parse()
 
@@ -359,15 +428,18 @@ func run() error {
 	if *leaderElect && *runtimeName != "kube" {
 		return errors.New("--leader-elect requires --runtime kube (it contends for a coordination.k8s.io Lease)")
 	}
+	if *shutdownTimeout <= 0 {
+		return errors.New("--shutdown-timeout must be > 0")
+	}
 	m := metrics.New()
 	m.SetStateCounter(reg)
-	// Disk-free visibility on the storage-root filesystem that holds all CoW
-	// branch volumes plus the SQLite registry. For docker/overlay that root is
-	// cfg.Home (~/.pgoverlay); for kube hostpath it is --kube-data-root on the
-	// storage node. CSI gives each branch its own PVC with no single shared
-	// local root to statfs, so the gauge is wired only for the local-FS modes.
-	if diskRoot := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home); diskRoot != "" {
-		m.SetDiskRoot(diskRoot)
+	// Disk-free visibility on the filesystem that holds the CoW branch data
+	// (see storageRoot). CSI gives each branch its own PVC with no single
+	// shared local root to statfs, so the gauges are wired only for the
+	// local-FS modes.
+	if root := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home, *diskRoot); root != "" {
+		m.SetDiskRoot(root)
+		log.Printf("disk gauges measure the filesystem of %s", root)
 	}
 	// running sagas bump their rows well inside the stuck timeout, so
 	// reconcile never fails a slow-but-alive create/reset/freeze
@@ -406,10 +478,39 @@ func run() error {
 		return nil
 	}
 
+	apiSrv := api.New(eng, reg, token, m.Handler(), ready, *stuckTimeout)
+	apiSrv.SetProxyEndpoint(proxyHost, proxyPort)
+
+	// HA wiring happens before the API listener serves: a replica must not
+	// accept a single mutation before it has contended for the Lease, so its
+	// gate is closed first.
+	var (
+		electionClient kubernetes.Interface
+		identity       string
+	)
+	if *leaderElect {
+		electionClient, err = runtime.NewKubeClient(*kubeconfig)
+		if err != nil {
+			return fmt.Errorf("leader election kube client: %w", err)
+		}
+		identity = ha.Identity()
+		// Non-leader until the Lease is acquired: a replica that has not yet
+		// won rejects writes with 503.
+		apiSrv.LeaderGate().Set(false)
+	}
+	apiSrv.LeaderGate().Observe(m.SetLeader)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	g, ctx := errgroup.WithContext(ctx)
+
+	// Leader election runs on its own context: on shutdown the Lease is
+	// released (ReleaseOnCancel) only after the API has drained, so no other
+	// replica takes over while this one is still finishing sagas, and the
+	// drained sagas are not cancelled by the demotion.
+	electCtx, stopElection := context.WithCancel(context.Background())
+	defer stopElection()
 
 	// REST API (plain listener, wrapped with TLS when --api-tls-* is set)
 	apiLis, err := net.Listen("tcp", *apiAddr)
@@ -419,9 +520,7 @@ func run() error {
 	if apiTLS != nil {
 		apiLis = tls.NewListener(apiLis, apiTLS)
 	}
-	apiSrv := api.New(eng, reg, token, m.Handler(), ready, *stuckTimeout)
-	apiSrv.SetProxyEndpoint(proxyHost, proxyPort)
-	srv := &http.Server{Addr: *apiAddr, Handler: apiSrv.Handler()}
+	srv := newAPIHTTPServer(*apiAddr, apiSrv.Handler())
 	g.Go(func() error {
 		log.Printf("REST API listening on %s (TLS %v)", *apiAddr, apiTLS != nil)
 		log.Printf("web UI at %s", uiURL(*apiAddr, apiTLS != nil))
@@ -432,9 +531,11 @@ func run() error {
 	})
 	g.Go(func() error {
 		<-ctx.Done()
-		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return srv.Shutdown(shCtx)
+		stop() // a second SIGINT/SIGTERM now terminates immediately
+		log.Printf("shutting down: draining in-flight requests (up to %s)", *shutdownTimeout)
+		drainAPI(srv, apiSrv, *shutdownTimeout)
+		stopElection()
+		return nil
 	})
 
 	// Postgres wire-protocol router (Serve closes the listener on ctx done)
@@ -460,22 +561,28 @@ func run() error {
 	// reconcileLoop is the leader-only work: with --leader-elect off it runs for
 	// the whole process (the API gate defaults to leader=true). With it on, the
 	// election callbacks start it on gaining leadership and cancel it on losing.
+	// Either way it stops as soon as shutdown begins: the leader keeps the
+	// Lease while the API drains, but must not start new reap/GC passes then.
 	reconcileLoop := func(loopCtx context.Context) {
+		loopCtx, cancel := context.WithCancel(loopCtx)
+		defer cancel()
+		defer context.AfterFunc(ctx, cancel)()
 		eng.RunReconcile(loopCtx, *reconcileInterval, *stuckTimeout, log.Printf)
 	}
 	if *leaderElect {
-		cs, err := runtime.NewKubeClient(*kubeconfig)
-		if err != nil {
-			return fmt.Errorf("leader election kube client: %w", err)
+		var cbOpts []ha.Option
+		// In-cluster (POD_NAME set by the chart) the leader labels its pod so
+		// the API Service routes to it; see docs/ha.md.
+		if pod := os.Getenv("POD_NAME"); pod != "" {
+			cbOpts = append(cbOpts, ha.WithMarker(&ha.PodLabeler{Client: electionClient, Namespace: kubeNS, Pod: pod}))
+			log.Printf("leader election: the leader labels its pod %s=true (the API Service selects it)", ha.LeaderLabel)
+		} else {
+			log.Printf("leader election: POD_NAME is unset, so the leader pod is not labelled; route API traffic to the Lease holder yourself")
 		}
-		identity := ha.Identity()
-		// Non-leader until the Lease is acquired: close the mutating gate now so
-		// a replica that has not yet won rejects writes with 503.
-		apiSrv.LeaderGate().Set(false)
-		cb := ha.NewCallbacks(apiSrv.LeaderGate(), reconcileLoop)
+		cb := ha.NewCallbacks(apiSrv.LeaderGate(), reconcileLoop, cbOpts...)
 		log.Printf("leader election enabled: contending for Lease %s/%s as %q", kubeNS, ha.LeaseName, identity)
 		g.Go(func() error {
-			return ha.Run(ctx, cs, kubeNS, identity, cb)
+			return ha.Run(electCtx, electionClient, kubeNS, identity, cb)
 		})
 	} else {
 		g.Go(func() error {

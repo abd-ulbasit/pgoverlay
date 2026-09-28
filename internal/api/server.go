@@ -139,6 +139,17 @@ type Transition struct {
 	At        string `json:"at"`
 }
 
+// Usage is the body of GET /v1/branches/{name}/usage: the branch's rw-layer
+// disk usage in bytes.
+type Usage struct {
+	Bytes int64 `json:"bytes"`
+}
+
+// ErrorResponse is the body of every non-2xx /v1 response.
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
 // Ready reports whether branchd can serve traffic: the registry is reachable
 // and the container driver responds. Returns nil when ready, an error
 // otherwise. branchd supplies a closure; tests inject a fake.
@@ -153,6 +164,7 @@ type Server struct {
 	stuckTimeout time.Duration
 	leader       *LeaderGate
 	proxy        proxyEndpoint // advertised router address (SetProxyEndpoint)
+	muts         *mutations
 }
 
 // New builds the API server. metricsHandler serves /metrics (promhttp over the
@@ -164,7 +176,10 @@ func New(eng *engine.Engine, reg *registry.Registry, token string, metricsHandle
 	if stuckTimeout <= 0 {
 		stuckTimeout = DefaultStuckTimeout
 	}
-	return &Server{eng: eng, reg: reg, token: token, metrics: metricsHandler, ready: ready, stuckTimeout: stuckTimeout, leader: newLeaderGate()}
+	return &Server{
+		eng: eng, reg: reg, token: token, metrics: metricsHandler, ready: ready, stuckTimeout: stuckTimeout,
+		leader: newLeaderGate(), muts: newMutations(),
+	}
 }
 
 // LeaderGate exposes the HA mutating-route gate so branchd's leader-election
@@ -176,32 +191,38 @@ func (s *Server) LeaderGate() *LeaderGate { return s.leader }
 const DefaultStuckTimeout = 10 * time.Minute
 
 func (s *Server) Handler() http.Handler {
-	// Per-route minimum role (admin > operator > viewer). GETs are viewer;
-	// branch lifecycle mutations + applying reconcile are operator; source and
-	// token management are admin. Every route requires at least viewer (a valid
-	// token); /healthz, /readyz and /metrics sit outside this mux unauthenticated.
+	// Per-route minimum role (admin > operator > viewer). Reads are viewer;
+	// branch lifecycle mutations, diff and applying reconcile are operator;
+	// source and token management are admin. Every route requires at
+	// least viewer (a valid token); /healthz, /readyz and /metrics sit outside
+	// this mux unauthenticated.
 	admin, operator, viewer := registry.RoleAdmin, registry.RoleOperator, registry.RoleViewer
 	v1 := http.NewServeMux()
-	// Reads use requireRole (bearer + min-role). Mutations use s.mutate, which
-	// composes the HA leader gate (503 "not leader" on non-leaders) in front of
-	// the same role check — so only the leader accepts writes.
+	// Reads use requireRole (bearer + min-role). Mutations use s.mutate /
+	// s.mutateBranch: the same role check, then the HA leader gate (503 "not
+	// leader" on non-leaders), then the handler on a context detached from the
+	// client connection — so only the leader writes, and a dropped connection
+	// never aborts a half-done saga.
 	v1.HandleFunc("POST /v1/sources", s.mutate(admin, s.createSource))
 	v1.HandleFunc("GET /v1/sources", s.requireRole(viewer, s.listSources))
 	v1.HandleFunc("DELETE /v1/sources/{name}", s.mutate(admin, s.removeSource))
 	v1.HandleFunc("POST /v1/sources/{name}/refresh", s.mutate(admin, s.refreshSource))
 	v1.HandleFunc("PUT /v1/sources/{name}/mask", s.mutate(admin, s.setMaskScripts))
 	v1.HandleFunc("GET /v1/sources/{name}/mask", s.requireRole(viewer, s.getMaskScripts))
-	v1.HandleFunc("POST /v1/branches", s.mutate(operator, s.createBranch))
+	v1.HandleFunc("POST /v1/branches", s.mutateBranch(operator, s.createBranch))
 	v1.HandleFunc("GET /v1/branches", s.requireRole(viewer, s.listBranches))
 	v1.HandleFunc("GET /v1/branches/{name}", s.requireRole(viewer, s.getBranch))
 	v1.HandleFunc("GET /v1/branches/{name}/usage", s.requireRole(viewer, s.branchUsage))
-	v1.HandleFunc("GET /v1/branches/{name}/diff", s.requireRole(viewer, s.branchDiff))
+	// diff is a GET but not a read: it writes a throwaway registry row and
+	// provisions (then destroys) a full Postgres instance, so it is
+	// operator-level and leader-only like any other branch saga.
+	v1.HandleFunc("GET /v1/branches/{name}/diff", s.mutateBranch(operator, s.branchDiff))
 	v1.HandleFunc("GET /v1/branches/{name}/history", s.requireRole(viewer, s.branchHistory))
-	v1.HandleFunc("DELETE /v1/branches/{name}", s.mutate(operator, s.destroyBranch))
-	v1.HandleFunc("POST /v1/branches/{name}/reset", s.mutate(operator, s.resetBranch))
-	v1.HandleFunc("POST /v1/branches/{name}/recover", s.mutate(operator, s.recoverBranch))
+	v1.HandleFunc("DELETE /v1/branches/{name}", s.mutateBranch(operator, s.destroyBranch))
+	v1.HandleFunc("POST /v1/branches/{name}/reset", s.mutateBranch(operator, s.resetBranch))
+	v1.HandleFunc("POST /v1/branches/{name}/recover", s.mutateBranch(operator, s.recoverBranch))
 	v1.HandleFunc("GET /v1/reconcile/plan", s.requireRole(viewer, s.reconcilePlan))
-	v1.HandleFunc("POST /v1/reconcile", s.mutate(operator, s.reconcileApply))
+	v1.HandleFunc("POST /v1/reconcile", s.mutateBranch(operator, s.reconcileApply))
 	v1.HandleFunc("POST /v1/tokens", s.mutate(admin, s.createToken))
 	v1.HandleFunc("GET /v1/tokens", s.requireRole(admin, s.listTokens))
 	v1.HandleFunc("DELETE /v1/tokens/{name}", s.mutate(admin, s.revokeToken))

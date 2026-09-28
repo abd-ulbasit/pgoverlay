@@ -54,8 +54,9 @@ type Engine struct {
 // clone parent) that runs detached from the request context.
 const parentStepTimeout = 2 * time.Minute
 
-// ErrQuotaExceeded is returned by the create paths when --max-branches is set
-// and the live-branch count is already at the cap. The API maps it to 403.
+// ErrQuotaExceeded is returned by the create paths (and DiffBranch, whose
+// throwaway is a branch too) when --max-branches is set and the live-branch
+// count is already at the cap. The API maps it to 403.
 var ErrQuotaExceeded = errors.New("branch quota exceeded")
 
 // Option configures optional engine behavior at construction time.

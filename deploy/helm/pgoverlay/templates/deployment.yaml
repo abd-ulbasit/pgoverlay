@@ -30,6 +30,10 @@ spec:
       # Pin to the storage node: branchd's sqlite state shares the node (and
       # data root) with the CoW volumes it manages.
       nodeName: {{ required "set node to the storage node name (kubectl get nodes)" .Values.node }}
+      # On SIGTERM branchd drains in-flight sagas for --shutdown-timeout, then
+      # cancels and rolls back the rest (up to 15s more) before it exits; the
+      # kubelet must not SIGKILL it first.
+      terminationGracePeriodSeconds: {{ add (int .Values.shutdownTimeout) 30 }}
       containers:
         - name: branchd
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -63,6 +67,7 @@ spec:
             {{- end }}
             - --reconcile-interval={{ .Values.reconcileInterval }}
             - --stuck-timeout={{ .Values.stuckTimeout }}
+            - --shutdown-timeout={{ int .Values.shutdownTimeout }}s
             {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
             # HA: contend for the pgoverlay-branchd Lease; only the leader
             # reconciles + accepts mutating /v1 requests (see docs/ha.md).
