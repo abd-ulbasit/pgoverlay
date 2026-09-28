@@ -1,0 +1,41 @@
+:root {
+  --bg: #0d1117; --panel: #161b22; --line: #30363d;
+  --fg: #c9d1d9; --dim: #8b949e; --accent: #3fb950;
+  --warn: #d29922; --err: #f85149; --blue: #58a6ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 1.5rem; background: var(--bg); color: var(--fg);
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+h1 { font-size: 1.1rem; margin: 0; }
+h1 .cursor { color: var(--accent); animation: blink 1.2s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+h2 { font-size: 0.8rem; color: var(--dim); text-transform: uppercase; letter-spacing: .12em; margin: 1.6rem 0 .5rem; }
+header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+header .spacer { flex: 1; }
+input, select, button {
+  background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 4px; padding: .3rem .5rem; font: inherit;
+}
+input:focus, select:focus { outline: none; border-color: var(--blue); }
+button { cursor: pointer; }
+button:hover { border-color: var(--dim); }
+button.danger:hover { border-color: var(--err); color: var(--err); }
+table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+th, td { text-align: left; padding: .45rem .7rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--dim); font-weight: normal; font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
+tr:last-child td { border-bottom: none; }
+.badge { padding: .05rem .45rem; border-radius: 999px; font-size: .75rem; border: 1px solid; }
+.badge.ready { color: var(--accent); border-color: var(--accent); }
+.badge.creating, .badge.resetting { color: var(--warn); border-color: var(--warn); }
+.badge.failed { color: var(--err); border-color: var(--err); }
+.badge.seeding { color: var(--blue); border-color: var(--blue); }
+.dim { color: var(--dim); }
+.empty { color: var(--dim); padding: .6rem .7rem; }
+#msg { margin-top: .8rem; min-height: 1.2rem; }
+#msg.err { color: var(--err); }
+#msg.ok { color: var(--accent); }
+form.create { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: .6rem 0 0; }
+td .rowbtns { display: flex; gap: .35rem; }
+#token { width: 16rem; }
