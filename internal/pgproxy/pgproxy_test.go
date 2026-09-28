@@ -479,6 +479,8 @@ func TestSSLRequestRepeatedWithoutTLSStaysN(t *testing.T) {
 	}
 }
 
+// A CancelRequest whose key no live session holds is dropped and the
+// connection closed without a reply, as Postgres does.
 func TestCancelRequestClosedSilently(t *testing.T) {
 	addr := startProxy(t, fakeResolver{})
 	conn := dialProxy(t, addr)

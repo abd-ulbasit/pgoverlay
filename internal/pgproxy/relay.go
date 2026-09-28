@@ -11,15 +11,25 @@ import (
 	"time"
 )
 
+// maxBackendKeyDataLen bounds the BackendKeyData body the proxy records: a
+// 4-byte process ID plus a secret key of at most 256 bytes (protocol 3.2; it
+// is exactly 4 bytes under 3.0).
+const maxBackendKeyDataLen = 4 + 256
+
 // session is one routed client<->backend connection pair.
 type session struct {
 	client    net.Conn // what the client speaks: the TLS conn when TLS is in use
 	clientRaw net.Conn // the client's TCP conn, closed to force a teardown
 	backend   net.Conn
+	addr      string // backend address, recorded against the cancel key
 	idle      time.Duration
 	grace     time.Duration
+	cancels   *cancelMap
 
 	ready atomic.Bool
+	// cancelKey is the BackendKeyData body registered in cancels. Written only
+	// by the backend->client goroutine; read by relay() after both finish.
+	cancelKey string
 }
 
 // relay copies bytes in both directions until both are done.
@@ -65,6 +75,9 @@ func (s *session) relay() {
 	}()
 	wg.Wait()
 	timer.Stop()
+	if s.cancelKey != "" {
+		s.cancels.remove(s.cancelKey, s.addr)
+	}
 }
 
 func (s *session) copyClientToBackend() {
@@ -92,9 +105,10 @@ func (s *session) copyBackendToClient() {
 // relayStartup copies the backend's startup response to the client message by
 // message until the first ReadyForQuery, which it also copies. The bytes are
 // forwarded unchanged; the proxy only reads the frame headers (type byte and
-// length). Authentication messages are streamed through without being
-// inspected, and everything the client sends meanwhile (a SCRAM exchange, say)
-// is relayed by the other direction untouched.
+// length) and the BackendKeyData body, whose key it records so a later
+// CancelRequest can be routed here. Authentication messages are streamed
+// through without being inspected, and everything the client sends meanwhile
+// (a SCRAM exchange, say) is relayed by the other direction untouched.
 //
 // It returns nil after ReadyForQuery (having marked the session ready), or the
 // error that ended the exchange (the backend closing after an ErrorResponse, a
@@ -121,7 +135,16 @@ func (s *session) relayStartup(src *bufio.Reader) error {
 		if _, err := w.Write(hdr[:]); err != nil {
 			return err
 		}
-		if _, err := io.CopyN(w, src, n); err != nil {
+		if hdr[0] == 'K' && n >= 8 && n <= maxBackendKeyDataLen {
+			body := make([]byte, n)
+			if _, err := io.ReadFull(src, body); err != nil {
+				return err
+			}
+			if _, err := w.Write(body); err != nil {
+				return err
+			}
+			s.registerCancelKey(body)
+		} else if _, err := io.CopyN(w, src, n); err != nil {
 			return err
 		}
 		if hdr[0] == 'Z' {
@@ -131,6 +154,16 @@ func (s *session) relayStartup(src *bufio.Reader) error {
 			return w.Flush()
 		}
 	}
+}
+
+// registerCancelKey records body (process ID + secret key) as this session's
+// cancel key, replacing any earlier one.
+func (s *session) registerCancelKey(body []byte) {
+	if s.cancelKey != "" {
+		s.cancels.remove(s.cancelKey, s.addr)
+	}
+	s.cancelKey = string(body)
+	s.cancels.add(s.cancelKey, s.addr)
 }
 
 // markReady ends the startup phase: switch both connections from the

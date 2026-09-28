@@ -12,7 +12,8 @@ import (
 // The startup exchange is relayed byte for byte even though the proxy parses
 // it: a client-driven SASL (SCRAM-shaped) exchange crosses the proxy
 // untouched in both directions, bytes the backend sends right after
-// ReadyForQuery are not lost, and the session keeps working.
+// ReadyForQuery are not lost, the session keeps working, and the key it
+// handed out is cancellable.
 func TestStartupRelayIsTransparentThroughSASLExchange(t *testing.T) {
 	enc := func(msgs ...pgproto3.Message) []byte {
 		var b []byte
@@ -95,4 +96,8 @@ func TestStartupRelayIsTransparentThroughSASLExchange(t *testing.T) {
 			t.Fatalf("%s: client got %x, want %x", step.name, got, step.want)
 		}
 	}
+
+	frame := cancelFrame(555, key)
+	sendCancel(t, dialProxy(t, addr), frame)
+	expectCancel(t, srv, frame)
 }

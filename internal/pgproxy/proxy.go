@@ -3,6 +3,10 @@
 // branch to its backend address, rewrites the database param back to the
 // real dbname, replays the startup to the branch backend, and then relays
 // bytes transparently in both directions (SCRAM auth flows untouched).
+//
+// While relaying the backend's startup response the proxy watches the
+// message frames (never altering them) for BackendKeyData, so a later
+// CancelRequest carrying that key can be forwarded to the right backend.
 package pgproxy
 
 import (
@@ -65,7 +69,8 @@ const (
 
 type Proxy struct {
 	Resolver BranchResolver
-	// DialTimeout bounds the backend dial. Defaults to 5s.
+	// DialTimeout bounds the backend dial (and a forwarded cancel request's
+	// exchange with the backend). Defaults to 5s.
 	DialTimeout time.Duration
 	// StartupTimeout bounds the client's startup packets (SSL/GSS negotiation,
 	// the TLS handshake and the StartupMessage), measured from accept. A client
@@ -97,6 +102,9 @@ type Proxy struct {
 
 	// closeGrace overrides defaultCloseGrace (tests only).
 	closeGrace time.Duration
+
+	// cancels maps live sessions' cancel keys to their backend addresses.
+	cancels cancelMap
 }
 
 func New(r BranchResolver) *Proxy {
@@ -234,8 +242,8 @@ func isTemporaryAcceptError(err error) bool {
 }
 
 // handleConn drives the startup phase: answer SSLRequest ('S' + TLS upgrade
-// when TLSConfig is set, else 'N'), drop CancelRequest silently, then route
-// the StartupMessage.
+// when TLSConfig is set, else 'N'), forward a CancelRequest whose key belongs
+// to a live session, then route the StartupMessage.
 func (p *Proxy) handleConn(client net.Conn) {
 	raw := client
 	defer func() { client.Close() }() // closure: client may be re-bound to the TLS conn
@@ -253,8 +261,9 @@ func (p *Proxy) handleConn(client net.Conn) {
 		}
 		switch code {
 		case cancelRequestCode:
-			// No session map in P2; close silently per protocol (the server
-			// never replies to a cancel request).
+			// The server never replies to a cancel request; the client learns
+			// it was handled when the connection closes.
+			p.forwardCancel(payload)
 			return
 		case sslRequestCode:
 			if p.TLSConfig == nil {
@@ -345,8 +354,10 @@ func (p *Proxy) route(client, raw net.Conn, startup *pgproto3.StartupMessage) {
 		client:    client,
 		clientRaw: raw,
 		backend:   backend,
+		addr:      addr,
 		idle:      p.idleTimeout(),
 		grace:     p.graceTimeout(),
+		cancels:   &p.cancels,
 	}
 	s.relay()
 }
