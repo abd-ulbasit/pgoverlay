@@ -17,6 +17,20 @@ type Actor struct {
 // state changes.
 const SystemActor = "system:reconcile"
 
+// LocalActorPrefix marks the actor of a mutation made by the pgb CLI in local
+// mode, which reaches the registry directly instead of through an API token.
+// Stored token names cannot contain ':' (see ValidateTokenName), so neither this
+// prefix nor SystemActor can be spoofed by a token.
+const LocalActorPrefix = "local:"
+
+// LocalActor is the actor for local-mode CLI mutations: "local:<os user>".
+func LocalActor(osUser string) Actor {
+	if osUser == "" {
+		osUser = "unknown"
+	}
+	return Actor{Name: LocalActorPrefix + osUser}
+}
+
 // String renders the actor as "name (role)", or the bare name when no role is
 // known, or SystemActor when the actor is empty. This is the exact text stored
 // in the transitions.actor column and shown in the audit history.

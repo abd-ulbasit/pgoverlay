@@ -357,7 +357,15 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// CreateSource inserts a new source row (state seeding) and journals it with
+// the system actor. Use CreateSourceCtx to record the request actor.
 func (r *Registry) CreateSource(s *Source) error {
+	return r.CreateSourceCtx(context.Background(), s)
+}
+
+// CreateSourceCtx is CreateSource with the actor read from ctx (see WithActor)
+// stamped onto the "created" transition.
+func (r *Registry) CreateSourceCtx(ctx context.Context, s *Source) error {
 	if err := validatePGVersion(s.PGVersion); err != nil {
 		return err
 	}
@@ -373,14 +381,22 @@ func (r *Registry) CreateSource(s *Source) error {
 	if err != nil {
 		return fmt.Errorf("create source %q: %w", s.Name, err)
 	}
-	return r.journal(context.Background(), "source", s.ID, "", string(SourceSeeding), "created")
+	return r.journal(ctx, "source", s.ID, "", string(SourceSeeding), "created")
 }
 
+// SetSourceState moves a source to a new state, journaled with the system
+// actor. Use SetSourceStateCtx to record the request actor.
 func (r *Registry) SetSourceState(id string, to SourceState, reason string) error {
-	return r.setState("sources", "source", id, string(to), reason)
+	return r.SetSourceStateCtx(context.Background(), id, to, reason)
 }
 
-func (r *Registry) setState(table, entity, id, to, reason string) error {
+// SetSourceStateCtx is SetSourceState with the actor read from ctx recorded on
+// the transition.
+func (r *Registry) SetSourceStateCtx(ctx context.Context, id string, to SourceState, reason string) error {
+	return r.setState(ctx, "sources", "source", id, string(to), reason)
+}
+
+func (r *Registry) setState(ctx context.Context, table, entity, id, to, reason string) error {
 	var from string
 	if err := r.db.QueryRow(`SELECT state FROM `+table+` WHERE id=?`, id).Scan(&from); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -391,7 +407,7 @@ func (r *Registry) setState(table, entity, id, to, reason string) error {
 	if _, err := r.db.Exec(`UPDATE `+table+` SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, to, id); err != nil {
 		return err
 	}
-	return r.journal(context.Background(), entity, id, from, to, reason)
+	return r.journal(ctx, entity, id, from, to, reason)
 }
 
 func (r *Registry) journal(ctx context.Context, entity, id, from, to, reason string) error {
@@ -658,16 +674,17 @@ type Transition struct {
 }
 
 // BranchHistory returns the audit trail for every branch that has ever borne
-// the given name, oldest first. It joins transitions to the branch rows by
+// the given name, oldest first. It matches transitions to the branch rows by
 // id (a destroyed-then-recreated name maps to multiple ids), so an incident on
-// a since-recreated name is still recoverable. ErrNotFound when the name was
-// never used.
+// a since-recreated name is still recoverable, and also by the entity_name
+// DeleteSource stamps on the rows of branches it removes, so the trail
+// outlives the source. ErrNotFound when the name was never used.
 func (r *Registry) BranchHistory(name string) ([]Transition, error) {
 	rows, err := r.db.Query(`SELECT t.from_state, t.to_state, t.reason, t.actor, t.at
 		FROM transitions t
-		JOIN branches b ON b.id = t.entity_id AND t.entity = 'branch'
-		WHERE b.name = ?
-		ORDER BY t.id ASC`, name)
+		WHERE t.entity = 'branch'
+		  AND (t.entity_id IN (SELECT id FROM branches WHERE name = ?) OR t.entity_name = ?)
+		ORDER BY t.id ASC`, name, name)
 	if err != nil {
 		return nil, err
 	}
@@ -823,9 +840,23 @@ func (r *Registry) GetMaskScripts(sourceID string) ([]MaskScript, error) {
 }
 
 // BumpSourceGeneration advances a source to its next generation volume after
-// a successful refresh seed.
+// a successful refresh seed, journaled with the system actor. Use
+// BumpSourceGenerationCtx to record the request actor.
 func (r *Registry) BumpSourceGeneration(id, newVolume string) error {
-	res, err := r.db.Exec(`UPDATE sources SET generation=generation+1, volume=?,
+	return r.BumpSourceGenerationCtx(context.Background(), id, newVolume)
+}
+
+// BumpSourceGenerationCtx is BumpSourceGeneration with a transitions row
+// (state unchanged, reason naming the new generation) recording the actor read
+// from ctx, so a refresh, which changes what every new branch sees, is
+// attributable like any other source mutation.
+func (r *Registry) BumpSourceGenerationCtx(ctx context.Context, id, newVolume string) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE sources SET generation=generation+1, volume=?,
 		updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`, newVolume, id)
 	if err != nil {
 		return err
@@ -835,7 +866,16 @@ func (r *Registry) BumpSourceGeneration(id, newVolume string) error {
 	} else if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	var state string
+	var gen int
+	if err := tx.QueryRow(`SELECT state, generation FROM sources WHERE id=?`, id).Scan(&state, &gen); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor) VALUES (?,?,?,?,?,?)`,
+		"source", id, state, state, fmt.Sprintf("refreshed to generation %d (%s)", gen, newVolume), actorString(ctx)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CountLiveBranches counts every branch that is not destroyed (creating,
@@ -1055,14 +1095,48 @@ func (r *Registry) CommitFreezeCtx(ctx context.Context, parentID, childID, layer
 	return l, tx.Commit()
 }
 
-// DeleteSource removes a source row and its (destroyed) branch history rows.
-// Callers must ensure no live branches reference the source first.
+// sourceDeleted is the to_state journaled when a source row is removed. It is
+// a journal-only marker: no source row ever carries it.
+const sourceDeleted = "deleted"
+
+// DeleteSource removes a source row and its (destroyed) branch rows, journaled
+// with the system actor. Use DeleteSourceCtx to record the request actor.
 func (r *Registry) DeleteSource(id string) error {
+	return r.DeleteSourceCtx(context.Background(), id)
+}
+
+// DeleteSourceCtx removes a source row, its layers, masking scripts and
+// (destroyed) branch rows. Callers must ensure no live branches reference the
+// source first. The audit trail survives: before the rows go, every
+// transitions row of the source and of its branches is stamped with the
+// entity's name (so BranchHistory still resolves it by name), and a
+// "<state> -> deleted" row records who removed the source, all in one
+// transaction.
+func (r *Registry) DeleteSourceCtx(ctx context.Context, id string) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var name, state string
+	if err := tx.QueryRow(`SELECT name, state FROM sources WHERE id=?`, id).Scan(&name, &state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE transitions
+		SET entity_name = (SELECT b.name FROM branches b WHERE b.id = transitions.entity_id)
+		WHERE entity = 'branch' AND entity_id IN (SELECT id FROM branches WHERE source_id = ?)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE transitions SET entity_name = ? WHERE entity = 'source' AND entity_id = ?`, name, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO transitions (entity,entity_id,from_state,to_state,reason,actor,entity_name) VALUES (?,?,?,?,?,?,?)`,
+		"source", id, state, sourceDeleted, "source removed", actorString(ctx), name); err != nil {
+		return err
+	}
 	// layers self-reference via parent_layer_id; defer FK checks so the whole
 	// chain can go in one statement
 	if _, err := tx.Exec(`PRAGMA defer_foreign_keys=ON`); err != nil {
