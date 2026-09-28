@@ -104,7 +104,7 @@ func (d *DockerDriver) CloneVolume(ctx context.Context, src, dst string, labels 
 		return fmt.Errorf("clone volume %s -> %s: %w", src, dst, err)
 	}
 	if _, err := d.RunHelper(ctx, HelperSpec{
-		Image: "alpine:3.21",
+		Image: UtilityImage,
 		Cmd:   []string{"sh", "-c", "cp -a /pgoverlay-clone-src/. /pgoverlay-clone-dst/"},
 		Mounts: []Mount{
 			{Volume: src, Target: "/pgoverlay-clone-src", ReadOnly: true},
