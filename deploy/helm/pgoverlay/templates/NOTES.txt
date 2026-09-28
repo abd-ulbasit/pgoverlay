@@ -26,6 +26,15 @@ SECURITY — read before exposing pgoverlay beyond a single trusted node:
   [!] The ghook webhook/GitHub secrets were rendered by the chart — same
       release-history caveat. Use `ghook.existingSecret` in production.
 {{- end }}
+{{- if and .Values.ghook.enabled (not .Values.ghook.apiTokenSecret) }}
+
+  [!] GHOOK USES THE ADMIN TOKEN: the webhook receiver was handed branchd's
+      admin API token, which can also manage sources and mint tokens. It only
+      needs an operator token:
+        pgb token create ghook --role operator
+        kubectl -n {{ .Release.Namespace }} create secret generic {{ include "pgoverlay.ghook.fullname" . }}-api --from-literal=token=<printed token>
+        helm upgrade {{ .Release.Name }} ... --reuse-values --set ghook.apiTokenSecret={{ include "pgoverlay.ghook.fullname" . }}-api
+{{- end }}
 
   [!] PROXY TLS / TRUSTED BOUNDARY: the Postgres proxy speaks the Postgres wire
       protocol. {{ if .Values.proxy.tls.certSecret }}TLS is configured (proxy.tls.certSecret), good.{{ else }}TLS is NOT configured (proxy.tls.certSecret is empty), so the
@@ -40,11 +49,23 @@ SECURITY — read before exposing pgoverlay beyond a single trusted node:
       password. Set `rotateBranchCredentials: true` so each branch gets its own
       generated credential when the proxy is reachable off-cluster.
 {{- end }}
+{{- if and (eq .Values.proxy.service.type "LoadBalancer") (not .Values.proxy.service.loadBalancerSourceRanges) }}
+
+  [!] The proxy LoadBalancer accepts connections from ANY address
+      (proxy.service.loadBalancerSourceRanges is empty). Restrict it to the
+      client CIDRs that need it (CI egress, VPN), or make it internal with
+      proxy.service.annotations.
+{{- end }}
 {{- if not .Values.networkPolicy.enabled }}
 
   [i] NetworkPolicies are disabled. On a shared/multi-tenant cluster set
       `networkPolicy.enabled: true` (requires a policy-enforcing CNI) to limit
       who can reach branchd and the branch pods.
+{{- else if not .Values.networkPolicy.sourceEgress }}
+
+  [i] networkPolicy.sourceEgress is empty, so the seed helper pods (which
+      connect to your Postgres source with its password) may reach any
+      address. Set it to the source's CIDR/selector to confine them.
 {{- end }}
 {{- if eq .Values.storage.mode "hostpath" }}
 

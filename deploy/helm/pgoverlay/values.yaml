@@ -104,11 +104,21 @@ api:
 
 # Postgres wire-protocol router (connect with dbname@branch). Expose as
 # NodePort to reach branches from outside the cluster without port-forward.
+# Before exposing it beyond a trusted network, set tls.certSecret below, turn
+# on rotateBranchCredentials, and (LoadBalancer) restrict
+# loadBalancerSourceRanges: branches are copies of production.
 proxy:
   port: 6432
   service:
     type: ClusterIP
     nodePort: "" # set when type is NodePort, e.g. 30432
+    # Service annotations, e.g. to make a cloud load balancer internal:
+    #   service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    annotations: {}
+    # type LoadBalancer only: client CIDRs allowed through the load balancer
+    # (e.g. your CI runners' egress). Empty = the provider default, which on
+    # most clouds (EKS Classic ELB included) is 0.0.0.0/0.
+    loadBalancerSourceRanges: []
   # Wire-protocol TLS for the Postgres router. Point certSecret at a Secret
   # with tls.crt and tls.key (e.g. a cert-manager Certificate's secret); it is
   # mounted into branchd and passed to --pg-tls-cert/--pg-tls-key, so the proxy
@@ -219,6 +229,17 @@ ghook:
   #    production — keeps all ghook secrets out of Helm values/history.
   webhookSecret: ""
   existingSecret: ""
+  # Token ghook uses against branchd's REST API. ghook only creates, resets
+  # and destroys branches, so give it an operator-role token rather than the
+  # admin one (which also manages sources, credentials and tokens):
+  #   pgb token create ghook --role operator          # prints the token once
+  #   kubectl -n <ns> create secret generic pgoverlay-ghook-api --from-literal=token=<it>
+  #   helm upgrade ... --set ghook.apiTokenSecret=pgoverlay-ghook-api
+  # Empty = fall back to branchd's admin token (token/existingSecret above);
+  # NOTES.txt warns when that happens.
+  apiTokenSecret: ""
+  # Key holding the token in apiTokenSecret.
+  apiTokenKey: token
   # GitHub credentials enable the live connect-info PR comment and the
   # pgoverlay/branch commit status. Two auth modes, mutually exclusive:
   #
@@ -263,4 +284,10 @@ ghook:
   port: 8080
   service:
     type: ClusterIP
+    annotations: {}
+    # type LoadBalancer only: CIDRs allowed to reach the webhook, e.g.
+    # GitHub's hook ranges (curl -s https://api.github.com/meta | jq .hooks).
+    # Deliveries are HMAC-verified either way; this also keeps everyone else
+    # off the endpoint.
+    loadBalancerSourceRanges: []
   resources: {}

@@ -25,6 +25,10 @@ spec:
       labels:
         {{- include "pgoverlay.ghook.selectorLabels" . | nindent 8 }}
     spec:
+      # ghook talks to branchd's REST API and to GitHub, never to the
+      # Kubernetes API: a ServiceAccount token in this internet-facing pod
+      # would only be one more credential to steal.
+      automountServiceAccountToken: false
       containers:
         - name: ghook
           image: "{{ .Values.ghook.image.repository }}:{{ .Values.ghook.image.tag | default .Chart.AppVersion }}"
@@ -40,11 +44,20 @@ spec:
             # branchd's REST API via in-cluster DNS
             - name: GHOOK_PGOVERLAY_SERVER
               value: http://{{ include "pgoverlay.fullname" . }}-api:{{ .Values.api.port }}
+            # ghook only creates, resets and destroys branches: give it an
+            # operator-role token (ghook.apiTokenSecret). Without one it falls
+            # back to branchd's admin token, which also manages sources and
+            # tokens (NOTES.txt warns).
             - name: GHOOK_PGOVERLAY_TOKEN
               valueFrom:
                 secretKeyRef:
+                  {{- if .Values.ghook.apiTokenSecret }}
+                  name: {{ .Values.ghook.apiTokenSecret }}
+                  key: {{ .Values.ghook.apiTokenKey | default "token" }}
+                  {{- else }}
                   name: {{ include "pgoverlay.tokenSecretName" . }}
                   key: token
+                  {{- end }}
             - name: GHOOK_SOURCE
               value: {{ required "set ghook.source (pgoverlay source to branch from)" .Values.ghook.source | quote }}
             {{- with .Values.ghook.ttl }}
