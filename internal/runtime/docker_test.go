@@ -184,6 +184,27 @@ func TestDockerInspectReportsStateAndAddress(t *testing.T) {
 	}
 }
 
+// CreateVolume must not adopt a volume that already exists (docker's
+// VolumeCreate would return it unchanged, data and all).
+func TestDockerCreateVolumeRefusesExisting(t *testing.T) {
+	f, d := newFakeDockerAPI(t)
+	ctx := context.Background()
+	f.volumes["pgoverlay-br-p-rw"] = volume.Volume{Name: "pgoverlay-br-p-rw", Labels: map[string]string{"old": "true"}}
+	err := d.CreateVolume(ctx, "pgoverlay-br-p-rw", map[string]string{"new": "true"})
+	if !errors.Is(err, ErrVolumeExists) {
+		t.Fatalf("CreateVolume(existing) = %v, want ErrVolumeExists", err)
+	}
+	if n := f.called("POST /volumes/create"); n != 0 {
+		t.Errorf("VolumeCreate called %d times for an existing name", n)
+	}
+	if err := d.CreateVolume(ctx, "pgoverlay-br-q-rw", map[string]string{"new": "true"}); err != nil {
+		t.Fatalf("CreateVolume(new) = %v", err)
+	}
+	if v := f.volumes["pgoverlay-br-q-rw"]; v.Labels["new"] != "true" {
+		t.Errorf("new volume labels = %v", v.Labels)
+	}
+}
+
 func TestDockerListManagedVolumesReportsCreated(t *testing.T) {
 	f, d := newFakeDockerAPI(t)
 	f.volumes["v1"] = volume.Volume{Name: "v1", CreatedAt: "2024-05-06T07:08:09Z"}

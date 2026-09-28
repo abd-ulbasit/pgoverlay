@@ -89,7 +89,18 @@ func (d *DockerDriver) EnsureImage(ctx context.Context, ref string) error {
 	return err
 }
 
+// CreateVolume creates an empty named volume. Docker's VolumeCreate is
+// idempotent on the name — it hands back an existing volume unchanged, labels
+// and data included — so the name is checked first and an existing volume is
+// an error wrapping ErrVolumeExists. Volume names are derived from branch and
+// source names, so adopting silently would give a recreated branch the writes
+// (or the frozen layer) of whatever last used the name.
 func (d *DockerDriver) CreateVolume(ctx context.Context, name string, labels map[string]string) error {
+	if _, err := d.cli.VolumeInspect(ctx, name); err == nil {
+		return fmt.Errorf("create volume %s: %w", name, ErrVolumeExists)
+	} else if !client.IsErrNotFound(err) {
+		return fmt.Errorf("create volume %s: %w", name, err)
+	}
 	_, err := d.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels})
 	return err
 }
