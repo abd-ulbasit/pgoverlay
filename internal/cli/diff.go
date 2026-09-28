@@ -81,16 +81,23 @@ func renderDiff(w io.Writer, res *engine.DiffResult, all, data bool) error {
 		fmt.Fprint(w, res.SchemaDiff)
 	}
 	rows := res.Tables
+	hidden := 0 // unknown-count tables left out of the changed-only view
 	if !all {
 		rows = nil
 		for _, t := range res.Tables {
 			if t.Delta != 0 {
 				rows = append(rows, t)
+			} else if t.RowsUnknown {
+				hidden++
 			}
 		}
 	}
 	if len(rows) == 0 {
-		fmt.Fprintln(w, "tables: no row-count changes")
+		if hidden > 0 {
+			fmt.Fprintln(w, "tables: no known row-count changes")
+		} else {
+			fmt.Fprintln(w, "tables: no row-count changes")
+		}
 	} else {
 		fmt.Fprintln(w)
 		tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
@@ -103,6 +110,12 @@ func renderDiff(w io.Writer, res *engine.DiffResult, all, data bool) error {
 			return err
 		}
 		fmt.Fprintln(w, "(row counts are planner estimates)")
+	}
+	switch {
+	case hidden == 1:
+		fmt.Fprintln(w, "(1 table with an unknown row count not shown: never analyzed and too large to count exactly; --all lists it)")
+	case hidden > 1:
+		fmt.Fprintf(w, "(%d tables with an unknown row count not shown: never analyzed and too large to count exactly; --all lists them)\n", hidden)
 	}
 	if data {
 		if err := renderSamples(w, res); err != nil {
