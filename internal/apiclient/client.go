@@ -37,10 +37,15 @@ type Client struct {
 
 // RetryPolicy bounds the retries of one request. A request is retried only
 // when repeating it is safe:
-//   - 503 Service Unavailable, for any method. branchd answers 503 only from
-//     its HA leader gate ("not leader"), before doing any work, and proxies
-//     answer 503 when no backend took the request.
+//   - 503 Service Unavailable, for any method. branchd answers 503 from its
+//     HA leader gate ("not leader") and while shutting down, before doing
+//     any work, and for a mutation interrupted by a leadership change or
+//     shutdown after its saga rolled the partial work back; proxies answer
+//     503 when no backend took the request.
 //   - 502 and 504 from a proxy in front of branchd, for idempotent methods.
+//     branchd's own 504 (an operation that ran into the stuck timeout and
+//     was rolled back) is not retried: repeating it would run the whole
+//     operation again, for as long again.
 //   - A connection that could not be established (nothing was sent), for any
 //     method, except a host name that does not resolve.
 //   - A connection reset or closed mid-request, for idempotent methods.
@@ -183,6 +188,9 @@ func tlsConfigWithCA(path string) (*tls.Config, error) {
 type StatusError struct {
 	StatusCode int
 	Message    string
+	// fromBranchd is set when the body was branchd's JSON error: the status
+	// came from branchd itself, not from a proxy in front of it.
+	fromBranchd bool
 }
 
 func (e *StatusError) Error() string { return e.Message }
@@ -268,14 +276,15 @@ func (c *Client) once(ctx context.Context, method, path string, payload []byte, 
 		Error string `json:"error"`
 	}
 	msg := fmt.Sprintf("HTTP %d", resp.StatusCode)
-	if json.Unmarshal(data, &e) == nil && e.Error != "" {
+	fromBranchd := json.Unmarshal(data, &e) == nil && e.Error != ""
+	if fromBranchd {
 		msg = e.Error
 	}
 	if resp.StatusCode == http.StatusUnauthorized && c.Token == "" {
 		msg += " (no bearer token was sent)"
 	}
 	return nil, retryAfterHeader(resp.Header.Get("Retry-After")),
-		&StatusError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("%s %s: %s", method, path, msg)}
+		&StatusError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("%s %s: %s", method, path, msg), fromBranchd: fromBranchd}
 }
 
 // retryable reports whether a failed request may be sent again (see
@@ -290,7 +299,7 @@ func retryable(method string, err error) bool {
 		case http.StatusServiceUnavailable:
 			return true
 		case http.StatusBadGateway, http.StatusGatewayTimeout:
-			return idempotent(method)
+			return idempotent(method) && !se.fromBranchd
 		}
 		return false
 	}

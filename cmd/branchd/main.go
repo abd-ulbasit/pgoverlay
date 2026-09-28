@@ -309,7 +309,7 @@ func run() error {
 	advertiseProxyAddr := flag.String("advertise-proxy-addr", "", "host:port where clients reach the Postgres router, returned as proxy_host/proxy_port in branch API responses and used by `pgb connect` (default: --pg-addr's port; clients use the API host)")
 	reconcileInterval := flag.Duration("reconcile-interval", 60*time.Second, "reconcile loop tick interval (TTL reap + leak GC + drift convergence)")
 	reapInterval := flag.Duration("reap-interval", 0, "DEPRECATED alias for --reconcile-interval (folded into the unified reconcile loop)")
-	stuckTimeout := flag.Duration("stuck-timeout", 10*time.Minute, "age past which reconcile treats a row as abandoned: a creating/resetting branch or seeding source is failed, a destroying branch is retried (live sagas and seeds heartbeat well inside it); also the grace before an unclaimed volume or a finished helper is removed")
+	stuckTimeout := flag.Duration("stuck-timeout", 10*time.Minute, "age past which reconcile treats a row as abandoned: a creating/resetting branch or seeding source is failed, a destroying branch is retried (live sagas and seeds heartbeat well inside it); also the longest a branch operation through the API may run (it is then rolled back with 504), and the grace before an unclaimed volume or a finished helper is removed")
 	runtimeName := flag.String("runtime", "docker", "container runtime: docker or kube")
 	kubeNamespace := flag.String("kube-namespace", "", `namespace for branch/helper pods (default: POD_NAMESPACE when in-cluster, else "pgoverlay")`)
 	kubeNode := flag.String("kube-node", "", "storage node name (required with --runtime kube --kube-storage hostpath; all CoW data lives on this node)")

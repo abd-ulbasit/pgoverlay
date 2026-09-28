@@ -191,10 +191,13 @@ func (s *Server) mutate(min string, next http.HandlerFunc) http.HandlerFunc {
 	return s.requireRole(min, s.requireLeader(0, next))
 }
 
-// mutateBranch is mutate for branch sagas (create, reset, destroy, diff,
-// reconcile): they are additionally bounded by the stuck timeout, the age at
-// which the reconcile loop fails a creating/resetting row anyway — so the saga
-// stops and compensates itself before reconcile races it for the same row.
+// mutateBranch is mutate for branch sagas (create, reset, recover, destroy,
+// diff, reconcile): they are additionally bounded by the stuck timeout. A
+// running saga heartbeats its rows (engine keepAlive), so reconcile never
+// fails a row whose saga is alive; the bound is what ends a saga that is
+// alive but wedged (a hung runtime call, a masking script that never
+// returns), which the heartbeat would otherwise keep in creating/resetting
+// forever. The saga then compensates itself and the client gets a 504.
 func (s *Server) mutateBranch(min string, next http.HandlerFunc) http.HandlerFunc {
 	return s.requireRole(min, s.requireLeader(s.stuckTimeout, next))
 }

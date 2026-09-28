@@ -42,6 +42,9 @@ func (s *scripted) handler(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case st == http.StatusServiceUnavailable:
 		json.NewEncoder(w).Encode(map[string]string{"error": "not leader"})
+	case st == http.StatusBadGateway || st == http.StatusGatewayTimeout:
+		// what a proxy in front of branchd sends: not branchd's JSON error
+		w.Write([]byte("<html><body>" + http.StatusText(st) + "</body></html>"))
 	case st >= 400:
 		json.NewEncoder(w).Encode(map[string]string{"error": http.StatusText(st)})
 	default:
@@ -116,6 +119,35 @@ func TestGatewayErrorsRetryOnlyIdempotentMethods(t *testing.T) {
 		if s.count() != 1 {
 			t.Fatalf("POST after %d: %d requests, want 1", st, s.count())
 		}
+	}
+}
+
+// branchd's own 504 means the operation ran into the stuck timeout and was
+// rolled back; repeating even a GET (diff provisions a throwaway branch)
+// would run it again for as long again, so it is final.
+func TestBranchdGatewayTimeoutIsNotRetried(t *testing.T) {
+	var mu sync.Mutex
+	n := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		json.NewEncoder(w).Encode(map[string]string{"error": "operation exceeded the stuck timeout; the operation was cancelled and its partial work rolled back, retry it"})
+	}))
+	t.Cleanup(ts.Close)
+	c := New(ts.URL, "tok")
+	c.Retry = fastRetry
+	_, err := c.GetBranch(context.Background(), "pr-1")
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != http.StatusGatewayTimeout || !strings.Contains(err.Error(), "stuck timeout") {
+		t.Fatalf("err = %v, want branchd's 504", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d requests, want 1: branchd's 504 must not be retried", n)
 	}
 }
 
