@@ -30,7 +30,7 @@ expect a few seconds.
 With --data, up to --sample (default 20) branch-only rows are shown per
 grown table — rows present on the branch but not the base, matched by
 primary key. Tables without a primary key are skipped (noted in a footer).`,
-		Args: cobra.ExactArgs(1),
+		Args: nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			n := 0
 			if data {

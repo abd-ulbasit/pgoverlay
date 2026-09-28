@@ -45,8 +45,29 @@ Seeding methods (--via):
               scoped with repeatable --dump-schema. --pg-version must be >=
               the remote server's major version (pg_dump cannot dump newer
               servers); branches run on --pg-version.`,
-		Args: cobra.ExactArgs(1),
+		Args: nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// MarkFlagRequired only checks that --host was passed; `--host ""`
+			// (e.g. from an empty $(docker inspect ...)) would otherwise make
+			// pg_basebackup fall back to a local Unix socket.
+			if err := nonEmptyFlag("host", host,
+				"pass the source Postgres host as reachable from branch containers (host.docker.internal for a database on this machine)"); err != nil {
+				return err
+			}
+			for _, f := range []struct{ name, value string }{{"user", user}, {"database", db}, {"pg-version", pgVersion}} {
+				if err := nonEmptyFlag(f.name, f.value, ""); err != nil {
+					return err
+				}
+			}
+			if err := validPort("port", port); err != nil {
+				return err
+			}
+			// Validated here as well as by the API: in local mode nothing
+			// else checks it, and any value but "dump" used to fall through
+			// to pg_basebackup.
+			if via != registry.SeedViaBasebackup && via != registry.SeedViaDump {
+				return fmt.Errorf("invalid --via %q: want %q or %q", via, registry.SeedViaBasebackup, registry.SeedViaDump)
+			}
 			if len(dumpSchemas) > 0 && via != registry.SeedViaDump {
 				return fmt.Errorf("--dump-schema is only valid with --via dump")
 			}
@@ -131,7 +152,7 @@ func newSourceRmCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "rm NAME",
 		Short: "Remove a source (refused while it has live branches)",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if c := serverClient(cmd); c != nil {
 				if err := c.RemoveSource(cmd.Context(), args[0]); err != nil {
@@ -157,7 +178,7 @@ func newSourceSetMaskCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "set-mask NAME FILE...",
 		Short: "Replace a source's masking SQL (applied, in argument order, inside every new/reset branch)",
-		Args:  cobra.MinimumNArgs(2),
+		Args:  nonEmptyArgs(cobra.MinimumNArgs(2)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			scripts := make([]api.MaskScript, 0, len(args)-1)
@@ -200,7 +221,7 @@ func newSourceGetMaskCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "get-mask NAME",
 		Short: "List a source's masking scripts in application order",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			var names []string
@@ -243,7 +264,7 @@ func newSourceRefreshCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "refresh NAME",
 		Short: "Re-seed a source into a new generation (existing branches keep their snapshot)",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			password, err := passwordFromEnv(passwordEnv)
 			if err != nil {

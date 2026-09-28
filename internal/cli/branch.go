@@ -24,10 +24,13 @@ func newBranchCreateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create NAME",
 		Short: "Create an instant copy-on-write branch (off a source, or off another branch)",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if (from == "") == (fromBranch == "") {
 				return fmt.Errorf("exactly one of --from (source) or --from-branch (parent branch) is required")
+			}
+			if ttl < 0 {
+				return fmt.Errorf("--ttl %s is negative; use 0 for a branch that never expires", ttl)
 			}
 			start := time.Now()
 			if c := serverClient(cmd); c != nil {
@@ -144,7 +147,7 @@ func newBranchDestroyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "destroy NAME",
 		Short: "Destroy a branch (container + CoW layer)",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if c := serverClient(cmd); c != nil {
 				if err := c.DestroyBranch(cmd.Context(), args[0]); err != nil {
@@ -170,7 +173,7 @@ func newBranchResetCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "reset NAME",
 		Short: "Discard a branch's writes and re-clone it from its source snapshot",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			start := time.Now()
 			port := 0
@@ -206,7 +209,7 @@ func newHistoryCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "history NAME",
 		Short: "Show a branch's audit trail (who transitioned it, when, and why)",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var rows []api.Transition
 			if c := serverClient(cmd); c != nil {
@@ -254,7 +257,7 @@ func newConnectCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "connect NAME",
 		Short: "Print connection strings for a branch",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if c := serverClient(cmd); c != nil {
 				b, err := c.GetBranch(cmd.Context(), args[0])
