@@ -4,7 +4,7 @@ package registry
 // database at version i to version i+1. Phase 1 shipped with user_version 0
 // and the v1 tables already created, so schemaV1 stays IF NOT EXISTS — it is
 // a no-op on an existing P1 database and a full create on a fresh one.
-var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11}
+var migrations = []string{schemaV1, migrateV2, migrateV3, migrateV4, migrateV5, migrateV6, migrateV7, migrateV8, migrateV9, migrateV10, migrateV11, migrateV12}
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS sources (
@@ -176,4 +176,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS api_tokens_hash ON api_tokens(token_hash);
 // backfill to the empty string (unknown actor, predating the audit log).
 const migrateV11 = `
 ALTER TABLE transitions ADD COLUMN actor TEXT NOT NULL DEFAULT '';
+`
+
+// v12: indexes for the queries that scanned every row, tombstones included.
+// Destroyed branch rows and their transitions are kept for history, so
+// without these, GET /v1/branches/{name}/history (transitions by entity id,
+// branches by name), the reconcile loop's expiry, stuck and destroying scans,
+// the layer refcount walk and branch create's volume-name check all slowed
+// down linearly with the number of branches ever created, holding the single
+// registry connection while other requests queued behind it.
+const migrateV12 = `
+CREATE INDEX IF NOT EXISTS transitions_entity ON transitions(entity, entity_id);
+CREATE INDEX IF NOT EXISTS branches_name ON branches(name);
+CREATE INDEX IF NOT EXISTS branches_state_updated ON branches(state, updated_at);
+CREATE INDEX IF NOT EXISTS branches_expiry ON branches(expires_at) WHERE expires_at != '';
+CREATE INDEX IF NOT EXISTS branches_rw_volume ON branches(rw_volume);
+CREATE INDEX IF NOT EXISTS branches_source_volume ON branches(source_volume);
+CREATE INDEX IF NOT EXISTS branches_base_layer ON branches(base_layer_id) WHERE base_layer_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS layers_volume ON layers(volume);
 `
