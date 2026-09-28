@@ -105,6 +105,7 @@ func TestEmptyPositionalArgumentsAreRejected(t *testing.T) {
 		"branch create":   {[]string{"branch", "create", " ", "--from", "main"}, "pgb branch create: NAME must not be empty"},
 		"branch destroy":  {[]string{"branch", "destroy", ""}, "NAME must not be empty"},
 		"branch reset":    {[]string{"branch", "reset", ""}, "NAME must not be empty"},
+		"branch recover":  {[]string{"branch", "recover", ""}, "NAME must not be empty"},
 		"history":         {[]string{"history", ""}, "NAME must not be empty"},
 		"diff":            {[]string{"diff", ""}, "NAME must not be empty"},
 		"source rm":       {[]string{"source", "rm", ""}, "NAME must not be empty"},

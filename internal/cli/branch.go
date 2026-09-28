@@ -222,7 +222,7 @@ func newBranchRecoverCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "recover NAME",
 		Short: "Restart a failed branch on its existing data (keeps its writes; reset discards them)",
-		Args:  cobra.ExactArgs(1),
+		Args:  nonEmptyArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			port := 0
 			if c := serverClient(cmd); c != nil {
