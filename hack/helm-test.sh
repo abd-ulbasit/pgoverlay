@@ -156,4 +156,93 @@ if helm template "$CHART" --set node=n >/dev/null 2>&1; then
   echo "FAIL: template without token/existingSecret must fail" >&2; exit 1
 fi
 
+# --- kube hardening (docs/kubernetes.md, "Pod security & network hardening") ---
+
+# branchd creates and deletes the short-lived Secrets that carry helper env
+# (the seed password), and never reads Secrets back; it learns its own pod so
+# helpers can be owned by it; the helper image is overridable.
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret)
+has "$out" 'resources: ["secrets"]' default
+has "$out" 'verbs: ["create", "delete"]' default
+has "$out" 'name: PGOVERLAY_POD_NAME' default
+has "$out" 'name: PGOVERLAY_POD_UID' default
+has "$out" 'fieldPath: metadata.uid' default
+hasnt "$out" '--kube-helper-image' default
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret \
+  --set helperImage=registry.internal/alpine@sha256:abc)
+has "$out" '--kube-helper-image=registry.internal/alpine@sha256:abc' helper-image
+
+# csi with its state on a PVC pins branchd to no node (so it comes back after
+# the node is replaced) and needs no `node` at all; without persistence the
+# state is a hostPath again and the pin (and `node`) are back.
+out=$(helm template rel "$CHART" --set token=t \
+  --set storage.mode=csi --set storage.storageClass=fast-clone)
+hasnt "$out" 'nodeName:' csi-unpinned
+hasnt "$out" '--kube-node' csi-unpinned
+out=$(helm template rel "$CHART" --set node=worker-3 --set token=t \
+  --set storage.mode=csi --set storage.storageClass=fast-clone)
+hasnt "$out" 'nodeName:' csi-unpinned-node-set
+out=$(helm template rel "$CHART" --set node=worker-3 --set token=t \
+  --set storage.mode=csi --set storage.storageClass=fast-clone --set persistence.enabled=false)
+has "$out" 'nodeName: worker-3' csi-hostpath-state
+if helm template "$CHART" --set token=t --set storage.mode=csi --set storage.storageClass=fast-clone \
+  --set persistence.enabled=false >/dev/null 2>&1; then
+  echo "FAIL: csi with a hostPath state dir and no node must fail" >&2; exit 1
+fi
+# unpinned HA replicas share the RWO state PVC, so they must co-locate
+out=$(helm template rel "$CHART" --set token=t --set replicaCount=2 \
+  --set storage.mode=csi --set storage.storageClass=fast-clone)
+has "$out" 'podAffinity:' csi-ha
+has "$out" 'topologyKey: kubernetes.io/hostname' csi-ha
+out=$(helm template rel "$CHART" --set node=n --set token=t --set replicaCount=2)
+hasnt "$out" 'podAffinity' hostpath-ha # nodeName already co-locates them
+out=$(helm template rel "$CHART" --set node=n --set token=t --set nodeSelector.pool=pg \
+  --set 'tolerations[0].key=dedicated' --set 'tolerations[0].operator=Exists')
+has "$out" 'pool: pg' scheduling
+has "$out" 'key: dedicated' scheduling
+
+# ghook: no ServiceAccount token in the internet-facing pod, and an operator
+# token when one is provided instead of branchd's admin token
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set ghook.enabled=true --set ghook.webhookSecret=w --set ghook.source=main)
+has "$out" 'automountServiceAccountToken: false' ghook
+ghook_token=$(awk '/name: GHOOK_PGOVERLAY_TOKEN/{f=1} f&&/key:/{print; exit} f&&/name: rel-/{print}' <<<"$out")
+has "$ghook_token" 'name: rel-pgoverlay-token' ghook-admin-fallback
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set ghook.enabled=true --set ghook.webhookSecret=w --set ghook.source=main \
+  --set ghook.apiTokenSecret=ghook-api --set ghook.apiTokenKey=tok)
+ghook_token=$(awk '/name: GHOOK_PGOVERLAY_TOKEN/{f=1} f&&/name: ghook-api/{print} f&&/key:/{print; exit}' <<<"$out")
+has "$ghook_token" 'name: ghook-api' ghook-operator-token
+has "$ghook_token" 'key: tok' ghook-operator-token
+
+# load balancer exposure can be restricted; the field is only valid (and only
+# rendered) for type LoadBalancer
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set proxy.service.type=LoadBalancer --set 'proxy.service.loadBalancerSourceRanges={203.0.113.0/24}' \
+  --set proxy.service.annotations.team=db \
+  --set ghook.enabled=true --set ghook.webhookSecret=w --set ghook.source=main \
+  --set ghook.service.type=LoadBalancer --set 'ghook.service.loadBalancerSourceRanges={192.30.252.0/22}')
+has "$out" '- 203.0.113.0/24' proxy-lb
+has "$out" 'team: db' proxy-lb
+has "$out" '- 192.30.252.0/22' ghook-lb
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set 'proxy.service.loadBalancerSourceRanges={203.0.113.0/24}')
+hasnt "$out" 'loadBalancerSourceRanges' proxy-clusterip
+
+# NetworkPolicy: branch pods never reach the source (DNS-only egress); the
+# seed helper pods get sourceEgress, and only them
+out=$(helm template rel "$CHART" --set node=n --set token=t --set networkPolicy.enabled=true \
+  --set 'networkPolicy.sourceEgress[0].ipBlock.cidr=10.0.5.10/32')
+branch_np=$(awk '/name: rel-pgoverlay-branch-pods/{f=1} f&&/^---/{exit} f' <<<"$out")
+helper_np=$(awk '/name: rel-pgoverlay-helper-pods/{f=1} f&&/^---/{exit} f' <<<"$out")
+has "$branch_np" 'k8s-app: kube-dns' netpol-branch
+hasnt "$branch_np" '10.0.5.10' netpol-branch
+has "$helper_np" 'pgoverlay.role: helper' netpol-helper
+has "$helper_np" 'cidr: 10.0.5.10/32' netpol-helper
+has "$helper_np" '- Egress' netpol-helper
+out=$(helm template rel "$CHART" --set node=n --set token=t --set networkPolicy.enabled=true)
+helper_np=$(awk '/name: rel-pgoverlay-helper-pods/{f=1} f&&/^---/{exit} f' <<<"$out")
+has "$helper_np" '- Ingress' netpol-helper-no-source
+hasnt "$helper_np" 'Egress' netpol-helper-no-source # seeding must still reach the source
+
 echo "helm-test OK"
