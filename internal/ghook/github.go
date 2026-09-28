@@ -207,10 +207,13 @@ func (g *GitHub) do(ctx context.Context, method, path string, in, out any) error
 
 // commentBody renders the live status comment for a branch: a small table
 // with the branch name, its state (creating/resetting/ready/reset @ sha/
-// destroyed), the psql connect string and the expiry when a TTL is set.
-// The marker makes the comment discoverable for the in-place update on
+// failed/destroyed), the psql connect string and the expiry when a TTL is
+// set. The marker makes the comment discoverable for the in-place update on
 // later events. b is nil while the branch operation is still running (and
-// after destroy), so connect info is omitted then.
+// after a failure or destroy), so connect info is omitted then. Without a
+// proxy address (GHOOK_PROXY_HOST) there is no host to connect to, so the
+// comment names the proxy database instead of printing a psql command with
+// an empty -h.
 func commentBody(proxyHost, branch, state string, b *api.Branch) string {
 	var sb strings.Builder
 	sb.WriteString(commentMarker + "\n")
@@ -219,29 +222,48 @@ func commentBody(proxyHost, branch, state string, b *api.Branch) string {
 	fmt.Fprintf(&sb, "| Branch | `%s` |\n", branch)
 	fmt.Fprintf(&sb, "| State | %s |\n", state)
 	if b != nil {
-		fmt.Fprintf(&sb, "| Connect | `%s` |\n", psqlCommand(proxyHost, b))
+		if proxyHost != "" {
+			fmt.Fprintf(&sb, "| Connect | %s |\n", mdCode(psqlCommand(proxyHost, b)))
+		} else {
+			fmt.Fprintf(&sb, "| Database | %s (user %s) through the pgoverlay proxy |\n",
+				mdCode(b.ProxyDatabase), mdCode(b.User))
+		}
 		if b.ExpiresAt != "" {
 			fmt.Fprintf(&sb, "| Expires | %s |\n", b.ExpiresAt)
 		}
 	}
 	if state == "destroyed" {
 		sb.WriteString("\nThe branch was destroyed when the pull request closed.\n")
-	} else {
-		sb.WriteString("\nThe database name routes through the pgoverlay proxy to the branch. " +
-			"The branch is destroyed when the pull request is closed.\n")
+		return sb.String()
+	}
+	sb.WriteString("\nThe database name routes through the pgoverlay proxy to the branch. " +
+		"The branch is destroyed when the pull request is closed.\n")
+	if b != nil && proxyHost == "" {
+		sb.WriteString("\nNo connect command: the proxy address is not configured (GHOOK_PROXY_HOST).\n")
 	}
 	return sb.String()
 }
 
 // diffSchemaLimit caps the schema diff embedded in the PR comment; longer
 // diffs are truncated with a note so the comment stays readable and within
-// GitHub's body size limits.
-const diffSchemaLimit = 3000
+// GitHub's body size limits. diffTableLimit does the same for the rows of the
+// table-delta table (GitHub rejects comments over 65536 characters).
+const (
+	diffSchemaLimit = 3000
+	diffTableLimit  = 100
+)
 
 // diffCommentBody renders the schema/data diff comment for a branch: the
 // schema diff inside a ```diff fence (truncated to diffSchemaLimit chars with
-// a note), followed by the per-table row-estimate delta table. Carries the
-// diff marker so it is upserted independently of the connect comment.
+// a note), followed by the per-table row-estimate delta table (at most
+// diffTableLimit rows). Carries the diff marker so it is upserted
+// independently of the connect comment.
+//
+// The schema and the table names are data written to the branch (by the
+// pull request's migrations, say), so they are escaped: the fence is longer
+// than any backtick run in the diff, so it cannot be closed early and the
+// rest rendered as markdown from the bot, and table names are code spans
+// with their pipes escaped.
 func diffCommentBody(branch string, res *engine.DiffResult) string {
 	var sb strings.Builder
 	sb.WriteString(diffMarker + "\n")
@@ -256,12 +278,13 @@ func diffCommentBody(branch string, res *engine.DiffResult) string {
 			schema = string([]rune(schema)[:diffSchemaLimit])
 			truncated = true
 		}
-		sb.WriteString("Schema diff:\n\n```diff\n")
+		fence := strings.Repeat("`", max(3, longestRun(schema, '`')+1))
+		sb.WriteString("Schema diff:\n\n" + fence + "diff\n")
 		sb.WriteString(schema)
 		if !strings.HasSuffix(schema, "\n") {
 			sb.WriteString("\n")
 		}
-		sb.WriteString("```\n")
+		sb.WriteString(fence + "\n")
 		if truncated {
 			fmt.Fprintf(&sb, "\n_(schema diff truncated to %d characters)_\n", diffSchemaLimit)
 		}
@@ -278,11 +301,42 @@ func diffCommentBody(branch string, res *engine.DiffResult) string {
 		return sb.String()
 	}
 	sb.WriteString("\n| TABLE | BASE | BRANCH | DELTA |\n|---|---|---|---|\n")
-	for _, t := range changed {
-		fmt.Fprintf(&sb, "| `%s` | %d | %d | %+d |\n", t.Table, t.BaseRows, t.BranchRows, t.Delta)
+	for i, t := range changed {
+		if i == diffTableLimit {
+			fmt.Fprintf(&sb, "\n_(and %d more changed tables)_\n", len(changed)-diffTableLimit)
+			break
+		}
+		fmt.Fprintf(&sb, "| %s | %d | %d | %+d |\n", mdCode(t.Table), t.BaseRows, t.BranchRows, t.Delta)
 	}
 	sb.WriteString("\n_(row counts are planner estimates)_\n")
 	return sb.String()
+}
+
+// longestRun returns the length of the longest run of c in s.
+func longestRun(s string, c byte) int {
+	longest, run := 0, 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != c {
+			run = 0
+			continue
+		}
+		run++
+		longest = max(longest, run)
+	}
+	return longest
+}
+
+// mdCode renders s as an inline code span that stays inside one GitHub table
+// cell: the delimiter is longer than any backtick run in s, pipes are escaped
+// (GitHub splits table cells on them even inside code), and line breaks
+// become spaces.
+func mdCode(s string) string {
+	s = strings.NewReplacer("\r", " ", "\n", " ", "|", `\|`).Replace(s)
+	delim := strings.Repeat("`", longestRun(s, '`')+1)
+	if strings.HasPrefix(s, "`") || strings.HasSuffix(s, "`") {
+		s = " " + s + " "
+	}
+	return delim + s + delim
 }
 
 // psqlCommand renders the proxy connect string shown in comments.

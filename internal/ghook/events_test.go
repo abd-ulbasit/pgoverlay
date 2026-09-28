@@ -526,6 +526,9 @@ func TestEnsureTimesOutOnABranchThatNeverSettles(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "timed out waiting for branch "+pr7Branch+" (still resetting)") {
 		t.Fatalf("err = %v, want a timeout naming the state", err)
 	}
+	if got := publicReason(err, "d1"); got != err.Error() {
+		t.Errorf("public reason = %q, want the timeout message", got)
+	}
 }
 
 // A failed branch (its create or reset did not finish) is destroyed and

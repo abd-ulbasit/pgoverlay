@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -358,7 +359,7 @@ func (s *Service) handleEnsure(ctx context.Context, log *slog.Logger, p *payload
 	b, didReset, err := s.ensureBranch(ctx, log, p, branch)
 	if err != nil {
 		log.Error("handling event failed", "err", err)
-		s.setStatus(ctx, log, p, "failure", err.Error())
+		s.setStatus(ctx, log, p, "failure", publicReason(err, p.Delivery))
 		s.upsertComment(ctx, log, p, commentMarker, commentBody(s.cfg.ProxyHost, branch, "failed (see the pgoverlay/branch status)", nil))
 		return
 	}
@@ -572,6 +573,32 @@ func (e *stateError) Error() string {
 		return fmt.Sprintf("timed out waiting for branch %s (still %s)", e.branch, e.state)
 	}
 	return fmt.Sprintf("branch %s is %s, not ready", e.branch, e.state)
+}
+
+// publicReason is the commit-status description for a failed operation.
+// Commit statuses are public on public repositories, so only messages whose
+// wording is known are passed through: ghook's own state errors and
+// branchd's deliberate 4xx answers (an invalid name, a quota, a conflict).
+// Anything else, such as a transport error that names branchd's in-cluster
+// address, stays in the log; the status points there by delivery id.
+func publicReason(err error, delivery string) string {
+	var (
+		ste *stateError
+		se  *apiclient.StatusError
+		oe  *opError
+	)
+	if errors.As(err, &ste) || (errors.As(err, &se) && se.StatusCode >= 400 && se.StatusCode < 500) {
+		return err.Error()
+	}
+	op := "branch operation"
+	if errors.As(err, &oe) {
+		op = oe.op
+	}
+	msg := op + " failed; see the pgoverlay-github logs"
+	if delivery != "" {
+		msg += " (delivery " + delivery + ")"
+	}
+	return msg
 }
 
 // setStatus posts a pgoverlay/branch commit status on the PR head SHA when a
