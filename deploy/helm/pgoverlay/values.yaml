@@ -157,9 +157,10 @@ resources: {}
 # installs don't lose connectivity, but RECOMMENDED on any shared cluster.
 # Needs a CNI that enforces NetworkPolicy (Calico, Cilium, ...). When enabled
 # the chart locks down: (a) ingress to branchd API/proxy to ghook + the
-# selectors below + the metrics source; (b) ingress to branch pods to branchd
-# only; (c) egress from branch pods to cluster DNS + the configured Postgres
-# source(s) only.
+# selectors below + the metrics source; (b) branch pods: ingress from branchd
+# only, egress to cluster DNS only (branches never talk to the source); (c)
+# helper pods: no ingress, and — once sourceEgress is set — egress to cluster
+# DNS + the configured Postgres source(s) only.
 networkPolicy:
   enabled: false
   # Who may reach branchd's API (7070) and proxy (6432). A list of raw
@@ -177,14 +178,17 @@ networkPolicy:
   #     - namespaceSelector:
   #         matchLabels: { kubernetes.io/metadata.name: monitoring }
   metricsFrom: []
-  # Cluster DNS peer(s) for branch-pod egress. Defaults to the kube-dns pods in
-  # any namespace (k8s-app=kube-dns, the CoreDNS convention). Override if your
-  # DNS uses different labels/namespace.
+  # Cluster DNS peer(s) for branch- and helper-pod egress. Defaults to the
+  # kube-dns pods in any namespace (k8s-app=kube-dns, the CoreDNS convention).
+  # Override if your DNS uses different labels/namespace.
   dnsFrom: []
-  # The Postgres source(s) branch pods hydrate from — a list of
-  # NetworkPolicyPeer (podSelector/namespaceSelector and/or ipBlock). Empty =
-  # no source egress opened (CSI-clone branches that carry their own data need
-  # none; overlay branches reading a remote source do). Example:
+  # The Postgres source(s) seeding reads from — a list of NetworkPolicyPeer
+  # (podSelector/namespaceSelector and/or ipBlock). Only the seed HELPER pods
+  # (pgoverlay.role=helper: pg_basebackup / pg_dump) connect to a source;
+  # branch pods never do, in any storage mode, and get no source egress.
+  # When set, helper pods may reach only these (plus DNS). Empty = helper
+  # egress is left unrestricted, since seeding has to reach the source.
+  # Example:
   #   sourceEgress:
   #     - ipBlock: { cidr: 10.0.5.10/32 }
   sourceEgress: []

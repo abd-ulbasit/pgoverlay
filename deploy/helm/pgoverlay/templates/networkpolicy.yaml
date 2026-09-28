@@ -7,8 +7,12 @@
 # Three policies:
 #  1. ingress to branchd (API + proxy) — from ghook, configured client
 #     selectors, and the metrics scrape source.
-#  2. ingress to branch pods — only from branchd.
-#  3. egress from branch pods — only the Postgres source(s) + cluster DNS.
+#  2. branch pods — ingress only from branchd; egress only to cluster DNS.
+#     Branch pods never contact the Postgres source: they run on local
+#     volumes (overlay layers or PVC clones) seeded beforehand.
+#  3. helper pods — no ingress; when networkPolicy.sourceEgress is set,
+#     egress only to cluster DNS and those source(s). Helpers are what seed
+#     from the source (pg_basebackup / pg_dump, with its password).
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -54,10 +58,11 @@ spec:
           port: {{ $.Values.api.port }}
     {{- end }}
 ---
-# Branch pods are created by branchd at RUNTIME (not by this chart). The Go
-# runtime stamps them with pgoverlay.managed=true and pgoverlay.role=branch
-# (see internal/engine branchLabels / internal/runtime). These policies select
-# on those labels; if the runtime label scheme changes, update them here.
+# Branch and helper pods are created by branchd at RUNTIME (not by this chart).
+# The Go runtime stamps them with pgoverlay.managed=true and
+# pgoverlay.role=branch|helper (see internal/engine branchLabels /
+# internal/runtime). These policies select on those labels; if the runtime
+# label scheme changes, update them here.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -79,28 +84,46 @@ spec:
             matchLabels:
               {{- include "pgoverlay.selectorLabels" . | nindent 14 }}
   egress:
-    # Cluster DNS (kube-dns / CoreDNS) so the branch pod can resolve names.
+    # Cluster DNS only. A branch is a copy of production that developers get
+    # superuser on; it has no business reaching the production source (or
+    # anything else) over the network, e.g. through dblink or COPY ... PROGRAM.
     - to:
-        {{- with .Values.networkPolicy.dnsFrom }}
-        {{- toYaml . | nindent 8 }}
-        {{- else }}
-        - namespaceSelector: {}
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-        {{- end }}
+        {{- include "pgoverlay.dnsPeers" . | nindent 8 }}
       ports:
         - protocol: UDP
           port: 53
         - protocol: TCP
           port: 53
-    # The Postgres source(s) a branch hydrates from. Configure with the source's
-    # selector(s) and/or CIDRs; empty = no source egress is opened (branch pods
-    # that hold their own data, e.g. CSI clones, need none).
-    {{- with .Values.networkPolicy.sourceEgress }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pgoverlay.fullname" . }}-helper-pods
+  labels:
+    {{- include "pgoverlay.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      pgoverlay.managed: "true"
+      pgoverlay.role: helper
+  policyTypes:
+    # Nothing connects to a helper (logs and exec go through the kubelet).
+    - Ingress
+    {{- if .Values.networkPolicy.sourceEgress }}
+    - Egress
+  egress:
+    # Cluster DNS, to resolve the source's host name.
     - to:
-        {{- toYaml . | nindent 8 }}
-      {{- with $.Values.networkPolicy.sourcePorts }}
+        {{- include "pgoverlay.dnsPeers" . | nindent 8 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The Postgres source(s) seeding reads from.
+    - to:
+        {{- toYaml .Values.networkPolicy.sourceEgress | nindent 8 }}
+      {{- with .Values.networkPolicy.sourcePorts }}
       ports:
         {{- toYaml . | nindent 8 }}
       {{- end }}

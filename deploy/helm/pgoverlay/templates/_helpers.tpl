@@ -44,6 +44,19 @@ false
 {{- end -}}
 {{- end -}}
 
+{{/* NetworkPolicy peers for cluster DNS: networkPolicy.dnsFrom, or the
+     kube-dns pods in any namespace (the CoreDNS convention). */}}
+{{- define "pgoverlay.dnsPeers" -}}
+{{- with .Values.networkPolicy.dnsFrom -}}
+{{- toYaml . -}}
+{{- else -}}
+- namespaceSelector: {}
+  podSelector:
+    matchLabels:
+      k8s-app: kube-dns
+{{- end -}}
+{{- end -}}
+
 {{/* Secret holding the API bearer token (key "token"). */}}
 {{- define "pgoverlay.tokenSecretName" -}}
 {{- .Values.existingSecret | default (printf "%s-token" (include "pgoverlay.fullname" .)) -}}
