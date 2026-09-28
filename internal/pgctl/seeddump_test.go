@@ -64,7 +64,7 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 	}
 	// prep helper chowns the seed volume to the in-image postgres uid
 	prep := d.helpers[0]
-	if prep.Image != "alpine:3.21" || !strings.Contains(strings.Join(prep.Cmd, " "), "chown 999:999 /seed") {
+	if prep.Image != runtime.UtilityImage || !strings.Contains(strings.Join(prep.Cmd, " "), "chown 999:999 /seed") {
 		t.Fatalf("prep helper: %+v", prep)
 	}
 	if len(prep.Mounts) != 1 || prep.Mounts[0].Volume != "pgoverlay-src-main" || prep.Mounts[0].Target != "/seed" {

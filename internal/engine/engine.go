@@ -271,7 +271,7 @@ func (e *Engine) BranchUsage(ctx context.Context, name string) (int64, error) {
 		return 0, err
 	}
 	spec := runtime.HelperSpec{
-		Image:  "alpine:3.21",
+		Image:  runtime.UtilityImage,
 		Cmd:    []string{"du", "-sb", cow.RWPath},
 		Mounts: []runtime.Mount{{Volume: b.RWVolume, Target: cow.RWPath, ReadOnly: true}},
 	}

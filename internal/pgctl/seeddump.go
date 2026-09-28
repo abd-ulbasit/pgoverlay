@@ -68,7 +68,7 @@ pg_ctl -D /seed/data -w stop -m fast
 func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 	seedMount := runtime.Mount{Kind: s.MountKind, Volume: s.Volume, Target: "/seed"}
 	if _, err := d.RunHelper(ctx, runtime.HelperSpec{
-		Image:  "alpine:3.21",
+		Image:  runtime.UtilityImage,
 		Cmd:    []string{"sh", "-c", "mkdir -p /seed && chown 999:999 /seed"},
 		Mounts: []runtime.Mount{seedMount},
 	}); err != nil {
