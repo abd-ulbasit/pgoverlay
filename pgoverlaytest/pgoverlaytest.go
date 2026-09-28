@@ -115,8 +115,12 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 	})
 
 	// The create endpoint returns ready synchronously today, but don't depend
-	// on it: poll GET until the branch reports ready.
+	// on it: poll GET until the branch reports ready, and stop at once on a
+	// state it can never leave for ready.
 	for b.State != "ready" {
+		if terminalState(b.State) {
+			t.Fatalf("pgoverlaytest: branch %q is %s and will never become ready%s", name, b.State, c.lastReason(ctx, name))
+		}
 		select {
 		case <-ctx.Done():
 			t.Fatalf("pgoverlaytest: branch %q not ready after %s (state %q)", name, acquireTimeout, b.State)
@@ -128,6 +132,17 @@ func Acquire(t testing.TB, opts ...Option) *Branch {
 		}
 	}
 	return newBranch(b, c.base)
+}
+
+// terminalState reports whether a branch in state s can never become ready:
+// it failed, or is being (or has been) destroyed — by the TTL reaper, an
+// operator, or reconcile.
+func terminalState(s string) bool {
+	switch s {
+	case "failed", "destroying", "destroyed":
+		return true
+	}
+	return false
 }
 
 // newBranch maps the wire shape to the public Branch, building DSNs. The
@@ -298,6 +313,28 @@ func (c *client) getBranch(ctx context.Context, name string) (*wireBranch, error
 		return nil, fmt.Errorf("GET /v1/branches/%s: decode response: %w", name, err)
 	}
 	return &b, nil
+}
+
+// lastReason returns ": <reason>" for the branch's most recent recorded
+// transition (GET /v1/branches/{name}/history), or "" when the history is
+// unavailable. Best-effort: it only enriches an error message.
+func (c *client) lastReason(ctx context.Context, name string) string {
+	code, data, err := c.do(ctx, http.MethodGet, "/v1/branches/"+url.PathEscape(name)+"/history", nil)
+	if err != nil || code != http.StatusOK {
+		return ""
+	}
+	var hist []struct {
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal(data, &hist) != nil {
+		return ""
+	}
+	for i := len(hist) - 1; i >= 0; i-- {
+		if hist[i].Reason != "" {
+			return ": " + hist[i].Reason
+		}
+	}
+	return ""
 }
 
 // destroyBranch deletes the branch; a 404 means it is already gone (TTL
