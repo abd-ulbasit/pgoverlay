@@ -101,7 +101,7 @@ func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 		Network: s.Network,
 	})
 	if err != nil {
-		return fmt.Errorf("pg_dump seed: %w", err)
+		return seedError{fmt.Errorf("pg_dump seed: %w", err)}
 	}
 	return nil
 }

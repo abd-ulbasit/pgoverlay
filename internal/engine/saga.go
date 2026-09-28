@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/cow"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -20,6 +21,25 @@ import (
 // (docker container names, k8s pod names — RFC 1123 after the pgoverlay-br-
 // prefix). The API maps it to 400.
 var ErrInvalidName = errors.New("invalid branch name")
+
+// ErrMaskingFailed marks a branch provision that failed because one of the
+// source's masking scripts failed inside the branch (bad SQL, a missing
+// table): a problem with operator-supplied configuration, not with pgoverlay.
+// The error message names the script and carries psql's output. Test with
+// errors.Is; the API maps it to 422.
+var ErrMaskingFailed = errors.New("masking script failed")
+
+// ErrSeedFailed marks a source add/refresh whose seed command (pg_basebackup
+// or pg_dump) failed against the source; see pgctl.ErrSeedFailed. The API
+// maps it to 422 with the tool's message.
+var ErrSeedFailed = pgctl.ErrSeedFailed
+
+// markedError tags err with a sentinel for errors.Is without changing its
+// message.
+type markedError struct{ kind, err error }
+
+func (m markedError) Error() string   { return m.err.Error() }
+func (m markedError) Unwrap() []error { return []error{m.kind, m.err} }
 
 var branchNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 
@@ -445,7 +465,7 @@ func (e *Engine) applyMasking(ctx context.Context, cid string, src *registry.Sou
 	defer func() { e.metrics.ObserveMasking(time.Since(start).Seconds()) }()
 	for _, sc := range scripts {
 		if err := e.drv.Exec(ctx, cid, psqlCmd(src, sc.SQL)); err != nil {
-			return fmt.Errorf("masking script %q: %w", sc.Name, err)
+			return markedError{ErrMaskingFailed, fmt.Errorf("masking script %q: %w", sc.Name, err)}
 		}
 	}
 	return nil

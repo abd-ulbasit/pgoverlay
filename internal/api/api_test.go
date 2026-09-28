@@ -29,6 +29,8 @@ type fakeDriver struct {
 	starts     int
 	execs      [][]string // every Exec call, in order
 	execOutErr error      // returned by every ExecOutput call when set
+	seedErr    error      // returned by the pg_basebackup helper when set
+	execErr    error      // returned by every in-branch psql Exec when set
 
 	// startBlock, when set, parks every StartBranch until it is closed or the
 	// saga's context is cancelled; startEntered receives once per parked call
@@ -57,6 +59,9 @@ func (f *fakeDriver) CloneVolume(ctx context.Context, src, dst string, l map[str
 
 // RunHelper returns canned du output so the usage endpoint has something to parse.
 func (f *fakeDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
+	if f.seedErr != nil && len(s.Cmd) > 0 && s.Cmd[0] == "pg_basebackup" {
+		return "", f.seedErr
+	}
 	return "4096\t/pgoverlay/rw", nil
 }
 func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (string, error) {
@@ -78,6 +83,9 @@ func (f *fakeDriver) StartBranch(ctx context.Context, s runtime.BranchSpec) (str
 }
 func (f *fakeDriver) Exec(ctx context.Context, id string, cmd []string) error {
 	f.execs = append(f.execs, cmd)
+	if len(cmd) > 0 && cmd[0] == "psql" {
+		return f.execErr
+	}
 	return nil
 }
 

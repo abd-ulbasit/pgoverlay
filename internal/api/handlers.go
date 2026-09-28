@@ -29,13 +29,18 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 // writeEngineError maps engine/registry failures to HTTP statuses: invalid
-// input -> 400, missing rows -> 404, quota exceeded -> 403, name/lifecycle
-// conflicts -> 409, everything else -> 500.
+// input -> 400, missing rows -> 404, quota exceeded -> 403, a mutation
+// interrupted by lost leadership or shutdown -> 503 (stuck timeout -> 504), a
+// failing seed or masking script -> 422, name/lifecycle conflicts -> 409,
+// everything else -> 500.
 //
-// The mapped 4xx cases return their (intentional, already-clean) messages.
-// The default 500 case does NOT: err.Error() can carry SQLite/driver/volume/
-// path internals, so the real error is logged server-side and the client sees
-// a generic body. r may be nil (logs without method/path then).
+// The mapped 4xx cases return their (intentional, already-clean) messages;
+// seed/masking failures return the tool's output (never a password: it only
+// travels in the helper's environment), clipped. A duplicate name returns a
+// plain sentence instead of the raw SQLite constraint text. The default 500
+// case does NOT return the message: err.Error() can carry SQLite/driver/
+// volume/path internals, so the real error is logged server-side and the
+// client sees a generic body. r may be nil (logs without method/path then).
 func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	msg := err.Error()
 	switch {
@@ -46,18 +51,25 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusNotFound, msg)
 	case errors.Is(err, engine.ErrQuotaExceeded):
 		writeError(w, http.StatusForbidden, msg)
-	case strings.Contains(msg, "UNIQUE constraint"),
-		strings.Contains(msg, "live branch"),
-		strings.Contains(msg, "child branch"),
-		strings.Contains(msg, "illegal branch transition"),
-		strings.Contains(msg, "not ready"):
-		writeError(w, http.StatusConflict, msg)
 	case r != nil && r.Context().Err() != nil && interruptedStatus(r.Context()) != 0:
 		// The mutation's context was ended from outside the saga (leadership
 		// lost, shutdown, stuck timeout): the failure is that interruption, and
 		// the saga has already compensated. Tell the client it can retry.
 		cause := context.Cause(r.Context())
 		writeError(w, interruptedStatus(r.Context()), cause.Error()+"; the operation was cancelled and its partial work rolled back, retry it")
+	case errors.Is(err, engine.ErrSeedFailed), errors.Is(err, engine.ErrMaskingFailed):
+		// Caused by the source's configuration or its masking SQL; checked
+		// before the substring matches below because the message carries
+		// arbitrary tool output. The full text stays in the log.
+		slog.Warn("api: operation failed on user-supplied configuration", "error", err)
+		writeError(w, http.StatusUnprocessableEntity, clipMessage(msg))
+	case strings.Contains(msg, "UNIQUE constraint"):
+		writeError(w, http.StatusConflict, duplicateMessage(msg))
+	case strings.Contains(msg, "live branch"),
+		strings.Contains(msg, "child branch"),
+		strings.Contains(msg, "illegal branch transition"),
+		strings.Contains(msg, "not ready"):
+		writeError(w, http.StatusConflict, msg)
 	default:
 		// Unmapped: treat as internal. Log the full detail; tell the client nothing.
 		attrs := []any{"error", err}
@@ -67,6 +79,42 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		slog.Error("api: internal server error", attrs...)
 		writeError(w, http.StatusInternalServerError, "internal server error")
 	}
+}
+
+// uniqueTableRe pulls the table out of SQLite's "UNIQUE constraint failed:
+// <table>.<column>" text.
+var uniqueTableRe = regexp.MustCompile(`UNIQUE constraint failed: (\w+)\.`)
+
+// duplicateMessage turns a raw SQLite unique-constraint error into a sentence
+// a client can act on, without echoing driver internals.
+func duplicateMessage(msg string) string {
+	kind := "an object"
+	if m := uniqueTableRe.FindStringSubmatch(msg); m != nil {
+		switch m[1] {
+		case "branches":
+			kind = "a live branch"
+		case "sources":
+			kind = "a source"
+		case "api_tokens":
+			kind = "a token"
+		}
+	}
+	return kind + " with that name already exists"
+}
+
+// maxErrorMessage bounds the tool output returned in a 422 body; the full
+// error is still in branchd's log.
+const maxErrorMessage = 2048
+
+// clipMessage keeps the head (what failed) and the tail (the tool's final
+// error lines) of an over-long message.
+func clipMessage(msg string) string {
+	if len(msg) <= maxErrorMessage {
+		return msg
+	}
+	const head = 512
+	tail := maxErrorMessage - head
+	return strings.ToValidUTF8(msg[:head]+" … "+msg[len(msg)-tail:], "")
 }
 
 // interruptedStatus maps why a mutation's context ended to a status: 503 when
