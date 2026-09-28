@@ -275,8 +275,8 @@ func run() error {
 	}
 
 	token := os.Getenv("PGOVERLAY_TOKEN")
-	if token == "" {
-		return errors.New("PGOVERLAY_TOKEN must be set (bearer token for the REST API)")
+	if err := config.ValidateAdminToken(token); err != nil {
+		return err
 	}
 
 	cfg, err := config.Load()
