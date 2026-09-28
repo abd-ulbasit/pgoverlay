@@ -86,6 +86,16 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# Image for the file-level helper pods branchd starts at runtime (seed-volume
+# prep, entrypoint installs, disk usage, hostPath volume copies; branchd
+# --kube-helper-image). Empty = the built-in default, alpine pinned by digest
+# to the same base the pgoverlay images use. Set it to a mirror when the
+# cluster cannot pull from Docker Hub (private or air-gapped registries), and
+# pin it by digest (repo@sha256:...): in hostpath mode this image runs as root
+# with the whole data root mounted. The postgres images for branches and
+# seeding still follow the source's pg_version (postgres:<major>).
+helperImage: ""
+
 # Bearer token for the REST API. Exactly one of these is required:
 #  - token: the chart renders a Secret holding it. WARNING: a value passed via
 #    --set token= (or a values file committed to git) is persisted IN CLEARTEXT

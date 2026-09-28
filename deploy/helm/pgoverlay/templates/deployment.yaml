@@ -39,8 +39,13 @@ spec:
           {{- end }}
           args:
             - --runtime=kube
+            {{- if eq .Values.storage.mode "hostpath" }}
             - --kube-node={{ .Values.node }}
+            {{- end }}
             - --kube-data-root={{ .Values.dataRoot }}
+            {{- with .Values.helperImage }}
+            - --kube-helper-image={{ . }}
+            {{- end }}
             {{- if eq .Values.storage.mode "csi" }}
             - --kube-storage=csi
             - --csi-storage-class={{ required "set storage.storageClass to a StorageClass supporting PVC cloning (required with storage.mode=csi)" .Values.storage.storageClass }}
@@ -81,6 +86,17 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # branchd makes its own pod the owner of the helper pods (and their
+            # env Secrets) it starts, so they are garbage-collected with it if
+            # branchd dies mid-seed.
+            - name: PGOVERLAY_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PGOVERLAY_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
             # leader-election identity (the Lease holder)
             - name: POD_NAME
