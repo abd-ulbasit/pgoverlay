@@ -147,12 +147,35 @@ stay visible on the Security tab, and the `vuln` job keeps gating.
 
 ## Hardening posture
 
-See [docs/kubernetes.md](docs/kubernetes.md) (pod securityContext,
-NetworkPolicy, RBAC, CSI vs hostPath) and [docs/api.md](docs/api.md) (the
-`/v1` stability promise). Notable defaults: branch passwords are AES-256-GCM
-encrypted at rest, every `/v1` route is role-gated, the GitHub webhook verifies
-HMAC-SHA256, and an audit trail records the acting token for every branch
-transition (`pgb history`). `make helm-test` asserts the chart's container
-hardening (no privilege escalation, all capabilities dropped, RuntimeDefault
-seccomp, read-only root filesystem, and a non-root user for the webhook
-service).
+[docs/security.md](docs/security.md) is the threat model (who can reach what,
+what each component trusts) and the hardening checklist;
+[docs/kubernetes.md](docs/kubernetes.md) covers the pod securityContext,
+NetworkPolicy, RBAC and CSI vs hostPath, and [docs/api.md](docs/api.md) the
+`/v1` routes, roles and stability promise. Notable defaults:
+
+- Every `/v1` route is role-gated (viewer, operator, admin). branchd refuses
+  to start with a `PGOVERLAY_TOKEN` shorter than 16 characters; stored tokens
+  are kept as SHA-256 digests, and their names cannot impersonate the built-in
+  token (`root`) or the system actors in the audit log.
+- Rotated branch passwords are encrypted at rest with AES-256-GCM under a
+  dedicated random key with a key id (`secret.key` in the state directory, or
+  `PGOVERLAY_SECRET_KEY`), independent of `PGOVERLAY_TOKEN`, so the token can
+  be rotated without touching them. A password no configured key can decrypt
+  is reported as `password_unavailable` instead of breaking the branch, and a
+  destroyed branch keeps no password.
+- The state directory is created `0700`, and the registry and key files
+  `0600`; older installs are tightened on start.
+- An audit trail records the acting identity for every branch and source
+  transition (`name (role)` for tokens, `root` for the built-in token,
+  `local:<user>` for local-mode `pgb`, `system:reconcile` for the daemon),
+  and outlives the source (`pgb history`).
+- The GitHub webhook verifies HMAC-SHA256 with a secret of at least 16
+  characters and de-duplicates deliveries.
+- `make helm-test` asserts the chart's container hardening (no privilege
+  escalation, all capabilities dropped, RuntimeDefault seccomp, read-only
+  root filesystem, and a non-root user for the webhook service).
+
+Branch containers are the exception to least privilege: on Docker and in
+Kubernetes hostpath mode they run with `CAP_SYS_ADMIN` and AppArmor
+unconfined for their overlay mount. See
+[docs/security.md](docs/security.md#branch-instances).
