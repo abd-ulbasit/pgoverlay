@@ -3,6 +3,7 @@ package registry
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -210,5 +211,56 @@ func TestMigrateRejectsFutureSchema(t *testing.T) {
 	}
 	if _, err := Open(path); err == nil {
 		t.Fatal("Open on a future schema version = nil, want error")
+	}
+}
+
+// TestMigrateV12ClearsTombstonePasswords: upgrading a registry whose destroyed
+// branch rows still hold passwords clears them, leaves live rows alone, and
+// adds transitions.entity_name for the rows a source removal would orphan.
+func TestMigrateV12ClearsTombstonePasswords(t *testing.T) {
+	v12 := -1
+	for i, m := range migrations {
+		if m == migrateV12 {
+			v12 = i
+		}
+	}
+	if v12 < 0 {
+		t.Fatal("migrateV12 is not registered")
+	}
+	path := filepath.Join(t.TempDir(), "pre-v12.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range migrations[:v12] {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version=%d`, v12)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sources (id,name,pg_version,volume,state) VALUES ('s1','main','17','v','ready');
+		INSERT INTO branches (id,name,source_id,state,rw_volume,password) VALUES
+		  ('b-dead','old','s1','destroyed','rw1','enc:v1:c2VjcmV0'),
+		  ('b-live','new','s1','ready','rw2','livepassword0001');`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if raw := rawBranchPassword(t, r, "b-dead"); raw != "" {
+		t.Fatalf("destroyed row kept its password: %q", raw)
+	}
+	if raw := rawBranchPassword(t, r, "b-live"); raw != "livepassword0001" {
+		t.Fatalf("live row password changed: %q", raw)
+	}
+	var n int
+	if err := r.db.QueryRow(`SELECT count(*) FROM transitions WHERE entity_name = ''`).Scan(&n); err != nil {
+		t.Fatalf("transitions.entity_name missing after v12: %v", err)
 	}
 }

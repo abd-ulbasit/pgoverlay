@@ -166,8 +166,8 @@ func TestMigrateV1ToLatest(t *testing.T) {
 	if err := r.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
-	if v != 11 {
-		t.Fatalf("user_version=%d want 11", v)
+	if v != len(migrations) {
+		t.Fatalf("user_version=%d want %d", v, len(migrations))
 	}
 	s, err := r.GetSourceByName("main")
 	if err != nil {
