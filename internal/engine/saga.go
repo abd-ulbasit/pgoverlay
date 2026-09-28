@@ -16,12 +16,21 @@ import (
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
 
-// ErrInvalidName rejects branch names that cannot be used across runtimes
-// (docker container names, k8s pod names — RFC 1123 after the pgoverlay-br-
-// prefix). The API maps it to 400.
-var ErrInvalidName = errors.New("invalid branch name")
+// ErrInvalidName rejects branch and source names that cannot be used across
+// runtimes (docker container names, k8s pod names — RFC 1123 after the
+// pgoverlay-br- prefix). The error text names the kind ("invalid branch
+// name", "invalid source name"). The API maps it to 400.
+var ErrInvalidName = errors.New("invalid name")
 
 var branchNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
+
+type invalidNameError struct{ kind, name string }
+
+func (e *invalidNameError) Error() string {
+	return fmt.Sprintf("invalid %s name %q: %s name must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", e.kind, e.name, e.kind)
+}
+
+func (e *invalidNameError) Is(target error) bool { return target == ErrInvalidName }
 
 // validateName enforces the cross-runtime naming rule shared by branch and
 // source names: lowercase letters/digits/hyphens, starting with a letter or
@@ -30,7 +39,7 @@ var branchNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 // names flow into container/dataset/volume names, so this is the one gate.
 func validateName(kind, name string) error {
 	if !branchNameRe.MatchString(name) {
-		return fmt.Errorf("%w %q: %s name must match [a-z0-9][a-z0-9-]{0,40} (lowercase letters, digits and hyphens, starting with a letter or digit, at most 41 characters)", ErrInvalidName, name, kind)
+		return &invalidNameError{kind: kind, name: name}
 	}
 	return nil
 }
@@ -80,7 +89,7 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	}
 	src, err := e.reg.GetSourceByName(sourceName)
 	if err != nil {
-		return nil, fmt.Errorf("source %q: %w", sourceName, err)
+		return nil, err
 	}
 	if src.State != registry.SourceReady {
 		return nil, fmt.Errorf("source %q is %s, not ready", sourceName, src.State)
@@ -100,7 +109,7 @@ func (e *Engine) CreateBranch(ctx context.Context, name, sourceName string, ttl 
 	defer e.keepAlive(b.ID)()
 	if err := e.provision(ctx, b, src); err != nil {
 		e.logCompensationErr("transition", "create: mark branch failed after provision failed",
-			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, err.Error()), "branch", b.Name, "branch_id", b.ID)
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, failureReason(err)), "branch", b.Name, "branch_id", b.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)
@@ -468,7 +477,7 @@ func (e *Engine) ResetBranch(ctx context.Context, name string) (_ *registry.Bran
 	defer e.keepAlive(b.ID)()
 	fail := func(stepErr error) (*registry.Branch, error) {
 		e.logCompensationErr("transition", "reset: mark branch failed after reset step failed",
-			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, stepErr.Error()), "branch", b.Name, "branch_id", b.ID)
+			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, failureReason(stepErr)), "branch", b.Name, "branch_id", b.ID)
 		return nil, stepErr
 	}
 	if b.ContainerID != "" {
@@ -628,7 +637,7 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	defer cancel()
 	if err := e.teardownBranch(td, b, guarded); err != nil {
 		e.logCompensationErr("transition", "destroy: journal failed teardown",
-			e.reg.NoteBranchCtx(td, b.ID, "destroy failed, destroy again to retry: "+err.Error()),
+			e.reg.NoteBranchCtx(td, b.ID, "destroy failed, destroy again to retry: "+failureReason(err)),
 			"branch", b.Name, "branch_id", b.ID)
 		return err
 	}

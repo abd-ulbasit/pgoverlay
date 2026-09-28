@@ -61,7 +61,7 @@ func (e *Engine) RecoverBranch(ctx context.Context, name string) (_ *registry.Br
 	bg := context.WithoutCancel(ctx)
 	fail := func(stepErr error) (*registry.Branch, error) {
 		e.logCompensationErr("transition", "recover: mark branch failed after recover failed",
-			e.reg.TransitionBranchCtx(bg, b.ID, registry.BranchFailed, "recover failed: "+stepErr.Error()),
+			e.reg.TransitionBranchCtx(bg, b.ID, registry.BranchFailed, "recover failed: "+failureReason(stepErr)),
 			"branch", b.Name, "branch_id", b.ID)
 		return nil, stepErr
 	}

@@ -42,7 +42,7 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	}
 	parent, err := e.reg.GetBranchByName(parentName)
 	if err != nil {
-		return nil, fmt.Errorf("parent branch %q: %w", parentName, err)
+		return nil, fmt.Errorf("parent %w", err) // `parent branch "x" not found`
 	}
 	if parent.State != registry.BranchReady {
 		return nil, fmt.Errorf("parent branch %q is %s, not ready", parentName, parent.State)
@@ -91,7 +91,7 @@ func (e *Engine) CreateBranchFrom(ctx context.Context, name, parentName string, 
 	}
 	if err := provision(); err != nil {
 		e.logCompensationErr("transition", "from_branch: mark child failed after provision failed",
-			e.reg.TransitionBranchCtx(ctx, child.ID, registry.BranchFailed, err.Error()), "branch", child.Name, "branch_id", child.ID)
+			e.reg.TransitionBranchCtx(ctx, child.ID, registry.BranchFailed, failureReason(err)), "branch", child.Name, "branch_id", child.ID)
 		return nil, err
 	}
 	return e.reg.GetBranchByName(name)

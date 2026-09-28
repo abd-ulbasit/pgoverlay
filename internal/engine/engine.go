@@ -282,7 +282,7 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 		e.logCompensationErr("undo", "add source: remove source layer after seed failed",
 			e.removeSourceLayer(context.WithoutCancel(ctx), s.Volume), "source", s.Name, "volume", s.Volume)
 		e.logCompensationErr("transition", "add source: mark source failed after seed failed",
-			e.reg.SetSourceState(s.ID, registry.SourceFailed, err.Error()), "source", s.Name)
+			e.reg.SetSourceState(s.ID, registry.SourceFailed, failureReason(err)), "source", s.Name)
 		return fmt.Errorf("seed source %q: %w", s.Name, err)
 	}
 	return e.reg.SetSourceState(s.ID, registry.SourceReady, "seed complete")
@@ -295,7 +295,7 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 func (e *Engine) RefreshSource(ctx context.Context, name, password string) error {
 	src, err := e.reg.GetSourceByName(name)
 	if err != nil {
-		return fmt.Errorf("source %q: %w", name, err)
+		return err
 	}
 	if src.State != registry.SourceReady {
 		return fmt.Errorf("source %q is %s, not ready", name, src.State)
@@ -305,7 +305,8 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 		return err
 	}
 	if err := e.seedSource(ctx, src, newVol, password); err != nil {
-		e.removeSourceLayer(context.WithoutCancel(ctx), newVol)
+		e.logCompensationErr("undo", "refresh source: remove new generation layer after seed failed",
+			e.removeSourceLayer(context.WithoutCancel(ctx), newVol), "source", name, "volume", newVol)
 		return fmt.Errorf("refresh source %q: %w", name, err)
 	}
 	oldVol := src.Volume
@@ -322,7 +323,7 @@ func (e *Engine) RefreshSource(ctx context.Context, name, password string) error
 func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 	src, err := e.reg.GetSourceByName(name)
 	if err != nil {
-		return fmt.Errorf("source %q: %w", name, err)
+		return err
 	}
 	n, err := e.reg.CountLiveBranchesBySource(src.ID)
 	if err != nil {
@@ -354,7 +355,42 @@ func (e *Engine) RemoveSource(ctx context.Context, name string) error {
 		return fmt.Errorf("remove source layer: %w", err)
 	}
 	// DeleteSource cascades the layer rows
-	return e.reg.DeleteSource(src.ID)
+	if err := e.reg.DeleteSource(src.ID); err != nil {
+		return err
+	}
+	// failed attempts of the same name (registries from before CreateSource
+	// replaced them could hold several) go too, or `source rm` would report
+	// success while `source ls` still lists the name. They own no volumes.
+	if _, err := e.reg.DeleteFailedSources(name); err != nil {
+		return fmt.Errorf("remove failed attempts of source %q: %w", name, err)
+	}
+	return nil
+}
+
+// maxFailureReason caps a failure reason stored in the registry.
+const maxFailureReason = 1024
+
+// failureReason renders err for the transitions journal, which lives at rest
+// in the registry file. Seed and masking failures embed the helper's or
+// psql's output, and Postgres prints offending row values in DETAIL and
+// CONTEXT lines (`DETAIL:  Key (email)=(…) already exists`, `CONTEXT:  COPY
+// customers, line 4213, column email: "…"`) — production data, and for a
+// failed masking script data that was never masked. Those lines are dropped
+// and the rest is capped; the caller still gets the full error.
+func failureReason(err error) string {
+	lines := strings.Split(err.Error(), "\n")
+	kept := lines[:0]
+	for _, l := range lines {
+		if strings.Contains(l, "DETAIL:") || strings.Contains(l, "CONTEXT:") {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	reason := strings.Join(kept, "\n")
+	if len(reason) > maxFailureReason {
+		reason = strings.ToValidUTF8(reason[:maxFailureReason], "") + " …(truncated)"
+	}
+	return reason
 }
 
 // BranchUsage measures a branch's copy-on-write layer in bytes (the branch's
