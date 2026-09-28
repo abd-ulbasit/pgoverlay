@@ -412,6 +412,20 @@ func TestWithDataSampleDefaultCap(t *testing.T) {
 	}
 }
 
+// WithDataSample clamps an oversized n to MaxSampleRows: the sample is
+// buffered in memory, so the cap is what bounds it.
+func TestWithDataSampleClampsToMax(t *testing.T) {
+	var o diffOptions
+	WithDataSample(2_000_000_000)(&o)
+	if o.sample != MaxSampleRows {
+		t.Fatalf("sample = %d, want the %d cap", o.sample, MaxSampleRows)
+	}
+	WithDataSample(MaxSampleRows - 1)(&o)
+	if o.sample != MaxSampleRows-1 {
+		t.Fatalf("sample = %d, want %d", o.sample, MaxSampleRows-1)
+	}
+}
+
 func TestStripDumpNoise(t *testing.T) {
 	in := "--\nCREATE TABLE t (id int);\n\\restrict aB3xQ\nSET x=1;\n\\unrestrict zZ9kP\n"
 	got := stripDumpNoise(in)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -283,6 +284,10 @@ func (s *Server) getMaskScripts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// maxTTLSeconds is the largest ttl_seconds that fits a time.Duration (~292
+// years).
+const maxTTLSeconds = math.MaxInt64 / int64(time.Second)
+
 func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) {
 	req, ok := decode[CreateBranchRequest](w, r)
 	if !ok {
@@ -296,8 +301,11 @@ func (s *Server) createBranch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "exactly one of source or parent is required")
 		return
 	}
-	if req.TTLSeconds < 0 {
-		writeError(w, http.StatusBadRequest, "ttl_seconds must be >= 0")
+	// Bound the TTL before converting it: time.Duration(n)*time.Second wraps
+	// negative for n > maxTTLSeconds, which the engine would read as "no TTL"
+	// (never expires) and so slip past --max-ttl.
+	if req.TTLSeconds < 0 || int64(req.TTLSeconds) > maxTTLSeconds {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("ttl_seconds must be between 0 and %d", maxTTLSeconds))
 		return
 	}
 	ttl := time.Duration(req.TTLSeconds) * time.Second
@@ -361,11 +369,12 @@ func (s *Server) branchUsage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) branchDiff(w http.ResponseWriter, r *http.Request) {
 	var opts []engine.DiffOption
 	// ?data=N turns on bounded data sampling (up to N branch-only rows per
-	// grown table). data=0/absent leaves sampling off.
+	// grown table, N <= engine.MaxSampleRows). data=0/absent leaves sampling
+	// off.
 	if v := r.URL.Query().Get("data"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "data must be a non-negative integer")
+		if err != nil || n < 0 || n > engine.MaxSampleRows {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("data must be an integer between 0 and %d", engine.MaxSampleRows))
 			return
 		}
 		if n > 0 {

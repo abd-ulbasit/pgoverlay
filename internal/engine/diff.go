@@ -57,17 +57,23 @@ type DiffOption func(*diffOptions)
 // requested with a non-positive n.
 const defaultSampleRows = 20
 
+// MaxSampleRows is the largest per-table sample WithDataSample honours. The
+// sample is buffered in memory (psql output, then JSON), so an unbounded n
+// against a grown table could exhaust branchd's memory; the API rejects a
+// larger ?data= with 400.
+const MaxSampleRows = 500
+
 // WithDataSample turns on bounded data sampling: for each table whose branch
 // row-estimate exceeds its base estimate, DiffBranch returns up to n
 // branch-only rows (matched by primary key) in TableDelta.SampleRows. A
-// non-positive n uses the default cap (20). Tables without a primary key are
-// skipped. Off by default.
+// non-positive n uses the default cap (20); n above MaxSampleRows is clamped
+// to it. Tables without a primary key are skipped. Off by default.
 func WithDataSample(n int) DiffOption {
 	return func(o *diffOptions) {
 		if n <= 0 {
 			n = defaultSampleRows
 		}
-		o.sample = n
+		o.sample = min(n, MaxSampleRows)
 	}
 }
 
