@@ -60,7 +60,7 @@ func TestSourceImageRejectsGarbage(t *testing.T) {
 	d := newFake()
 	e, r := testEngine(t, d)
 	for _, img := range []string{"postgis/postgis:17 ; rm -rf /", "Upper/Case:1", "has space:1", "img:tag\nkey: value"} {
-		err := e.AddSource(context.Background(), &registry.Source{Name: "x", PGVersion: "17", Image: img}, "pw")
+		err := e.AddSource(context.Background(), &registry.Source{Name: "x", PGVersion: "17", Image: img, ConnHost: "h", ConnPort: 5432, ConnUser: "postgres"}, "pw")
 		if !errors.Is(err, registry.ErrInvalidImage) {
 			t.Errorf("image %q: err=%v, want ErrInvalidImage", img, err)
 		}
@@ -69,7 +69,7 @@ func TestSourceImageRejectsGarbage(t *testing.T) {
 		t.Fatalf("rejected images left rows: %+v", list)
 	}
 	for _, img := range []string{"postgres:17", "ghcr.io/acme/postgres:17-pgvector", "localhost:5000/pg/custom", "pgvector/pgvector:pg17@sha256:" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"} {
-		if err := e.AddSource(context.Background(), &registry.Source{Name: "ok", PGVersion: "17", Image: img}, "pw"); err != nil {
+		if err := e.AddSource(context.Background(), &registry.Source{Name: "ok", PGVersion: "17", Image: img, ConnHost: "h", ConnPort: 5432, ConnUser: "postgres"}, "pw"); err != nil {
 			t.Errorf("image %q rejected: %v", img, err)
 		}
 		if err := e.RemoveSource(context.Background(), "ok"); err != nil {

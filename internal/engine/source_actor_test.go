@@ -22,7 +22,7 @@ func TestSourceOpsRecordRequestActor(t *testing.T) {
 	e := New(r, newFake(), "postgres:17")
 	ctx := registry.WithActor(context.Background(), registry.Actor{Name: "alice", Role: registry.RoleAdmin})
 
-	if err := e.AddSource(ctx, &registry.Source{Name: "main", PGVersion: "17", ConnHost: "db"}, "pw"); err != nil {
+	if err := e.AddSource(ctx, &registry.Source{Name: "main", PGVersion: "17", ConnHost: "db", ConnPort: 5432, ConnUser: "postgres"}, "pw"); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.RefreshSource(ctx, "main", "pw"); err != nil {

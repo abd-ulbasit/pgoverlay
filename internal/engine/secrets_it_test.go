@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -24,7 +24,7 @@ func TestRotatedBranchRecoversFromKeyLoss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	mustExec(t, ctx, hostConn, `CREATE TABLE accounts(id int primary key);
 		INSERT INTO accounts SELECT i FROM generate_series(1,10) i`)
 

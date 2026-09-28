@@ -29,7 +29,8 @@ func zfsEngine(t *testing.T, d runtime.Driver) (*Engine, *registry.Registry) {
 // readyZFSSource registers a ready source whose layer is a zfs dataset.
 func readyZFSSource(t *testing.T, r *registry.Registry) *registry.Source {
 	t.Helper()
-	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "tank/pgoverlay/src-main-g1"}
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "tank/pgoverlay/src-main-g1",
+		ConnHost: "db", ConnPort: 5432, ConnUser: "postgres"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}

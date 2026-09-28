@@ -286,6 +286,15 @@ func (e *Engine) AddSource(ctx context.Context, s *registry.Source, password str
 	if err := validateSourceName(s.Name); err != nil {
 		return err
 	}
+	// reject unusable connection settings (empty host, bad port or sslmode,
+	// unstorable schema patterns) before any row or layer exists
+	conn := pgctl.SeedDumpSpec{
+		SeedSpec: pgctl.SeedSpec{Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser},
+		Schemas:  s.DumpSchemas,
+	}
+	if err := conn.Validate(); err != nil {
+		return fmt.Errorf("source %q: %w", s.Name, err)
+	}
 	s.Volume = e.planner.SourceLayerName(s.Name, 1)
 	if err := e.reg.CreateSourceCtx(ctx, s); err != nil {
 		return err

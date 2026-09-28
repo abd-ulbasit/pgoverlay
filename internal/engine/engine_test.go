@@ -239,7 +239,8 @@ func testEngine(t *testing.T, d runtime.Driver, opts ...Option) (*Engine, *regis
 
 func readySource(t *testing.T, r *registry.Registry) *registry.Source {
 	t.Helper()
-	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main"}
+	s := &registry.Source{Name: "main", PGVersion: "17", Volume: "pgoverlay-src-main",
+		ConnHost: "db", ConnPort: 5432, ConnUser: "postgres"}
 	if err := r.CreateSource(s); err != nil {
 		t.Fatal(err)
 	}

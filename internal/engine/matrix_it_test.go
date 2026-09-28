@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -39,7 +39,7 @@ func runMatrixCycle(t *testing.T, ver string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePGVersion(t, ctx, ver)
+	host, port, network, hostConn := pgctltest.StartSourcePGVersion(t, ctx, ver)
 	mustExec(t, ctx, hostConn, `CREATE TABLE accounts(id int primary key, balance int);
 		INSERT INTO accounts SELECT i, 100 FROM generate_series(1,1000) i`)
 

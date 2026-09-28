@@ -21,7 +21,7 @@ import (
 
 	"github.com/abd-ulbasit/pgoverlay/internal/api"
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 	"github.com/abd-ulbasit/pgoverlay/pgoverlaytest"
@@ -36,7 +36,7 @@ func TestSDKAcquire(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	seedConn, err := pgx.Connect(ctx, hostConn)
 	if err != nil {
 		t.Fatal(err)

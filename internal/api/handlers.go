@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 )
 
@@ -38,7 +39,9 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, engine.ErrInvalidName),
 		errors.Is(err, registry.ErrUnsupportedPGVersion),
 		errors.Is(err, registry.ErrInvalidImage),
-		errors.Is(err, registry.ErrInvalidTokenName):
+		errors.Is(err, registry.ErrInvalidTokenName),
+		errors.Is(err, pgctl.ErrInvalidSpec),
+		errors.Is(err, pgctl.ErrVersionMismatch):
 		writeError(w, http.StatusBadRequest, msg)
 	case errors.Is(err, registry.ErrNotFound):
 		writeError(w, http.StatusNotFound, msg)
@@ -110,7 +113,7 @@ func (s *Server) createSource(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if req.Name == "" || req.Host == "" {
+	if req.Name == "" || strings.TrimSpace(req.Host) == "" {
 		writeError(w, http.StatusBadRequest, "name and host are required")
 		return
 	}

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 )
@@ -24,7 +24,7 @@ func TestDiffBranchEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	mustExec(t, ctx, hostConn, `CREATE TABLE dft_users(id int primary key, email text);
 		INSERT INTO dft_users SELECT i, 'u' || i FROM generate_series(1,500) i;
 		ANALYZE dft_users`)
@@ -141,7 +141,7 @@ func TestDiffBranchDataSampleEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	mustExec(t, ctx, hostConn, `CREATE TABLE diffd_users(id int primary key, email text);
 		INSERT INTO diffd_users SELECT i, 'u' || i FROM generate_series(1,10) i;
 		CREATE TABLE diffd_log(msg text);

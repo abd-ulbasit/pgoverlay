@@ -17,7 +17,7 @@ import (
 
 	"github.com/abd-ulbasit/pgoverlay/internal/api"
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
-	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/pgproxy"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
@@ -89,7 +89,7 @@ func TestPhase2DataPlane(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	host, port, network, hostConn := pgctl.StartSourcePG(t, ctx)
+	host, port, network, hostConn := pgctltest.StartSourcePG(t, ctx)
 	exec(t, ctx, hostConn, `CREATE TABLE accounts(id int primary key, balance int);
 		INSERT INTO accounts SELECT i, 100 FROM generate_series(1,1000) i`)
 
