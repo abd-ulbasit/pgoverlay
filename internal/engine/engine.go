@@ -40,6 +40,10 @@ type Engine struct {
 	maxTTL     time.Duration
 }
 
+// parentStepTimeout bounds a parent-affecting step (stopping a freeze or
+// clone parent) that runs detached from the request context.
+const parentStepTimeout = 2 * time.Minute
+
 // ErrQuotaExceeded is returned by the create paths when --max-branches is set
 // and the live-branch count is already at the cap. The API maps it to 403.
 var ErrQuotaExceeded = errors.New("branch quota exceeded")

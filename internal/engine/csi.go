@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/cow"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
@@ -54,8 +53,14 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 				"branch", parent.Name, "branch_id", parent.ID)
 			return fmt.Errorf("checkpoint parent %q: %w", parent.Name, err)
 		}
-		if err := e.drv.StopRemove(ctx, parent.ContainerID); err != nil {
-			// container state unknown — don't guess; reconcile/destroy can clean
+		// the stop and every later parent step run detached from the request
+		// (bounded): cancelling the child's create must not strand the parent
+		stopCtx, cancelStop := context.WithTimeout(bg, parentStepTimeout)
+		err := e.drv.StopRemove(stopCtx, parent.ContainerID)
+		cancelStop()
+		if err != nil {
+			// container state unknown — don't guess; the parent is marked
+			// failed with its PVC intact (RecoverBranch restarts it)
 			e.logCompensationErr("transition", "csi: mark parent failed after stop parent failed",
 				e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed, "stop for clone to "+b.Name+" failed: "+err.Error()),
 				"branch", parent.Name, "branch_id", parent.ID)
@@ -89,13 +94,14 @@ func (e *Engine) provisionCSI(ctx context.Context, b *registry.Branch, src *regi
 		return fail(fmt.Errorf("install entrypoint: %w", err))
 	}
 
-	// 3. parent back up before the child starts
+	// 3. parent back up before the child starts, detached from the request.
+	// A failed first attempt falls through to fail(), which undoes the clone
+	// and restarts the parent once more before marking it failed.
 	if parent != nil {
-		p := parent
-		parent = nil // restarting now; fail() must not restart again
-		if err := e.restartCSIBranch(ctx, p, src, nil); err != nil {
-			return fail(fmt.Errorf("restart parent %q: %w", p.Name, err))
+		if err := e.restartAndMarkReady(bg, parent, src, nil); err != nil {
+			return fail(fmt.Errorf("restart parent %q: %w", parent.Name, err))
 		}
+		parent = nil // back up; fail() must not restart it again
 	}
 
 	// 4. branch container on the clone
@@ -141,33 +147,19 @@ func (e *Engine) csiQuiesceTarget(b *registry.Branch) (*registry.Branch, error) 
 // restartCSIBranch starts a stopped csi branch's pod back on its own PVC,
 // waits for readiness and records the new container/address. On failure the
 // branch is marked failed (cause, when non-nil, is the saga error that
-// triggered the restore); its PVC — the data — is always preserved.
+// triggered the restore); its PVC — the data — is always preserved, and
+// RecoverBranch can restart it later.
 func (e *Engine) restartCSIBranch(ctx context.Context, b *registry.Branch, src *registry.Source, cause error) error {
-	failed := func(err error) error {
+	err := e.restartAndMarkReady(ctx, b, src, nil)
+	if err != nil {
 		msg := "restart failed: " + err.Error()
 		if cause != nil {
 			msg = fmt.Sprintf("clone failed (%v); restart failed: %v", cause, err)
 		}
 		e.logCompensationErr("transition", "restartCSIBranch: mark branch failed after restart failed",
 			e.reg.TransitionBranchCtx(ctx, b.ID, registry.BranchFailed, msg), "branch", b.Name, "branch_id", b.ID)
-		return err
 	}
-	cid, err := e.startDirectBranch(ctx, b.Name, b.RWVolume, e.image(src.PGVersion), e.branchLabels(b))
-	if err != nil {
-		return failed(err)
-	}
-	e.logCompensationErr("transition", "restartCSIBranch: own restarted container before readiness wait",
-		e.reg.SetBranchContainer(b.ID, cid), "branch", b.Name, "container", cid) // own the in-flight container before the readiness wait (reconcile-safe)
-	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
-		e.logCompensationErr("undo", "restartCSIBranch: stop/remove container after readiness wait failed",
-			e.drv.StopRemove(ctx, cid), "branch", b.Name, "container", cid)
-		return failed(err)
-	}
-	info, err := e.inspectAddr(ctx, cid)
-	if err != nil {
-		return failed(err)
-	}
-	return e.reg.MarkBranchReadyCtx(ctx, b.ID, cid, info.Host, info.Port)
+	return err
 }
 
 // installDirectEntrypoint writes the direct (no-overlay) entrypoint into a

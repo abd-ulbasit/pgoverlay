@@ -95,7 +95,6 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err != nil {
 		return err
 	}
-	origPlan := cow.PlanBranch(parent.RWVolume, parent.SourceVolume, layerVolumes(chain))
 	// the parent's current rw volume becomes the newest frozen layer
 	frozen := append([]string{parent.RWVolume}, layerVolumes(chain)...)
 	// a generation no row has used: a recreated parent may already sit on a
@@ -124,9 +123,16 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 
 	// 2. stop the parent: its rw volume must not change while it becomes a
 	// layer. The parent container is untouched up to here, so a checkpoint
-	// failure above leaves it ready and running.
-	if err := e.drv.StopRemove(ctx, parent.ContainerID); err != nil {
-		// container state unknown — don't guess; reconcile/destroy can clean
+	// failure above leaves it ready and running. From here on every step
+	// that affects the parent runs detached from the request (bounded by
+	// parentStepTimeout): cancelling the child's create must abort the
+	// child, not leave the parent half-stopped and failed.
+	stopCtx, cancelStop := context.WithTimeout(bg, parentStepTimeout)
+	err = e.drv.StopRemove(stopCtx, parent.ContainerID)
+	cancelStop()
+	if err != nil {
+		// container state unknown — don't guess; the parent is marked failed
+		// with its data intact (RecoverBranch restarts it)
 		e.logCompensationErr("transition", "freeze: mark parent failed after stop parent failed",
 			e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed, "freeze for child "+child.Name+": stop parent failed: "+err.Error()),
 			"branch", parent.Name, "branch_id", parent.ID)
@@ -138,7 +144,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 		for i := len(undo) - 1; i >= 0; i-- {
 			undo[i]()
 		}
-		e.restoreParent(bg, parent, src, origPlan, stepErr)
+		e.restoreParent(bg, parent, src, chain, stepErr)
 		return stepErr
 	}
 
@@ -237,34 +243,13 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 // restoreParent puts a parent back on its original rw volume and chain after
 // a failed freeze (the compensations already removed the fresh rw volume and
 // any new containers). If the restoration restart itself fails the parent is
-// marked failed — its data (the original rw volume) is always preserved.
-func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src *registry.Source, origPlan cow.Plan, cause error) {
-	failed := func(err error) {
+// marked failed — its data (the original rw volume) is always preserved, and
+// RecoverBranch can restart it later.
+func (e *Engine) restoreParent(ctx context.Context, parent *registry.Branch, src *registry.Source, chain []registry.Layer, cause error) {
+	if err := e.restartAndMarkReady(ctx, parent, src, chain); err != nil {
 		e.logCompensationErr("transition", "restoreParent: mark parent failed after restore failed",
 			e.reg.TransitionBranchCtx(ctx, parent.ID, registry.BranchFailed,
 				fmt.Sprintf("freeze failed (%v); parent restore failed: %v", cause, err)),
 			"branch", parent.Name, "branch_id", parent.ID)
 	}
-	cid, err := e.startOverlayBranch(ctx, parent.Name, origPlan, e.image(src.PGVersion), e.branchLabels(parent))
-	if err == nil {
-		e.logCompensationErr("transition", "restoreParent: own restored parent container before readiness wait",
-			e.reg.SetBranchContainer(parent.ID, cid), "branch", parent.Name, "container", cid) // own the in-flight container before the readiness wait
-	}
-	if err != nil {
-		failed(err)
-		return
-	}
-	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
-		e.logCompensationErr("undo", "restoreParent: stop/remove parent container after readiness wait failed",
-			e.drv.StopRemove(ctx, cid), "branch", parent.Name, "container", cid)
-		failed(err)
-		return
-	}
-	info, err := e.inspectAddr(ctx, cid)
-	if err != nil {
-		failed(err)
-		return
-	}
-	e.logCompensationErr("transition", "restoreParent: mark parent ready after restore",
-		e.reg.MarkBranchReadyCtx(ctx, parent.ID, cid, info.Host, info.Port), "branch", parent.Name, "branch_id", parent.ID)
 }

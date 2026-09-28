@@ -72,13 +72,14 @@ func (e *Engine) RecoverBranch(ctx context.Context, name string) (_ *registry.Br
 			return fail(fmt.Errorf("remove old container: %w", err))
 		}
 	}
-	cid, info, err := e.restartOnOwnData(ctx, b, src, chain)
-	if err != nil {
-		return fail(err)
+	if !e.zfs() && !e.csi() {
+		// rewrite the overlay entrypoint (the current version); its mkdir -p
+		// of upper/work is a no-op on intact data
+		if err := e.installOverlayEntrypoint(ctx, b.RWVolume); err != nil {
+			return fail(fmt.Errorf("install entrypoint: %w", err))
+		}
 	}
-	if err := e.reg.MarkBranchReadyCtx(ctx, b.ID, cid, info.Host, info.Port); err != nil {
-		e.logCompensationErr("undo", "recover: stop/remove container after mark ready failed",
-			e.drv.StopRemove(bg, cid), "branch", b.Name, "container", cid)
+	if err := e.restartAndMarkReady(ctx, b, src, chain); err != nil {
 		return fail(err)
 	}
 	return e.reg.GetBranchByName(name)
@@ -137,11 +138,6 @@ func (e *Engine) restartOnOwnData(ctx context.Context, b *registry.Branch, src *
 	case e.csi():
 		cid, err = e.startDirectBranch(ctx, b.Name, b.RWVolume, image, e.branchLabels(b))
 	default:
-		// rewrite the entrypoint (current version); its mkdir -p of
-		// upper/work is a no-op on intact data
-		if err := e.installOverlayEntrypoint(ctx, b.RWVolume); err != nil {
-			return "", runtime.ContainerInfo{}, fmt.Errorf("install entrypoint: %w", err)
-		}
 		plan := cow.PlanBranch(b.RWVolume, b.SourceVolume, layerVolumes(chain))
 		cid, err = e.startOverlayBranch(ctx, b.Name, plan, image, e.branchLabels(b))
 	}
@@ -166,4 +162,20 @@ func (e *Engine) restartOnOwnData(ctx context.Context, b *registry.Branch, src *
 		return "", runtime.ContainerInfo{}, err
 	}
 	return cid, info, nil
+}
+
+// restartAndMarkReady is restartOnOwnData followed by the transition to
+// ready. If the transition fails (the row moved meanwhile, e.g. reconcile
+// failed it) the new container is removed again.
+func (e *Engine) restartAndMarkReady(ctx context.Context, b *registry.Branch, src *registry.Source, chain []registry.Layer) error {
+	cid, info, err := e.restartOnOwnData(ctx, b, src, chain)
+	if err != nil {
+		return err
+	}
+	if err := e.reg.MarkBranchReadyCtx(ctx, b.ID, cid, info.Host, info.Port); err != nil {
+		e.logCompensationErr("undo", "restart: stop/remove container after mark ready failed",
+			e.drv.StopRemove(context.WithoutCancel(ctx), cid), "branch", b.Name, "container", cid)
+		return fmt.Errorf("mark ready: %w", err)
+	}
+	return nil
 }
