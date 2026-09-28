@@ -223,12 +223,14 @@ func splitProxyHost(hp string) (string, int, error) {
 	return h, n, nil
 }
 
-// dsn builds postgres://user[:password]@host:port/db. db may contain '@'
-// (proxy routing) — legal in a URL path, kept literal.
+// dsn builds postgres://user[:password]@host:port/db. The userinfo is
+// percent-encoded the way URL parsers (pgx, libpq) decode it — a space is
+// %20, never '+'. db may contain '@' (proxy routing) — legal in a URL path,
+// kept literal.
 func dsn(user, password, host string, port int, db string) string {
-	auth := url.QueryEscape(user)
+	auth := url.User(user)
 	if password != "" {
-		auth += ":" + url.QueryEscape(password)
+		auth = url.UserPassword(user, password)
 	}
-	return fmt.Sprintf("postgres://%s@%s/%s", auth, net.JoinHostPort(host, strconv.Itoa(port)), db)
+	return fmt.Sprintf("postgres://%s@%s/%s", auth.String(), net.JoinHostPort(host, strconv.Itoa(port)), db)
 }

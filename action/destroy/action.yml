@@ -7,8 +7,11 @@
 #       server: ${{ vars.PGOVERLAY_SERVER }}
 #       token: ${{ secrets.PGOVERLAY_TOKEN }}
 #       branch: ${{ steps.branch.outputs.branch }}
+#
+# An empty branch (the create step failed before creating one) is a no-op
+# with a warning; a value that is not a branch name fails.
 name: pgoverlay destroy
-description: Delete a pgoverlay branch by name (404 counts as success)
+description: Delete a pgoverlay branch by name (a branchd 404 counts as success)
 author: abd-ulbasit
 branding:
   icon: trash-2
@@ -22,7 +25,9 @@ inputs:
     description: pgoverlay API bearer token (store it as a secret)
     required: true
   branch:
-    description: branch name to delete (the create action's `branch` output)
+    description: >-
+      branch name to delete: the create action's `branch` output, not a git
+      ref (must match ^[a-z0-9][a-z0-9-]{0,40}$; empty = nothing to delete)
     required: true
 
 runs:
