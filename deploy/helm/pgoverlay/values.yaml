@@ -308,10 +308,13 @@ ghook:
   # Comma-separated "owner/name" allow-list; empty accepts any repository
   # that signs with the webhook secret (logged as a warning).
   repos: ""
-  # Branch naming: "pr-number" (default, pr-<N>) or "git-branch" (the PR's
-  # head ref, sanitized — lets preview platforms derive the branch from the
-  # git ref they already know, e.g. Vercel's VERCEL_GIT_COMMIT_REF, which is
-  # present from the first build before any PR association exists).
+  # Branch naming: "pr-number" (default, gh-<repo-key>-pr-<N>) or
+  # "git-branch" (gh-<repo-key>-<the PR's head ref, sanitized> — lets preview
+  # platforms derive the branch from the git ref they already know, e.g.
+  # Vercel's VERCEL_GIT_COMMIT_REF, which is present from the first build
+  # before any PR association exists; fork PRs are named by number). The
+  # repo key keeps PRs of different repositories apart; see
+  # docs/github-app.md.
   branchNaming: ""
   # host[:port] of the pgoverlay proxy as reachable by developers (shown in
   # PR comments), e.g. a NodePort or LB address for proxy.service.

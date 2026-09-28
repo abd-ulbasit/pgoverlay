@@ -1,7 +1,7 @@
 {
   "action": "synchronize",
   "number": 7,
-  "pull_request": {"head": {"sha": "9f8e7d6c5b4a3210"}},
+  "pull_request": {"head": {"sha": "9f8e7d6c5b4a3210", "ref": "feat/Health_Endpoint", "repo": {"full_name": "acme/widgets"}}},
   "repository": {"full_name": "acme/widgets"},
   "installation": {"id": 4242}
 }
