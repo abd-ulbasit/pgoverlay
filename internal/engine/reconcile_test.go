@@ -715,6 +715,74 @@ func TestRefreshBranchEndpoint(t *testing.T) {
 	}
 }
 
+// Every repair that changes a ready branch's container or address is in its
+// history (issue #8): restart_branch and update_endpoint journal a ready ->
+// ready entry naming the reason, by system:reconcile when the reconcile loop
+// ran them, and the router's address refresh does the same. A pass with
+// nothing to repair journals nothing.
+func TestReconcileRepairsAreJournaled(t *testing.T) {
+	ctx := context.Background()
+	d := newFake()
+	e, r := testEngine(t, d)
+	readySource(t, r)
+	b := readyBranch(t, e, "pr-1")
+
+	// restart_branch: the container was removed
+	delete(d.containers, b.ContainerID)
+	if taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute); err != nil || !hasAction(taken, ActionRestartBranch, "pr-1") {
+		t.Fatalf("restart: %+v, %v", taken.Actions, err)
+	}
+	restarted := mustBranch(t, r, "pr-1")
+	last := lastTransition(t, r, "pr-1")
+	for _, want := range []string{"reconcile:", "container " + b.ContainerID + " of the ready branch is gone", "restarted", restarted.ContainerID, "127.0.0.1:54321"} {
+		if !strings.Contains(last.Reason, want) {
+			t.Errorf("restart entry %q does not mention %q", last.Reason, want)
+		}
+	}
+	if last.FromState != "ready" || last.ToState != "ready" || last.Actor != registry.SystemActor {
+		t.Fatalf("restart entry = %+v, want ready -> ready by %s", last, registry.SystemActor)
+	}
+
+	// restart_branch: the container is stopped for good
+	d.containerState[restarted.ContainerID] = runtime.ContainerInfo{Stopped: true, Status: "exited (0)"}
+	if taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute); err != nil || !hasAction(taken, ActionRestartBranch, "pr-1") {
+		t.Fatalf("restart of the stopped container: %+v, %v", taken.Actions, err)
+	}
+	if last := lastTransition(t, r, "pr-1"); !strings.Contains(last.Reason, "is not running (exited (0))") || !strings.Contains(last.Reason, "restarted") {
+		t.Fatalf("stopped-container entry = %+v", last)
+	}
+
+	// update_endpoint: the container runs on another port
+	cur := mustBranch(t, r, "pr-1")
+	d.containerState[cur.ContainerID] = runtime.ContainerInfo{Running: true, Host: "127.0.0.1", Port: 40002}
+	if taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute); err != nil || !hasAction(taken, ActionUpdateEndpoint, "pr-1") {
+		t.Fatalf("update_endpoint: %+v, %v", taken.Actions, err)
+	}
+	last = lastTransition(t, r, "pr-1")
+	if want := "reconcile: container " + cur.ContainerID + " moved from 127.0.0.1:54321 to 127.0.0.1:40002; recorded the new address"; last.Reason != want ||
+		last.FromState != "ready" || last.ToState != "ready" || last.Actor != registry.SystemActor {
+		t.Fatalf("update_endpoint entry = %+v, want %q by %s", last, want, registry.SystemActor)
+	}
+
+	// nothing to repair: nothing journaled
+	hist, _ := r.BranchHistory("pr-1")
+	if taken, err := e.ApplyReconcile(ctx, time.Now(), 10*time.Minute); err != nil || taken.Drift() {
+		t.Fatalf("converged pass: %+v, %v", taken.Actions, err)
+	}
+	if again, _ := r.BranchHistory("pr-1"); len(again) != len(hist) {
+		t.Fatalf("a pass with no repair journaled %+v", again[len(hist):])
+	}
+
+	// the router's refresh after a failed dial
+	d.containerState[cur.ContainerID] = runtime.ContainerInfo{Running: true, Host: "127.0.0.1", Port: 40003}
+	if addr, err := e.RefreshBranchEndpoint(ctx, "pr-1"); err != nil || addr != "127.0.0.1:40003" {
+		t.Fatalf("RefreshBranchEndpoint = %q, %v", addr, err)
+	}
+	if last := lastTransition(t, r, "pr-1"); !strings.HasPrefix(last.Reason, "router: container "+cur.ContainerID+" moved from 127.0.0.1:40002 to 127.0.0.1:40003") {
+		t.Fatalf("router refresh entry = %+v", last)
+	}
+}
+
 // --- in-flight volumes and volume GC grace (issue #11) ---
 
 // Reconcile running while a freeze is between creating the parent's fresh rw

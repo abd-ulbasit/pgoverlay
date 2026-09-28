@@ -662,6 +662,28 @@ func (e *Engine) waitReady(ctx context.Context, cid string, timeout time.Duratio
 	return lastErr
 }
 
+// DestroyError is what DestroyBranch returns when the teardown itself failed.
+// The branch stays in destroying with Reason journaled (`pgb history`), and
+// destroying it again, or reconcile's retry_destroy, retries the teardown.
+// Reason is the journaled text; InUse and RuntimeUnavailable classify the
+// cause so the API can answer with a status the caller can act on. Error()
+// is the underlying error's text.
+type DestroyError struct {
+	Branch string
+	Reason string
+	// InUse: the runtime refused to remove something another user still
+	// holds (a volume another container mounts, a busy zfs dataset); the
+	// retry succeeds once it is released.
+	InUse bool
+	// RuntimeUnavailable: the container runtime could not be reached or did
+	// not answer in time; the retry succeeds once it is back.
+	RuntimeUnavailable bool
+	Err                error
+}
+
+func (e *DestroyError) Error() string { return e.Err.Error() }
+func (e *DestroyError) Unwrap() error { return e.Err }
+
 // destroyTimeout bounds a destroy's teardown. The teardown runs detached from
 // the caller's context — a client that disconnects, a ghook deadline or a
 // shutdown must not abandon it halfway — so it needs a bound of its own.
@@ -678,7 +700,7 @@ const destroyTimeout = 5 * time.Minute
 // step of which tolerates already-gone resources. A teardown failure leaves
 // the row in destroying with the cause journaled (pgb history) for the next
 // attempt: another destroy call, or reconcile's retry_destroy
-// (Registry.ListStuckDestroyingBranches).
+// (Registry.ListStuckDestroyingBranches); the error is then a *DestroyError.
 func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	defer e.observeOp("destroy", &err)()
 	b, err := e.reg.GetBranchByName(name)
@@ -725,10 +747,12 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 	td, cancel := context.WithTimeout(context.WithoutCancel(ctx), destroyTimeout)
 	defer cancel()
 	if err := e.teardownBranch(td, b, guarded); err != nil {
+		reason := failureReason(err)
 		e.logCompensationErr("transition", "destroy: journal failed teardown",
-			e.reg.NoteBranchCtx(td, b.ID, "destroy failed, destroy again to retry: "+failureReason(err)),
+			e.reg.NoteBranchCtx(td, b.ID, "destroy failed, destroy again to retry: "+reason),
 			"branch", b.Name, "branch_id", b.ID)
-		return err
+		return &DestroyError{Branch: b.Name, Reason: reason,
+			InUse: runtime.IsInUse(err), RuntimeUnavailable: runtime.IsUnavailable(err), Err: err}
 	}
 	if err := e.reg.TransitionBranchCtx(td, b.ID, registry.BranchDestroyed, ""); err != nil {
 		// a concurrent destroy of the same row (a retry racing reconcile)

@@ -11,7 +11,8 @@ stateDiagram-v2
     [*] --> creating
     creating --> ready
     creating --> failed
-    ready --> resetting: reset, fork of a child, reconcile restart
+    ready --> ready: reconcile restart or new address
+    ready --> resetting: reset, fork of a child, failed reconcile restart
     ready --> destroying
     resetting --> ready
     resetting --> failed
@@ -26,7 +27,7 @@ stateDiagram-v2
 |---|---|---|
 | `creating`, `resetting` | an operation is running. `resetting` also covers a branch-from-branch freeze or clone of this branch | wait. If the process running it died, reconcile fails the row once it has made no progress for `--stuck-timeout` (default 10m); live operations heartbeat, so a slow one is never failed |
 | `failed` | a create, reset, recover or restart did not finish | read `pgb history NAME`. `pgb branch recover NAME` restarts it on its existing data and keeps its writes (for a branch that failed with its volumes intact, such as a parent interrupted mid-freeze or a branch whose container could not be restarted). `pgb branch reset NAME` discards its writes and re-clones it; for a failed create this is a retry. Or destroy it |
-| `destroying` | a destroy started and did not finish | run `pgb branch destroy NAME` again; it retries the teardown. Reconcile also retries it after `--stuck-timeout`. Each failed attempt is a `destroying -> destroying` entry in the history |
+| `destroying` | a destroy started and did not finish | the destroy's error and each `destroying -> destroying` entry in the history say why (through the API: `409` while something still uses the branch's volume, `502` when the runtime is unreachable). Remove the cause, then run `pgb branch destroy NAME` again; it retries the teardown. Reconcile also retries it after `--stuck-timeout` |
 
 Reset and recover are refused while another branch is still being created
 from this one. The failure reason stored in the registry is capped at 1 KiB
@@ -62,6 +63,36 @@ policy, so Docker, daemon and host restarts keep the port. A `docker stop` or
 `docker rm` of a branch container is undone by the next reconcile pass. When a
 connection through the router fails to reach a branch, the router re-reads
 the branch's address (at most once per branch every 5 s) before refusing.
+
+Each such repair is a `ready -> ready` entry in `pgb history NAME`, with the
+reason: `restart_branch` names the lost container and the new one,
+`update_endpoint` and the router's re-read name the old and new address. The
+actor is `system:reconcile` for the reconcile loop and the router, or the
+token or local user that ran `pgb gc`.
+
+## An operation ends in `504`
+
+A branch operation through the REST API (create, reset, recover, destroy,
+diff) is bounded by branchd's `--stuck-timeout` (default `10m`) in total.
+Past it, the operation is cancelled, its partial work is rolled back, and the
+client gets a `504` such as:
+
+```
+the operation ran 10m0s, past branchd's stuck timeout of 10m0s, and was
+cancelled; its partial work was rolled back. If it is legitimately this slow
+(a long masking script, a slow image pull), raise branchd's --stuck-timeout
+(Helm value stuckTimeout) above its run time, then retry
+```
+
+Retrying unchanged runs into the same limit. If the operation is slow for a
+reason you expect (masking scripts that rewrite large tables are the usual
+one), raise `--stuck-timeout` above its run time: the flag on `branchd`, or
+`stuckTimeout` in the Helm chart's values. There is no environment variable
+for it. The same value is also how long reconcile waits before it fails a row
+that has stopped making progress, so a larger value delays that cleanup, but
+it never fails a slow operation that is still running (running operations
+heartbeat). If the operation should have been fast, `pgb history NAME` and
+branchd's log show where it stalled. In local mode `pgb` has no such bound.
 
 ## Seeding
 

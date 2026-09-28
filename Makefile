@@ -57,9 +57,11 @@ vuln:
 vuln-test:
 	hack/vulncheck_test.sh
 
-# Asserts the Dockerfiles' golang base image matches go.mod's `go` directive.
-# The golang image pins GOTOOLCHAIN=local, so drift here breaks every image
-# build (and the helm ITs that build one) at `go mod download`.
+# Asserts the Dockerfiles' golang base image matches go.mod's `go` directive,
+# and that the goreleaser release-check builds needs no newer Go (and matches
+# release.yml's pin; this part reads the module proxy). The golang image pins
+# GOTOOLCHAIN=local, so drift here breaks every image build (and the helm ITs
+# that build one) at `go mod download`.
 check-toolchain:
 	hack/check-toolchain.sh
 
@@ -86,7 +88,13 @@ js-sdk-test:
 # Validates .goreleaser.yaml with the goreleaser version the release workflow
 # pins. `make release-check GORELEASER_ARGS="release --snapshot --clean"`
 # builds every release archive locally into dist/ without publishing.
-GORELEASER_VERSION ?= v2.18.2
+#
+# `go run` builds goreleaser from source with the repository's toolchain, so
+# the pin must not need a newer Go than go.mod: under GOTOOLCHAIN=local a
+# goreleaser asking for a newer Go fails before it starts. v2.17.1 needs Go
+# 1.26.5; v2.18.0 and later need Go 1.27. `make check-toolchain` (run in CI)
+# checks this and that release.yml pins the same version.
+GORELEASER_VERSION ?= v2.17.1
 GORELEASER_ARGS ?= check
 release-check:
 	go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION) $(GORELEASER_ARGS)

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -214,7 +215,10 @@ func TestCancelMutationsEndsInflight(t *testing.T) {
 }
 
 // Branch sagas are bounded by the stuck timeout: past it the saga is cancelled
-// (and compensates) instead of racing the reconcile loop for the row.
+// (and compensates) instead of racing the reconcile loop for the row. The 504
+// says how long the operation ran against which limit, and names the setting
+// to raise when the operation is legitimately that slow (a long masking
+// script), instead of only "retry it", which would time out the same way.
 func TestBranchSagaBoundedByStuckTimeout(t *testing.T) {
 	ts, _, d := newTestServerCfg(t, 100*time.Millisecond)
 	addSource(t, ts)
@@ -225,8 +229,19 @@ func TestBranchSagaBoundedByStuckTimeout(t *testing.T) {
 	if err := recvWithin(t, d.startErr, "the saga to hit its deadline"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("saga context error = %v, want deadline exceeded", err)
 	}
-	if r := recvWithin(t, res, "the create call"); r.code != http.StatusGatewayTimeout {
+	r := recvWithin(t, res, "the create call")
+	if r.code != http.StatusGatewayTimeout {
 		t.Fatalf("timed-out create = %d %q (err %v), want 504", r.code, r.body, r.err)
+	}
+	for _, want := range []string{"the operation ran ", "past branchd's stuck timeout of 100ms", "rolled back", "--stuck-timeout", "stuckTimeout", "retry"} {
+		if !strings.Contains(r.body, want) {
+			t.Errorf("504 body %q does not contain %q", r.body, want)
+		}
+	}
+	if m := regexp.MustCompile(`ran (\S+), past`).FindStringSubmatch(r.body); m == nil {
+		t.Errorf("504 body %q does not state the elapsed time", r.body)
+	} else if el, err := time.ParseDuration(m[1]); err != nil || el < 100*time.Millisecond {
+		t.Errorf("elapsed %q (%v) is not a duration at or past the 100ms limit", m[1], err)
 	}
 }
 

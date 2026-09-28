@@ -1579,6 +1579,33 @@ func (r *Registry) UpdateBranchEndpoint(id, fromContainerID, containerID, host s
 	return n == 1, err
 }
 
+// UpdateBranchEndpointCtx is UpdateBranchEndpoint for a repair that belongs in
+// the branch's history: when the swap happens it also journals a ready ->
+// ready transitions row carrying reason and the actor from ctx, and bumps
+// updated_at, in the same transaction. Reconcile's restart_branch and
+// update_endpoint and the Postgres router's address refresh use it, so `pgb
+// history` explains why a branch's container or address changed.
+func (r *Registry) UpdateBranchEndpointCtx(ctx context.Context, id, fromContainerID, containerID, host string, port int, reason string) (updated bool, err error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE branches SET container_id=?, host=?, port=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id=? AND state=? AND container_id=?`,
+		containerID, host, port, id, string(BranchReady), fromContainerID)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return false, err
+	}
+	if err := journalTx(ctx, tx, "branch", id, string(BranchReady), string(BranchReady), reason); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // FailReadyBranch marks a ready branch failed when reconcile could not bring
 // its container back. The state machine has no direct ready -> failed edge,
 // so the row takes the two legal edges ready -> resetting -> failed, both

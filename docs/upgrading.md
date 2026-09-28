@@ -47,6 +47,10 @@ or `{repo, ref}`. Details: [GitHub App](github-app.md#branch-names).
   output), `503` when leadership moves or branchd shuts down mid-operation,
   `504` when a branch operation outlives `--stuck-timeout`. All three mean the
   operation was rolled back.
+- A failed destroy answers `409` (something still uses the branch's volume),
+  `502` (the container runtime is unreachable) or `500` with the cause it
+  journaled, instead of a bare `500`; the branch stays `destroying` until a
+  destroy succeeds.
 - Token names must be lowercase (`^[a-z0-9][a-z0-9._-]{0,62}$`) and `root` is
   reserved. Existing tokens keep working.
 - New: `POST /v1/branches/{name}/recover`; `Branch.password_unavailable`,

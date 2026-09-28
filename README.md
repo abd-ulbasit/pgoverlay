@@ -56,7 +56,7 @@ docker exec demo-src psql -U postgres -c "SELECT count(*) FROM t"  # still 10000
 
 pgb branch destroy pr-1
 pgb source rm main
-docker rm -f demo-src
+docker rm -f -v demo-src
 ```
 
 `--host` must be reachable **from containers**, not just from your shell. For a database on the Docker host itself, use `host.docker.internal` on Docker Desktop and Colima; on Linux Docker Engine that name does not resolve inside containers, so use the `docker0` gateway address (usually `172.17.0.1`) or the host's IP, or put the database on a user-defined network and pass `--network <net>`. State lives in `~/.pgoverlay` (`PGOVERLAY_HOME`). The Docker endpoint comes from `DOCKER_HOST` or your current docker context; `ssh://` contexts are not supported (run pgoverlay on the Docker host instead). The full walkthrough, including the server, is in [docs/quickstart.md](docs/quickstart.md).

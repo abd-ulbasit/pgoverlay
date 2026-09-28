@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -226,8 +227,11 @@ func TestReconcileRepairsDockerDrift(t *testing.T) {
 		t.Fatalf("drift after a plain docker restart: %+v", a)
 	}
 
-	// 2. docker rm -f: reconcile starts a new container on the same volumes
-	if err := cli.ContainerRemove(ctx, b.ContainerID, container.RemoveOptions{Force: true}); err != nil {
+	// 2. docker rm -f -v: reconcile starts a new container on the same
+	// volumes. -v (RemoveVolumes) drops the anonymous volume the postgres
+	// image's VOLUME declaration gave the container, as StopRemove does;
+	// without it every run leaks one. The branch's named volumes stay.
+	if err := cli.ContainerRemove(ctx, b.ContainerID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
 		t.Fatal(err)
 	}
 	if plan, _ := e.PlanReconcile(ctx, time.Now(), 10*time.Minute); !hasAction(plan, ActionRestartBranch, "drift-pr") {
@@ -243,6 +247,11 @@ func TestReconcileRepairsDockerDrift(t *testing.T) {
 	}
 	if n := mustQueryInt(t, ctx, branchConn(b2), `SELECT x FROM kept`); n != 42 {
 		t.Fatalf("kept = %d after the restart: the branch's writes were lost", n)
+	}
+	// the repair is in the branch's history, not only in branchd's log
+	if last := lastTransition(t, r, "drift-pr"); last.FromState != "ready" || last.ToState != "ready" ||
+		last.Actor != registry.SystemActor || !strings.Contains(last.Reason, "is gone; restarted the branch") {
+		t.Fatalf("restart not journaled: last history entry %+v", last)
 	}
 
 	// 3. docker stop: not restarted by the policy; reconcile does it
