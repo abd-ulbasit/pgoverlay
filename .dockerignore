@@ -1,0 +1,31 @@
+# Build context for Dockerfile and Dockerfile.ghook. Both images compile Go
+# from go.mod, go.sum, cmd/, internal/ and the public packages, so everything
+# else stays on this side of the daemon: it would only slow every build (the
+# engine is often remote) and bake local state into the cached build layer.
+
+# VCS, CI and editor/agent state
+.git
+.github
+.claude
+.DS_Store
+
+# local build output and working notes
+bin/
+/pgb
+*.db
+.notes/
+
+# terraform: provider plugins (hundreds of MB) and state files, which hold
+# cluster endpoints and certificate data and are gitignored for that reason
+deploy/terraform/
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+
+# JS packages, docs and the GitHub Action are not part of either image
+**/node_modules/
+sdk/
+docs/
+site/
+action/
