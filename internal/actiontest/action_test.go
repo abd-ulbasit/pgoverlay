@@ -555,13 +555,33 @@ func TestDestroy(t *testing.T) {
 		}
 	})
 
-	t.Run("404 is success (already gone)", func(t *testing.T) {
+	t.Run("branchd 404 is success (already gone)", func(t *testing.T) {
 		s := newStub(t)
-		s.setDelete(func(w http.ResponseWriter) { w.WriteHeader(http.StatusNotFound) })
-		if out, _, err := run(t, script, map[string]string{
+		s.setDelete(func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":"not found"}` + "\n"))
+		})
+		out, _, err := run(t, script, map[string]string{
 			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t", "PGOVERLAY_BRANCH": "gone",
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatalf("destroy failed on 404: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "already gone") {
+			t.Errorf("output:\n%s", out)
+		}
+	})
+
+	// a 404 that is not branchd's JSON error (a wrong server URL, a proxy in
+	// front, an unmatched route) must not be reported as success
+	t.Run("non-branchd 404 fails", func(t *testing.T) {
+		s := newStub(t)
+		s.setDelete(func(w http.ResponseWriter) { http.Error(w, "404 page not found", http.StatusNotFound) })
+		if out, _, err := run(t, script, map[string]string{
+			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t", "PGOVERLAY_BRANCH": "b",
+		}); err == nil {
+			t.Fatalf("destroy succeeded on a plain-text 404:\n%s", out)
 		}
 	})
 
@@ -575,12 +595,48 @@ func TestDestroy(t *testing.T) {
 		}
 	})
 
-	t.Run("missing branch name fails", func(t *testing.T) {
+	// a raw git ref would hit a different route (DELETE /v1/branches/feat/login
+	// is a 404 from the mux) and used to print "already gone"
+	t.Run("a git ref is rejected before any request", func(t *testing.T) {
 		s := newStub(t)
+		out, _, err := run(t, script, map[string]string{
+			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t", "PGOVERLAY_BRANCH": "feat/login",
+		})
+		if err == nil {
+			t.Fatalf("destroy accepted feat/login:\n%s", out)
+		}
+		if !strings.Contains(out, "invalid branch name") {
+			t.Errorf("output:\n%s", out)
+		}
+		if n := s.requestCount(); n != 0 {
+			t.Errorf("%d requests sent for an invalid name", n)
+		}
+	})
+
+	// the create step sets `branch` as soon as a branch exists, so an empty
+	// name means it failed before creating one: nothing to clean up, and no
+	// second red step on top of the create failure
+	t.Run("empty branch name is a no-op with a warning", func(t *testing.T) {
+		s := newStub(t)
+		out, _, err := run(t, script, map[string]string{
+			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t", "PGOVERLAY_BRANCH": "",
+		})
+		if err != nil {
+			t.Fatalf("destroy failed without a branch name: %v\n%s", err, out)
+		}
+		if !strings.Contains(out, "::warning") {
+			t.Errorf("no warning annotation:\n%s", out)
+		}
+		if n := s.requestCount(); n != 0 {
+			t.Errorf("%d requests sent without a branch name", n)
+		}
+	})
+
+	t.Run("missing server fails", func(t *testing.T) {
 		if out, _, err := run(t, script, map[string]string{
-			"PGOVERLAY_SERVER": s.ts.URL, "PGOVERLAY_TOKEN": "t",
+			"PGOVERLAY_TOKEN": "t", "PGOVERLAY_BRANCH": "b",
 		}); err == nil {
-			t.Fatalf("destroy succeeded without a branch name:\n%s", out)
+			t.Fatalf("destroy succeeded without a server:\n%s", out)
 		}
 	})
 }
