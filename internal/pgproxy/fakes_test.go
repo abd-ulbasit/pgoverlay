@@ -98,3 +98,22 @@ func openSession(t *testing.T, conn net.Conn, branch string) *pgproto3.BackendKe
 		}
 	}
 }
+
+// slotFree reports whether the proxy accepts and serves a new connection:
+// an SSLRequest is answered 'N' instead of the connection being closed by a
+// full cap.
+func slotFree(addr string) bool {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	ssl := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 8), sslRequestCode)
+	if _, err := conn.Write(ssl); err != nil {
+		return false
+	}
+	var b [1]byte
+	_, err = io.ReadFull(conn, b[:])
+	return err == nil && b[0] == 'N'
+}

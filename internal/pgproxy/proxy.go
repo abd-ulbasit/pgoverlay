@@ -8,11 +8,13 @@ package pgproxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -131,8 +133,18 @@ func (p *Proxy) idleTimeout() time.Duration {
 
 func (p *Proxy) maxConns() int { return capOr(p.MaxConns, defaultMaxConns) }
 
+// Accept-retry backoff bounds, the same as net/http.Server's.
+const (
+	minAcceptBackoff = 5 * time.Millisecond
+	maxAcceptBackoff = time.Second
+)
+
 // Serve accepts connections until ctx is cancelled (which closes the
-// listener) or Accept fails. Each connection is handled in its own goroutine.
+// listener) or Accept fails with a non-temporary error. Temporary Accept
+// errors (EMFILE, ENFILE, ENOBUFS, ...) are retried with backoff, like
+// net/http, so running out of file descriptors under a connection flood does
+// not stop the router. A non-temporary error means the listener itself is
+// broken and is returned. Each connection is handled in its own goroutine.
 func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 	stop := context.AfterFunc(ctx, func() { lis.Close() })
 	defer stop()
@@ -143,14 +155,28 @@ func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 	if n := p.maxConns(); n > 0 {
 		sem = make(chan struct{}, n)
 	}
+	var backoff time.Duration
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil // graceful shutdown
 			}
-			return err
+			if !isTemporaryAcceptError(err) {
+				return err
+			}
+			backoff = min(max(2*backoff, minAcceptBackoff), maxAcceptBackoff)
+			slog.Warn("pgproxy: accept failed, retrying", "error", err, "backoff", backoff)
+			t := time.NewTimer(backoff)
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return nil
+			}
+			continue
 		}
+		backoff = 0
 		// Connection cap: acquire a slot before spawning the handler. If the
 		// cap is full, refuse fast (close the conn) rather than queueing — an
 		// unbounded backlog is itself the DoS we're guarding against.
@@ -170,6 +196,22 @@ func (p *Proxy) Serve(ctx context.Context, lis net.Listener) error {
 			p.handleConn(conn)
 		}()
 	}
+}
+
+// isTemporaryAcceptError reports whether an Accept error is worth retrying:
+// descriptor or buffer exhaustion, and anything whose Temporary method says
+// so.
+func isTemporaryAcceptError(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	for _, errno := range []error{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	var t interface{ Temporary() bool }
+	return errors.As(err, &t) && t.Temporary()
 }
 
 // handleConn drives the startup phase: answer SSLRequest ('S' + TLS upgrade
