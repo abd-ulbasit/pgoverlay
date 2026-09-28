@@ -145,7 +145,8 @@ func (e *Engine) csiQuiesceTarget(b *registry.Branch) (*registry.Branch, error) 
 // reset would remove the child's PVC first and then fail the clone, leaving
 // the child failed with its data gone. A live branch now carrying the
 // parent's name but created after the child is a different branch that
-// reuses the name (and so the PVC name), never the child's base.
+// reuses the name (and so the PVC name), never the child's base. The refusal
+// wraps ErrBaseGone.
 func (e *Engine) checkCSIChildBase(b *registry.Branch) error {
 	if !e.csi() || b.ParentBranchName == "" {
 		return nil
@@ -155,11 +156,16 @@ func (e *Engine) checkCSIChildBase(b *registry.Branch) error {
 		return err
 	}
 	if err != nil || p.RWVolume != b.SourceVolume || p.CreatedAt > b.CreatedAt {
-		return fmt.Errorf("branch %q was cloned from parent %q, which has been destroyed: its base volume %s is gone, so it can no longer be reset or diffed (the branch itself still works; destroy it and branch again to start over)",
-			b.Name, b.ParentBranchName, b.SourceVolume)
+		return fmt.Errorf("%w: branch %q was cloned from parent %q, which has been destroyed: its base volume %s is gone, so it can no longer be reset or diffed (the branch itself still works; destroy it and branch again to start over)",
+			ErrBaseGone, b.Name, b.ParentBranchName, b.SourceVolume)
 	}
 	return nil
 }
+
+// ErrBaseGone is returned by ResetBranch and DiffBranch for a csi branch
+// whose parent, and so its base volume, has been destroyed. The API maps it
+// to 409.
+var ErrBaseGone = errors.New("branch base is gone")
 
 // restartCSIBranch starts a stopped csi branch's pod back on its own PVC,
 // waits for readiness and records the new container/address. On failure the

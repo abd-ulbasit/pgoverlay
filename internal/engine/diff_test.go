@@ -902,11 +902,14 @@ func TestCSIChildOfDestroyedParentRefusesResetAndDiff(t *testing.T) {
 	}
 	clones := len(d.clones)
 
-	if _, err := e.DiffBranch(context.Background(), "pr-2"); err == nil || !strings.Contains(err.Error(), "destroyed") {
-		t.Fatalf("diff err = %v, want a refusal naming the destroyed parent", err)
+	// the same refusal with or without permission to quiesce the parent
+	for _, opts := range [][]DiffOption{nil, {WithParentQuiesce()}} {
+		if _, err := e.DiffBranch(context.Background(), "pr-2", opts...); !errors.Is(err, ErrBaseGone) || !strings.Contains(err.Error(), "destroyed") {
+			t.Fatalf("diff err = %v, want ErrBaseGone naming the destroyed parent", err)
+		}
 	}
-	if _, err := e.ResetBranch(context.Background(), "pr-2"); err == nil || !strings.Contains(err.Error(), "destroyed") {
-		t.Fatalf("reset err = %v, want a refusal naming the destroyed parent", err)
+	if _, err := e.ResetBranch(context.Background(), "pr-2"); !errors.Is(err, ErrBaseGone) || !strings.Contains(err.Error(), "destroyed") {
+		t.Fatalf("reset err = %v, want ErrBaseGone naming the destroyed parent", err)
 	}
 	if len(d.clones) != clones {
 		t.Fatalf("a clone was attempted: %v", d.clones[clones:])
@@ -941,11 +944,11 @@ func TestCSIChildRefusesResetWhenParentNameReused(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := e.ResetBranch(context.Background(), "pr-2"); err == nil || !strings.Contains(err.Error(), "destroyed") {
-		t.Fatalf("reset err = %v, want a refusal: the new pr-1 is not pr-2's base", err)
+	if _, err := e.ResetBranch(context.Background(), "pr-2"); !errors.Is(err, ErrBaseGone) || !strings.Contains(err.Error(), "destroyed") {
+		t.Fatalf("reset err = %v, want ErrBaseGone: the new pr-1 is not pr-2's base", err)
 	}
-	if _, err := e.DiffBranch(context.Background(), "pr-2"); err == nil {
-		t.Fatal("diff against a reused parent name succeeded")
+	if _, err := e.DiffBranch(context.Background(), "pr-2", WithParentQuiesce()); !errors.Is(err, ErrBaseGone) {
+		t.Fatalf("diff against a reused parent name: err = %v, want ErrBaseGone", err)
 	}
 	// the live parent path still works
 	if _, err := e.CreateBranchFrom(context.Background(), "pr-3", "pr-1", 0); err != nil {

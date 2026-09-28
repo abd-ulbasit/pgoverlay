@@ -91,3 +91,22 @@ func TestBranchDiffCSIChildNeedsOperator(t *testing.T) {
 		t.Fatalf("parent after the operator's diff: %+v", p)
 	}
 }
+
+// A csi child whose parent was destroyed can no longer be diffed or reset:
+// its base volume is gone. That is a state conflict (409) with the reason in
+// the body, not an opaque 500.
+func TestCSIChildOfDestroyedParentIsConflict(t *testing.T) {
+	ts, _ := newCSITestServer(t)
+	if code, body := do(t, ts, testToken, "DELETE", "/v1/branches/pr-1", nil); code != http.StatusNoContent {
+		t.Fatalf("destroy parent: code=%d body=%s", code, body)
+	}
+	for _, req := range []struct{ method, path string }{
+		{"GET", "/v1/branches/pr-2/diff"},
+		{"POST", "/v1/branches/pr-2/reset"},
+	} {
+		code, body := do(t, ts, testToken, req.method, req.path, nil)
+		if code != http.StatusConflict || !strings.Contains(string(body), "destroyed") {
+			t.Errorf("%s %s: code=%d body=%s, want 409 explaining the parent was destroyed", req.method, req.path, code, body)
+		}
+	}
+}

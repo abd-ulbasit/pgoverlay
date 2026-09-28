@@ -40,6 +40,8 @@ func writeEngineError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusBadRequest, msg)
 	case errors.Is(err, registry.ErrNotFound):
 		writeError(w, http.StatusNotFound, msg)
+	case errors.Is(err, engine.ErrBaseGone):
+		writeError(w, http.StatusConflict, msg)
 	case errors.Is(err, engine.ErrQuotaExceeded):
 		writeError(w, http.StatusForbidden, msg)
 	case strings.Contains(msg, "UNIQUE constraint"),
