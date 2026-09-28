@@ -230,6 +230,30 @@ func TestBranchSagaBoundedByStuckTimeout(t *testing.T) {
 	}
 }
 
+// GET .../diff provisions a throwaway instance and writes a registry row, so
+// it is operator-level (a read-only viewer token cannot spawn instances) and
+// leader-only (a follower must not write the registry).
+func TestDiffIsOperatorAndLeaderOnly(t *testing.T) {
+	ts, srv := newTestServerWithLeader(t)
+	addSource(t, ts)
+	if code, body := do(t, ts, testToken, "POST", "/v1/branches", CreateBranchRequest{Name: "pr-1", Source: "main"}); code != http.StatusCreated {
+		t.Fatalf("create: %d %s", code, body)
+	}
+	viewer := mintToken(t, ts, "ro", registry.RoleViewer)
+	operator := mintToken(t, ts, "ci", registry.RoleOperator)
+
+	if code, body := do(t, ts, viewer, "GET", "/v1/branches/pr-1/diff", nil); code != http.StatusForbidden {
+		t.Errorf("viewer diff = %d (%s), want 403", code, body)
+	}
+	if code, body := do(t, ts, operator, "GET", "/v1/branches/pr-1/diff", nil); code != http.StatusOK {
+		t.Errorf("operator diff = %d (%s), want 200", code, body)
+	}
+	srv.LeaderGate().Set(false)
+	if code, body := do(t, ts, operator, "GET", "/v1/branches/pr-1/diff", nil); code != http.StatusServiceUnavailable {
+		t.Errorf("operator diff on a follower = %d (%s), want 503", code, body)
+	}
+}
+
 // The gate reports every leadership change to its observers (the leader
 // gauge), plus the current value on registration.
 func TestLeaderGateObserve(t *testing.T) {

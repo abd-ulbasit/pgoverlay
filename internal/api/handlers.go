@@ -327,7 +327,9 @@ func (s *Server) branchUsage(w http.ResponseWriter, r *http.Request) {
 // unified schema diff plus per-table row-estimate deltas (engine.DiffResult).
 // This is a LONG request — the engine provisions a throwaway clone of the
 // branch's base and pg_dumps both instances, so expect ~5-10s of latency;
-// clients should use a generous timeout. 404 unknown branch, 409 not ready.
+// clients should use a generous timeout. Because it writes a registry row and
+// provisions an instance it is routed like a mutation: operator role, leader
+// only. 404 unknown branch, 409 not ready.
 func (s *Server) branchDiff(w http.ResponseWriter, r *http.Request) {
 	var opts []engine.DiffOption
 	// ?data=N turns on bounded data sampling (up to N branch-only rows per

@@ -162,8 +162,8 @@ const DefaultStuckTimeout = 10 * time.Minute
 
 func (s *Server) Handler() http.Handler {
 	// Per-route minimum role (admin > operator > viewer). Reads are viewer;
-	// branch lifecycle mutations and applying reconcile are operator; source
-	// and token management are admin. Every route requires at
+	// branch lifecycle mutations, diff and applying reconcile are operator;
+	// source and token management are admin. Every route requires at
 	// least viewer (a valid token); /healthz, /readyz and /metrics sit outside
 	// this mux unauthenticated.
 	admin, operator, viewer := registry.RoleAdmin, registry.RoleOperator, registry.RoleViewer
@@ -183,7 +183,10 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("GET /v1/branches", s.requireRole(viewer, s.listBranches))
 	v1.HandleFunc("GET /v1/branches/{name}", s.requireRole(viewer, s.getBranch))
 	v1.HandleFunc("GET /v1/branches/{name}/usage", s.requireRole(viewer, s.branchUsage))
-	v1.HandleFunc("GET /v1/branches/{name}/diff", s.requireRole(viewer, s.branchDiff))
+	// diff is a GET but not a read: it writes a throwaway registry row and
+	// provisions (then destroys) a full Postgres instance, so it is
+	// operator-level and leader-only like any other branch saga.
+	v1.HandleFunc("GET /v1/branches/{name}/diff", s.mutateBranch(operator, s.branchDiff))
 	v1.HandleFunc("GET /v1/branches/{name}/history", s.requireRole(viewer, s.branchHistory))
 	v1.HandleFunc("DELETE /v1/branches/{name}", s.mutateBranch(operator, s.destroyBranch))
 	v1.HandleFunc("POST /v1/branches/{name}/reset", s.mutateBranch(operator, s.resetBranch))
