@@ -261,6 +261,9 @@ func newConnectCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				if b.PasswordUnavailable {
+					return errPasswordUnavailable(b.Name, false)
+				}
 				u, err := url.Parse(c.BaseURL)
 				if err != nil {
 					return err
@@ -279,7 +282,7 @@ func newConnectCmd() *cobra.Command {
 				fmt.Fprintf(cmd.OutOrStdout(), "postgres://%s@%s:6432/%s\n", auth, serverHost, b.ProxyDatabase)
 				return nil
 			}
-			_, reg, err := open()
+			reg, err := openRegistry()
 			if err != nil {
 				return err
 			}
@@ -287,6 +290,9 @@ func newConnectCmd() *cobra.Command {
 			b, err := reg.GetBranchByName(args[0])
 			if err != nil {
 				return err
+			}
+			if b.PasswordUnavailable {
+				return errPasswordUnavailable(b.Name, true)
 			}
 			s, err := reg.GetSourceByID(b.SourceID)
 			if err != nil {
@@ -296,6 +302,18 @@ func newConnectCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// errPasswordUnavailable explains a branch whose rotated password cannot be
+// decrypted: printing a DSN without it would silently fall back to the
+// source's credentials, which the branch no longer accepts.
+func errPasswordUnavailable(name string, local bool) error {
+	where := "branchd's at-rest key changed since it was stored"
+	if local {
+		where = "local mode reads the key from $PGOVERLAY_SECRET_KEY, $PGOVERLAY_SECRET_KEY_FILE or <state dir>/secret.key"
+	}
+	return fmt.Errorf("branch %q has a rotated password that cannot be decrypted with the configured at-rest key (%s); "+
+		"reset it (pgb branch reset %s) to mint a new one", name, where, name)
 }
 
 // userInfo renders the DSN userinfo part: user, or user:password when the

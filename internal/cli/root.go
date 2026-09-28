@@ -5,7 +5,9 @@
 package cli
 
 import (
+	"fmt"
 	"os"
+	"os/user"
 
 	"github.com/spf13/cobra"
 
@@ -22,6 +24,13 @@ func NewRootCmd() *cobra.Command {
 		Short:         "pgoverlay — git branch for Postgres",
 		SilenceUsage:  true,
 		SilenceErrors: false,
+		// Local-mode commands call the engine/registry directly, so stamp the
+		// OS user as the audit actor; otherwise their transitions would be
+		// journaled as the daemon (system:reconcile). Server mode ignores it:
+		// branchd records the actor behind the bearer token.
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			cmd.SetContext(registry.WithActor(cmd.Context(), localActor()))
+		},
 	}
 	root.PersistentFlags().String("server", os.Getenv("PGOVERLAY_SERVER"),
 		"branchd base URL (http:// or https://, e.g. http://localhost:7070); enables server mode [env PGOVERLAY_SERVER, token from PGOVERLAY_TOKEN; PGOVERLAY_TLS_SKIP_VERIFY=1 for self-signed certs]")
@@ -47,10 +56,47 @@ func openRegistry() (*registry.Registry, error) {
 	if err != nil {
 		return nil, err
 	}
+	return openRegistryAt(cfg)
+}
+
+// openRegistryAt opens the registry under cfg's state dir with the same
+// at-rest keys branchd uses, so local mode can read passwords a branchd on this
+// state dir stored: the dedicated key ($PGOVERLAY_SECRET_KEY, else
+// $PGOVERLAY_SECRET_KEY_FILE, else <state dir>/secret.key; never generated
+// here) plus sha256($PGOVERLAY_TOKEN) for legacy rows. A key that cannot be
+// loaded is a warning, not an error: only rotated passwords need it, and they
+// then read as unavailable.
+func openRegistryAt(cfg *config.Config) (*registry.Registry, error) {
 	if err := cfg.EnsureHome(); err != nil {
 		return nil, err
 	}
-	return registry.Open(cfg.RegistryPath)
+	reg, err := registry.Open(cfg.RegistryPath)
+	if err != nil {
+		return nil, err
+	}
+	key, _, err := cfg.LoadSecretKey(os.Getenv(config.SecretKeyFileEnv), false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v (rotated branch passwords will read as unavailable)\n", err)
+		key = nil
+	}
+	if err := reg.SetSecretKeys(registry.SecretKeys{
+		Primary: key,
+		Legacy:  [][]byte{registry.LegacyTokenKey(os.Getenv("PGOVERLAY_TOKEN"))},
+	}); err != nil {
+		reg.Close()
+		return nil, err
+	}
+	return reg, nil
+}
+
+// localActor is the audit identity recorded for mutations made in local mode
+// (direct registry access, no API token): "local:<os user>".
+func localActor() registry.Actor {
+	name := os.Getenv("USER")
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		name = u.Username
+	}
+	return registry.LocalActor(name)
 }
 
 // open builds the engine; callers must Close the returned registry.
@@ -59,10 +105,7 @@ func open() (*engine.Engine, *registry.Registry, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := cfg.EnsureHome(); err != nil {
-		return nil, nil, err
-	}
-	reg, err := registry.Open(cfg.RegistryPath)
+	reg, err := openRegistryAt(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
