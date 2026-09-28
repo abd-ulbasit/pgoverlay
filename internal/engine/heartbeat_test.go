@@ -27,11 +27,11 @@ func (d *slowMaskDriver) Exec(ctx context.Context, id string, cmd []string) erro
 // must not get the branch (or, in a freeze, its parent) failed by reconcile
 // while the saga is alive — the saga's heartbeat keeps both rows fresh.
 //
-// Registry timestamps compare at one-second granularity against the cutoff,
-// so the "slow" script sleeps 2.1s against a 1s stuck timeout.
+// The "slow" script sleeps 600ms against a 300ms stuck timeout, with a 50ms
+// heartbeat.
 func TestHeartbeatKeepsSlowSagaAliveAcrossReconcile(t *testing.T) {
 	if testing.Short() {
-		t.Skip("sleeps ~4s")
+		t.Skip("sleeps ~1s")
 	}
 	for _, tc := range []struct {
 		name   string
@@ -67,9 +67,9 @@ func TestHeartbeatKeepsSlowSagaAliveAcrossReconcile(t *testing.T) {
 						return
 					}
 				}
-				time.Sleep(2100 * time.Millisecond)
+				time.Sleep(600 * time.Millisecond)
 				var err error
-				taken, err = e.ApplyReconcile(context.Background(), time.Now(), time.Second)
+				taken, err = e.ApplyReconcile(context.Background(), time.Now(), 300*time.Millisecond)
 				if err != nil {
 					t.Errorf("reconcile: %v", err)
 				}

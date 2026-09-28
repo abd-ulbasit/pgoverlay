@@ -946,7 +946,7 @@ func (r *Registry) ListExpiredBranches(now string) ([]*Branch, error) {
 // a branch that legitimately takes a while to provision keeps bumping it.
 func (r *Registry) ListStuckBranches(before string) ([]*Branch, error) {
 	rows, err := r.db.Query(`SELECT `+branchCols+` FROM branches
-		WHERE state IN ('creating','resetting') AND updated_at < ? ORDER BY created_at`, before)
+		WHERE state IN ('creating','resetting') AND updated_at < ? ORDER BY created_at`, msCutoff(before))
 	if err != nil {
 		return nil, err
 	}
@@ -969,7 +969,20 @@ func (r *Registry) ListStuckBranches(before string) ([]*Branch, error) {
 // retry them; every failed attempt bumps updated_at (NoteBranchCtx), so the
 // retries back off by the cutoff's age.
 func (r *Registry) ListDestroyingBranches(before string) ([]*Branch, error) {
-	return r.listBranches(`state='destroying' AND updated_at < ?`, before)
+	return r.listBranches(`state='destroying' AND updated_at < ?`, msCutoff(before))
+}
+
+// msCutoff renders an RFC3339 cutoff in the millisecond form updated_at is
+// stored in (strftime '%Y-%m-%dT%H:%M:%fZ'). The two are compared as text,
+// and a whole-second cutoff "…T15:04:05Z" sorts after every timestamp inside
+// that second ('.' < 'Z'), so rows touched up to a second after the cutoff
+// counted as older than it. Unparseable input is passed through unchanged.
+func msCutoff(before string) string {
+	t, err := time.Parse(time.RFC3339Nano, before)
+	if err != nil {
+		return before
+	}
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
 // VolumeNameUsed reports whether any registry row has ever used volume: as a
