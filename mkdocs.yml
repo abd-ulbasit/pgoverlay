@@ -28,6 +28,7 @@ nav:
       - REST API: api.md
       - Troubleshooting: troubleshooting.md
       - Upgrading to v1.0: upgrading.md
+      - Changelog: https://github.com/abd-ulbasit/pgoverlay/blob/main/CHANGELOG.md
   - How it works:
       - Core concepts: concepts.md
       - Architecture: architecture.md

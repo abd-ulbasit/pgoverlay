@@ -1,0 +1,79 @@
+# libc (and liburing) functions the lazyrw shim must see when Postgres calls
+# them: hack/pg-import-audit.sh fails when the postgres binary of a supported
+# image imports one that the shim neither interposes nor allowlists
+# (allow.txt). One symbol per line; version suffixes are ignored.
+
+# Opening: a relation file opened through an entry point the shim misses is
+# copied up on open, as without the shim.
+open
+open64
+openat
+openat64
+__open_2
+__open64_2
+__openat_2
+__openat64_2
+
+# Writing file data through an fd.
+write
+pwrite
+pwrite64
+writev
+pwritev
+pwritev64
+pwritev2
+pwritev64v2
+
+# Changing a file's size or allocation.
+ftruncate
+ftruncate64
+truncate
+truncate64
+fallocate
+fallocate64
+posix_fallocate
+posix_fallocate64
+
+# Copying into an fd inside the kernel.
+copy_file_range
+sendfile
+sendfile64
+splice
+tee
+vmsplice
+
+# Writable mappings.
+mmap
+mmap64
+mprotect
+pkey_mprotect
+mremap
+
+# Asynchronous and batched I/O, which reaches the kernel without the shim.
+aio_write
+aio_write64
+lio_listio
+lio_listio64
+io_submit
+io_uring_submit
+io_uring_submit_and_wait
+io_uring_submit_and_wait_timeout
+io_uring_submit_and_get_events
+io_uring_enter
+io_uring_enter2
+
+# fd bookkeeping: a duplicate the shim does not track fails its writes with
+# EBADF; a close it does not see leaves a stale slot (guarded, see H2).
+close
+close_range
+closefrom
+dup
+dup2
+dup3
+fcntl
+fcntl64
+
+# Wrapping an fd in stdio or calling the kernel directly bypasses the shim.
+fdopen
+syscall
+ioctl

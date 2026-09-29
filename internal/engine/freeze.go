@@ -197,6 +197,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err := e.waitReady(ctx, parentCID, 90*time.Second); err != nil {
 		return fail(fmt.Errorf("parent %q never became ready after freeze: %w", parent.Name, err))
 	}
+	e.observeCowMode(ctx, parent, parentCID)
 	// freeze checkpoint: the parent is back up. Bump both rows' stuck-timer so a
 	// slow child start below does not make either look abandoned to reconcile.
 	e.logCompensationErr("transition", "freeze: touch parent stuck-timer", e.reg.TouchBranch(parent.ID),
@@ -228,6 +229,7 @@ func (e *Engine) freezeAndProvision(ctx context.Context, child, parent *registry
 	if err := e.waitReady(ctx, childCID, 90*time.Second); err != nil {
 		return fail(fmt.Errorf("instance never became ready: %w", err))
 	}
+	e.observeCowMode(ctx, child, childCID)
 	// masking runs on every branch create; the data lineage is already
 	// masked (the parent was), so scripts see their own prior output —
 	// the documented contract is that mask scripts are idempotent

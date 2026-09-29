@@ -1,0 +1,155 @@
+name: bench-cow
+
+# The copy-on-write (#49) pgbench benchmark, hack/bench-cow.sh, on a
+# GitHub-hosted runner: a fresh VM that runs nothing else, which is what the
+# release gate needs ("select-only within noise of eager/plain; warm TPC-B
+# within 5% of eager"). A shared host cannot decide the write half: its
+# run-to-run spread is larger than 5%.
+#
+# Manual runs take the knobs as inputs. A push to a bench/** branch runs it
+# with the defaults, which is how to benchmark a branch before this file is on
+# the default branch (workflow_dispatch only sees workflows there).
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: interleaved rounds (each runs every configuration once)
+        type: number
+        default: 5
+      duration:
+        description: seconds per pgbench run
+        type: number
+        default: 60
+      scale:
+        description: pgbench scale (15 MiB per unit)
+        type: number
+        default: 50
+  push:
+    branches: ["bench/**"]
+
+# Least privilege: the job reads the repository and uploads an artifact.
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-cow-${{ github.ref }}
+  cancel-in-progress: false
+
+# Third-party actions are pinned to commit SHAs, as in ci.yml.
+jobs:
+  bench:
+    name: bench (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # A plain, B eager, C shim on Docker's ext4 volumes, D shim with
+          # --volume-root on an XFS reflink=1 loop filesystem.
+          - arch: amd64
+            runner: ubuntu-24.04
+            configs: A B C D
+          # arm64 (Apple Silicon Docker Desktop, Colima and OrbStack run arm64
+          # images): the shim's aarch64 build against plain and eager.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            configs: A B C
+    env:
+      BENCH_ROUNDS: ${{ inputs.rounds || '5' }}
+      BENCH_DURATION: ${{ inputs.duration || '60' }}
+      BENCH_SCALE: ${{ inputs.scale || '50' }}
+      BENCH_CONFIGS: ${{ matrix.configs }}
+      ARCH: ${{ matrix.arch }}
+      RUNNER_LABEL: ${{ matrix.runner }}
+      OUT_DIR: ${{ github.workspace }}/bench-out
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: check the knobs
+        run: |
+          for v in "$BENCH_ROUNDS" "$BENCH_DURATION" "$BENCH_SCALE"; do
+            [[ "$v" =~ ^[1-9][0-9]*$ ]] || { echo "not a positive integer: '$v'" >&2; exit 1; }
+          done
+      - name: pre-pull postgres and the helper images
+        run: |
+          # UtilityImage is the digest-pinned alpine the engine's helpers run.
+          utility=$(sed -nE 's/^const UtilityImage = "([^"]+)"/\1/p' internal/runtime/helper_image.go)
+          [ -n "$utility" ] || { echo "UtilityImage not found" >&2; exit 1; }
+          for img in postgres:17 alpine:3.21 "$utility"; do docker pull -q "$img"; done
+      - name: build pgb and branchd
+        run: make build
+      - name: XFS reflink=1 volume root for D (a loop filesystem on the runner's disk)
+        if: contains(matrix.configs, 'D')
+        run: |
+          command -v mkfs.xfs >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq xfsprogs; }
+          # The image lives on the filesystem that holds Docker's volumes, so
+          # D and A/B/C share the same disk. Sparse: it only takes what D
+          # writes. Direct I/O on the loop device keeps a second page cache out
+          # of the numbers.
+          docker_root=$(docker info -f '{{.DockerRootDir}}')
+          img="$(dirname "$docker_root")/pgoverlay-bench-xfs.img"
+          sudo truncate -s 24G "$img"
+          dev=$(sudo losetup -f --show --direct-io=on "$img")
+          sudo mkfs.xfs -q -m reflink=1 "$dev"
+          sudo mkdir -p /srv/pgoverlay-xfs
+          sudo mount "$dev" /srv/pgoverlay-xfs
+          sudo chown "$(id -u):$(id -g)" /srv/pgoverlay-xfs
+          xfs_info /srv/pgoverlay-xfs | grep -o 'reflink=[01]'
+          echo "BENCH_VOLUME_ROOT=/srv/pgoverlay-xfs/vr" >>"$GITHUB_ENV"
+          echo "XFS_IMAGE=$img ($dev)" >>"$GITHUB_ENV"
+      - name: record the host
+        run: |
+          mkdir -p "$OUT_DIR"
+          {
+            echo "runner: $RUNNER_LABEL ($RUNNER_NAME); commit: $GITHUB_SHA"
+            echo "kernel: $(uname -srm)"
+            echo "cpu: $(nproc) x $(lscpu | sed -nE 's/^Model name: *//p' | head -1)"
+            echo "memory: $(free -m | awk '/^Mem:/{print $2" MiB total, "$7" MiB available"}')"
+            echo "loadavg: $(cat /proc/loadavg)"
+            echo "docker: $(docker version -f '{{.Server.Version}}'), storage driver $(docker info -f '{{.Driver}}'), root $(docker info -f '{{.DockerRootDir}}')"
+            echo "docker root filesystem: $(df -hT "$(docker info -f '{{.DockerRootDir}}')" | tail -1)"
+            echo "disks:"; lsblk -d -o NAME,ROTA,SIZE,MODEL | sed 's/^/  /'
+            if [ -n "${BENCH_VOLUME_ROOT:-}" ]; then
+              echo "D volume root: $BENCH_VOLUME_ROOT on $XFS_IMAGE, $(xfs_info /srv/pgoverlay-xfs | grep -o 'reflink=[01]')"
+            fi
+            echo "knobs: rounds=$BENCH_ROUNDS duration=${BENCH_DURATION}s scale=$BENCH_SCALE configs='$BENCH_CONFIGS'"
+          } | tee "$OUT_DIR/host.txt"
+      - name: hack/bench-cow.sh
+        run: |
+          set -o pipefail
+          BENCH_OUT="$OUT_DIR/results.md" BENCH_JSON="$OUT_DIR/results.jsonl" \
+            hack/bench-cow.sh 2>&1 | tee "$OUT_DIR/bench.log"
+          echo "loadavg after: $(cat /proc/loadavg)" | tee -a "$OUT_DIR/host.txt"
+      - name: job summary
+        if: always()
+        run: |
+          {
+            echo "## bench-cow ($ARCH)"
+            echo
+            echo '```'
+            cat "$OUT_DIR/host.txt" 2>/dev/null
+            echo '```'
+            echo
+            cat "$OUT_DIR/results.md" 2>/dev/null || echo "no results.md: see the bench step's log"
+            echo
+            echo "<details><summary>raw per-run JSON</summary>"
+            echo
+            echo '```'
+            cat "$OUT_DIR/results.jsonl.meta" "$OUT_DIR/results.jsonl" 2>/dev/null
+            echo '```'
+            echo "</details>"
+          } >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: bench-cow-${{ matrix.arch }}
+          path: bench-out/
+          if-no-files-found: warn

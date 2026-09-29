@@ -106,6 +106,9 @@ success and `1` on any error.
 | `PGOVERLAY_HOME` | local mode | state directory (default `~/.pgoverlay`) |
 | `PGOVERLAY_SECRET_KEY`, `PGOVERLAY_SECRET_KEY_FILE`, `PGOVERLAY_SECRET_KEY_PREVIOUS` | local mode | the at-rest key, read the same way branchd reads it, to decrypt rotated passwords; `pgb` never generates a key |
 | `PGOVERLAY_SEED_SSLMODE` | local mode | `sslmode` of seed connections (default `prefer`) |
+| `PGOVERLAY_LAZYRW`, `PGOVERLAY_WAL_RECYCLE` | local mode | `on` or `off`, as branchd's `--lazyrw` and `--wal-recycle`: how the branches `pgb` starts copy files up (default `on` for both) |
+| `PGOVERLAY_SEED_SETTLE` | local mode | how `source add` and `source refresh` settle a new seed: `freeze` (default), `recover` or `off`; see [`--seed-settle`](#seed-settle) |
+| `PGOVERLAY_VOLUME_ROOT` | local mode | directory on the Docker host to create volumes under, as branchd's `--volume-root`; use the same value as a branchd sharing the state directory |
 | `PGPASSWORD` | `source add`, `source refresh` | the source password, unless `--password-env` names another variable |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` | local mode | the Docker endpoint, resolved like the `docker` CLI does, including a context's TLS material. `ssh://` endpoints are not supported: run branchd on the Docker host and use `--server`, or forward the socket (`ssh -NL /tmp/pgoverlay-docker.sock:/var/run/docker.sock HOST` and `DOCKER_HOST=unix:///tmp/pgoverlay-docker.sock`). Branch ports are published on the Docker host's `127.0.0.1`, so direct connection strings only work on that host |
 
@@ -141,7 +144,12 @@ state. A second signal exits immediately.
 | `--default-ttl` | `0` (none) | `PGOVERLAY_DEFAULT_TTL` | TTL for branches created without one |
 | `--max-ttl` | `0` (none) | `PGOVERLAY_MAX_TTL` | upper bound on any requested TTL; longer ones are capped |
 | `--max-layer-depth` | `100` | `PGOVERLAY_MAX_LAYER_DEPTH` | overlay backend: cap on a branch's frozen layer chain; branching from a branch at the cap returns `403` (see [Troubleshooting](troubleshooting.md#layer-chains-and-max-layer-depth)) |
+| `--lazyrw` | `on` | `PGOVERLAY_LAZYRW` | overlay backend: `on` preloads the lazyrw shim into branch Postgres, so a table file is copied into the branch on its first write, not when it is read; a branch whose kernel (below 4.19) or image cannot use it copies on open and says so ([Troubleshooting](troubleshooting.md#a-branch-copies-eagerly)); `off` always copies on open. Branches pick a change up when they next start; see [below](#copy-on-first-write-lazyrw) |
+| `--wal-recycle` | `on` | `PGOVERLAY_WAL_RECYCLE` | overlay backend, experimental: `off` starts branch Postgres with `wal_recycle=off`, so a checkpoint removes a WAL segment that came from the seed instead of copying it up to rename it. A settled seed keeps a single segment, which the branch's first WAL write has already copied up, so measured on ext4 `off` saves no copy-up; it only keeps fewer recycled segments (16-32 MiB less after 45 MiB of WAL) at the cost of zero-filling every new one |
+| `--seed-settle` | `freeze` | `PGOVERLAY_SEED_SETTLE` | how a new seed (source add or refresh) is prepared before branches start from it: `freeze`, `recover` or `off`; see [below](#seed-settle) |
 | `--disk-root` | see [Observability](observability.md#metrics) | | path whose filesystem the `pgoverlay_disk_bytes_*` gauges measure |
+| `--volume-root` | | `PGOVERLAY_VOLUME_ROOT` | docker runtime, overlay backend: create every pgoverlay volume as a local bind volume over `<dir>/<volume>` on the Docker host instead of in Docker's own volume store; see [the volume root](#the-volume-root) |
+| `--xfs-cowextsize` | `16k` | | overlay backend: when copy-up clones on XFS, the copy-on-write extent size hint set on the volume root (`--volume-root`, or `--kube-data-root`); `0` leaves the filesystem default (128 KiB) |
 | `--runtime` | `docker` | | `docker` or `kube` |
 | `--cow` | `overlay` | | copy-on-write backend: `overlay`, `zfs` ([experimental](zfs.md)) or `csi` (forced by `--kube-storage csi`) |
 | `--zfs-dataset` | | | dataset prefix pgoverlay owns, e.g. `tank/pgoverlay` (required with `--cow zfs`) |
@@ -165,8 +173,9 @@ as abandoned:
 - a `creating` or `resetting` branch, or a `seeding` source, that has made no
   progress for this long is failed. Running operations heartbeat their rows
   every `min(stuck-timeout / 4, 30s)`, so a slow but live operation (a long
-  masking script, a large first recovery) is never failed by reconcile; the
-  timeout bounds time without progress, not total time;
+  masking script, a large first recovery, a seed whose
+  [settle](#seed-settle) VACUUMs a large database) is never failed by
+  reconcile; the timeout bounds time without progress, not total time;
 - a branch stuck in `destroying` for this long is retried;
 - volumes younger than this are never garbage-collected, and finished helper
   containers older than this are removed.
@@ -177,7 +186,151 @@ rolled back (`504`) if it runs longer than `--stuck-timeout` in total. The
 legitimately that slow (a long masking script is the usual case), raise
 `--stuck-timeout` (Helm value `stuckTimeout`) above its run time; there is no
 environment variable for it. Operations `pgb` runs in local mode have no such
-bound.
+bound, and neither do `source add` and `source refresh` through the API,
+settle included: they only heartbeat.
+
+#### Copy on first write (lazyrw)
+
+On the overlay backend (Docker and Kubernetes hostpath) every branch's
+Postgres runs with the lazyrw shim preloaded: it opens table and
+transaction-status files read-only and reopens a file read-write on its
+first write, so a read copies nothing into the branch and a write copies
+the file it touches once ([how it works](concepts.md#copy-on-first-write-the-lazyrw-shim)).
+
+- `--lazyrw=on` (default; `PGOVERLAY_LAZYRW`, Helm `cow.lazyrw: true`): each
+  branch checks at start that its kernel re-targets read-only files after a
+  copy-up (Linux 4.19 and later) and that the build for its image's libc and
+  architecture loads into its `postgres`, and uses the shim only then; on
+  PG 18 and later it also pins `io_method=worker`. Otherwise the branch
+  copies on open, as with `off`, and logs a warning.
+- `--lazyrw=off`: branches copy every relation file Postgres opens, reads
+  included.
+- A change reaches a branch when it next starts: a reset, a recover, or a
+  restart by reconcile. The setting is passed in the branch's environment
+  (`PGOVERLAY_LAZYRW`), so no reinstall is needed. `pgb` in local mode reads
+  `PGOVERLAY_LAZYRW` too.
+- What each branch runs in is in `/pgoverlay/rw/cow-mode` inside it (`lazyrw`,
+  `eager` or `off`, then a detail line), in branchd's log when the branch
+  becomes ready, and in the `pgoverlay_branch_cow_mode{mode}` gauge
+  ([Observability](observability.md#metrics)). Branches created by a release
+  before v1.0.0 count as `eager` until they are reset
+  ([Upgrading](upgrading.md#copy-on-write)).
+- The zfs and csi backends ignore it: their clones copy blocks.
+
+`--wal-recycle=off` (experimental, `PGOVERLAY_WAL_RECYCLE`) starts overlay
+branches with `wal_recycle=off`: a checkpoint then removes a WAL segment that
+came from the seed instead of renaming it, which on OverlayFS copies it up
+first.
+
+#### Seed settle
+
+A `pg_basebackup` copy is an online backup: every branch started from it
+would replay the WAL streamed during the backup, and its pages carry the
+source's unset hint bits, dead tuples and unfrozen transaction ids, so reads
+in a branch write (hint bits, pruning, anti-wraparound autovacuum) and, on the
+overlay backend, copy the touched files into the branch. `--seed-settle` does
+that work once, in the seed:
+
+- `freeze` (default): start the seed once in a helper on the branch image,
+  which completes the backup's recovery; run `VACUUM (FREEZE, ANALYZE)` on
+  every database, then `VACUUM (FREEZE)` of `pg_statistic` and
+  `pg_statistic_ext_data` in each of them again (the ANALYZE writes their
+  rows after they were vacuumed, and the first query planned in a branch
+  would otherwise set hint bits on them and copy the catalog up);
+  `CHECKPOINT`; switch to a fresh WAL segment; stop it cleanly.
+- `recover`: the same without the VACUUMs. Branches start without WAL replay,
+  but reads may still set hint bits.
+- `off`: leave the seed as `pg_basebackup` wrote it.
+
+After the clean stop (`freeze` and `recover`) the WAL segment holding the
+shutdown checkpoint keeps its first pages and the zero-filled rest becomes a
+hole, byte for byte the same file, and the unused segments after it are
+removed. A branch appends its WAL to that segment, so on the overlay backend
+its first WAL write copies a few KiB instead of the whole 16 MiB segment
+(measured on ext4: about 1 MiB allocated instead of 16 MiB, and a first
+write of 12-27 ms instead of 46-119 ms). Branch usage counts apparent bytes
+(`du -sb`), so it still shows the segment at 16 MiB.
+
+`--via dump` seeds end with a clean shutdown anyway; with `freeze` their
+helper runs the VACUUMs first, and unless `off` it trims the WAL the same way.
+The source is never touched. The settle server listens on a private socket
+only and ignores the parts of the source's configuration that cannot start in
+a throwaway container; see [Troubleshooting](troubleshooting.md#seeding) for
+what can still fail it.
+
+Seeding writes the cluster as the image's own `postgres` user, looked up in
+the image first (`id -u postgres`): 999:999 in the Debian images, 70:70 in the
+Alpine ones. An image without a `postgres` user cannot be seeded.
+
+#### Copy-up mode
+
+On the overlay backend branchd probes, once at startup and in the
+background, what an OverlayFS copy-up costs on the filesystem that holds the
+volumes: it copies a 64 MiB file up through an overlay across two temporary
+volumes, in a helper with the privileges a branch container already has
+(`CAP_SYS_ADMIN`). The result is logged (`copy-up probe: mode=clone fs=xfs
+...`) and exported as `pgoverlay_cow_copyup_mode`:
+
+- `clone`: the filesystem reflinks (XFS with `reflink=1`, btrfs). Copy-up
+  clones extents in milliseconds, and the copy shares every block with the
+  source until one is rewritten, which is block-level copy-on-write. Branch
+  usage is counted as the bytes the branch owns alone (a small static tool,
+  `pgoverlay-du`, reads the extent map), because `du` would count a cloned
+  1 GiB segment with one changed page as 1 GiB.
+- `copy`: copy-up copies data (ext4, XFS without reflink, most others);
+  usage is `du -sb`.
+- `unknown`: not probed yet, or the probe failed; usage is `du -sb`.
+
+The mode changes what a branch's first write to a file costs, not whether
+reads copy (they do not, with `--lazyrw=on`): a copy of up to 1 GiB in
+`copy` mode, an extent clone and then the rewritten blocks in `clone` mode.
+`pgb` in local mode does not probe, so `pgb branch ls --usage` there is
+always `du -sb`, which over-counts on a filesystem that clones.
+
+On XFS, branchd also sets a copy-on-write extent size hint
+(`--xfs-cowextsize`, 16 KiB) on the volume root, so the first write to a
+cloned block copies 16 KiB rather than 128 KiB. Volumes created afterwards
+inherit it. Docker's own volume directories are never touched, so the hint
+needs `--volume-root` on the docker runtime.
+
+#### The volume root
+
+By default the docker runtime keeps pgoverlay's volumes in Docker's volume
+store (`/var/lib/docker/volumes`), on whatever filesystem that is: usually
+ext4, where copy-up copies. `--volume-root DIR` (or `PGOVERLAY_VOLUME_ROOT`)
+creates every volume instead as a local-driver bind volume over `DIR/<volume>`
+(`type=none,o=bind,device=DIR/<volume>`): source generations, writable
+layers, frozen layers and diff throwaways alike. Point it at a directory on an
+XFS (`reflink=1`) or btrfs disk and branches get block-level copy-on-write
+without moving Docker. Volumes are still named volumes, mounted, listed and
+labelled by name; `docker volume ls` shows them.
+
+- `DIR` is a path on the Docker host, which is not this machine when
+  `DOCKER_HOST` points elsewhere (it is inside the VM for Docker Desktop,
+  Colima and OrbStack). It must exist; branchd checks it at startup and never
+  creates it, so a disk that failed to mount cannot turn into a directory on
+  the root filesystem.
+- pgoverlay creates and deletes the directories itself, in helper containers
+  that mount `DIR`, and records each volume's labels in
+  `DIR/<volume>/.pgoverlay-labels.json`. Removing a volume deletes its
+  directory. A directory whose volume is gone (a removal cut short, or a
+  `docker volume rm`) is found and deleted by reconcile.
+- Set the same value for `pgb` in local mode (`PGOVERLAY_VOLUME_ROOT`); both
+  share the registry and the volumes.
+- Changing or dropping it later is safe: existing volumes stay where they
+  were created, keep working, and are removed from there.
+- On SELinux-enforcing hosts (RHEL, Fedora) containers may only use
+  directories labelled for them: `chcon -Rt container_file_t DIR`, or a
+  matching `semanage fcontext` rule.
+- Keep `DIR` on one filesystem: an extent clone cannot cross filesystems, so
+  copy-up between two of them copies. Across subvolumes of one btrfs
+  filesystem copy-up still clones (measured on Linux 7.0), but keep the
+  volume directories themselves plain directories, as pgoverlay creates them:
+  in the #49 evaluation, a branch whose overlay lower and upper sat in
+  different btrfs subvolumes did not start (the image entrypoint's `find`
+  reported `File system loop detected`).
+- Every volume create and remove runs one short helper container (about a
+  second on a busy host), in addition to what the operation already does.
 
 #### The at-rest key
 
@@ -201,7 +354,7 @@ previous key automatically. Back the key up with the registry. Details in
 | `PGOVERLAY_SECRET_KEY` | the at-rest key itself; wins over the key file |
 | `PGOVERLAY_SECRET_KEY_PREVIOUS` | retired keys, comma-separated, decrypt-only |
 | `PGOVERLAY_SEED_SSLMODE` | `sslmode` of seed connections: `disable`, `allow`, `prefer` (default), `require`, `verify-ca` or `verify-full` |
-| `PGOVERLAY_MAX_BRANCHES`, `PGOVERLAY_DEFAULT_TTL`, `PGOVERLAY_MAX_TTL`, `PGOVERLAY_MAX_LAYER_DEPTH`, `PGOVERLAY_SHUTDOWN_TIMEOUT`, `PGOVERLAY_SECRET_KEY_FILE` | defaults for the flags above |
+| `PGOVERLAY_MAX_BRANCHES`, `PGOVERLAY_DEFAULT_TTL`, `PGOVERLAY_MAX_TTL`, `PGOVERLAY_MAX_LAYER_DEPTH`, `PGOVERLAY_SHUTDOWN_TIMEOUT`, `PGOVERLAY_SECRET_KEY_FILE`, `PGOVERLAY_LAZYRW`, `PGOVERLAY_WAL_RECYCLE`, `PGOVERLAY_SEED_SETTLE`, `PGOVERLAY_VOLUME_ROOT` | defaults for the flags above |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` | Docker endpoint (docker runtime), as for `pgb` |
 | `POD_NAMESPACE`, `POD_NAME`, `PGOVERLAY_POD_NAME`, `PGOVERLAY_POD_UID` | set by the Helm chart: the namespace, the leader-election identity (and leader label), and the pod that owns helper pods |
 
@@ -211,9 +364,12 @@ The chart's [`values.yaml`](https://github.com/abd-ulbasit/pgoverlay/blob/main/d
 documents every value; [Kubernetes](kubernetes.md) explains the ones that
 matter. The chart maps these to branchd flags: `reconcileInterval`,
 `stuckTimeout`, `shutdownTimeout` (seconds; the pod's grace period is this
-plus 30), `rotateBranchCredentials`, `helperImage`, `dataRoot`, `node`,
+plus 30), `rotateBranchCredentials`, `cow.lazyrw` (`--lazyrw`, `true` or
+`false`), `seedSettle`, `helperImage`, `dataRoot`, `node`,
 `storage.*`, `proxy.tls.certSecret`, `replicaCount` and
 `leaderElection.enabled`. It does not yet expose `--max-branches`,
 `--default-ttl`, `--max-ttl`, `--max-layer-depth`, `--advertise-proxy-addr`,
-`--api-tls-*` or a way to inject `PGOVERLAY_SECRET_KEY`; the at-rest key is
-generated on the state volume.
+`--api-tls-*`, `--xfs-cowextsize`, `--wal-recycle` or a way to inject
+`PGOVERLAY_SECRET_KEY`; the at-rest key is generated on the state volume.
+`dataRoot` is `--kube-data-root`: put it on XFS (`reflink=1`) or btrfs for
+clone copy-up (`--volume-root` is docker-only).

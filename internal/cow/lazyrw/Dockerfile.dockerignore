@@ -1,0 +1,7 @@
+# Build context for internal/cow/lazyrw/Dockerfile is internal/cow. Only the C
+# sources go in, so nothing else (the committed dist/ included) can reach the
+# build or its cache key.
+*
+!lazyrw/lazyrw.c
+!lazyrw/test/lazyrw_test.c
+!usage/pgoverlay-du.c

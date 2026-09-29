@@ -73,6 +73,10 @@ tests, both JavaScript SDK suites, both image builds, and the Kubernetes suites
 on kind. A weekly scheduled run repeats the vulnerability scan and runs the
 Postgres 14 to 18 version matrix. You can reproduce every job locally with the
 Makefile target it calls.
+[`.github/workflows/bench-cow.yml`](.github/workflows/bench-cow.yml) runs the
+copy-on-write pgbench benchmark (`hack/bench-cow.sh`) on GitHub-hosted amd64
+and arm64 runners; start it from the Actions tab or by pushing a branch named
+`bench/<anything>` (see [docs/benchmarks.md](docs/benchmarks.md#running-it)).
 
 ## Commit style
 
