@@ -238,20 +238,26 @@ The Go code is a control plane only: a SQLite registry with a journaled state ma
 
 ## How it compares
 
-All of these give you production-shaped databases faster than a full copy. They differ in what they ask you to run.
+All of these give you production-shaped databases faster than a full copy. They differ in what you have to run, where the branches live, and whether the data follows the source.
 
 | | What it needs | A branch is | Notes |
 |---|---|---|---|
-| **pgoverlay** (overlay backend) | Docker, or Kubernetes with one storage node | a Postgres container on an OverlayFS view of a shared seed | Any Postgres 14 to 18 as the source; stock images; reads copy nothing, a write copies the file it touches once (only the changed blocks on XFS or btrfs; see limits) |
-| **pgoverlay** (zfs / csi backends) | a ZFS pool, or a CSI driver that clones volumes | a Postgres container on a block-level clone | zfs is experimental |
-| [DBLab Engine](https://github.com/postgres-ai/database-lab-engine) | a ZFS (or LVM) pool on the host | a Postgres container on a thin clone | Mature, self-hosted, block-level CoW |
+| **pgoverlay** (overlay backend) | Docker on Linux (Docker Desktop and Colima are expected to work, not measured at v1.0.0), or Kubernetes with one storage node | a Postgres container on an OverlayFS view of a shared seed | Stock images, any Postgres 14 to 18 as the source. Reads copy no table data (settled seed, Linux 4.19+); a write copies the file it touches once, or only the changed blocks on XFS (`reflink=1`) or btrfs. Branch containers get `CAP_SYS_ADMIN`. Re-seeded on demand, not kept in sync with the source (see limits) |
+| **pgoverlay** (csi backend) | Kubernetes with a CSI driver that clones volumes | a pod on a CSI volume clone (block-level where the driver clones copy-on-write) | No added capabilities; branch pods are not pinned to a node |
+| **pgoverlay** (zfs backend) | a ZFS pool | a Postgres container on a ZFS clone | Experimental |
+| [DBLab Engine](https://github.com/postgres-ai/database-lab-engine) | a Linux machine with a dedicated ZFS (or LVM) pool, running the engine as a privileged container | a Postgres container on a thin clone, on that machine | Mature (first release January 2020); Apache-2.0 Community Edition, with paid Standard and Enterprise editions that add support. Every write is block-level. In physical mode the base can follow the source by replaying WAL, with scheduled snapshots and branching (4.0 and later). One port per clone; its install docs cover a single Linux machine |
 | [Neon](https://neon.com) | Neon's service | a copy-on-write branch in Neon's storage engine | The storage is open source, but there is no supported self-hosted path; your data lives in Neon |
 | [Supabase branching](https://supabase.com/docs/guides/deployment/branching) | the hosted Supabase platform | a separate Supabase project | Hosted-only |
 | [Xata](https://github.com/xataio) (open source) | Kubernetes with CloudNativePG and OpenEBS | a CloudNativePG cluster on a copy-on-write volume | Self-hosted on Kubernetes |
 | PostgreSQL 18 `file_copy_method = clone` | a filesystem that can clone files (reflinks: XFS, Btrfs, ...) | a database cloned inside the same instance | No extra software, but every branch shares one server, and the template database must have no other connections while it is copied |
 | `pg_dump` / `createdb -T` | nothing | a full copy | Minutes to hours for real datasets; N copies cost N times the disk |
 
-pgoverlay's niche is the middle: plain Docker and stock Postgres images, against the Postgres you already run, with no special filesystem, and block-level copy-on-write when the volumes happen to sit on XFS or btrfs. If you already operate ZFS, DBLab Engine or pgoverlay's zfs backend copy blocks rather than files on any host, which uses less disk for branches that write into many large tables.
+Which one to pick:
+
+- **pgoverlay** for a database per pull request or per test, on the Docker or Kubernetes you already run: no storage pool to provision, stock Postgres images, every branch behind one port as `dbname@branch` (with `branchd`), and a [GitHub App](docs/github-app.md) that creates a branch per pull request, keeps a comment with its connection details (no password), and destroys it on close. It is young (v1.0.0): branch creation was timed up to 5 GiB, and read and write behaviour measured on databases under 2 GiB. On ext4 the first write to a table or index file copies that whole file.
+- **DBLab Engine** when you can dedicate a ZFS machine to a large database that should stay close to production: its base can follow the source (physical mode), every write is block-level, and it has years of releases and a vendor behind it.
+- **Neon or Supabase** when the database already lives there, or can.
+- **`createdb -T`, or PostgreSQL 18's clone,** for a few copies on one server you already have.
 
 ## Supported Postgres versions
 
