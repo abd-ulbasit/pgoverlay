@@ -69,6 +69,11 @@ type SeedSpec struct {
 	// SSLMode is the libpq sslmode for the source connection ("" =
 	// $PGOVERLAY_SEED_SSLMODE, else DefaultSSLMode).
 	SSLMode string
+	// Settle is how the seeded cluster is prepared before any branch starts
+	// from it ("" = DefaultSettleMode). Seed leaves the cluster as
+	// pg_basebackup wrote it and the caller runs Settle next; SeedDump
+	// applies the mode inside its own helper.
+	Settle SettleMode
 }
 
 // sslMode resolves the effective sslmode.
@@ -101,6 +106,9 @@ func (s SeedSpec) Validate() error {
 	if m := s.sslMode(); !slices.Contains(sslModes, m) {
 		return fmt.Errorf("%w: sslmode %q (from the seed request or $%s): want one of %s",
 			ErrInvalidSpec, m, SSLModeEnv, strings.Join(sslModes, ", "))
+	}
+	if _, err := ParseSettleMode(string(s.Settle)); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSpec, err)
 	}
 	return nil
 }
