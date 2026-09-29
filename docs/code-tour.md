@@ -30,10 +30,11 @@ Kubernetes CSI clones).
 
 The "instant cheap branch" insight, made concrete: see
 `internal/engine/saga.go` (the create saga) and `internal/cow/plan.go` (how the
-overlay layers are named and stacked). The default overlay backend's one
-load-bearing detail — `recovery_init_sync_method=syncfs` in the in-container
-entrypoint, which is what stops Postgres from copying the whole DB up on first
-boot — is documented in `docs/architecture.md`.
+overlay layers are named and stacked). The default overlay backend's
+load-bearing details — `recovery_init_sync_method=syncfs` in the in-container
+entrypoint, which stops Postgres from copying the whole DB up on first boot,
+and the lazyrw shim (`internal/cow/lazyrw`), which stops it copying every
+table it reads — are documented in `docs/architecture.md`.
 
 ---
 
@@ -223,7 +224,7 @@ Every managed resource is labelled `pgoverlay.instance=<id>` (see
 `LabelInstance`) so reconcile only ever reclaims resources belonging to *its*
 registry.
 
-### `internal/cow` — copy-on-write planning (pure, no I/O)
+### `internal/cow` — copy-on-write planning and the in-branch pieces
 
 `plan.go` decides volume/layer **names** and the **overlay stack order**; the
 overlay mount itself happens *inside* the branch container via an embedded
@@ -231,6 +232,19 @@ entrypoint script (`//go:embed entrypoint.sh`). `PlanBranch` lays out the
 lowerdirs (frozen layers newest-first, source last) and renders
 `PGOVERLAY_LOWERS`. The `Planner` also produces the exact `zfs` argv the engine
 runs in privileged helpers, and the source/branch layer names for every backend.
+Those files are pure, with no I/O. Around them:
+
+- `lazyrw/lazyrw.c` is the lazyrw `LD_PRELOAD` shim (C, with its own tests
+  under `lazyrw/test` and the postgres import audit under `lazyrw/audit`);
+  `lazyrw/dist` holds its four committed builds and `SHA256SUMS`, which
+  `hack/build-lazyrw.sh` reproduces byte for byte. `lazyrw.go` embeds them
+  (`Variants`, `VerifyLazyRW`), and `install.go` builds the install helper's
+  command and environment (`OverlayInstall`) and names the `cow-mode` values.
+- `usage/pgoverlay-du.c` is the static FIEMAP tool that counts exclusive
+  bytes; `usage.go` embeds its builds from `usage/dist` and renders the
+  helper commands that run it (usage, and the XFS extent size hint).
+- `fsprobe.go` is the copy-up probe (`ProbeCopyUp`): it runs through the
+  driver and reports `clone`, `copy` or `unknown`.
 
 ### `internal/pgctl` — seeding helpers
 
@@ -238,7 +252,9 @@ runs in privileged helpers, and the source/branch layer names for every backend.
 **through the runtime driver** as one-shot helper containers — pgoverlay never
 touches data files from the host. `pg_basebackup` is physical/crash-consistent
 (needs `REPLICATION`); `pg_dump` is logical (works against managed Postgres like
-RDS/Neon/Supabase that forbid physical replication).
+RDS/Neon/Supabase that forbid physical replication). `settle.go` (`Settle`)
+then recovers, freezes and cleanly shuts down a basebackup seed in a helper
+on the branch image; the dump script runs the same VACUUM itself.
 
 ### `internal/apiclient` — the Go REST client
 
@@ -317,10 +333,11 @@ sequenceDiagram
     E->>R: CreateBranchCtx → state=creating
     Note over E,D: provision() — each step registers a compensation
     E->>D: CreateVolume (rw layer)
-    E->>D: RunHelper: write entrypoint.sh + mkdir upper/work
-    E->>D: StartBranch (overlay mounted IN-container)
+    E->>D: RunHelper: write entrypoint.sh + lazyrw builds, mkdir upper/work
+    E->>D: StartBranch (overlay mounted IN-container, shim preloaded)
     E->>R: SetBranchContainer(cid)
-    E->>PG: waitReady (pg_isready, ≤90s — covers WAL recovery)
+    E->>PG: waitReady (pg_isready, ≤90s — covers any WAL recovery)
+    E->>PG: observeCowMode (read /pgoverlay/rw/cow-mode)
     E->>PG: applyMasking (psql over local socket)
     E->>PG: rotateBranchCredentials (if enabled)
     E->>D: Inspect → host:port
@@ -352,22 +369,29 @@ Walking each step with the file that does it:
    each push a compensation onto an `undo` stack:
    - **rw volume** — `drv.CreateVolume`. Compensation: `RemoveVolume`.
    - **entrypoint install** — `installOverlayEntrypoint` runs an Alpine helper
-     that writes `cow.EntrypointScript` into the rw volume and creates
-     `upper/` and `work/`.
+     with the command and environment from `cow.OverlayInstall`: it writes
+     `cow.EntrypointScript` into the rw volume, creates `upper/` and `work/`,
+     and installs the four lazyrw shim builds into `lazyrw/` (each passed
+     base64-encoded in its own environment variable and checked against its
+     SHA-256).
    - **start branch** — `startOverlayBranch` mounts the source `ro` at
      `/pgoverlay/lower0`, frozen layers `ro` at `/pgoverlay/lower1..N`, the rw
-     volume at `/pgoverlay/rw`, sets `PGDATA=/pgoverlay/merged` and
-     `PGOVERLAY_LOWERS`, and runs the entrypoint that assembles the OverlayFS
-     mount *inside the container* and execs Postgres. Compensation:
-     `StopRemove`.
+     volume at `/pgoverlay/rw`, sets `PGDATA=/pgoverlay/merged`,
+     `PGOVERLAY_LOWERS` and `PGOVERLAY_LAZYRW`, and runs the entrypoint that
+     assembles the OverlayFS mount *inside the container*, self-tests and
+     probes the shim, and execs Postgres with it preloaded (or without it,
+     reporting `eager`). Compensation: `StopRemove`.
    - If any step fails, `fail()` unwinds the `undo` stack in reverse — **no
      orphaned volumes or containers, ever**.
 6. **Readiness + masking + credentials** — `awaitAndMark` (saga.go):
    `SetBranchContainer` first (so a concurrent reconcile treats the in-flight
    container as owned, not an orphan), then `waitReady` (`pg_isready` loop,
    90s budget — this is where WAL crash recovery happens for basebackup
-   seeds; on Kubernetes a fatal pod state such as `ImagePullBackOff` fails it
-   early, with the reason), then `applyMasking` (per-source SQL via
+   seeds that were not settled; on Kubernetes a fatal pod state such as
+   `ImagePullBackOff` fails it early, with the reason), then
+   `observeCowMode` (`cowmode.go`: reads the branch's `cow-mode` file for
+   `pgoverlay_branch_cow_mode`; best-effort, never fails the saga), then
+   `applyMasking` (per-source SQL via
    in-container `psql` over the local socket, so the branch never serves
    unmasked data), then optional `rotateBranchCredentials`. Throughout, the
    saga's `keepAlive` heartbeat bumps the row's `updated_at`, so reconcile's

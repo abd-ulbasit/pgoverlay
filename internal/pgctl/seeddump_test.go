@@ -109,6 +109,9 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 		// a scoped dump pre-creates extensions and makes CREATE SCHEMA
 		// idempotent
 		"PGB_SCOPED=1", "PGB_DATA=/seed/data",
+		// the default settle mode freezes the restored cluster before its
+		// clean stop
+		"PGB_SETTLE=freeze",
 	} {
 		if !strings.Contains(env, want) {
 			t.Errorf("env missing %q: %v", want, dump.Env)
@@ -138,6 +141,7 @@ func TestSeedDumpHelperSpec(t *testing.T) {
 		"ON_ERROR_STOP=1",
 		"VERBOSITY=terse",
 		"SHOW_CONTEXT=never",
+		`vacuumdb -h /tmp -U "$PGB_USER" --all --freeze --analyze`,
 		`pg_ctl -D "$PGB_DATA" -w stop -m fast`,
 	} {
 		if !strings.Contains(script, want) {

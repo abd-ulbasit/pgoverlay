@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/pgctl/pgctltest"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
@@ -274,7 +275,10 @@ func TestDiffBranchSchemasAndUnanalyzedEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { r.Close() })
-	e := New(r, d, "postgres:17")
+	// --seed-settle=recover: the default (freeze) runs VACUUM (FREEZE,
+	// ANALYZE) on the seed, which gives the never-analyzed table a planner
+	// estimate and so takes it off the exact-count path this test covers
+	e := New(r, d, "postgres:17", WithSeedSettle(pgctl.SettleRecover))
 
 	src := &registry.Source{Name: "diffs-main", PGVersion: "17", ConnHost: host, ConnPort: port, ConnUser: "postgres", Network: network}
 	if err := e.AddSource(ctx, src, "secret"); err != nil {

@@ -9,6 +9,8 @@ set -eu
 chown postgres:postgres "$PGDATA"
 chmod 0700 "$PGDATA"
 rm -f "$PGDATA/postmaster.pid"
+# extra postgres settings, appended after the fixed ones at the end
+set --
 # --- shared with entrypoint.sh from here on; keep the two in sync ---
 # A branch is always an independent, writable primary. A base backup of a
 # standby carries standby.signal; seeding removes it, this covers sources
@@ -26,8 +28,7 @@ if [ ! -e "$PGDATA/pg_hba.conf" ]; then
   chown postgres:postgres "$PGDATA/pg_hba.conf"
 fi
 # ssl=on with certificates outside the data dir cannot start here.
-set --
-[ -e "$PGDATA/server.crt" ] || set -- -c ssl=off
+[ -e "$PGDATA/server.crt" ] || set -- "$@" -c ssl=off
 # recovery_init_sync_method=syncfs is kept for parity with the overlay
 # entrypoint, where the default per-file fsync pass forces a full OverlayFS
 # copy-up (see docs/benchmarks.md). Block/file-level clones have no copy-up

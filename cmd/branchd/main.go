@@ -10,6 +10,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -36,6 +37,7 @@ import (
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 	"github.com/abd-ulbasit/pgoverlay/internal/ha"
 	"github.com/abd-ulbasit/pgoverlay/internal/metrics"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/pgproxy"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
@@ -91,6 +93,15 @@ func envDuration(key string, def time.Duration) time.Duration {
 		log.Fatalf("invalid %s=%q: %v", key, v, err)
 	}
 	return d
+}
+
+// envString reads a string env var as a flag default; an unset/empty var
+// keeps def (the flag's own parsing validates the value).
+func envString(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // tlsConfigFromFlags loads an optional PEM cert/key flag pair (--<name>-tls-cert
@@ -328,6 +339,7 @@ func run() error {
 	defaultTTL := flag.Duration("default-ttl", envDuration("PGOVERLAY_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGOVERLAY_DEFAULT_TTL)")
 	maxTTL := flag.Duration("max-ttl", envDuration("PGOVERLAY_MAX_TTL", 0), "upper bound on any requested branch TTL; longer TTLs are capped to this, e.g. 168h (0 = no cap; env PGOVERLAY_MAX_TTL)")
 	maxLayerDepth := flag.Int("max-layer-depth", envInt("PGOVERLAY_MAX_LAYER_DEPTH", engine.DefaultMaxLayerDepth), "overlay backend: cap on a branch's frozen layer chain; branching from a branch at the cap returns 403 (env PGOVERLAY_MAX_LAYER_DEPTH)")
+	seedSettle := flag.String("seed-settle", envString(pgctl.SettleEnv, string(pgctl.DefaultSettleMode)), "how a new seed (source add or refresh) is prepared before branches start from it: freeze (recover the copy once, VACUUM (FREEZE, ANALYZE) every database, shut down cleanly, so branches start without WAL replay and their reads write nothing), recover (recover and shut down cleanly, no VACUUM) or off (env PGOVERLAY_SEED_SETTLE)")
 	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
@@ -335,6 +347,10 @@ func run() error {
 	leaderElect := flag.Bool("leader-elect", false, "HA: contend for a coordination.k8s.io Lease (pgoverlay-branchd) so only the leader runs reconcile and accepts mutating /v1 requests (kube runtime only; off = single-instance, always leader)")
 	shutdownTimeout := flag.Duration("shutdown-timeout", envDuration("PGOVERLAY_SHUTDOWN_TIMEOUT", defaultShutdownTimeout), "on SIGINT/SIGTERM, how long in-flight requests and the sagas behind them get to finish before they are cancelled and rolled back (keep it below the pod's terminationGracePeriodSeconds minus ~20s; env PGOVERLAY_SHUTDOWN_TIMEOUT)")
 	diskRoot := flag.String("disk-root", "", "path whose filesystem the pgoverlay_disk_bytes_free/_total gauges measure (default: the filesystem holding the branch data, see docs/observability.md)")
+	lazyrw := flag.String("lazyrw", cmp.Or(os.Getenv(config.LazyRWEnv), "on"), "overlay backend: on preloads the lazyrw shim into branch Postgres, so a relation file is copied into the branch on its first write instead of when it is read; each branch checks its kernel (4.19+) and image at start and copies on open, with a warning, when it cannot use it (pgoverlay_branch_cow_mode reports which); off always copies on open. Branches pick a change up when they next start (env PGOVERLAY_LAZYRW)")
+	walRecycle := flag.String("wal-recycle", cmp.Or(os.Getenv(config.WALRecycleEnv), "on"), "overlay backend, experimental: off starts branch Postgres with wal_recycle=off, so a WAL segment from the seed is removed instead of being copied up and renamed when a checkpoint recycles it (env PGOVERLAY_WAL_RECYCLE)")
+	volumeRoot := flag.String("volume-root", os.Getenv(config.VolumeRootEnv), "docker runtime: create every pgoverlay volume as a local bind volume over a directory under this path on the Docker host instead of in Docker's own volume store, e.g. a directory on an XFS (reflink=1) or btrfs disk, where overlay copy-up clones extents (block-level copy-on-write). The directory must exist; existing volumes stay where they are. Set the same value for pgb in local mode (env PGOVERLAY_VOLUME_ROOT)")
+	xfsCowExtSize := flag.String("xfs-cowextsize", "16k", "overlay backend: when copy-up clones on XFS, set this copy-on-write extent size hint on the volume root (--volume-root, or --kube-data-root), so a write into a cloned block copies this much instead of the filesystem default of 128 KiB; accepts a byte count with an optional k or m suffix (0 = leave the default)")
 	showVersion := flag.Bool("version", false, "print the branchd version and exit")
 	flag.Parse()
 
@@ -362,6 +378,10 @@ func run() error {
 	proxyHost, proxyPort, err := advertisedProxy(*advertiseProxyAddr, *pgAddr)
 	if err != nil {
 		return err
+	}
+	settle, err := pgctl.ParseSettleMode(*seedSettle)
+	if err != nil {
+		return fmt.Errorf("--seed-settle (or $%s): %w", pgctl.SettleEnv, err)
 	}
 
 	token := os.Getenv("PGOVERLAY_TOKEN")
@@ -401,11 +421,32 @@ func run() error {
 	if backend == cow.BackendZFS && *zfsDataset == "" {
 		return errors.New("--zfs-dataset is required with --cow zfs (the dataset prefix pgoverlay owns, e.g. tank/pgoverlay)")
 	}
+	cowOpts, err := lazyrwOptions(*lazyrw, *walRecycle, backend)
+	if err != nil {
+		return err
+	}
+	if err := checkVolumeRootFlag(*volumeRoot, *runtimeName, backend); err != nil {
+		return err
+	}
+	cowExtSize, err := parseByteSize(*xfsCowExtSize)
+	if err != nil {
+		return fmt.Errorf("--xfs-cowextsize: %w", err)
+	}
 	var drv runtime.Driver
 	var kubeNS string // resolved branchd namespace (kube runtime); also the Lease namespace
 	switch *runtimeName {
 	case "docker":
-		drv, err = runtime.NewDockerDriver()
+		var dd *runtime.DockerDriver
+		dd, err = runtime.NewDockerDriver(runtime.WithVolumeRoot(*volumeRoot))
+		if err == nil && *volumeRoot != "" {
+			checkCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			err = dd.CheckVolumeRoot(checkCtx)
+			cancel()
+			if err == nil {
+				log.Printf("volumes are created as bind volumes under %s on the Docker host", *volumeRoot)
+			}
+		}
+		drv = dd
 	case "kube":
 		ns := *kubeNamespace
 		if ns == "" {
@@ -446,7 +487,7 @@ func run() error {
 	// (see storageRoot). CSI gives each branch its own PVC with no single
 	// shared local root to statfs, so the gauges are wired only for the
 	// local-FS modes.
-	if root := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home, *diskRoot); root != "" {
+	if root := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home, diskRootOverride(*diskRoot, *volumeRoot, isLocalDir)); root != "" {
 		m.SetDiskRoot(root)
 		log.Printf("disk gauges measure the filesystem of %s", root)
 	}
@@ -472,8 +513,16 @@ func run() error {
 		return errors.New("--max-layer-depth must be >= 1")
 	}
 	engOpts = append(engOpts, engine.WithMaxLayerDepth(*maxLayerDepth))
+	engOpts = append(engOpts, cowOpts...)
+	log.Printf("new seeds are settled with --seed-settle=%s", settle)
+	engOpts = append(engOpts, engine.WithSeedSettle(settle))
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
 		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")}, engOpts...)
+	if backend == cow.BackendOverlay {
+		// pgoverlay_branch_cow_mode: which branches the lazyrw shim is
+		// active in (engine.CowModeCounts)
+		m.SetCowModes(eng.CowModeCounts)
+	}
 
 	// readiness: the registry is reachable (trivial query) and the driver
 	// responds (cheap ListManaged). branchd's liveness stays /healthz.
@@ -513,6 +562,30 @@ func run() error {
 	defer stop()
 
 	g, ctx := errgroup.WithContext(ctx)
+
+	// Overlay backend: branches that were already running when branchd
+	// started report their copy-on-write mode here (later starts report it
+	// themselves), and a background probe works out once whether copy-up on
+	// the volumes' filesystem copies data or clones extents; branch usage is
+	// counted accordingly, and pgoverlay_cow_copyup_mode reports it.
+	if backend == cow.BackendOverlay {
+		go eng.RefreshCowModes(ctx)
+		m.SetCopyUpMode(func() string { return string(eng.CopyUpMode()) })
+		opts := engine.CopyUpOptions{Root: probeRoot(*runtimeName, *volumeRoot, *kubeDataRoot), CowExtSize: cowExtSize}
+		go func() {
+			pctx, cancel := context.WithTimeout(ctx, copyUpProbeTimeout)
+			defer cancel()
+			res, err := eng.DetectCopyUp(pctx, opts)
+			if err != nil {
+				slog.Warn("copy-up probe", "err", err)
+			}
+			if res.Mode != cow.CopyUpUnknown {
+				log.Printf("copy-up probe: %s", res)
+			} else {
+				slog.Warn("copy-up probe could not tell whether copy-up copies or clones; branch usage is counted with du -sb, which is exact unless the filesystem reflinks")
+			}
+		}()
+	}
 
 	// Leader election runs on its own context: on shutdown the Lease is
 	// released (ReleaseOnCancel) only after the API has drained, so no other

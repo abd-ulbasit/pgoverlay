@@ -75,8 +75,11 @@ Notes:
   diffing a branch that was created from another branch briefly stops and
   restarts that parent.
 - **Usage** measures the branch's own layer with a one-shot helper, so it
-  costs a container start. On csi it reports the clone's full size as the
-  filesystem sees it, not the copy-on-write delta.
+  costs a container start. On the overlay backend it is `du -sb` of the
+  writable layer, or, where branchd found that copy-up clones extents (XFS,
+  btrfs), the bytes the layer does not share with the seed
+  ([usage accounting](concepts.md#usage-accounting)). On csi it reports the
+  clone's full size as the filesystem sees it, not the copy-on-write delta.
 - **History** keeps working after the branch is destroyed and after its source
   is removed, and records failed destroy attempts as `destroying -> destroying`
   entries.

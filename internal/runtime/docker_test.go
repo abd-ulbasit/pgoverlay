@@ -210,7 +210,8 @@ func TestDockerCreateVolumeRefusesExisting(t *testing.T) {
 
 func TestDockerListManagedVolumesReportsCreated(t *testing.T) {
 	f, d := newFakeDockerAPI(t)
-	f.volumes["v1"] = volume.Volume{Name: "v1", CreatedAt: "2024-05-06T07:08:09Z"}
+	f.volumes["v1"] = volume.Volume{Name: "v1", CreatedAt: "2024-05-06T07:08:09Z",
+		Labels: map[string]string{"pgoverlay.managed": "true", LabelInstance: "inst"}}
 	vols, err := d.ListManagedVolumes(context.Background(), "inst")
 	if err != nil {
 		t.Fatal(err)

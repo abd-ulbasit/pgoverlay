@@ -146,6 +146,30 @@ func assertHardenedHelper(t *testing.T, sc *corev1.SecurityContext) {
 
 // The helper's environment lives in a Secret named like its pod, with the
 // pod's labels and owner, and only when there is environment to hold.
+// Seed helpers run as the image's detected postgres user ("70:70" in the
+// Alpine images): numeric identities pass through, uid alone doubles as the
+// gid, and the name postgres keeps the Debian images' 999.
+func TestHelperSecurityContextUser(t *testing.T) {
+	for _, tc := range []struct {
+		user     string
+		uid, gid int64
+	}{
+		{"postgres", 999, 999},
+		{"70:70", 70, 70},
+		{"1001:0", 1001, 0},
+		{"26", 26, 26},
+		{"0", 0, 0},
+		{"70:x", 999, 999},
+		{"-1:5", 999, 999},
+	} {
+		sc := helperSecurityContext(HelperSpec{User: tc.user})
+		if sc.RunAsUser == nil || sc.RunAsGroup == nil || *sc.RunAsUser != tc.uid || *sc.RunAsGroup != tc.gid {
+			t.Errorf("User %q: RunAsUser/RunAsGroup = %v/%v, want %d/%d", tc.user, sc.RunAsUser, sc.RunAsGroup, tc.uid, tc.gid)
+		}
+		assertHardenedHelper(t, sc)
+	}
+}
+
 func TestBuildHelperSecret(t *testing.T) {
 	owner := &metav1.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: "branchd-0", UID: "uid-1"}
 	meta := helperObjectMeta("pgb", "pgoverlay-helper-abcde", "inst-1", owner)
@@ -221,6 +245,30 @@ func TestBuildHelperPodPrivileged(t *testing.T) {
 	sc = pod.Spec.Containers[0].SecurityContext
 	if sc == nil || sc.Privileged == nil || !*sc.Privileged || sc.RunAsUser == nil || *sc.RunAsUser != 999 {
 		t.Fatalf("SecurityContext = %+v, want privileged + RunAsUser 999", sc)
+	}
+}
+
+// The copy-up probe mounts an overlay: its helper gets what a hostPath branch
+// pod has, SYS_ADMIN with seccomp and AppArmor unconfined, and nothing more.
+func TestBuildHelperPodSysAdmin(t *testing.T) {
+	st := &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}
+	pod := buildHelperPod(helperObjectMeta("pgb", "pgoverlay-helper-x", "", nil), st, HelperSpec{
+		Image: UtilityImage, Cmd: []string{"sh", "-c", "mount -t overlay ..."}, SysAdmin: true,
+	})
+	got := pod.Spec.Containers[0].SecurityContext
+	want := st.branchSecurityContext()
+	if got == nil || got.Privileged != nil || got.AllowPrivilegeEscalation != nil {
+		t.Fatalf("SecurityContext = %+v, want the branch pod's, unprivileged", got)
+	}
+	if got.Capabilities == nil || len(got.Capabilities.Add) != 1 || got.Capabilities.Add[0] != want.Capabilities.Add[0] ||
+		got.SeccompProfile == nil || got.SeccompProfile.Type != want.SeccompProfile.Type ||
+		got.AppArmorProfile == nil || got.AppArmorProfile.Type != want.AppArmorProfile.Type {
+		t.Fatalf("SecurityContext = %+v, want %+v", got, want)
+	}
+	// Privileged wins over SysAdmin
+	pod = buildHelperPod(helperObjectMeta("pgb", "pgoverlay-helper-x", "", nil), st, HelperSpec{Image: UtilityImage, SysAdmin: true, Privileged: true})
+	if sc := pod.Spec.Containers[0].SecurityContext; sc.Privileged == nil || !*sc.Privileged || sc.Capabilities != nil {
+		t.Fatalf("SecurityContext = %+v, want privileged only", sc)
 	}
 }
 

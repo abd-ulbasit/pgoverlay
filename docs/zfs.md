@@ -9,22 +9,33 @@
 
 ## Why a second backend
 
-OverlayFS copies up **whole files**, and it does so when a file is first
-opened read-write, which Postgres does for every table and index segment
-(files of up to 1 GiB) even to read it. A branch on the overlay backend
-therefore grows toward the size of every table it touches, reads included
-([benchmarks](benchmarks.md#reads-copy-up-too)). ZFS does copy-on-write at
-the **block** level: a clone shares blocks with its origin snapshot and pays
-only for the blocks it actually changes, no matter which file they live in or
-how Postgres opens them. If you already run ZFS, and especially if your
-branches read large tables, the trade is usually worth it.
+OverlayFS copies up **whole files**. Since v1.0.0 the overlay backend's
+lazyrw shim makes that happen on a file's first write rather than its first
+read-write open, so reads copy nothing; but on ext4 the first write to a
+table or index segment still copies the whole segment (up to 1 GiB), and a
+branch grows by every segment it writes. Where the volumes sit on XFS
+(`reflink=1`) or btrfs, the overlay backend's copy-up becomes a clone and
+writes are block level too
+([concepts](concepts.md#8-clone-or-copy-what-a-copy-up-costs)). ZFS does
+copy-on-write at the **block** level on its own: a clone shares blocks with
+its origin snapshot and pays only for the blocks it actually changes, no
+matter which file they live in or how Postgres opens them, and it needs
+neither the shim nor a reflink filesystem. If you already run ZFS, and
+especially if your branches write into many large tables, the trade is
+usually worth it.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
-- ZFS clones have **no copy-up problem**, so the
+- ZFS clones have **no copy-up**, so the
   `recovery_init_sync_method=syncfs` flag the overlay entrypoint needs (see
   [benchmarks — The fix](benchmarks.md#the-fix)) isn't load-bearing here. The
   zfs entrypoint keeps it anyway for parity — it is simply harmless on ZFS.
+- ZFS branches run **without the lazyrw shim** (`--lazyrw` is ignored): a read
+  of a clone never copies anything, so there is nothing for it to do.
+- **Seed settle** applies to zfs seeds as to overlay ones (`--seed-settle`,
+  default `freeze`): the seed dataset is recovered, frozen, analyzed and
+  cleanly shut down before its first snapshot, so branches start without WAL
+  replay and their reads write no hint bits into the clone.
 - The branch entrypoint shrinks to perms + stale-pid cleanup + exec
   (`internal/cow/entrypoint_direct.sh`, shared with the CSI backend — both
   hand the container a ready-made writable clone): there is nothing to
@@ -53,8 +64,10 @@ under `<prefix>` instead of docker/kube volumes:
   network access and an alpine `zfs` package version compatible with the
   host's zfs kernel module.
 - **Branch containers** bind-mount the clone's mountpoint at `/pgoverlay/rw`
-  and run with `PGDATA=/pgoverlay/rw/data`. No overlay assembly; WAL crash
-  recovery on first boot, exactly as the overlay backend. They still run with
+  and run with `PGDATA=/pgoverlay/rw/data`. No overlay assembly; a branch of
+  a settled seed starts from its clean shutdown, and with
+  `--seed-settle=off` it runs WAL crash recovery on first boot, exactly as
+  the overlay backend does. They still run with
   `CAP_SYS_ADMIN` and AppArmor unconfined: the runtime drivers give every
   branch container those settings, whatever the backend (see
   [Security](security.md)).

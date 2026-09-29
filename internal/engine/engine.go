@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/cow"
@@ -48,6 +49,19 @@ type Engine struct {
 	// seeding, branches reconcile is restarting, and the endpoint-refresh
 	// rate limit (see reconcile.go).
 	rs reconcileState
+	// lazyrwOff turns the lazyrw shim off for overlay branches and
+	// walRecycleOff starts them with wal_recycle=off (WithLazyRW,
+	// WithWALRecycle); cowModes is the copy-on-write mode each one reported
+	// at its last start (see cowmode.go).
+	lazyrwOff     bool
+	walRecycleOff bool
+	cowModes      cowModeState
+	// seedSettle is how a fresh seed is prepared before branches start from
+	// it (branchd --seed-settle). "" = pgctl.DefaultSettleMode.
+	seedSettle pgctl.SettleMode
+	// copyUp is the last copy-up probe's result (DetectCopyUp); nil until
+	// one has measured. BranchUsage picks its measurement by it.
+	copyUp atomic.Pointer[cow.ProbeResult]
 }
 
 // parentStepTimeout bounds a parent-affecting step (stopping a freeze or
@@ -265,21 +279,45 @@ func (e *Engine) image(src *registry.Source) string {
 	return "postgres:" + src.PGVersion
 }
 
+// WithSeedSettle sets how every seed (source add and refresh) is prepared
+// before branches start from it: pgctl.SettleFreeze (the default) recovers
+// the copy, freezes and analyzes it and shuts it down cleanly,
+// pgctl.SettleRecover only recovers and shuts down, pgctl.SettleOff leaves it
+// as the seed command wrote it. branchd --seed-settle, pgb
+// $PGOVERLAY_SEED_SETTLE. "" keeps the default.
+func WithSeedSettle(m pgctl.SettleMode) Option {
+	return func(e *Engine) { e.seedSettle = m }
+}
+
 // seedSource runs the source's seeding method (pg_basebackup or pg_dump,
-// per Source.SeedVia) into the given layer. Backend-neutral: the layer is
-// resolved through seedTarget (overlay volume, zfs mountpoint, csi PVC).
+// per Source.SeedVia) into the given layer, then settles it (see
+// pgctl.Settle; the dump helper settles in place). Backend-neutral: the
+// layer is resolved through seedTarget (overlay volume, zfs mountpoint, csi
+// PVC), and every backend gains from a settled seed: branches start from a
+// clean shutdown instead of replaying the backup's WAL, and their reads do
+// not write.
 func (e *Engine) seedSource(ctx context.Context, s *registry.Source, layer, password string) error {
 	seedVol, seedKind := e.seedTarget(layer)
+	// the seed's files belong to the image's own postgres user (999 in the
+	// Debian images, 70 in the Alpine ones), which branches run as
+	owner, err := pgctl.DetectOwner(ctx, e.drv, e.image(s))
+	if err != nil {
+		return err
+	}
 	spec := pgctl.SeedSpec{
 		Image: e.image(s), Volume: seedVol, MountKind: seedKind, Network: s.Network,
 		Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser, Password: password,
+		Settle: e.seedSettle, Owner: owner,
 	}
 	if s.SeedVia == registry.SeedViaDump {
 		return pgctl.SeedDump(ctx, e.drv, pgctl.SeedDumpSpec{
 			SeedSpec: spec, Database: s.ConnDB, Schemas: s.DumpSchemas,
 		})
 	}
-	return pgctl.Seed(ctx, e.drv, spec)
+	if err := pgctl.Seed(ctx, e.drv, spec); err != nil {
+		return err
+	}
+	return pgctl.Settle(ctx, e.drv, spec)
 }
 
 // AddSource registers a source and seeds it from the given live Postgres.
@@ -437,22 +475,31 @@ func failureReason(err error) string {
 }
 
 // BranchUsage measures a branch's copy-on-write layer in bytes (the branch's
-// own writes, not the shared source data). Overlay: `du -sb` on the rw
-// volume; zfs: the clone's `used` property (space unique to the clone). It
-// is a helper-container roundtrip — cheap, but not free.
+// own writes, not the shared source data). Overlay: the rw volume's size,
+// counted with `du -sb` where copy-up copies, and as exclusive bytes with
+// pgoverlay-du where it clones extents (see DetectCopyUp and usageHelpers);
+// zfs: the clone's `used` property (space unique to the clone). It is a
+// helper-container roundtrip — cheap, but not free.
 func (e *Engine) BranchUsage(ctx context.Context, name string) (int64, error) {
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
 		return 0, err
 	}
-	spec := runtime.HelperSpec{
-		Image:  runtime.UtilityImage,
-		Cmd:    []string{"du", "-sb", cow.RWPath},
-		Mounts: []runtime.Mount{{Volume: b.RWVolume, Target: cow.RWPath, ReadOnly: true}},
+	specs := e.usageHelpers(b.RWVolume)
+	var n int64
+	for i, spec := range specs {
+		if n, err = e.measureUsage(ctx, name, spec); err == nil || i == len(specs)-1 {
+			break
+		}
+		slog.Warn("measuring branch usage with pgoverlay-du failed; falling back to du -sb, which counts cloned extents as the branch's own",
+			"branch", name, "err", err)
 	}
-	if e.zfs() {
-		spec = zfsHelperSpec(e.planner.ZFSUsed(b.RWVolume))
-	}
+	return n, err
+}
+
+// measureUsage runs one usage helper and reads the byte count it prints
+// first (du -sb, pgoverlay-du and zfs list -Hp all lead with it).
+func (e *Engine) measureUsage(ctx context.Context, name string, spec runtime.HelperSpec) (int64, error) {
 	out, err := e.drv.RunHelper(ctx, spec)
 	if err != nil {
 		return 0, fmt.Errorf("measure branch %q usage: %w", name, err)

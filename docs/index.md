@@ -7,7 +7,9 @@ Each branch is its own Postgres container whose data directory is an
 **OverlayFS copy-on-write** mount over one shared, read-only seed of the
 source. Creating a branch mounts that seed instead of copying it, so branches
 start in about two seconds whatever the database size, run side by side, can
-be reset, diffed against their base, and branched again.
+be reset, diffed against their base, and branched again. Reads in a branch
+copy nothing; a write copies the file it touches once, or only the blocks it
+changes where the volumes sit on XFS or btrfs.
 
 ```
 $ pgb branch create pr-1 --from main
@@ -15,8 +17,10 @@ branch "pr-1" ready in 2.482s (port 34467)
 ```
 
 **Measured:** a 1 GiB and a 5 GiB database both branch in ~1.9 s (p50 of 5
-runs), and a fresh branch holds 33.1 MiB of its own data, not a copy of the
-dataset. Full results and methodology in [Benchmarks](benchmarks.md).
+runs), and a fresh branch holds its own changes, not a copy of the dataset:
+under 1 MiB since v1.0.0 settles the seed. A 60 s pgbench select-only run grew
+a branch by 16.5 MiB (1.6 MiB allocated), where copying files on open grew it
+by 768 MiB. Full results and methodology in [Benchmarks](benchmarks.md).
 
 !!! warning "Honest limits"
     - **A dev/test tool.** Branches are disposable Postgres instances for
@@ -27,12 +31,20 @@ dataset. Full results and methodology in [Benchmarks](benchmarks.md).
       hostpath mode every branch container gets `CAP_SYS_ADMIN` with AppArmor
       unconfined, for its overlay mount. Kubernetes csi mode adds no
       capabilities. See [Security](security.md).
-    - **Reads copy data too.** Postgres opens table files read-write even to
-      read them, and OverlayFS copies a file whole into the branch the first
-      time that happens: branches grow toward the size of the tables they
-      touch ([measurement](benchmarks.md#reads-copy-up-too)). For read-heavy
-      branches of large databases, use the [zfs](zfs.md) or
-      [csi](kubernetes.md) backend.
+    - **On ext4, a write copies the whole file.** Reads copy nothing, but the
+      first time Postgres writes to a table or index file, that file (a
+      segment, up to 1 GiB) is copied into the branch, and the write waits for
+      the copy: usually a checkpoint's write rather than the `UPDATE`'s
+      ([measured](benchmarks.md#throughput-and-the-first-write-stall)). Where the
+      volumes live on XFS (`reflink=1`) or btrfs, the copy is an extent clone
+      and a write copies only the blocks it changes; branchd detects this, and
+      `--volume-root` puts the volumes on such a disk
+      ([how](concepts.md#8-clone-or-copy-what-a-copy-up-costs)).
+    - **Linux 4.19 or later for copy-free reads.** Each branch checks at start
+      that its kernel and image can run the lazyrw shim. Where they cannot,
+      it copies every table file it opens, as releases before v1.0.0 did, and
+      says so in its log and in `pgoverlay_branch_cow_mode`
+      ([Troubleshooting](troubleshooting.md#a-branch-copies-eagerly)).
     - **Postgres 14 to 18**, Linux containers; one `branchd` writes the
       registry (more replicas are failover, not scale-out).
 
@@ -50,9 +62,11 @@ in-instance database cloning on reflink filesystems. The README
 pgoverlay takes the middle path: plain Docker, stock Postgres images, and
 OverlayFS copy-on-write (the mechanism container images use) applied to
 `PGDATA`, against the Postgres you already run. No special filesystem, no
-cloud, no fork of Postgres. If you *do* run ZFS, the
-[experimental zfs backend](zfs.md) does block-level copy-on-write, and on
-Kubernetes the [csi mode](kubernetes.md) clones volumes.
+cloud, no fork of Postgres: a small preload library keeps Postgres's reads
+from copying files, and a filesystem that can clone (XFS or btrfs) turns the
+file copies of writes into block-level copy-on-write. If you *do* run ZFS,
+the [experimental zfs backend](zfs.md) does block-level copy-on-write on its
+own, and on Kubernetes the [csi mode](kubernetes.md) clones volumes.
 
 ## Where to go
 
@@ -68,12 +82,13 @@ Kubernetes the [csi mode](kubernetes.md) clones volumes.
 - [Kubernetes](kubernetes.md): branch pods on a storage node or as CSI
   clones, and the Helm chart.
 - [GitHub App](github-app.md): a database branch per pull request.
-- [Benchmarks](benchmarks.md): measured numbers, and the OverlayFS copy-up
-  diagnosis behind them.
+- [Benchmarks](benchmarks.md): measured numbers, the OverlayFS copy-up
+  diagnosis behind them, and what copy-on-write costs since v1.0.0.
 - [Core concepts](concepts.md): copy-on-write and OverlayFS from first
   principles.
 - [Architecture](architecture.md), [Code tour](code-tour.md),
   [Design decisions](DESIGN-DECISIONS.md) and [Deep dives](deep-dives.md):
   how it works, as built, and where the obvious implementation was wrong.
 - [Upgrading to v1.0](upgrading.md): what changed since the release
-  candidates.
+  candidates, and the
+  [changelog](https://github.com/abd-ulbasit/pgoverlay/blob/main/CHANGELOG.md).

@@ -34,6 +34,8 @@ has "$out" 'pods/exec' default
 # graceful drain: the kubelet waits longer than branchd's --shutdown-timeout
 has "$out" '--shutdown-timeout=60s' default
 has "$out" 'terminationGracePeriodSeconds: 90' default
+# branches copy a file on its first write, not on open (cow.lazyrw)
+has "$out" '--lazyrw=on' default
 # single replica: no leader election, so the API Service selects the pod as is
 hasnt "$out" '--leader-elect' default
 hasnt "$out" 'pgoverlay.leader: "true"' default

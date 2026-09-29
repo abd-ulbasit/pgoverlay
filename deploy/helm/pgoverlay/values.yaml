@@ -22,6 +22,15 @@ dataRoot: /var/lib/pgoverlay
 # zfs backend (branchd --cow zfs --zfs-dataset ...) needs a zpool on the
 # storage node and privileged helper pods; it is not wired into chart values
 # yet — see docs/zfs.md to run it by hand.
+cow:
+  # lazyrw (branchd --lazyrw, hostpath storage): branch Postgres opens a
+  # table file read-only until its first write, so a read copies nothing into
+  # the branch and a write copies the file it touches. Each branch checks the
+  # node's kernel (4.19+) and its image at start and otherwise copies on open,
+  # as with false, logging a warning; pgoverlay_branch_cow_mode reports which.
+  # Branches pick a change up when they next start. csi branches are block
+  # clones and ignore it.
+  lazyrw: true
 
 # Branch data storage (see docs/kubernetes.md):
 #  - hostpath (default): plain directories under dataRoot on `node`; branch
@@ -174,6 +183,14 @@ shutdownTimeout: 60
 # off for static-credential preview flows (e.g. Vercel-style env templating)
 # that need every branch to accept the same source password.
 rotateBranchCredentials: false
+
+# How a new seed (source add or refresh) is prepared before branches start
+# from it (branchd --seed-settle): freeze recovers the copy once, runs VACUUM
+# (FREEZE, ANALYZE) on every database and shuts it down cleanly, so branches
+# start without WAL replay and their reads write nothing; recover
+# only recovers and shuts down; off leaves the seed as pg_basebackup or
+# pg_dump wrote it. Settling works on pgoverlay's copy, never on the source.
+seedSettle: freeze
 
 # branchd writes its sqlite registry to a hostPath on the storage node, so it
 # must run as root for write access to that directory (simplest correct

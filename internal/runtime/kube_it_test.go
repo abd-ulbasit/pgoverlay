@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
 
+	"github.com/abd-ulbasit/pgoverlay/internal/cow"
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	rt "github.com/abd-ulbasit/pgoverlay/internal/runtime"
@@ -404,5 +406,205 @@ func TestKubeEndToEndBranching(t *testing.T) {
 	}
 	if list, err := drv.ListManaged(ctx); err != nil || len(list) != 0 {
 		t.Errorf("ListManaged after destroy = %v, %v", list, err)
+	}
+}
+
+// TestKubeCowLazyRWReadsCopyNothing is #49 on the hostPath backend: a branch
+// pod the engine creates runs the lazyrw shim (cow-mode lazyrw), and a
+// read-only pass over a ~40 MB table (count, EXPLAIN, pg_relation_size) grows
+// its rw layer by less than 2 MiB and leaves the table's file out of the
+// upper layer. The control, a --lazyrw=off engine on the same source, copies
+// the table on the same read. The source never vacuums the table: the seed
+// settle (on by default) freezes it once in the seed, so reads in a branch
+// set no hint bits. The data is small so the kube job stays quick.
+func TestKubeCowLazyRWReadsCopyNothing(t *testing.T) {
+	drv, cs, cfg := kubeIT(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	const srcPod, rows = "pgoverlay-it-source", 120000
+	srcIP := startSourcePod(t, ctx, drv, cs)
+	if err := drv.Exec(ctx, srcPod, []string{"psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c",
+		fmt.Sprintf(`CREATE TABLE big AS SELECT g AS id, repeat('x', 300) AS pad FROM generate_series(1, %d) g`, rows)}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := drv.ExecOutput(ctx, srcPod, []string{"psql", "-U", "postgres", "-tAc", `SELECT pg_relation_size('big')`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tableBytes, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		t.Fatalf("source table size %q: %v", out, err)
+	}
+
+	r, err := registry.Open(t.TempDir() + "/it.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() }) // after the destroy cleanups below (LIFO)
+
+	e := engine.New(r, drv, "postgres:17")                              // lazyrw on: the default
+	eOff := engine.New(r, drv, "postgres:17", engine.WithLazyRW(false)) // --lazyrw=off, same registry
+
+	src := &registry.Source{Name: "k8s-cow", PGVersion: "17", ConnHost: srcIP, ConnPort: 5432, ConnUser: "postgres"}
+	start := time.Now()
+	if err := e.AddSource(ctx, src, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("source seeded and settled in %s (table big: %d rows, %d bytes)", time.Since(start).Round(time.Millisecond), rows, tableBytes)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := e.RemoveSource(ctx, src.Name); err != nil {
+			t.Errorf("remove source: %v", err)
+		}
+	})
+
+	create := func(eng *engine.Engine, name string) (*registry.Branch, int) {
+		t.Helper()
+		start := time.Now()
+		b, err := eng.CreateBranch(ctx, name, src.Name, 0)
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			if err := eng.DestroyBranch(ctx, name); err != nil {
+				t.Errorf("destroy %s: %v", name, err)
+			}
+		})
+		t.Logf("branch %s created in %s (pod %s)", name, time.Since(start).Round(time.Millisecond), b.ContainerID)
+		return b, forwardPort(t, cfg, cs, b.ContainerID)
+	}
+	// cowMode reads the mode the branch's entrypoint recorded and its detail
+	// line (the preloaded build, or why the shim is not active)
+	cowMode := func(b *registry.Branch) (mode, detail string) {
+		t.Helper()
+		out, err := drv.ExecOutput(ctx, b.ContainerID, []string{"cat", cow.CowModePath})
+		if err != nil {
+			t.Fatalf("read cow-mode of %s: %v", b.Name, err)
+		}
+		mode, detail, _ = strings.Cut(strings.TrimSpace(out), "\n")
+		return mode, detail
+	}
+	// inUpper reports whether a data-dir-relative path has an entry in the
+	// branch's upper layer (the hostPath directory, seen from the branch pod)
+	inUpper := func(b *registry.Branch, rel string) bool {
+		t.Helper()
+		out, err := drv.ExecOutput(ctx, b.ContainerID, []string{"sh", "-c",
+			`if [ -e "$1" ]; then echo yes; else echo no; fi`, "in-upper", cow.RWPath + "/upper/" + rel})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(out) == "yes"
+	}
+	largestUpper := func(b *registry.Branch) string {
+		out, err := drv.ExecOutput(ctx, b.ContainerID, []string{"sh", "-c",
+			"cd " + cow.RWPath + "/upper && find . -type f -exec du -b {} + | sort -rn | head -n 12"})
+		if err != nil {
+			return err.Error()
+		}
+		return out
+	}
+	usage := func(eng *engine.Engine, b *registry.Branch) int64 {
+		t.Helper()
+		n, err := eng.BranchUsage(ctx, b.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// readGrowth is how much a read-only pass over big grows the branch's rw
+	// layer (BranchUsage: du -sb of its hostPath directory, from a helper
+	// pod). Both sides are measured after a CHECKPOINT, so the WAL segment
+	// the first checkpoint record copies up is counted before the read. It
+	// also returns the Buffers line of the scan's plan, for the log.
+	readGrowth := func(eng *engine.Engine, b *registry.Branch, port int) (growth int64, buffers string) {
+		t.Helper()
+		c, err := pgx.Connect(ctx, fmt.Sprintf("postgres://postgres:secret@127.0.0.1:%d/postgres", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close(ctx)
+		if _, err := c.Exec(ctx, `CHECKPOINT`); err != nil {
+			t.Fatal(err)
+		}
+		before := usage(eng, b)
+		var n int64
+		if err := c.QueryRow(ctx, `SELECT count(*) FROM big`).Scan(&n); err != nil || n != rows {
+			t.Fatalf("%s: count(*) = %d, %v; want %d", b.Name, n, err, rows)
+		}
+		plan, err := c.Query(ctx, `EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM big WHERE pad <> repeat('x', 300)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for plan.Next() {
+			var line string
+			if err := plan.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			if l := strings.TrimSpace(line); buffers == "" && strings.HasPrefix(l, "Buffers:") {
+				buffers = l
+			}
+		}
+		if err := plan.Err(); err != nil {
+			t.Fatal(err)
+		}
+		var size int64
+		if err := c.QueryRow(ctx, `SELECT pg_relation_size('big')`).Scan(&size); err != nil || size != tableBytes {
+			t.Fatalf("%s: pg_relation_size = %d, %v; want %d", b.Name, size, err, tableBytes)
+		}
+		if _, err := c.Exec(ctx, `CHECKPOINT`); err != nil {
+			t.Fatal(err)
+		}
+		return usage(eng, b) - before, buffers
+	}
+
+	// lazyrw (the default): the shim is active and the read copies nothing
+	b, port := create(e, "k8s-cow-lrw")
+	mode, detail := cowMode(b)
+	if mode != cow.CowModeLazyRW {
+		t.Fatalf("%s cow-mode = %q (%s), want %q", b.Name, mode, detail, cow.CowModeLazyRW)
+	}
+	t.Logf("%s cow-mode %s, shim %s", b.Name, mode, detail)
+	if n := e.CowModeCounts()[cow.CowModeLazyRW]; n != 1 {
+		t.Errorf("CowModeCounts[lazyrw] = %d, want 1", n)
+	}
+	var rel string
+	{
+		c, err := pgx.Connect(ctx, fmt.Sprintf("postgres://postgres:secret@127.0.0.1:%d/postgres", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = c.QueryRow(ctx, `SELECT pg_relation_filepath('big')`).Scan(&rel)
+		c.Close(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	g, buffers := readGrowth(e, b, port)
+	t.Logf("lazyrw: a read of the %d-byte table grew the branch by %d bytes (scan %s)", tableBytes, g, buffers)
+	if g >= 2<<20 {
+		t.Errorf("a read of the %d-byte table grew the lazyrw branch by %d bytes, want < 2 MiB; largest files in its upper layer:\n%s",
+			tableBytes, g, largestUpper(b))
+	}
+	if inUpper(b, rel) {
+		t.Errorf("the read copied big (%s) into the lazyrw branch's upper layer", rel)
+	}
+
+	// control: with lazyrw off, Postgres's read-write open of the table's
+	// file copies it up in full on the same read
+	off, offPort := create(eOff, "k8s-cow-off")
+	if mode, detail := cowMode(off); mode != cow.CowModeOff {
+		t.Fatalf("%s cow-mode = %q (%s), want %q", off.Name, mode, detail, cow.CowModeOff)
+	}
+	g, buffers = readGrowth(eOff, off, offPort)
+	t.Logf("lazyrw off: the same read grew the branch by %d bytes (scan %s)", g, buffers)
+	if g < tableBytes/2 {
+		t.Errorf("with lazyrw off a read grew the branch by only %d bytes; the %d-byte table should have been copied", g, tableBytes)
+	}
+	if !inUpper(off, rel) {
+		t.Errorf("with lazyrw off the read did not copy big (%s) into the branch's upper layer", rel)
 	}
 }

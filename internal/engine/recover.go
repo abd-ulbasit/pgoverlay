@@ -130,7 +130,11 @@ func (e *Engine) checkBranchData(ctx context.Context, b *registry.Branch, chain 
 	}
 	have := make(map[string]bool, len(vols))
 	for _, v := range vols {
-		have[v.Name] = true
+		// a leftover directory has no volume to mount: starting on it
+		// would create a fresh, empty docker volume of that name
+		if !v.Leftover {
+			have[v.Name] = true
+		}
 	}
 	var missing []string
 	for _, v := range need {
@@ -167,6 +171,7 @@ func (e *Engine) restartOnOwnData(ctx context.Context, b *registry.Branch, src *
 		cleanup()
 		return "", runtime.ContainerInfo{}, fmt.Errorf("instance never became ready: %w", err)
 	}
+	e.observeCowMode(ctx, b, cid)
 	info, err := e.inspectAddr(ctx, cid)
 	if err != nil {
 		cleanup()

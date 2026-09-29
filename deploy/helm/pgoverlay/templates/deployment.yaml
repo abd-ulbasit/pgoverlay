@@ -88,6 +88,11 @@ spec:
             {{- if .Values.rotateBranchCredentials }}
             - --rotate-branch-credentials
             {{- end }}
+            {{- $lazyrw := dig "lazyrw" true (.Values.cow | default dict) }}
+            {{- if not (kindIs "bool" $lazyrw) }}
+            {{- fail "cow.lazyrw must be true or false" }}
+            {{- end }}
+            - --lazyrw={{ ternary "on" "off" $lazyrw }}
             - --api-addr=:{{ .Values.api.port }}
             - --pg-addr=:{{ .Values.proxy.port }}
             {{- with .Values.proxy.tls.certSecret }}
@@ -98,6 +103,10 @@ spec:
             - --reconcile-interval={{ .Values.reconcileInterval }}
             - --stuck-timeout={{ .Values.stuckTimeout }}
             - --shutdown-timeout={{ int .Values.shutdownTimeout }}s
+            {{- if not (has .Values.seedSettle (list "freeze" "recover" "off")) }}
+            {{- fail "seedSettle must be freeze, recover or off" }}
+            {{- end }}
+            - --seed-settle={{ .Values.seedSettle }}
             {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
             # HA: contend for the pgoverlay-branchd Lease; only the leader
             # reconciles + accepts mutating /v1 requests (see docs/ha.md).

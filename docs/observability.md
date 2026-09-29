@@ -31,6 +31,8 @@ probes don't authenticate, and neither endpoint leaks secrets.
 | `pgoverlay_leader_transitions_total` | counter | — | Times this replica gained or lost leadership. |
 | `pgoverlay_disk_bytes_free` | gauge | — | Free bytes on the measured filesystem (read via `statfs` on every scrape; see below). |
 | `pgoverlay_disk_bytes_total` | gauge | — | Total bytes on the measured filesystem. |
+| `pgoverlay_branch_cow_mode` | gauge | `mode` | Ready overlay branches by the copy-on-write mode their Postgres started in: `lazyrw` (the shim is active: reads copy nothing, a file is copied into the branch on its first write), `eager` (it is not, although `--lazyrw=on`; see [Troubleshooting](troubleshooting.md#a-branch-copies-eagerly)), `off` (`--lazyrw=off`) or `unknown` (not read yet or unreadable). Overlay backend only. |
+| `pgoverlay_cow_copyup_mode` | gauge | `mode` | Overlay backend: `1` for what an OverlayFS copy-up costs where the volumes live, as probed at startup, `0` for the other modes. `clone` (XFS `reflink=1`, btrfs: extents are shared, block-level copy-on-write), `copy` (data is copied), `unknown` (not probed yet, or the probe failed). See [copy-up mode](reference.md#copy-up-mode). |
 
 **What the disk gauges measure.** They `statfs` one path on every scrape, and
 that path is not always where branch data lives:
@@ -38,6 +40,7 @@ that path is not always where branch data lives:
 | Setup | Path measured by default | Is branch data there? |
 |---|---|---|
 | Docker runtime | `PGOVERLAY_HOME` (`~/.pgoverlay`) | **No.** Branch and seed volumes are Docker volumes under the engine's data root (`/var/lib/docker/volumes`, inside the VM on Colima or Docker Desktop, or on another machine for a remote engine). The gauges cover the registry's filesystem only, unless both happen to be the same filesystem |
+| Docker runtime with `--volume-root` | the volume root, when it is a directory on branchd's machine; else `PGOVERLAY_HOME` | **Yes** when branchd runs on the Docker host. A volume root on a remote Docker host cannot be measured from branchd |
 | Kubernetes hostpath, chart layout (`PGOVERLAY_HOME` inside `--kube-data-root`) | the mounted state directory, `<dataRoot>/state` | **Yes** when the state directory is the hostPath (`persistence` off, the default in hostpath mode), since it sits on the data root's filesystem. With `persistence.enabled=true` it is the registry PVC instead |
 | Kubernetes hostpath, branchd running on the storage node itself | `--kube-data-root` | **Yes** |
 | Kubernetes csi | not emitted | Each branch is its own PVC; watch the CSI driver's capacity metrics |
@@ -64,6 +67,10 @@ of the data root). branchd logs the path it measures at startup
 - alert: PgoverlayBranchOpsFailing
   expr: increase(pgoverlay_branch_op_errors_total[15m]) > 0
   labels: { severity: info }
+- alert: PgoverlayBranchesCopyEagerly   # reads copy whole tables into branches
+  expr: pgoverlay_branch_cow_mode{mode="eager"} > 0
+  for: 15m
+  labels: { severity: warning }
 ```
 
 A compensation failure means a saga's cleanup did not complete; the next
@@ -74,15 +81,19 @@ resource. The leader alerts matter only with `--leader-elect` (see
 ## Running out of disk (ENOSPC)
 
 On the overlay backend every branch shares one filesystem (the Docker data
-root, or the storage node's data root), so a full disk is a fleet-wide, not
-per-branch, failure. Remember that branches grow on **reads** too: the first
-time Postgres opens a table file in a branch, OverlayFS copies the whole file
+root or `--volume-root`, or the storage node's data root), so a full disk is
+a fleet-wide, not per-branch, failure. A write copies the whole file it
+touches (a table segment, up to 1 GiB) into the branch the first time; where
+copy-up clones (`pgoverlay_cow_copyup_mode{mode="clone"}`), only the blocks
+it rewrites take new space. Branches in eager mode
+(`pgoverlay_branch_cow_mode{mode="eager"}` or `off`) grow on **reads** too:
+there the first time Postgres opens a table file, OverlayFS copies it whole
 into the branch ([Reads copy up too](benchmarks.md#reads-copy-up-too)), so a
 test suite that scans large tables fills the disk faster than its writes
 suggest.
 
-- **Overlay copy-up fails.** The first read-write open of a file in any
-  branch, which Postgres does for reads as well, must copy the whole file up
+- **Overlay copy-up fails.** The first write to a file in any branch (the
+  first open, in eager mode, even for a read) must copy the whole file up
   into that branch's upper layer; with no free space the copy-up returns
   `ENOSPC` and the query — and often the whole transaction — fails.
 - **Postgres write failures across *all* branches.** WAL/heap writes in every

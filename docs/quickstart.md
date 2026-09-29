@@ -11,7 +11,7 @@ From nothing to branches on a laptop, first with the CLI alone, then with the
 - `psql`, for the examples.
 - The binaries: a [release archive](https://github.com/abd-ulbasit/pgoverlay/releases),
   `go install github.com/abd-ulbasit/pgoverlay/cmd/pgb@latest` (and
-  `.../cmd/branchd@latest`; Go 1.26.6 or newer, once v1.0.0 is tagged), or
+  `.../cmd/branchd@latest`; Go 1.26.6 or newer), or
   `make build` in a checkout (binaries in `./bin`).
 - A source Postgres 14 to 18. `pg_basebackup` seeding needs
   `wal_level=replica` and a user with `REPLICATION`; managed Postgres uses

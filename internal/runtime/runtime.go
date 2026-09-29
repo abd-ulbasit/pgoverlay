@@ -63,6 +63,11 @@ type HelperSpec struct {
 	// explicitly; on kube a privileged container sees host devices anyway.
 	Privileged  bool
 	HostDevices []string
+	// SysAdmin runs the helper with the privileges an overlay branch
+	// container has, and no more: CAP_SYS_ADMIN (to mount an overlay) with
+	// the AppArmor profile, and on kube the seccomp profile, unconfined. The
+	// copy-up probe uses it. Ignored when Privileged is set.
+	SysAdmin bool
 }
 
 // BranchSpec is a long-running branch Postgres container.
@@ -102,6 +107,14 @@ type VolumeInfo struct {
 	// tell. Reconcile never garbage-collects a volume younger than its grace
 	// period, because a saga in another process may have just created it.
 	Created time.Time
+	// Leftover marks storage the runtime no longer has a volume for: a
+	// directory under the docker driver's volume root (WithVolumeRoot) whose
+	// volume is gone, because a removal stopped between deleting the volume
+	// and deleting its directory, or someone removed the volume by hand.
+	// Nothing can mount it (a container would get a fresh, empty volume of
+	// that name), so it counts as missing everywhere except garbage
+	// collection, where RemoveVolume deletes the directory.
+	Leftover bool
 }
 
 type Driver interface {

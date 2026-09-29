@@ -141,10 +141,9 @@ from the same outputs and percent-encode the password.
 workflow points it at the newest stable v1.x.y release each time one is
 published, so `action@v1` runs different code over time (see
 [SECURITY.md](https://github.com/abd-ulbasit/pgoverlay/blob/main/SECURITY.md)).
-Until v1.0.0 is released it points at `v1.0.0-rc.4`, which predates the
-`proxy_*` outputs used above. Never use `@main`, which runs whatever was
-pushed last. For an immutable reference, pin a full release tag (for example
-`action@v1.0.0`) or, stricter still, a commit SHA, since tags can be moved.
+Never use `@main`, which runs whatever was pushed last. For an immutable
+reference, pin a full release tag (for example `action@v1.0.0`) or, stricter
+still, a commit SHA, since tags can be moved.
 
 The action is a composite action that only talks to the `/v1` REST API — it
 ships no binary and is not tied to the `branchd` version you run.
