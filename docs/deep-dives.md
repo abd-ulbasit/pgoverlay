@@ -576,19 +576,44 @@ writes could not explain anything): one `SELECT count(*)` took the branch from
 
 ### The fix
 
-There is no code fix on the overlay backend: the open flags are how stock
-Postgres reads, and changing them means patching Postgres. The fix is
-positioning. The README, [concepts](concepts.md), [benchmarks](benchmarks.md)
-and [observability](observability.md) now say that a branch grows by every
-table file it opens, and point read-heavy workloads at the backends that copy
+The first fix was positioning. The open flags are how stock Postgres reads,
+and changing them seemed to mean patching Postgres, so the README,
+[concepts](concepts.md), [benchmarks](benchmarks.md) and
+[observability](observability.md) said that a branch grows by every table
+file it opens, and pointed read-heavy workloads at the backends that copy
 blocks instead of files: [zfs](zfs.md) and Kubernetes
 [csi](kubernetes.md#recommended-csi-mode).
+
+The real fix came in v1.0.0 ([#49](https://github.com/abd-ulbasit/pgoverlay/issues/49)),
+after every alternative was measured on one host
+([the evaluation](benchmarks.md#the-evaluation)). The flags Postgres asks
+for do not have to be the flags the kernel sees. An `LD_PRELOAD` library in
+the branch's Postgres, the lazyrw shim, opens relation files read-only and
+reopens one read-write, on the same descriptor number, at its first
+write-class call, so OverlayFS copies a file when it is written instead of
+when it is opened ([how](concepts.md#copy-on-first-write-the-lazyrw-shim)).
+Two things the first measurement had hidden then mattered:
+
+- The review had frozen its table on the source, so hint bits could not
+  explain the growth. pgoverlay's own `pg_basebackup` seed is not frozen,
+  and with the shim an unfrozen seed still copied 68-119 MiB on the first
+  read, because setting hint bits is a real write. Hence seed settle.
+- Correctness now rests on a kernel property: a read-only descriptor opened
+  by one backend must see what another backend writes after its upgrade,
+  which OverlayFS guarantees only since Linux 4.19. The entrypoint tests
+  exactly that property on every start instead of trusting a version number,
+  and falls back to the old behaviour, loudly, when it fails.
+
+A read of a 521 MB frozen table went from +555 MiB and 20.8 s to 0 bytes and
+277 ms, with no new privileges and stock images.
 
 ### The lesson
 
 **Measure the claim you publish, on the path your users take.** The
 benchmark tested creation and a write, because that is what the design was
-about, and the headline claim was about reads. And **copy-on-write is defined
+about, and the headline claim was about reads. And measure the fix on the
+data your users will have, not the data that makes the measurement clean:
+the frozen table that isolated the copy-up also hid the hint-bit writes. And **copy-on-write is defined
 by the layer that decides when to copy**: the question is never "does the
 application write?", it is "what does the filesystem see the application ask
 for?".
