@@ -8,8 +8,9 @@
 #   hack/build-lazyrw.sh test [PLATFORM...]
 #                                  run the C tests (internal/cow/lazyrw/test) on
 #                                  a real OverlayFS mount, against the committed
-#                                  dist/ builds, in privileged containers; the
-#                                  default platform is the Docker host's own
+#                                  dist/ builds, in privileged containers, then
+#                                  preload each build into real postgres images;
+#                                  the default platform is the Docker host's own
 #
 # The builds are reproducible (see internal/cow/lazyrw/Dockerfile), and the
 # results are committed so that `go install` needs no C toolchain.
@@ -25,6 +26,8 @@
 #   LAZYRW_PLATFORMS   build platforms (default linux/amd64,linux/arm64)
 #   LAZYRW_NO_CACHE    1: build without the builder's cache
 #   LAZYRW_TEST_NAME   container name prefix for `test` (default pgoverlay-lazyrw-test)
+#   LAZYRW_PROBE_IMAGES  postgres images `test` preloads each build into
+#                      (default postgres:18 postgres:17-bookworm postgres:17-alpine)
 #   BUILDX_BUILDER     buildx builder to use instead of pgoverlay-lazyrw
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -35,6 +38,7 @@ DOCKERFILE=$DIR/Dockerfile
 CONTEXT=internal/cow
 PLATFORMS=${LAZYRW_PLATFORMS:-linux/amd64,linux/arm64}
 TEST_NAME=${LAZYRW_TEST_NAME:-pgoverlay-lazyrw-test}
+PROBE_IMAGES=${LAZYRW_PROBE_IMAGES:-postgres:18 postgres:17-bookworm postgres:17-alpine}
 
 die() { echo "build-lazyrw: $*" >&2; exit 1; }
 
@@ -136,6 +140,24 @@ case $cmd in
         if ! tar -cf - -C "$stage" . | docker run --rm -i --privileged --platform "$p" \
           --name "$TEST_NAME-$libc-$arch" "$image" \
           sh -c 'mkdir -p /w && tar -xf - -C /w && sh /w/run.sh "/w/$1" "/w/$2"' sh "$so" "$bin"; then
+          rc=1
+        fi
+      done
+      # The builds load, stay silent and let the server run in real postgres
+      # images, whose glibc (2.36, 2.41) and musl are newer than the build's.
+      for image in $PROBE_IMAGES; do
+        libc=glibc
+        case $image in *alpine*) libc=musl ;; esac
+        so=liblazyrw-$libc-$arch.so
+        out=$(tar -cf - -C "$DIST" "$so" | docker run --rm -i --quiet --platform "$p" --entrypoint sh \
+          --name "$TEST_NAME-probe-$arch" "$image" \
+          -c 'mkdir -p /w && tar -xf - -C /w && LD_PRELOAD="/w/$1" /bin/true && LD_PRELOAD="/w/$1" postgres --version' \
+          sh "$so" 2>&1) || true
+        if printf '%s\n' "$out" | grep -Eqx 'postgres \(PostgreSQL\) [0-9.]+.*' && [ "$(printf '%s\n' "$out" | wc -l)" -eq 1 ]; then
+          echo "ok - $so preloads silently in $image ($p): $out"
+        else
+          echo "not ok - $so in $image ($p):"
+          printf '%s\n' "$out" | sed 's/^/#   /'
           rc=1
         fi
       done
