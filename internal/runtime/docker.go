@@ -22,14 +22,39 @@ import (
 	"github.com/docker/go-connections/nat"
 )
 
-type DockerDriver struct{ cli *client.Client }
+type DockerDriver struct {
+	cli *client.Client
+	// volumeRoot, when set, is the directory on the Docker host that holds
+	// every volume this driver creates (WithVolumeRoot).
+	volumeRoot string
+	// helper runs the volume-root helpers; nil = RunHelper. Tests script it.
+	helper func(ctx context.Context, spec HelperSpec) (string, error)
+}
 
 // NewDockerDriver builds a client for the Docker endpoint the docker CLI would
 // use: DOCKER_HOST (with DOCKER_CERT_PATH / DOCKER_TLS_VERIFY), else the
 // current CLI context, including its TLS material. Endpoints the SDK cannot
 // dial (ssh://) are rejected with an explanation instead of failing later
 // with a misleading HTTP error.
-func NewDockerDriver() (*DockerDriver, error) {
+func NewDockerDriver(opts ...DockerOption) (*DockerDriver, error) {
+	d := &DockerDriver{}
+	for _, o := range opts {
+		o(d)
+	}
+	if d.volumeRoot != "" {
+		if err := ValidateVolumeRoot(d.volumeRoot); err != nil {
+			return nil, err
+		}
+	}
+	cli, err := newDockerClient()
+	if err != nil {
+		return nil, err
+	}
+	d.cli = cli
+	return d, nil
+}
+
+func newDockerClient() (*client.Client, error) {
 	opts := []client.Opt{client.FromEnv, client.WithAPIVersionNegotiation()}
 	if host := os.Getenv("DOCKER_HOST"); host != "" {
 		if err := checkDockerHost(host, "DOCKER_HOST"); err != nil {
@@ -58,7 +83,7 @@ func NewDockerDriver() (*DockerDriver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	return &DockerDriver{cli: cli}, nil
+	return cli, nil
 }
 
 func (d *DockerDriver) EnsureImage(ctx context.Context, ref string) error {
@@ -80,18 +105,52 @@ func (d *DockerDriver) EnsureImage(ctx context.Context, ref string) error {
 // an error wrapping ErrVolumeExists. Volume names are derived from branch and
 // source names, so adopting silently would give a recreated branch the writes
 // (or the frozen layer) of whatever last used the name.
+//
+// With a volume root (WithVolumeRoot) the volume is a local-driver bind
+// volume over a fresh directory <root>/<name>; see createRootVolume.
 func (d *DockerDriver) CreateVolume(ctx context.Context, name string, labels map[string]string) error {
+	if d.volumeRoot != "" {
+		// the name becomes a directory under the root
+		if err := validVolumeName(name); err != nil {
+			return fmt.Errorf("create volume: %w", err)
+		}
+	}
 	if _, err := d.cli.VolumeInspect(ctx, name); err == nil {
 		return fmt.Errorf("create volume %s: %w", name, ErrVolumeExists)
 	} else if !client.IsErrNotFound(err) {
 		return fmt.Errorf("create volume %s: %w", name, err)
 	}
+	if d.volumeRoot != "" {
+		return d.createRootVolume(ctx, name, labels)
+	}
 	_, err := d.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels})
 	return err
 }
 
+// RemoveVolume removes the volume; a missing one is success. A bind volume
+// created under a volume root loses its directory too, once the volume itself
+// is gone (removing a volume a container still uses fails first, and leaves
+// the data alone).
 func (d *DockerDriver) RemoveVolume(ctx context.Context, name string) error {
-	return d.cli.VolumeRemove(ctx, name, true)
+	v, err := d.cli.VolumeInspect(ctx, name)
+	if err != nil {
+		if !client.IsErrNotFound(err) {
+			return fmt.Errorf("remove volume %s: %w", name, err)
+		}
+		// Already gone. Under a volume root, its directory may have
+		// outlived it (a removal that stopped half way): finish that.
+		if d.volumeRoot != "" && validVolumeName(name) == nil {
+			return d.removeRootDir(ctx, d.volumeRoot, name)
+		}
+		return nil
+	}
+	if err := d.cli.VolumeRemove(ctx, name, true); err != nil {
+		return err
+	}
+	if root, ok := rootVolumeDir(v); ok {
+		return d.removeRootDir(ctx, root, name)
+	}
+	return nil
 }
 
 // CloneVolume provisions dst as a copy of src. Docker named volumes have no
@@ -556,5 +615,12 @@ func (d *DockerDriver) ListManagedVolumes(ctx context.Context, instanceID string
 		}
 		out = append(out, info)
 	}
-	return out, nil
+	if d.volumeRoot == "" {
+		return out, nil
+	}
+	left, err := d.leftoverRootDirs(ctx, instanceID, out)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, left...), nil
 }
