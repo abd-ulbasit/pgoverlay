@@ -53,6 +53,7 @@ lint:
 #                 with their SHA256SUMS
 #   lazyrw-check  fail unless both are byte-identical to a fresh build (CI)
 #   lazyrw-test   the C tests on a real OverlayFS mount (privileged containers)
+#                 and the pgoverlay-du functional test
 lazyrw:
 	hack/build-lazyrw.sh build
 

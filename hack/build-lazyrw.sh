@@ -13,8 +13,11 @@
 #                                  run the C tests (internal/cow/lazyrw/test) on
 #                                  a real OverlayFS mount, against the committed
 #                                  dist/ builds, in privileged containers, then
-#                                  preload each build into real postgres images;
-#                                  the default platform is the Docker host's own
+#                                  preload each build into real postgres images,
+#                                  then run the pgoverlay-du functional test
+#                                  (internal/cow/usage/test) on the committed
+#                                  binary; the default platform is the Docker
+#                                  host's own
 #
 # The builds are reproducible (see internal/cow/lazyrw/Dockerfile), and the
 # results are committed so that `go install` needs no C toolchain.
@@ -40,7 +43,8 @@ DIR=internal/cow/lazyrw
 DIST=$DIR/dist
 # pgoverlay-du has its own directory (package cow embeds usage/dist); its
 # README.md is not a build output.
-DU_DIST=internal/cow/usage/dist
+DU_DIR=internal/cow/usage
+DU_DIST=$DU_DIR/dist
 DOCKERFILE=$DIR/Dockerfile
 CONTEXT=internal/cow
 PLATFORMS=${LAZYRW_PLATFORMS:-linux/amd64,linux/arm64}
@@ -192,6 +196,21 @@ case $cmd in
           rc=1
         fi
       done
+      # pgoverlay-du is static, so any image runs it. The functional test uses
+      # the container's own filesystem and runs as nobody, so that its
+      # unreadable-file case runs too; reflink cases run only where the
+      # filesystem clones.
+      du=pgoverlay-du-$arch
+      [ -f "$DU_DIST/$du" ] || die "$DU_DIST/$du is missing: run 'make lazyrw'"
+      stage=$tmp/stage-du-$arch
+      mkdir -p "$stage"
+      cp "$DU_DIR/test/pgoverlay-du-test.sh" "$DU_DIST/$du" "$stage/"
+      echo "=== $du on $p ($debian)"
+      if ! tar -cf - -C "$stage" . | docker run --rm -i --platform "$p" --user 65534:65534 \
+        --name "$TEST_NAME-du-$arch" "$debian" \
+        sh -c 'mkdir -p /tmp/w && tar -xf - -C /tmp/w && sh /tmp/w/pgoverlay-du-test.sh "/tmp/w/$1" /tmp/w' sh "$du"; then
+        rc=1
+      fi
     done
     exit $rc
     ;;

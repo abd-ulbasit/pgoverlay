@@ -18,7 +18,8 @@ the source.
 | `pgoverlay-du-aarch64` | linux/arm64, static |
 | `SHA256SUMS` | `sha256sum` lines for the two binaries |
 
-The names use `uname -m`, which is what the helper reports.
+The names use `uname -m`, which is what the helper reports. `make lazyrw-test`
+runs `../test/pgoverlay-du-test.sh` against the committed binary.
 
 Keep each binary small (a musl static build is well under 100 KiB): it travels
 to the helper base64-encoded in environment variables, and a binary larger

@@ -141,9 +141,11 @@ jobs:
       - run: make it
 
   # The lazyrw LD_PRELOAD shim's four builds (glibc and musl, amd64 and
-  # arm64) are committed so `go install` needs no C toolchain. Rebuild them
-  # from source and fail on any byte of difference, then run the C tests on a
-  # real OverlayFS mount (amd64 here, arm64 natively in integration-arm64).
+  # arm64) and the two static pgoverlay-du builds are committed so `go
+  # install` needs no C toolchain. Rebuild them from source and fail on any
+  # byte of difference, then run the C tests on a real OverlayFS mount and
+  # the pgoverlay-du functional test (amd64 here, arm64 natively in
+  # integration-arm64).
   # The build uses a docker-container buildx builder whose bundled QEMU
   # covers arm64, so no binfmt set-up is needed.
   lazyrw:
@@ -156,7 +158,7 @@ jobs:
           persist-credentials: false
       - name: committed builds are reproducible from source
         run: make lazyrw-check
-      - name: C tests on a real overlay (linux/amd64, glibc and musl)
+      - name: C tests on a real overlay (linux/amd64, glibc and musl) and pgoverlay-du
         run: make lazyrw-test
 
   # Every write-class libc function the postgres binary of postgres:14-18 and
@@ -192,7 +194,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: lazyrw C tests on a real overlay (linux/arm64, glibc and musl)
+      - name: lazyrw C tests on a real overlay (linux/arm64, glibc and musl) and pgoverlay-du
         run: make lazyrw-test
       - name: pre-pull images
         run: |
