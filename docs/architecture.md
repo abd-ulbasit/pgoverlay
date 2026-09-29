@@ -141,8 +141,13 @@ After either method the seed is **settled** (`--seed-settle`, default
 image starts Postgres once on the copy (socket only, with the source's
 preload libraries, archiving, TLS and other settings that cannot start in a
 throwaway container overridden), which completes the backup's recovery; runs
-`VACUUM (FREEZE, ANALYZE)` on every database; checkpoints; and stops it
-cleanly. A dump seed runs the same VACUUM before its own clean stop. Branches
+`VACUUM (FREEZE, ANALYZE)` on every database and then freezes `pg_statistic`
+once more; checkpoints; switches to a fresh WAL segment; and stops it
+cleanly. It then trims that segment to a hole after the shutdown checkpoint
+(the file reads the same) and removes unused segments after it, so a
+branch's first WAL write copies about 1 MiB, not 16 MiB. A dump seed runs the
+same VACUUMs before its own clean stop, and the same trim. Every helper runs
+as the image's `postgres` user. Branches
 then start from a clean shutdown, and a read in a branch has no hint bits to
 set, nothing to prune and no anti-wraparound VACUUM due, so it writes
 nothing and, with the shim, copies nothing. `recover` skips the VACUUM and

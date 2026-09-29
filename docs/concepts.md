@@ -189,11 +189,12 @@ on `eager`, and counts ready branches per mode in `pgoverlay_branch_cow_mode`. N
 the branch changes: the same stock image, the same privileges, and create time still does not
 depend on the database size.
 
-What a branch still writes after reads: nothing in table or index files. The integration run
-measured a few hundred KiB of catalog and transaction-status pages on the first read pass
-(`pg_statistic` hint bits, one page each of `pg_xact`, `pg_subtrans` and `pg_multixact`) and,
-once per branch, the current 16 MiB WAL segment when the branch first writes WAL. Both are
-constant, not proportional to the data read ([benchmarks](benchmarks.md#true-copy-on-write-v100)).
+What a branch of a settled seed still writes after reads: nothing in table or index files, and
+not `pg_statistic` either (the settle freezes it last, below). What remains is constant, not
+proportional to the data read: one page each of `pg_xact`, `pg_subtrans`, `pg_multixact` and
+`pg_control`, about 190 KB of relcache init files, and, the first time the branch writes WAL,
+its copy of the seed's last WAL segment, which the settle has trimmed to about 1 MiB allocated
+(16 MiB apparent) ([benchmarks](benchmarks.md#after-the-release-fixes-the-torture-suite)).
 
 ### Turning a PGDATA into a CoW branch
 
@@ -357,18 +358,34 @@ backend) does that work once, in the seed, right after `pg_basebackup`: a helper
 image, running as the postgres user, starts Postgres on the seed with a private socket and no
 listener (and with preload libraries, archiving, TLS, the logging collector and other settings
 that cannot start in a throwaway container overridden), which completes the backup's recovery;
-runs `vacuumdb --all --freeze --analyze`; checkpoints; and stops it with a fast, clean shutdown.
-The source is never touched. Modes (`--seed-settle`, `PGOVERLAY_SEED_SETTLE`, Helm `seedSettle`):
+runs `vacuumdb --all --freeze --analyze`, then `VACUUM (FREEZE)` of `pg_statistic` and
+`pg_statistic_ext_data` in every database once more (the ANALYZE wrote their rows after they were
+vacuumed, and the first query planned in a branch would otherwise set hint bits on them and copy
+the catalog up); checkpoints; switches to a fresh WAL segment; and stops it with a fast, clean
+shutdown. The source is never touched. Modes (`--seed-settle`, `PGOVERLAY_SEED_SETTLE`, Helm
+`seedSettle`):
 
 - `freeze` (default): recover, `VACUUM (FREEZE, ANALYZE)` every database, clean shutdown;
 - `recover`: recover and shut down cleanly, no VACUUM; branches skip WAL replay but reads may
   still set hint bits;
 - `off`: the seed as `pg_basebackup` wrote it.
 
-A dump seed already ends with a clean shutdown; with `freeze` its helper runs the same VACUUM
-before stopping. A VACUUM that fails is logged and the seed kept (it is still cleanly shut
-down); a seed that cannot start or stop cleanly fails, because every branch would fail the same
-way. Settling adds roughly one read of the database, plus a write of its unfrozen pages, to the
+**The last WAL segment.** A branch appends its WAL to the segment that holds the seed's
+shutdown checkpoint, so its first WAL write copies that segment up. After the clean stop the
+settle trims it: thanks to the switch the checkpoint sits at the start of a zero-filled segment,
+and everything after the first two pages becomes a hole. The file stays byte for byte the same
+(the tail is checked to be zeros and the trimmed copy compared with `cmp` before it replaces the
+original), so recovery reads exactly what it did; unused future segments after it are removed.
+Measured on ext4, a branch's first write went from 46-119 ms and a 16 MiB copy-up to 12-27 ms and
+about 1 MiB. `wal_recycle=off` in branches was measured as an alternative and not adopted: with
+one segment already copied there is no copy-up left for it to save
+([benchmarks](benchmarks.md#after-the-release-fixes-the-torture-suite)).
+
+A dump seed already ends with a clean shutdown; with `freeze` its helper runs the same VACUUMs
+before stopping, and unless `off` it trims the WAL the same way. Every seed helper runs as the
+image's own `postgres` user, so Debian (999:999) and Alpine (70:70) images both work. A VACUUM
+that fails is logged and the seed kept (it is still cleanly shut down); a seed that cannot start
+or stop cleanly fails, because every branch would fail the same way. Settling adds roughly one read of the database, plus a write of its unfrozen pages, to the
 seed time. It runs inside the seed's heartbeat, so a long settle is never mistaken for an
 abandoned seed. The zfs and csi backends gain from it too: their branches start without crash
 recovery.
@@ -574,7 +591,11 @@ up to the filesystem that holds the volumes, not to pgoverlay:
 
 - **Copy** (ext4, XFS without reflink, most others): the kernel copies the file's data. A
   1-row `UPDATE` in a 1 GiB segment copies 1 GiB into the branch, and the write waits for it.
-  After that, writes to the file go to the branch's copy.
+  That write is Postgres writing the page out, not the `UPDATE` itself, which only changes the
+  page in shared buffers: usually the next checkpoint pays (20 s for a 446 MiB segment on the
+  test host, against 0.18 s for the `UPDATE`), sometimes a backend that evicts the page. With
+  `--lazyrw=off` the `UPDATE` paid, because opening the file copied it. After that, writes to
+  the file go to the branch's copy.
 - **Clone** (XFS with `reflink=1`, btrfs): the kernel clones the file's extents. The copy-up
   takes milliseconds and no space; the branch's file shares every block with the seed until a
   block is rewritten, and then only that block is copied. That is block-level copy-on-write:

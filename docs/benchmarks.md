@@ -121,8 +121,9 @@ independent of database size, and no new privileges.
   which is when OverlayFS copies it
   ([how it works](concepts.md#copy-on-first-write-the-lazyrw-shim)).
 - **Seed settle, on by default.** Each new seed is recovered,
-  `VACUUM (FREEZE, ANALYZE)`d and cleanly shut down once, so branches start
-  without WAL replay and their reads have no hint bits to set
+  `VACUUM (FREEZE, ANALYZE)`d and cleanly shut down once, with its last WAL
+  segment trimmed, so branches start without WAL replay, their reads have no
+  hint bits to set, and their first WAL write copies about 1 MiB
   ([how it works](concepts.md#seed-settle-doing-the-first-reads-writes-once)).
 - **Block level where the filesystem allows it.** Where the volumes sit on
   XFS (`reflink=1`) or btrfs, OverlayFS copy-up is an extent clone. branchd

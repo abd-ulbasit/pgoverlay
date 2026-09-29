@@ -147,8 +147,9 @@ packages) get minimal generated `postgresql.conf`, `pg_hba.conf` and
 
 **Seed settle.** After `pg_basebackup`, the seed is started once in a helper
 on the branch image, which completes the backup's recovery, then
-`VACUUM (FREEZE, ANALYZE)` runs on every database and the seed is shut down
-cleanly (`--seed-settle=freeze`, the default; `recover` skips the VACUUM,
+`VACUUM (FREEZE, ANALYZE)` runs on every database (with `pg_statistic`
+frozen again last) and the seed is shut down cleanly, its last WAL segment
+trimmed (`--seed-settle=freeze`, the default; `recover` skips the VACUUMs,
 `off` skips the step). Branches then start without WAL replay, and their reads
 do not write: there are no hint bits to set, nothing to prune and no
 anti-wraparound VACUUM due. Only pgoverlay's copy is touched, never the source.
@@ -271,12 +272,23 @@ restart by reconcile).
 On a host where copy-up copies (`pgoverlay_cow_copyup_mode{mode="copy"}`,
 ext4 for most Docker hosts), the first write to each table or index segment
 in a branch waits while OverlayFS copies that segment, up to 1 GiB, into the
-branch. The statement that triggers it (often a one-row `UPDATE`, or an
-autovacuum of the table) takes as long as the copy, which runs at the disk's
-copy speed: 87 to 140 MB/s in the VM of the [June benchmark](benchmarks.md#before-the-fix-branch-creation-scaled-with-data-size),
-about 20 s for 500 MB on the loaded host where #49 was evaluated. Later writes to the same file are normal speed, and every branch
-pays for its own copy once. `TRUNCATE`, `DROP` and table rewrites copy
-nothing.
+branch. The copy runs at the disk's copy speed: 87 to 140 MB/s in the VM of
+the [June benchmark](benchmarks.md#before-the-fix-branch-creation-scaled-with-data-size),
+about 20 s for a 446 MiB segment on the shared host where #49 was measured.
+Later writes to the same file are normal speed, and every branch pays for its
+own copy once. `TRUNCATE`, `DROP` and table rewrites copy nothing.
+
+What waits is whatever first writes the file, which is usually not the
+statement that changed the row. An `UPDATE` changes the page in shared
+buffers and returns (0.18 s in that measurement); the page reaches the file
+at the next checkpoint, or earlier if the background writer or a backend
+evicts it, and that write waits for the copy (the `CHECKPOINT` took 20.1 s).
+So the stall shows up as a slow `CHECKPOINT`, a slow branch-from-branch or
+stop (both checkpoint), or now and then a query that had to evict the page;
+a statement can also wait itself when it extends the table or index, which
+writes the file directly. With `--lazyrw=off` it is the other way round: opening
+the file copies it, so the `UPDATE` took 21.0 s and the checkpoint 0.2 s
+([measurement](benchmarks.md#throughput-and-the-first-write-stall)).
 
 To avoid it, put the volumes where copy-up clones: `--volume-root` on an XFS
 (`reflink=1`) or btrfs disk for Docker, `dataRoot` on such a disk for
