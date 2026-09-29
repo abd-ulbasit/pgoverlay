@@ -247,9 +247,11 @@ docker exec pgoverlay-br-NAME cat /pgoverlay/rw/cow-mode   # or kubectl exec
 
 The mode is decided each time the branch's container starts. Once the cause
 is fixed, start the branch again: `pgb branch reset NAME` (discards its
-writes), or remove its container and let reconcile start a new one on the
-same data (`docker rm -f pgoverlay-br-NAME`, `kubectl delete pod`); branchd
-reads the mode again when it starts a branch, and at its own startup.
+writes), `docker restart pgoverlay-br-NAME` (keeps them), or on Kubernetes
+delete the branch pod and let reconcile start a new one on the same data.
+branchd reads the mode when it starts a branch itself and at its own
+startup, so after a `docker restart` the gauge catches up at branchd's next
+restart; `cow-mode` in the container is current.
 `pgoverlay_branch_cow_mode{mode="unknown"}` counts ready branches whose mode
 branchd could not read (the exec into the branch failed); its log says why.
 

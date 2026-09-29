@@ -190,7 +190,7 @@ audit_log  0     1204    +1204
 (row counts are planner estimates)
 ```
 
-The engine starts a temporary branch from the target's recorded base, dumps both, and destroys the temporary branch, so a diff takes a few seconds and never touches the source. Row counts are planner estimates, exact enough to see what a migration did; tables whose count is unknown show `?`. `--all` lists unchanged tables and `--data` samples the new rows. On the overlay backend the base is the branch's fork point; for a branch created from another branch on zfs or csi it is the parent's current state. More in [docs/usage.md](docs/usage.md#5-reviewing-migrations-with-pgb-diff).
+The engine starts a temporary branch from the target's recorded base, dumps both, and destroys the temporary branch, so a diff takes a few seconds and never touches the source. Row counts are planner estimates, exact enough to see what a migration did; tables whose count is unknown show `?`, and a small change to a seeded table shows once the branch has analyzed it (`ANALYZE` before the diff). `--all` lists unchanged tables and `--data` samples the new rows. On the overlay backend the base is the branch's fork point; for a branch created from another branch on zfs or csi it is the parent's current state. More in [docs/usage.md](docs/usage.md#5-reviewing-migrations-with-pgb-diff).
 
 ## The copy-on-write system that copied the whole database
 
