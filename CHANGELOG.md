@@ -69,7 +69,9 @@ Added:
   `SIGKILL` mid-TPC-B with `pg_amcheck`, branch-from-branch, reset, diff),
   the version matrix with the shim on 14 to 18 and `17-alpine`, and
   `hack/bench-cow.sh`, an interleaved pgbench comparison of plain Postgres,
-  eager and lazyrw branches, and a reflink volume root.
+  eager and lazyrw branches, and a reflink volume root, with the
+  `bench-cow` workflow that runs it on GitHub-hosted amd64 and arm64
+  runners and reports the release gate.
   ([#57](https://github.com/abd-ulbasit/pgoverlay/pull/57),
   [#58](https://github.com/abd-ulbasit/pgoverlay/pull/58))
 
@@ -101,13 +103,17 @@ Upgrade notes:
   with the fix for CVE-2026-64600
   ([docs/security.md](docs/security.md#xfs-reflink-hosts-cve-2026-64600)).
 
-Known gaps: only linux/amd64 on one kernel was measured by hand; arm64 is
-covered by CI; Docker Desktop, Colima and OrbStack are expected to work but
-were not measured. The pgbench release gate ran on a shared, loaded host:
-warm select-only throughput is within noise of plain Postgres and the eager
-branch, but warm TPC-B (9.4% below the eager branch on medians, with a
-spread several times larger) is inconclusive there and needs a quiet-host
-rerun ([benchmarks](docs/benchmarks.md#throughput-and-the-first-write-stall)).
+The pgbench release gate passes on dedicated GitHub-hosted runners
+(`.github/workflows/bench-cow.yml`, 5 interleaved rounds on amd64 and on
+arm64): warm select-only is within noise of plain Postgres and the eager
+branch, and warm TPC-B with the shim is 1.5% below the eager branch on amd64
+(no round more than 2.6% apart) and 1.7% above it on arm64. A first run on a
+shared, loaded host had been inconclusive
+([benchmarks](docs/benchmarks.md#throughput-and-the-first-write-stall)).
+
+Known gaps: the functional checks were measured by hand on linux/amd64 on one
+kernel; arm64 is covered by CI and the benchmark run; Docker Desktop, Colima
+and OrbStack are expected to work but were not measured.
 `--wal-recycle=off` was measured and saves no copy-up on a settled seed; it
 stays an experimental opt-in. A managed loopback XFS pool for block-level
 copy-on-write on ext4 hosts is planned for v1.1 as an opt-in.

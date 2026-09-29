@@ -15,13 +15,18 @@
 # select-only and TPC-B throughput cold (the first run after create, which pays
 # the copy-up first touch) and warm (after one warm-up run); and the first-write
 # stall — the wall time of the first one-row UPDATE of a ~1 GiB single-segment
-# table, which C copies whole and D clones (B has already paid it on the first
-# read). A has no rw layer, so its rw/stall columns are blank; it is the TPS
-# ceiling.
+# table, and of the CHECKPOINT after it. With the shim the UPDATE only dirties a
+# buffer; the segment is copied (C) or cloned (D) when the page is written out,
+# which the timed CHECKPOINT captures. B has already paid it on the first read.
+# A has no rw layer, so its rw columns are blank; it is the TPS ceiling.
 #
 # Interleaving, medians and the load average during every run are recorded
-# because the benchmark host is shared and not quiet. The raw per-run JSON is
-# kept; the markdown table is written to the path in $BENCH_OUT (default stdout).
+# because a benchmark host may be shared. The order of the configurations
+# rotates from round to round (BENCH_ROTATE=1), so none of them always runs
+# right after another one's copy-up. The gate compares C with B round by round
+# (paired ratios) as well as by medians. The raw per-run JSON is kept (at
+# $BENCH_JSON when set); the markdown table is written to the path in
+# $BENCH_OUT (default stdout).
 #
 # This is NOT hack/benchmark.sh (branch create/seed scaling across DB sizes).
 # This one holds the dataset fixed and measures the CoW machinery under pgbench.
@@ -38,6 +43,7 @@
 # Knobs (env): BENCH_ROUNDS=3  BENCH_DURATION=60  BENCH_CLIENTS=8
 #              BENCH_JOBS=4  BENCH_SCALE=50  BENCH_STALL_ROWS=850000
 #              BENCH_PG_IMAGE=postgres:17  BENCH_CONFIGS="A B C D"
+#              BENCH_ROTATE=1  BENCH_JSON=<path for the raw per-run JSON>
 set -euo pipefail
 
 ROUNDS="${BENCH_ROUNDS:-3}"
@@ -50,6 +56,7 @@ PG_IMAGE="${BENCH_PG_IMAGE:-postgres:17}"
 HELPER_IMAGE="alpine:3.21"
 VOLUME_ROOT="${BENCH_VOLUME_ROOT:-}"
 CONFIGS="${BENCH_CONFIGS:-A B C D}"
+ROTATE="${BENCH_ROTATE:-1}"
 OUT="${BENCH_OUT:-/dev/stdout}"
 
 PGPASS="pgoverlay-cowbench"
@@ -65,7 +72,11 @@ command -v docker >/dev/null || { echo "error: docker not found" >&2; exit 1; }
 
 PGOVERLAY_HOME="$(mktemp -d "${TMPDIR:-/tmp}/pgoverlay-cowbench-home.XXXXXX")"
 export PGOVERLAY_HOME
-RESULTS_JSON="$(mktemp "${TMPDIR:-/tmp}/pgoverlay-cowbench.XXXXXX.jsonl")"
+if [ -n "${BENCH_JSON:-}" ]; then
+    RESULTS_JSON="$BENCH_JSON"; : >"$RESULTS_JSON"; : >"$RESULTS_JSON.meta"
+else
+    RESULTS_JSON="$(mktemp "${TMPDIR:-/tmp}/pgoverlay-cowbench.XXXXXX.jsonl")"
+fi
 
 log() { echo "[bench-cow] $*" >&2; }
 
@@ -158,12 +169,11 @@ pgbench_tps() {
         | awk '/^tps = /{print $3; exit}'
 }
 
-# Time (seconds) of the first one-row UPDATE of the ~1 GiB stall table.
-stall_update() {
+# Wall time (seconds) of one SQL statement: timed_sql <container> <sql>.
+timed_sql() {
     local cont="$1" t0 t1
     t0=$(now_ns)
-    docker exec "$cont" psql -U postgres -d postgres -q \
-        -c "UPDATE stall_big SET pad = pad WHERE id = 1" >/dev/null 2>&1
+    docker exec "$cont" psql -U postgres -d postgres -q -c "$2" >/dev/null 2>&1
     t1=$(now_ns)
     elapsed "$t0" "$t1"
 }
@@ -266,7 +276,7 @@ want D && { probe_fs xfs "$VOLUME_ROOT" || true; }
 # For A: fresh plain postgres on a fresh ext4 volume, copied from the ext4
 # source's data dir (identical bytes). For B/C/D: a fresh branch. Then the
 # same run sequence, so every config is measured identically.
-measure() {
+measure() { # measure <config> <round> <position in the round>
     local cfg="$1" round="$2" br="cbench-${1,,}-r${2}" cont
     local t0 t1 create_s la_start la_end
     la_start=$(loadavg)
@@ -316,9 +326,15 @@ measure() {
     sS_warm=$(pgbench_tps "$cont" -S)
     tpcb_warm=$(pgbench_tps "$cont")
 
-    # first-write stall on the untouched ~1 GiB table (branches only; A writes
-    # to its plain volume, ~instant, recorded for reference)
-    local stall; stall=$(stall_update "$cont")
+    # first-write stall on the untouched ~1 GiB table (A writes to its plain
+    # volume, recorded for reference). An untimed CHECKPOINT first flushes the
+    # TPC-B runs' dirty pages. Then the one-row UPDATE (B already holds the
+    # segment; C and D only dirty a buffer) and the CHECKPOINT that writes the
+    # page out, which is where C copies the segment and D clones it.
+    local stall stall_ckpt
+    timed_sql "$cont" "CHECKPOINT" >/dev/null
+    stall=$(timed_sql "$cont" "UPDATE stall_big SET pad = pad WHERE id = 1")
+    stall_ckpt=$(timed_sql "$cont" "CHECKPOINT")
     la_end=$(loadavg)
 
     emit "$cfg" "$round" \
@@ -328,7 +344,7 @@ measure() {
         "rw_after_tpcb=${rw_tpcb:--}" "rw_after_tpcb_excl=${rw_tpcb_ex:--}" \
         "sel_cold_tps=${sS_cold:-0}" "sel_warm_tps=${sS_warm:-0}" \
         "tpcb_cold_tps=${tpcb_cold:-0}" "tpcb_warm_tps=${tpcb_warm:-0}" \
-        "stall_s=$stall" \
+        "stall_s=$stall" "stall_ckpt_s=$stall_ckpt" "pos=$3" \
         "loadavg_start=$la_start" "loadavg_end=$la_end"
 
     # tear down so peak disk stays at one config at a time
@@ -342,11 +358,16 @@ measure() {
 }
 
 # ============================ INTERLEAVED ROUNDS ===========================
+# Round r runs the wanted configurations rotated left by r-1 (A B C D, then
+# B C D A, ...), so each one takes every position in a round equally often.
+order=()
+for cfg in $CONFIGS; do want "$cfg" && order+=("$cfg"); done
 for r in $(seq 1 "$ROUNDS"); do
+    off=0; [ "$ROTATE" = 1 ] && off=$(( (r - 1) % ${#order[@]} ))
     log "########## ROUND $r/$ROUNDS ##########"
-    for cfg in $CONFIGS; do
-        want "$cfg" || continue
-        measure "$cfg" "$r" || log "WARN: $cfg round $r failed; continuing"
+    for i in "${!order[@]}"; do
+        cfg="${order[$(( (i + off) % ${#order[@]} ))]}"
+        measure "$cfg" "$r" "$((i + 1))" || log "WARN: $cfg round $r failed; continuing"
     done
 done
 
@@ -354,9 +375,10 @@ done
 log "aggregating; raw JSON: $RESULTS_JSON"
 {
     echo "<!-- generated by hack/bench-cow.sh -->"
-    [ -f "$RESULTS_JSON.meta" ] && sed 's/^# /Host: /' "$RESULTS_JSON.meta"
+    # one bullet per line of host facts and probe results
+    [ -f "$RESULTS_JSON.meta" ] && sed -E 's/^(# )?/- /' "$RESULTS_JSON.meta"
     echo
-    awk -v rounds="$ROUNDS" -v dur="$DURATION" -v cl="$CLIENTS" -v jb="$JOBS" -v sc="$SCALE" '
+    awk -v rounds="$ROUNDS" -v dur="$DURATION" -v cl="$CLIENTS" -v jb="$JOBS" -v sc="$SCALE" -v rot="$ROTATE" '
     function num(line,key,   re,v){ re="\""key"\":[-0-9.]+"; if(!match(line,re))return "";
         v=substr(line,RSTART,RLENGTH); sub(/^[^:]*:/,"",v); return v }
     function str(line,key,   re,v){ re="\""key"\":\"[^\"]*\""; if(!match(line,re))return "";
@@ -387,36 +409,74 @@ log "aggregating; raw JSON: $RESULTS_JSON"
         push(c,"tpcb_cold_tps",num(line,"tpcb_cold_tps"))
         push(c,"tpcb_warm_tps",num(line,"tpcb_warm_tps"))
         push(c,"stall_s",num(line,"stall_s"))
+        push(c,"stall_ckpt_s",num(line,"stall_ckpt_s"))
+        r=num(line,"round"); rounds_seen[r]=1
+        v=num(line,"sel_warm_tps"); if(v!=""&&v>0)SW[c,r]=v+0
+        v=num(line,"tpcb_warm_tps"); if(v!=""&&v>0)TW[c,r]=v+0
         push(c,"loadavg_start",num(line,"loadavg_start"))
         push(c,"loadavg_end",num(line,"loadavg_end"))
     }
     END{
         split("A B C D",order," ")
-        printf "Interleaved A/B/C/D, %d rounds, pgbench -c%d -j%d -T%d, scale %d. Median (min–max).\n\n", rounds,cl,jb,dur,sc
+        printf "Interleaved A/B/C/D%s, %d rounds, pgbench -c%d -j%d -T%d, scale %d. Median (min–max).\n\n", (rot=="1"?" (order rotated each round)":""),rounds,cl,jb,dur,sc
         print  "| Metric | A plain (baseline) | B eager (--lazyrw=off) | C shim (ext4) | D shim + XFS clone |"
         print  "|---|---|---|---|---|"
         printf "| Branch create (s) | %s | %s | %s | %s |\n", spread2("A","create_s"),spread2("B","create_s"),spread2("C","create_s"),spread2("D","create_s")
         printf "| rw after create (MiB) | — | %s | %s | %s |\n", mib("B","rw_after_create"),mib("C","rw_after_create"),mib("D","rw_after_create")
         printf "| rw after read-only (MiB) | — | %s | %s | %s |\n", mib("B","rw_after_ro"),mib("C","rw_after_ro"),mib("D","rw_after_ro")
+        printf "| rw after read-only, exclusive (MiB) | — | %s | %s | %s |\n", mib("B","rw_after_ro_excl"),mib("C","rw_after_ro_excl"),mib("D","rw_after_ro_excl")
         printf "| rw after TPC-B (MiB) | — | %s | %s | %s |\n", mib("B","rw_after_tpcb"),mib("C","rw_after_tpcb"),mib("D","rw_after_tpcb")
         printf "| rw after TPC-B, exclusive (MiB) | — | %s | %s | %s |\n", mib("B","rw_after_tpcb_excl"),mib("C","rw_after_tpcb_excl"),mib("D","rw_after_tpcb_excl")
         printf "| select-only TPS, cold | %s | %s | %s | %s |\n", spread("A","sel_cold_tps"),spread("B","sel_cold_tps"),spread("C","sel_cold_tps"),spread("D","sel_cold_tps")
         printf "| select-only TPS, warm | %s | %s | %s | %s |\n", spread("A","sel_warm_tps"),spread("B","sel_warm_tps"),spread("C","sel_warm_tps"),spread("D","sel_warm_tps")
         printf "| TPC-B TPS, cold | %s | %s | %s | %s |\n", spread("A","tpcb_cold_tps"),spread("B","tpcb_cold_tps"),spread("C","tpcb_cold_tps"),spread("D","tpcb_cold_tps")
         printf "| TPC-B TPS, warm | %s | %s | %s | %s |\n", spread("A","tpcb_warm_tps"),spread("B","tpcb_warm_tps"),spread("C","tpcb_warm_tps"),spread("D","tpcb_warm_tps")
-        printf "| first-write stall (s) | %s | %s | %s | %s |\n", spread2("A","stall_s"),spread2("B","stall_s"),spread2("C","stall_s"),spread2("D","stall_s")
+        printf "| first-write stall: UPDATE (s) | %s | %s | %s | %s |\n", spread2("A","stall_s"),spread2("B","stall_s"),spread2("C","stall_s"),spread2("D","stall_s")
+        printf "| first-write stall: CHECKPOINT after it (s) | %s | %s | %s | %s |\n", spread2("A","stall_ckpt_s"),spread2("B","stall_ckpt_s"),spread2("C","stall_ckpt_s"),spread2("D","stall_ckpt_s")
         printf "| loadavg during runs | %s | %s | %s | %s |\n", spread2("A","loadavg_start"),spread2("B","loadavg_start"),spread2("C","loadavg_start"),spread2("D","loadavg_start")
         print ""
-        # release gate
+        # Paired, per-round ratios: within one round the configurations ran
+        # minutes apart, so a ratio cancels most drift in the host.
+        print "Per-round ratios of warm throughput (same round, so host drift cancels): median (min–max)."
+        print ""
+        print "| Ratio | select-only, warm | TPC-B, warm |"
+        print "|---|---|---|"
+        split("C/B C/A B/A D/C", pairs, " ")
+        for(p=1;p<=4;p++){ split(pairs[p],xy,"/")
+            s1=pair(SW,xy[1],xy[2]); s2=pair(TW,xy[1],xy[2])
+            if(s1!=""||s2!="") printf "| %s | %s | %s |\n", pairs[p], (s1==""?"—":s1), (s2==""?"—":s2) }
+        print ""
+        # Release gate. The shim is judged against the eager branch B, which
+        # has the same overlay and differs only by the shim; C against plain A
+        # is reported beside it. Noise: the run-to-run spread (max-min)/median
+        # of the baselines A and B themselves, with a floor of 2%.
         sw_a=median("A","sel_warm_tps"); sw_b=median("B","sel_warm_tps"); sw_c=median("C","sel_warm_tps")
         tw_b=median("B","tpcb_warm_tps"); tw_c=median("C","tpcb_warm_tps")
         print "## Release gate"
-        if(sw_c!=""&&sw_b!=""){ ref=(sw_a!=""?sw_a:sw_b); d=(sw_c-ref)/ref*100
-            printf "- select-only, warm: C %.0f vs %s %.0f  (%+.1f%%)\n", sw_c,(sw_a!=""?"A":"B"),ref,d }
-        if(tw_c!=""&&tw_b!=""){ d=(tw_c-tw_b)/tw_b*100
-            printf "- TPC-B, warm: C %.0f vs B %.0f  (%+.1f%%; gate: within 5%%)\n", tw_c,tw_b,d
-            printf "- gate: %s\n", (d>=-5.0?"PASS (C within 5%% of B on writes; reads within noise)":"FAIL (C more than 5%% below B on writes)") }
+        if(sw_c!=""&&sw_b!=""){ d=(sw_c-sw_b)/sw_b*100; pr=pmed(SW,"C","B")
+            noise=relspread("B","sel_warm_tps"); if(sw_a!=""&&relspread("A","sel_warm_tps")>noise)noise=relspread("A","sel_warm_tps")
+            if(noise<2)noise=2
+            printf "- select-only, warm: C %.0f vs B %.0f (%+.1f%% on medians; paired C/B median %.3f)", sw_c,sw_b,d,pr
+            if(sw_a!="") printf "; vs A %.0f (%+.1f%%; paired C/A %.3f, B/A %.3f)", sw_a,(sw_c-sw_a)/sw_a*100,pmed(SW,"C","A"),pmed(SW,"B","A")
+            printf "; noise band ±%.1f%%: %s\n", noise, ((d>=-noise&&d<=noise&&(pr-1)*100>=-noise&&(pr-1)*100<=noise)?"PASS (within noise of B)":"FAIL (outside the noise band)") }
+        if(tw_c!=""&&tw_b!=""){ d=(tw_c-tw_b)/tw_b*100; pr=pmed(TW,"C","B"); nb=pbelow(TW,"C","B",0.95); np=pcount(TW,"C","B")
+            printf "- TPC-B, warm: C %.0f vs B %.0f (%+.1f%% on medians); paired C/B median %.3f, %d of %d rounds below 0.95; B spread %.1f%%, C spread %.1f%%\n", tw_c,tw_b,d,pr,nb,np,relspread("B","tpcb_warm_tps"),relspread("C","tpcb_warm_tps")
+            if(d>=-5.0&&pr>=0.95) v="PASS (C within 5% of B on warm TPC-B, by medians and by paired rounds)"
+            # FAIL needs the medians, the paired median and at least 80% of the
+            # paired rounds under the bar (a sign test: 5 of 5 by chance is 1/32).
+            else if(d<-5.0&&pr<0.95&&nb*5>=np*4) v="FAIL (C more than 5% below B on warm TPC-B, in at least 80% of the paired rounds)"
+            else v="INCONCLUSIVE (neither side of the 5% bar holds consistently across the medians and the paired rounds)"
+            printf "- gate (warm TPC-B within 5%% of B): %s\n", v }
     }
+    function relspread(cfg,key,   m){ m=median(cfg,key); if(m==""||m==0)return 0; return (hi(cfg,key)-lo(cfg,key))/m*100 }
+    # paired ratios X/Y over the rounds where both ran: pr[] 1..k, sorted
+    function pratios(M,x,y,pr,   r,k,i,j,t){ k=0; for(r in rounds_seen) if(((x,r) in M)&&((y,r) in M)) pr[++k]=M[x,r]/M[y,r]
+        for(i=1;i<=k;i++)for(j=i+1;j<=k;j++)if(pr[j]<pr[i]){t=pr[i];pr[i]=pr[j];pr[j]=t}
+        return k }
+    function pcount(M,x,y,   pr){ return pratios(M,x,y,pr) }
+    function pmed(M,x,y,   pr,k){ k=pratios(M,x,y,pr); if(k==0)return 0; return (k%2)?pr[(k+1)/2]:(pr[k/2]+pr[k/2+1])/2 }
+    function pbelow(M,x,y,th,   pr,k,i,c){ k=pratios(M,x,y,pr); c=0; for(i=1;i<=k;i++)if(pr[i]<th)c++; return c }
+    function pair(M,x,y,   pr,k){ k=pratios(M,x,y,pr); if(k==0)return ""; return sprintf("%.3f (%.3f–%.3f), n=%d", pmed(M,x,y), pr[1], pr[k], k) }
     ' "$RESULTS_JSON"
 } >"$OUT"
 log "wrote $OUT"
