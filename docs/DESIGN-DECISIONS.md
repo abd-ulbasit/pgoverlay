@@ -1,6 +1,6 @@
 # Design decisions (ADRs)
 
-Ten decisions that shaped pgoverlay, each recorded in the same four parts:
+Eleven decisions that shaped pgoverlay, each recorded in the same four parts:
 
 - **Context** — the problem and the competing pressures.
 - **Decision** — what was chosen, and where it lives in the code.
@@ -347,3 +347,113 @@ through the key id: retired keys in `PGOVERLAY_SECRET_KEY_PREVIOUS` (and a
 state-dir `secret.key` that is no longer the primary) are decrypt-only, and the
 startup sweep moves their rows under the new key, after which they can be
 dropped.
+
+---
+
+## ADR-11: Copy-on-write strategy — a lazy read-write shim on OverlayFS, clones where the filesystem allows
+
+**Context.** The overlay backend's premise is that a branch pays for what it
+changes. The pre-v1 review measured otherwise: PostgreSQL opens every relation
+segment `O_RDWR`, even to read it (`src/backend/storage/smgr/md.c`), and
+OverlayFS copies a lower file whole on a read-write open, so one
+`SELECT count(*)` on a 489 MB table copied the table into the branch
+([benchmarks](benchmarks.md#reads-copy-up-too)). Issue
+[#49](https://github.com/abd-ulbasit/pgoverlay/issues/49) set the bar for
+v1.0.0 on the **default** setup, plain Docker on an ext4 host with stock
+`postgres:14` to `18` images: a read-only workload adds approximately
+nothing; a write copies as little as the mechanism allows (block level the
+target, whole file on first write the minimum); no correctness regressions;
+no new privileges; create time independent of database size; Docker Desktop,
+Colima, OrbStack and Linux; Kubernetes keeps working. Every option was
+researched, prototyped and measured on one host
+([the evaluation](benchmarks.md#the-evaluation)). The finding that framed the
+decision: nothing gives block-level copy-on-write on a plain ext4 Docker host
+with stock images and no new privileges. ext4 cannot reflink, every OverlayFS
+variant copies the whole file on a read-write open, and every block-level
+mechanism needs a privileged loop, device-mapper or nbd set-up, or a
+userspace I/O layer.
+
+**Decision.** Copy on first *write* everywhere, and on first *changed block*
+where the filesystem can clone:
+
+- **The lazyrw shim, on by default** on the overlay backend (Docker and
+  Kubernetes hostPath). An `LD_PRELOAD` library
+  (`internal/cow/lazyrw/lazyrw.c`) opens relation and SLRU files read-only and
+  reopens a file read-write, on the same descriptor, at its first write-class
+  call. It ships hardened: `truncate(path, 0)` becomes an `O_TRUNC` open (a
+  plain truncate copies the whole lower file first); a descriptor is swapped
+  only if it is still the file it was; it is active only in the `postgres`
+  server binary; every libc pointer has a raw-syscall fallback; a failed
+  upgrade fails the write. The entrypoint (`internal/cow/entrypoint.sh`) uses
+  it only after a per-start kernel self-test (read-only descriptors must see
+  data written after a copy-up: stacked file operations, Linux 4.19) and a
+  preload probe, pins `io_method=worker` on PG 18, and otherwise falls back
+  to eager copying, reported in `cow-mode`, the log and
+  `pgoverlay_branch_cow_mode`. The builds are committed, reproducible and
+  embedded (`internal/cow/lazyrw.go`), so `go install` still needs no C
+  toolchain. `--lazyrw=off` restores the old behaviour.
+- **Seed settle, on by default** (`internal/pgctl/settle.go`). The shim only
+  helps if a read writes nothing, and a `pg_basebackup` copy makes reads
+  write: backup-label replay, hint bits, pruning, anti-wraparound vacuum.
+  Each seed is recovered, `VACUUM (FREEZE, ANALYZE)`d and cleanly shut down
+  once (`--seed-settle=freeze|recover|off`).
+- **Clones where the filesystem reflinks, detected, not configured.** On XFS
+  (`reflink=1`) and btrfs the kernel already turns copy-up into an extent
+  clone. branchd probes the volumes' filesystem at startup
+  (`internal/cow/fsprobe.go`), exports `pgoverlay_cow_copyup_mode`, counts
+  usage as exclusive bytes with a small FIEMAP tool (`pgoverlay-du`), and on
+  XFS sets a 16 KiB copy-on-write extent size hint on a volume root it
+  manages. `--volume-root DIR` puts Docker volumes on such a disk without
+  moving Docker (`internal/runtime/docker_volumeroot.go`). The shim stays on
+  there too: reads then open nothing read-write, so branches keep sharing the
+  seed's page cache instead of each cloning its own inode.
+- **zfs and csi are unchanged**: their clones were block level already.
+
+**Alternatives considered.**
+
+- *OverlayFS `metacopy=on`, data-only lower layers, `volatile`*: measured
+  byte-identical to the baseline; the kernel copies data on any write-mode
+  open.
+- *fuse-overlayfs*: the same whole-file copy on open, plus a daemon.
+- *A managed loopback XFS reflink pool on ext4 hosts* (the only route to
+  block-level copy-on-write on ext4): reads copied nothing and writes were
+  block level, but `fsync` ran at 0.4 to 0.6 times ext4's rate, TPC-B was
+  roughly half (on a noisy host), and it brings a privileged loop device
+  lifecycle, re-attach after reboot, and a fixed capacity that fails with
+  `ENOSPC` or `EIO`. Deferred to v1.1 as an opt-in, gated on a quiet-host
+  benchmark.
+- *A per-file `FICLONE` backend without overlay*: would drop `CAP_SYS_ADMIN`
+  from branch containers, but needs a reflink filesystem, cannot clone a
+  running branch atomically, and its create time grows with the file count.
+  A later experiment.
+- *btrfs subvolume snapshots, a btrfs pool, dm-thin, dm-snapshot, qcow2 over
+  nbd*: block level, but privileged and fragile set-ups, extra kernel modules
+  that desktop VMs may lack, and the slowest `fsync` measured.
+- *A seccomp user-notification supervisor, a custom FUSE filesystem, a
+  userspace block-redirect shim, a hardlink farm*: more moving parts in the
+  I/O path than the problem needs.
+- *A patched Postgres*: gives up stock images and means maintaining a fork of
+  every supported major.
+- *Keep documenting it and point read-heavy users at zfs or csi*: the v1.0-rc
+  answer. It leaves the default backend contradicting its own premise.
+
+**Consequences / trade-offs.** On the default setup reads are free: a read of
+a 521 MB frozen table went from +555 MiB and 20.8 s to 0 bytes and 277 ms,
+with select-only throughput unchanged and no new privileges. Writes on ext4
+still copy a whole segment (up to 1 GiB) on first write, inline: #49's
+minimum, not its target; block level comes only from a reflink filesystem
+(automatic, or via `--volume-root`) or, later, the v1.1 pool. Correctness now
+depends on the shim seeing every write: a missed write path fails loudly
+(`EBADF`, then a Postgres `ERROR`) rather than silently, CI audits the libc
+imports of every supported `postgres` binary against the interposition list,
+and each new Postgres major has to be re-audited (asynchronous I/O that
+writes through `io_uring` would bypass it, hence the `io_method` pin). It
+also depends on a kernel property, checked on every start rather than
+assumed. The repository now carries prebuilt binaries, kept honest by a
+byte-for-byte reproducibility check. Seeding takes longer (a read of the
+database plus a write of its unfrozen pages), and a settled seed is analyzed,
+which changes how `pgb diff` counts small seeded tables. Branches created
+before v1.0.0 stay eager until they are reset. Masking still runs in every
+branch and so still copies the segments it rewrites. Only linux/amd64 on one
+kernel was measured; arm64 is covered by CI, Docker Desktop, Colima and
+OrbStack are expected to work but were not measured.
