@@ -451,9 +451,10 @@ with select-only throughput unchanged and no new privileges. Writes on ext4
 still copy a whole segment (up to 1 GiB) on first write: #49's minimum, not
 its target. The copy waits in whatever writes the page out, usually a
 checkpoint rather than the statement (a one-row `UPDATE` 0.18 s, the next
-`CHECKPOINT` 20 s for a 446 MiB segment). The pgbench release gate met its
-read half; its write half (warm TPC-B within 5% of the eager branch) was
-inconclusive on the shared host it ran on and needs a quiet-host rerun
+`CHECKPOINT` 20 s for a 446 MiB segment). The pgbench release gate passes on
+dedicated GitHub-hosted runners: warm select-only within noise, and warm
+TPC-B with the shim 1.5% below the eager branch on amd64 and 1.7% above it
+on arm64; once a segment is copied the shim costs nothing measurable
 ([benchmarks](benchmarks.md#throughput-and-the-first-write-stall)).
 Block level comes only from a reflink filesystem
 (automatic, or via `--volume-root`) or, later, the v1.1 pool. Correctness now
