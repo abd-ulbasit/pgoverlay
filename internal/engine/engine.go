@@ -48,6 +48,9 @@ type Engine struct {
 	// seeding, branches reconcile is restarting, and the endpoint-refresh
 	// rate limit (see reconcile.go).
 	rs reconcileState
+	// seedSettle is how a fresh seed is prepared before branches start from
+	// it (branchd --seed-settle). "" = pgctl.DefaultSettleMode.
+	seedSettle pgctl.SettleMode
 }
 
 // parentStepTimeout bounds a parent-affecting step (stopping a freeze or
@@ -265,21 +268,39 @@ func (e *Engine) image(src *registry.Source) string {
 	return "postgres:" + src.PGVersion
 }
 
+// WithSeedSettle sets how every seed (source add and refresh) is prepared
+// before branches start from it: pgctl.SettleFreeze (the default) recovers
+// the copy, freezes and analyzes it and shuts it down cleanly,
+// pgctl.SettleRecover only recovers and shuts down, pgctl.SettleOff leaves it
+// as the seed command wrote it. branchd --seed-settle, pgb
+// $PGOVERLAY_SEED_SETTLE. "" keeps the default.
+func WithSeedSettle(m pgctl.SettleMode) Option {
+	return func(e *Engine) { e.seedSettle = m }
+}
+
 // seedSource runs the source's seeding method (pg_basebackup or pg_dump,
-// per Source.SeedVia) into the given layer. Backend-neutral: the layer is
-// resolved through seedTarget (overlay volume, zfs mountpoint, csi PVC).
+// per Source.SeedVia) into the given layer, then settles it (see
+// pgctl.Settle; the dump helper settles in place). Backend-neutral: the
+// layer is resolved through seedTarget (overlay volume, zfs mountpoint, csi
+// PVC), and every backend gains from a settled seed: branches start from a
+// clean shutdown instead of replaying the backup's WAL, and their reads do
+// not write.
 func (e *Engine) seedSource(ctx context.Context, s *registry.Source, layer, password string) error {
 	seedVol, seedKind := e.seedTarget(layer)
 	spec := pgctl.SeedSpec{
 		Image: e.image(s), Volume: seedVol, MountKind: seedKind, Network: s.Network,
 		Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser, Password: password,
+		Settle: e.seedSettle,
 	}
 	if s.SeedVia == registry.SeedViaDump {
 		return pgctl.SeedDump(ctx, e.drv, pgctl.SeedDumpSpec{
 			SeedSpec: spec, Database: s.ConnDB, Schemas: s.DumpSchemas,
 		})
 	}
-	return pgctl.Seed(ctx, e.drv, spec)
+	if err := pgctl.Seed(ctx, e.drv, spec); err != nil {
+		return err
+	}
+	return pgctl.Settle(ctx, e.drv, spec)
 }
 
 // AddSource registers a source and seeds it from the given live Postgres.

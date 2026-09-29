@@ -15,6 +15,7 @@ import (
 	"github.com/abd-ulbasit/pgoverlay/internal/apiclient"
 	"github.com/abd-ulbasit/pgoverlay/internal/config"
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
 	"github.com/abd-ulbasit/pgoverlay/internal/version"
@@ -198,6 +199,12 @@ func open() (*engine.Engine, *registry.Registry, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// how `source add` and `source refresh` settle a new seed, as branchd
+	// --seed-settle does in server mode
+	settle, err := pgctl.ParseSettleMode(os.Getenv(pgctl.SettleEnv))
+	if err != nil {
+		return nil, nil, fmt.Errorf("$%s: %w", pgctl.SettleEnv, err)
+	}
 	reg, err := openRegistryAt(cfg)
 	if err != nil {
 		return nil, nil, err
@@ -207,5 +214,5 @@ func open() (*engine.Engine, *registry.Registry, error) {
 		reg.Close()
 		return nil, nil, err
 	}
-	return engine.New(reg, drv, cfg.PostgresImage), reg, nil
+	return engine.New(reg, drv, cfg.PostgresImage, engine.WithSeedSettle(settle)), reg, nil
 }
