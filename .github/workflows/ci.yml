@@ -212,7 +212,9 @@ jobs:
       matrix:
         # The supported range (README "Supported Postgres versions"): 14 is the
         # floor because branch startup passes recovery_init_sync_method.
-        pg: ["14", "15", "16", "17", "18"]
+        # 17-alpine covers the musl build of the lazyrw shim and the Alpine
+        # images' postgres user (uid 70).
+        pg: ["14", "15", "16", "17", "18", "17-alpine"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
