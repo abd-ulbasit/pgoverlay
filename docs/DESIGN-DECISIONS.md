@@ -396,7 +396,9 @@ where the filesystem can clone:
   helps if a read writes nothing, and a `pg_basebackup` copy makes reads
   write: backup-label replay, hint bits, pruning, anti-wraparound vacuum.
   Each seed is recovered, `VACUUM (FREEZE, ANALYZE)`d and cleanly shut down
-  once (`--seed-settle=freeze|recover|off`).
+  once (`--seed-settle=freeze|recover|off`), and the WAL segment a branch
+  appends to is trimmed to a hole after its shutdown checkpoint, so a
+  branch's first WAL write copies about 1 MiB rather than 16 MiB.
 - **Clones where the filesystem reflinks, detected, not configured.** On XFS
   (`reflink=1`) and btrfs the kernel already turns copy-up into an extent
   clone. branchd probes the volumes' filesystem at startup
@@ -434,14 +436,26 @@ where the filesystem can clone:
   I/O path than the problem needs.
 - *A patched Postgres*: gives up stock images and means maintaining a fork of
   every supported major.
+- *`wal_recycle=off` in branches*, to stop a checkpoint copying a seed WAL
+  segment up only to rename it: measured, and on a settled seed there is no
+  such copy-up left to save (its single segment is already copied by the
+  branch's first write), so it only keeps fewer recycled segments at the cost
+  of zero-filling each new one. Kept as the experimental `--wal-recycle=off`;
+  trimming the segment in the settle is what removed the copy.
 - *Keep documenting it and point read-heavy users at zfs or csi*: the v1.0-rc
   answer. It leaves the default backend contradicting its own premise.
 
 **Consequences / trade-offs.** On the default setup reads are free: a read of
 a 521 MB frozen table went from +555 MiB and 20.8 s to 0 bytes and 277 ms,
 with select-only throughput unchanged and no new privileges. Writes on ext4
-still copy a whole segment (up to 1 GiB) on first write, inline: #49's
-minimum, not its target; block level comes only from a reflink filesystem
+still copy a whole segment (up to 1 GiB) on first write: #49's minimum, not
+its target. The copy waits in whatever writes the page out, usually a
+checkpoint rather than the statement (a one-row `UPDATE` 0.18 s, the next
+`CHECKPOINT` 20 s for a 446 MiB segment). The pgbench release gate met its
+read half; its write half (warm TPC-B within 5% of the eager branch) was
+inconclusive on the shared host it ran on and needs a quiet-host rerun
+([benchmarks](benchmarks.md#throughput-and-the-first-write-stall)).
+Block level comes only from a reflink filesystem
 (automatic, or via `--volume-root`) or, later, the v1.1 pool. Correctness now
 depends on the shim seeing every write: a missed write path fails loudly
 (`EBADF`, then a Postgres `ERROR`) rather than silently, CI audits the libc

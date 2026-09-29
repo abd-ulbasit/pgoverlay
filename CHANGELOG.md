@@ -30,9 +30,18 @@ Added:
   ([#50](https://github.com/abd-ulbasit/pgoverlay/pull/50),
   [#53](https://github.com/abd-ulbasit/pgoverlay/pull/53))
 - **Seed settle**: every new seed is recovered, `VACUUM (FREEZE, ANALYZE)`d
-  and cleanly shut down once, on pgoverlay's copy, never the source. Branches
-  start without WAL replay, and their reads set no hint bits.
-  ([#52](https://github.com/abd-ulbasit/pgoverlay/pull/52))
+  (with `pg_statistic` frozen last) and cleanly shut down once, on
+  pgoverlay's copy, never the source. Branches start without WAL replay, and
+  their reads set no hint bits. The settle then trims the seed's last WAL
+  segment to a hole after its checkpoint, byte for byte the same file, so a
+  branch's first WAL write copies about 1 MiB instead of 16 MiB (measured on
+  ext4: 12-27 ms instead of 46-119 ms), and removes unused segments after it.
+  ([#52](https://github.com/abd-ulbasit/pgoverlay/pull/52),
+  [#56](https://github.com/abd-ulbasit/pgoverlay/pull/56))
+- **Alpine and custom images as sources**: seed helpers run as the image's
+  own `postgres` user (999:999 on Debian, 70:70 on Alpine) instead of uid
+  999, so `postgres:*-alpine` sources seed, and their branches run the musl
+  build of the shim. ([#56](https://github.com/abd-ulbasit/pgoverlay/pull/56))
 - **Block-level copy-on-write where the filesystem clones.** branchd probes
   at startup whether OverlayFS copy-up copies data or clones extents (XFS
   with `reflink=1`, btrfs), counts branch usage as exclusive bytes in clone
@@ -55,13 +64,22 @@ Added:
   overlay), `pg-import-audit` (every write-class libc import of `postgres`
   in `postgres:14` to `18` and `17-alpine` is interposed or reviewed) and
   `integration-arm64`.
+- **Tests and benchmarks**: a copy-on-write torture suite (reads, writes,
+  `TRUNCATE`/`DROP`, `VACUUM FULL`, `CREATE INDEX`, `CREATE DATABASE`,
+  `SIGKILL` mid-TPC-B with `pg_amcheck`, branch-from-branch, reset, diff),
+  the version matrix with the shim on 14 to 18 and `17-alpine`, and
+  `hack/bench-cow.sh`, an interleaved pgbench comparison of plain Postgres,
+  eager and lazyrw branches, and a reflink volume root.
+  ([#57](https://github.com/abd-ulbasit/pgoverlay/pull/57),
+  [#58](https://github.com/abd-ulbasit/pgoverlay/pull/58))
 
 Changed:
 
 - On ext4 the first write to a table or index segment copies the segment
-  (up to 1 GiB) into the branch and waits for it. On XFS and btrfs volume
-  roots the copy is a clone, and later writes copy only the blocks they
-  change.
+  (up to 1 GiB) into the branch and waits for it. The write that waits is
+  usually a checkpoint writing the page out, not the statement that changed
+  it. On XFS and btrfs volume roots the copy is a clone, and later writes
+  copy only the blocks they change.
 - Seeding takes longer by the settle: roughly one read of the database plus
   a write of its unfrozen pages. A source whose configuration cannot start
   in a container (an `include` of a file outside the data directory) now
@@ -85,7 +103,13 @@ Upgrade notes:
 
 Known gaps: only linux/amd64 on one kernel was measured by hand; arm64 is
 covered by CI; Docker Desktop, Colima and OrbStack are expected to work but
-were not measured. A managed loopback XFS pool for block-level
+were not measured. The pgbench release gate ran on a shared, loaded host:
+warm select-only throughput is within noise of plain Postgres and the eager
+branch, but warm TPC-B (9.4% below the eager branch on medians, with a
+spread several times larger) is inconclusive there and needs a quiet-host
+rerun ([benchmarks](docs/benchmarks.md#throughput-and-the-first-write-stall)).
+`--wal-recycle=off` was measured and saves no copy-up on a settled seed; it
+stays an experimental opt-in. A managed loopback XFS pool for block-level
 copy-on-write on ext4 hosts is planned for v1.1 as an opt-in.
 
 ### Also since v1.0.0-rc.4

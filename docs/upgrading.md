@@ -60,6 +60,12 @@ by themselves.
   not know); every branch of that seed would have failed the same way. See
   [Troubleshooting](troubleshooting.md#seeding). `--seed-settle=off` restores
   the old behaviour.
+- **Seeds belong to the image's `postgres` user.** The seed helpers look the
+  user up in the branch image (`id -u postgres`, `id -g postgres`) instead of
+  assuming uid 999: 999:999 on the Debian images, 70:70 on the Alpine ones.
+  Alpine sources, which could not be seeded before, now work, and their
+  branches run the musl build of the shim; an image without a `postgres`
+  user cannot be seeded ([Troubleshooting](troubleshooting.md#seeding)).
 - **Diff row counts of seeded tables are estimates.** The settle runs
   `ANALYZE`, so a small table that was never analyzed on the source is no
   longer counted exactly; a small change to it shows once the branch has
