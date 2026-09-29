@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Builds and tests the lazyrw LD_PRELOAD shim (internal/cow/lazyrw) and W4's
-# pgoverlay-du for glibc and musl on linux/amd64 and linux/arm64.
+# Builds and tests the lazyrw LD_PRELOAD shim (internal/cow/lazyrw) for glibc
+# and musl, and the static pgoverlay-du usage tool (internal/cow/usage), on
+# linux/amd64 and linux/arm64.
 #
-#   hack/build-lazyrw.sh [build]   rebuild internal/cow/lazyrw/dist + SHA256SUMS
+#   hack/build-lazyrw.sh [build]   rebuild internal/cow/lazyrw/dist and
+#                                  internal/cow/usage/dist, each with its
+#                                  SHA256SUMS
 #   hack/build-lazyrw.sh check     rebuild into a temporary directory and fail
-#                                  unless it is byte-identical to dist/ (CI)
+#                                  unless both dist/ directories are
+#                                  byte-identical to it (CI)
 #   hack/build-lazyrw.sh test [PLATFORM...]
 #                                  run the C tests (internal/cow/lazyrw/test) on
 #                                  a real OverlayFS mount, against the committed
@@ -34,6 +38,9 @@ cd "$(dirname "$0")/.."
 
 DIR=internal/cow/lazyrw
 DIST=$DIR/dist
+# pgoverlay-du has its own directory (package cow embeds usage/dist); its
+# README.md is not a build output.
+DU_DIST=internal/cow/usage/dist
 DOCKERFILE=$DIR/Dockerfile
 CONTEXT=internal/cow
 PLATFORMS=${LAZYRW_PLATFORMS:-linux/amd64,linux/arm64}
@@ -71,15 +78,26 @@ buildx_out() {
   rm -rf "$tmp/raw-$target"
 }
 
-# build_dist <dest>: every variant plus SHA256SUMS.
+# sums <dir>: dir/SHA256SUMS for every file in dir.
+sums() {
+  (cd "$1" && find . -maxdepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort |
+    while read -r f; do sha256 "$f"; done > "$tmp/SHA256SUMS")
+  mv "$tmp/SHA256SUMS" "$1/SHA256SUMS"
+}
+
+# build_dist <dest>: every shim variant in dest/lazyrw and every pgoverlay-du
+# binary in dest/usage, each directory with its own SHA256SUMS.
 build_dist() {
   local dest=$1
-  buildx_out dist "$PLATFORMS" "$dest"
-  chmod 0644 "$dest"/*.so
-  if compgen -G "$dest/pgoverlay-du-*" >/dev/null; then chmod 0755 "$dest"/pgoverlay-du-*; fi
-  (cd "$dest" && find . -maxdepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort |
-    while read -r f; do sha256 "$f"; done > "$tmp/SHA256SUMS")
-  mv "$tmp/SHA256SUMS" "$dest/SHA256SUMS"
+  buildx_out dist "$PLATFORMS" "$dest/all"
+  mkdir -p "$dest/lazyrw" "$dest/usage"
+  mv "$dest/all"/*.so "$dest/lazyrw/"
+  mv "$dest/all"/pgoverlay-du-* "$dest/usage/"
+  rmdir "$dest/all" || die "unexpected build outputs: $(ls "$dest/all")"
+  chmod 0644 "$dest/lazyrw"/*.so
+  chmod 0755 "$dest/usage"/pgoverlay-du-*
+  sums "$dest/lazyrw"
+  sums "$dest/usage"
 }
 
 cmd=${1:-build}
@@ -88,22 +106,35 @@ case $cmd in
     build_dist "$tmp/dist"
     rm -f "$DIST"/*
     mkdir -p "$DIST"
-    cp -p "$tmp/dist"/* "$DIST/"
-    [ -f internal/cow/usage/pgoverlay-du.c ] || echo "note: internal/cow/usage/pgoverlay-du.c does not exist yet; pgoverlay-du not built"
+    cp -p "$tmp/dist/lazyrw"/* "$DIST/"
+    rm -f "$DU_DIST"/pgoverlay-du-* "$DU_DIST/SHA256SUMS"
+    mkdir -p "$DU_DIST"
+    cp -p "$tmp/dist/usage"/* "$DU_DIST/"
     (cd "$DIST" && cat SHA256SUMS)
+    (cd "$DU_DIST" && cat SHA256SUMS)
     ;;
 
   check)
     build_dist "$tmp/dist"
-    (cd "$DIST" && sha256 -c --quiet SHA256SUMS) || die "$DIST does not match its SHA256SUMS"
-    if ! diff -r "$tmp/dist" "$DIST" >"$tmp/diff" 2>&1; then
-      cat "$tmp/diff" >&2
-      echo "--- fresh build:" >&2
-      cat "$tmp/dist/SHA256SUMS" >&2
-      die "$DIST is not what its sources build: run 'make lazyrw' and commit the result"
-    fi
-    echo "ok: $DIST is reproducible from source"
-    (cd "$DIST" && cat SHA256SUMS)
+    rc=0
+    for pair in "lazyrw:$DIST" "usage:$DU_DIST"; do
+      fresh=$tmp/dist/${pair%%:*}
+      committed=${pair#*:}
+      if ! (cd "$committed" && sha256 -c --quiet SHA256SUMS); then
+        echo "build-lazyrw: $committed does not match its SHA256SUMS" >&2
+        rc=1
+      elif ! diff -r -x README.md "$fresh" "$committed" >"$tmp/diff" 2>&1; then
+        cat "$tmp/diff" >&2
+        echo "--- fresh build:" >&2
+        cat "$fresh/SHA256SUMS" >&2
+        echo "build-lazyrw: $committed is not what its sources build: run 'make lazyrw' and commit the result" >&2
+        rc=1
+      else
+        echo "ok: $committed is reproducible from source"
+        (cd "$committed" && cat SHA256SUMS)
+      fi
+    done
+    exit $rc
     ;;
 
   test)

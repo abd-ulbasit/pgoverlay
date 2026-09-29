@@ -70,22 +70,19 @@ RUN set -eu; \
         -Wl,--no-undefined -o "/out/liblazyrw-musl-$arch.so" lazyrw.c; \
     strip --strip-all "/out/liblazyrw-musl-$arch.so"
 
-# ---- pgoverlay-du (W4's FIEMAP exclusive-bytes counter): static, libc-free --------
-# Built only once internal/cow/usage/pgoverlay-du.c exists. The context holds
-# nothing but the C sources (Dockerfile.dockerignore), so copying all of it
-# works whether or not that file is there yet.
+# ---- pgoverlay-du (the FIEMAP exclusive-bytes counter): static, libc-free -----
+# hack/build-lazyrw.sh moves these into internal/cow/usage/dist, which package
+# cow embeds.
 
 FROM musl-toolchain AS du
 ARG TARGETARCH
-COPY . /src/
+COPY usage/pgoverlay-du.c /src/usage/pgoverlay-du.c
 RUN set -eu; \
     case "$TARGETARCH" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; *) echo "unsupported $TARGETARCH" >&2; exit 1 ;; esac; \
-    mkdir -p /out; cd /src/usage 2>/dev/null || exit 0; \
-    if [ -f pgoverlay-du.c ]; then \
-      gcc -std=gnu11 -O2 -Wall -Wextra -fstack-protector-strong -U_FORTIFY_SOURCE -fno-ident \
-          -ffile-prefix-map=/src/usage=. -static -Wl,--build-id=none -o "/out/pgoverlay-du-$arch" pgoverlay-du.c; \
-      strip --strip-all "/out/pgoverlay-du-$arch"; \
-    fi
+    mkdir -p /out; cd /src/usage; \
+    gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fstack-protector-strong -U_FORTIFY_SOURCE -fno-ident \
+        -ffile-prefix-map=/src/usage=. -static -Wl,--build-id=none -o "/out/pgoverlay-du-$arch" pgoverlay-du.c; \
+    strip --strip-all "/out/pgoverlay-du-$arch"
 
 FROM scratch AS dist
 COPY --from=glibc /out/ /

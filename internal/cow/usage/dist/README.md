@@ -5,7 +5,12 @@ This directory holds the static `pgoverlay-du` binaries that pgoverlay embeds
 containers: to measure a branch's exclusive bytes on reflink filesystems, and
 to set the XFS copy-on-write extent size hint on a volume root.
 
-Expected files, built from `../pgoverlay-du.c` by the lazyrw build script:
+The files are built from `../pgoverlay-du.c` by `make lazyrw`
+(`hack/build-lazyrw.sh`, `du` stage of `internal/cow/lazyrw/Dockerfile`). The
+build is static against musl on the pinned Alpine toolchain, and it is
+reproducible: CI's `make lazyrw-check` rebuilds the binaries and fails on any
+byte of difference, so commit what `make lazyrw` writes here after changing
+the source.
 
 | File | Target |
 |---|---|
@@ -13,11 +18,7 @@ Expected files, built from `../pgoverlay-du.c` by the lazyrw build script:
 | `pgoverlay-du-aarch64` | linux/arm64, static |
 | `SHA256SUMS` | `sha256sum` lines for the two binaries |
 
-The names use `uname -m`, which is what the helper reports. Build them static
-against musl, for example on `alpine` with `apk add build-base linux-headers`:
-
-    cc -static -O2 -Wall -Wextra -ffile-prefix-map=$PWD=. -Wl,--build-id=none \
-       -o pgoverlay-du-$(uname -m) pgoverlay-du.c && strip pgoverlay-du-$(uname -m)
+The names use `uname -m`, which is what the helper reports.
 
 Keep each binary small (a musl static build is well under 100 KiB): it travels
 to the helper base64-encoded in environment variables, and a binary larger

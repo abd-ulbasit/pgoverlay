@@ -45,11 +45,13 @@ lint:
 	go vet ./...
 
 # The lazyrw LD_PRELOAD shim (internal/cow/lazyrw), which makes a branch copy a
-# relation file up on its first write instead of its first read. Its glibc and
-# musl builds for amd64 and arm64 are committed (go:embed, so `go install`
+# relation file up on its first write instead of its first read, and the static
+# pgoverlay-du usage tool (internal/cow/usage). Their builds for amd64 and
+# arm64 (the shim for glibc and musl) are committed (go:embed, so `go install`
 # needs no C toolchain); these targets need Docker with buildx.
-#   lazyrw        rebuild internal/cow/lazyrw/dist and its SHA256SUMS
-#   lazyrw-check  fail unless dist/ is byte-identical to a fresh build (CI)
+#   lazyrw        rebuild internal/cow/lazyrw/dist and internal/cow/usage/dist
+#                 with their SHA256SUMS
+#   lazyrw-check  fail unless both are byte-identical to a fresh build (CI)
 #   lazyrw-test   the C tests on a real OverlayFS mount (privileged containers)
 lazyrw:
 	hack/build-lazyrw.sh build

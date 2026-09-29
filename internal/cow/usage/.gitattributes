@@ -1,0 +1,4 @@
+# Committed build outputs (hack/build-lazyrw.sh): never diffed, merged or
+# line-ending converted.
+dist/pgoverlay-du-* binary
+dist/SHA256SUMS text eol=lf
