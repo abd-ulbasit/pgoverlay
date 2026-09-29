@@ -145,7 +145,7 @@ state. A second signal exits immediately.
 | `--max-ttl` | `0` (none) | `PGOVERLAY_MAX_TTL` | upper bound on any requested TTL; longer ones are capped |
 | `--max-layer-depth` | `100` | `PGOVERLAY_MAX_LAYER_DEPTH` | overlay backend: cap on a branch's frozen layer chain; branching from a branch at the cap returns `403` (see [Troubleshooting](troubleshooting.md#layer-chains-and-max-layer-depth)) |
 | `--lazyrw` | `on` | `PGOVERLAY_LAZYRW` | overlay backend: `on` preloads the lazyrw shim into branch Postgres, so a table file is copied into the branch on its first write, not when it is read; a branch whose kernel (below 4.19) or image cannot use it copies on open and says so ([Troubleshooting](troubleshooting.md#a-branch-copies-eagerly)); `off` always copies on open. Branches pick a change up when they next start |
-| `--wal-recycle` | `on` | `PGOVERLAY_WAL_RECYCLE` | overlay backend, experimental: `off` starts branch Postgres with `wal_recycle=off`, so a checkpoint removes a WAL segment that came from the seed instead of copying it up to rename it |
+| `--wal-recycle` | `on` | `PGOVERLAY_WAL_RECYCLE` | overlay backend, experimental: `off` starts branch Postgres with `wal_recycle=off`, so a checkpoint removes a WAL segment that came from the seed instead of copying it up to rename it. A settled seed keeps a single segment, which the branch's first WAL write has already copied up, so measured on ext4 `off` saves no copy-up; it only keeps fewer recycled segments (16-32 MiB less after 45 MiB of WAL) at the cost of zero-filling every new one |
 | `--seed-settle` | `freeze` | `PGOVERLAY_SEED_SETTLE` | how a new seed (source add or refresh) is prepared before branches start from it: `freeze`, `recover` or `off`; see [below](#seed-settle) |
 | `--disk-root` | see [Observability](observability.md#metrics) | | path whose filesystem the `pgoverlay_disk_bytes_*` gauges measure |
 | `--volume-root` | | `PGOVERLAY_VOLUME_ROOT` | docker runtime, overlay backend: create every pgoverlay volume as a local bind volume over `<dir>/<volume>` on the Docker host instead of in Docker's own volume store; see [the volume root](#the-volume-root) |
@@ -198,16 +198,34 @@ that work once, in the seed:
 
 - `freeze` (default): start the seed once in a helper on the branch image,
   which completes the backup's recovery; run `VACUUM (FREEZE, ANALYZE)` on
-  every database; `CHECKPOINT`; stop it cleanly.
-- `recover`: the same without the VACUUM. Branches start without WAL replay,
+  every database, then `VACUUM (FREEZE)` of `pg_statistic` and
+  `pg_statistic_ext_data` in each of them again (the ANALYZE writes their
+  rows after they were vacuumed, and the first query planned in a branch
+  would otherwise set hint bits on them and copy the catalog up);
+  `CHECKPOINT`; switch to a fresh WAL segment; stop it cleanly.
+- `recover`: the same without the VACUUMs. Branches start without WAL replay,
   but reads may still set hint bits.
 - `off`: leave the seed as `pg_basebackup` wrote it.
 
+After the clean stop (`freeze` and `recover`) the WAL segment holding the
+shutdown checkpoint keeps its first pages and the zero-filled rest becomes a
+hole, byte for byte the same file, and the unused segments after it are
+removed. A branch appends its WAL to that segment, so on the overlay backend
+its first WAL write copies a few KiB instead of the whole 16 MiB segment
+(measured on ext4: about 1 MiB allocated instead of 16 MiB, and a first
+write of 12-27 ms instead of 46-119 ms). Branch usage counts apparent bytes
+(`du -sb`), so it still shows the segment at 16 MiB.
+
 `--via dump` seeds end with a clean shutdown anyway; with `freeze` their
-helper runs the VACUUM first. The source is never touched. The settle server
-listens on a private socket only and ignores the parts of the source's
-configuration that cannot start in a throwaway container; see
-[Troubleshooting](troubleshooting.md#seeding) for what can still fail it.
+helper runs the VACUUMs first, and unless `off` it trims the WAL the same way.
+The source is never touched. The settle server listens on a private socket
+only and ignores the parts of the source's configuration that cannot start in
+a throwaway container; see [Troubleshooting](troubleshooting.md#seeding) for
+what can still fail it.
+
+Seeding writes the cluster as the image's own `postgres` user, looked up in
+the image first (`id -u postgres`): 999:999 in the Debian images, 70:70 in the
+Alpine ones. An image without a `postgres` user cannot be seeded.
 
 #### Copy-up mode
 

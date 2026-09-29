@@ -35,7 +35,7 @@ start)
 stop)
   if [ -n "${STUB_STOP_FAIL:-}" ]; then printf '%s\n' "$STUB_STOP_FAIL" >> "$(cat "$REC/logpath")"; exit 1; fi ;;
 esac`,
-	"psql": `u= db= sql=
+	"psql": `u= db=${PGDATABASE:-} sql=
 while [ $# -gt 0 ]; do
   case "$1" in
   -U) u=$2; shift ;;
@@ -48,6 +48,13 @@ echo "$u@$db: $sql" >> "$REC/psql"
 printf 'PGHOST=%s PGPORT=%s PGAPPNAME=%s\nPGOPTIONS=%s\n' "$PGHOST" "$PGPORT" "$PGAPPNAME" "$PGOPTIONS" > "$REC/psql.env"
 case "$sql" in
 CHECKPOINT) echo checkpoint >> "$REC/order" ;;
+*pg_switch_wal*) echo switch >> "$REC/order" ;;
+*pg_database*)
+  if [ -n "${STUB_DATABASES_FAIL:-}" ]; then echo 'psql: error: connection lost' >&2; exit 2; fi
+  printf '%s\n' app postgres 'weird=db name' template1 ;;
+VACUUM*)
+  echo statistics >> "$REC/order"
+  if [ "$db" = "${STUB_STATISTICS_FAIL:-}" ]; then echo 'ERROR:  permission denied' >&2; exit 1; fi ;;
 *pg_roles*)
   case " ${STUB_LOGIN_OK-postgres} " in
   *" $u@$db "*|*" $u "*) ;;
@@ -66,7 +73,13 @@ done
 if [ -n "${STUB_VACUUM_FAIL:-}" ]; then printf '%s\n' "$STUB_VACUUM_FAIL" >&2; exit 1; fi
 echo 'vacuumdb: vacuuming database "postgres"'`,
 	"pg_controldata": `echo "pg_control version number:            1700"
-echo "Database cluster state:               ${STUB_STATE-shut down}"`,
+echo "Database cluster state:               ${STUB_STATE-shut down}"
+if [ -n "${STUB_WAL_FILE:-}" ]; then
+  echo "Latest checkpoint location:           $STUB_WAL_LOC"
+  echo "Latest checkpoint's REDO location:    $STUB_WAL_LOC"
+  echo "Latest checkpoint's REDO WAL file:    $STUB_WAL_FILE"
+  echo "WAL block size:                       8192"
+fi`,
 	"sync": `echo "$*" >> "$REC/sync"
 echo sync >> "$REC/order"`,
 }
@@ -97,6 +110,27 @@ func (r settleRun) has(name string) bool {
 // has a postgresql.conf.
 func runSettleScript(t *testing.T, mode SettleMode, major string, conf bool, extraEnv ...string) settleRun {
 	t.Helper()
+	return runSettleScriptOn(t, mode, major, conf, nil, extraEnv...)
+}
+
+// addTruncateStub gives the scripts a truncate(1) where the host has none
+// (macOS): the images the scripts run in all carry one.
+func addTruncateStub(t *testing.T, stubs string) {
+	t.Helper()
+	if _, err := exec.LookPath("truncate"); err == nil {
+		return
+	}
+	// truncate -s SIZE FILE: dd truncates its output at the seek offset
+	body := "#!/bin/sh\nexec dd if=/dev/null of=\"$3\" bs=1 seek=\"$2\" count=0 2>/dev/null\n"
+	if err := os.WriteFile(filepath.Join(stubs, "truncate"), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// runSettleScriptOn is runSettleScript with prepare run on the data dir
+// before the script starts.
+func runSettleScriptOn(t *testing.T, mode SettleMode, major string, conf bool, prepare func(data string), extraEnv ...string) settleRun {
+	t.Helper()
 	sh, err := exec.LookPath("sh")
 	if err != nil {
 		t.Skip("no sh")
@@ -121,6 +155,10 @@ func runSettleScript(t *testing.T, mode SettleMode, major string, conf bool, ext
 			t.Fatal(err)
 		}
 	}
+	addTruncateStub(t, stubs)
+	if prepare != nil {
+		prepare(data)
+	}
 	cmd := exec.Command(sh, append(h.Cmd[1:len(h.Cmd)-1], data)...)
 	cmd.Env = append([]string{
 		"PATH=" + stubs + string(os.PathListSeparator) + os.Getenv("PATH"),
@@ -136,7 +174,7 @@ func TestSettleScriptFreeze(t *testing.T) {
 		t.Fatalf("script failed:\n%s", r.out)
 	}
 	// recover (start), freeze, checkpoint, clean stop, then make it durable
-	if got := strings.Fields(r.file(t, "order")); strings.Join(got, " ") != "start vacuum checkpoint stop sync" {
+	if got := strings.Fields(r.file(t, "order")); strings.Join(got, " ") != "start vacuum statistics statistics statistics statistics checkpoint switch stop sync" {
 		t.Fatalf("steps = %v", got)
 	}
 	ctl := r.file(t, "pg_ctl")
@@ -209,6 +247,18 @@ func TestSettleScriptFreeze(t *testing.T) {
 	if !strings.Contains(psql, "postgres@template1: CHECKPOINT") {
 		t.Errorf("no CHECKPOINT as the superuser: %q", psql)
 	}
+	// after vacuumdb, the statistics catalogs of every database that
+	// accepts connections are frozen once more, each database named through
+	// PGDATABASE (a name with "=" stays a name), before the CHECKPOINT
+	if !strings.Contains(psql, "postgres@template1: SELECT datname FROM pg_database WHERE datallowconn") {
+		t.Errorf("no database list for the statistics step: %q", psql)
+	}
+	stats := "VACUUM (FREEZE) pg_catalog.pg_statistic, pg_catalog.pg_statistic_ext_data"
+	for _, db := range []string{"app", "postgres", "weird=db name", "template1"} {
+		if !strings.Contains(psql, "postgres@"+db+": "+stats+"\n") {
+			t.Errorf("no statistics VACUUM in %q: %q", db, psql)
+		}
+	}
 	if !strings.Contains(r.file(t, "psql.env"), "PGAPPNAME=pgoverlay-settle") {
 		t.Errorf("psql env = %q", r.file(t, "psql.env"))
 	}
@@ -219,7 +269,7 @@ func TestSettleScriptFreeze(t *testing.T) {
 		t.Error("postmaster.opts (with the settle overrides) left in the seed")
 	}
 	rep := parseSettleReport(r.out)
-	if rep.vacuum != "ok" || rep.superuser != "postgres" || rep.state != "shut down" || rep.locked != 0 {
+	if rep.vacuum != "ok" || rep.statistics != "ok" || rep.superuser != "postgres" || rep.state != "shut down" || rep.locked != 0 {
 		t.Errorf("report = %+v from:\n%s", rep, r.out)
 	}
 	// only the report reaches the helper output (the runtime keeps 20 lines)
@@ -235,13 +285,40 @@ func TestSettleScriptRecoverSkipsVacuum(t *testing.T) {
 	if r.failed {
 		t.Fatalf("script failed:\n%s", r.out)
 	}
-	if got := strings.Join(strings.Fields(r.file(t, "order")), " "); got != "start checkpoint stop sync" {
+	if got := strings.Join(strings.Fields(r.file(t, "order")), " "); got != "start checkpoint switch stop sync" {
 		t.Fatalf("steps = %v", got)
 	}
 	if r.has("vacuumdb") {
 		t.Fatal("recover ran vacuumdb")
 	}
-	if rep := parseSettleReport(r.out); rep.vacuum != "skipped" || rep.state != "shut down" {
+	if rep := parseSettleReport(r.out); rep.vacuum != "skipped" || rep.statistics != "skipped" || rep.state != "shut down" {
+		t.Errorf("report = %+v", rep)
+	}
+}
+
+// The statistics step is best effort: a database where it fails, or a
+// database list that cannot be read, is reported, and the rest of the settle
+// (the other databases, the CHECKPOINT, the clean stop) still runs.
+func TestSettleScriptStatisticsFailure(t *testing.T) {
+	r := runSettleScript(t, SettleFreeze, "17", true, "STUB_STATISTICS_FAIL=app")
+	if r.failed {
+		t.Fatalf("a failed statistics VACUUM failed the settle:\n%s", r.out)
+	}
+	if got := strings.Join(strings.Fields(r.file(t, "order")), " "); got != "start vacuum statistics statistics statistics statistics checkpoint switch stop sync" {
+		t.Fatalf("steps = %v", got)
+	}
+	if rep := parseSettleReport(r.out); rep.vacuum != "ok" || rep.statistics != "failed" || rep.state != "shut down" {
+		t.Errorf("report = %+v", rep)
+	}
+
+	r = runSettleScript(t, SettleFreeze, "17", true, "STUB_DATABASES_FAIL=1")
+	if r.failed {
+		t.Fatalf("an unreadable database list failed the settle:\n%s", r.out)
+	}
+	if got := strings.Join(strings.Fields(r.file(t, "order")), " "); got != "start vacuum checkpoint switch stop sync" {
+		t.Fatalf("steps = %v", got)
+	}
+	if rep := parseSettleReport(r.out); rep.statistics != "failed" {
 		t.Errorf("report = %+v", rep)
 	}
 }
@@ -333,7 +410,7 @@ func TestSettleScriptVacuumFailure(t *testing.T) {
 	if r.failed {
 		t.Fatalf("a failed VACUUM failed the settle:\n%s", r.out)
 	}
-	if got := strings.Join(strings.Fields(r.file(t, "order")), " "); got != "start vacuum checkpoint stop sync" {
+	if got := strings.Join(strings.Fields(r.file(t, "order")), " "); got != "start vacuum statistics statistics statistics statistics checkpoint switch stop sync" {
 		t.Fatalf("steps = %v", got)
 	}
 	if strings.Contains(r.out, "4111") || strings.Contains(r.out, "s3cr3t") {
@@ -374,7 +451,11 @@ func TestSettleScriptSuperuserDiscoveryFallsBack(t *testing.T) {
 		t.Fatalf("script failed:\n%s", r.out)
 	}
 	tries := strings.Split(strings.TrimSpace(r.file(t, "psql")), "\n")
-	want := []string{"replicator@template1", "postgres@template1", "replicator@postgres", "postgres@postgres", "admin@postgres"}
+	// four discovery attempts, then everything as the discovered superuser:
+	// the database list, the CHECKPOINT and the WAL switch in the database
+	// discovery reached, the statistics VACUUMs in each database
+	want := []string{"replicator@template1", "postgres@template1", "replicator@postgres", "postgres@postgres",
+		"admin@postgres", "admin@app", "admin@postgres", "admin@weird=db name", "admin@template1", "admin@postgres", "admin@postgres"}
 	if len(tries) != len(want) {
 		t.Fatalf("psql calls = %q, want %v", tries, want)
 	}
@@ -428,5 +509,118 @@ func TestSettleScriptUncleanStateFails(t *testing.T) {
 		if r.has("sync") {
 			t.Errorf("state %q: synced and reported an unclean seed", state)
 		}
+	}
+}
+
+// walSegment writes a 64 KiB WAL segment into data/pg_wal: non-zero bytes
+// (the page header and a checkpoint record) at [0, 200) and, when extra > 0,
+// at extra; zeros elsewhere. It returns the segment's content.
+func walSegment(t *testing.T, data, name string, extra int) []byte {
+	t.Helper()
+	seg := make([]byte, 64<<10)
+	for i := 0; i < 200; i++ {
+		seg[i] = byte(i%251 + 1)
+	}
+	if extra > 0 {
+		copy(seg[extra:], "stale WAL from a recycled segment")
+	}
+	if err := os.MkdirAll(filepath.Join(data, "pg_wal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "pg_wal", name), seg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return seg
+}
+
+// After the clean stop the zero tail of the checkpoint's WAL segment becomes
+// a hole: the file keeps its size, mode and every byte. A tail that is not
+// all zeros, or no tail past the checkpoint's pages, is kept.
+func TestSettleScriptTrimsWALTail(t *testing.T) {
+	const name = "000000010000000000000003"
+	for _, tc := range []struct {
+		loc   string // the checkpoint's location
+		extra int    // offset of non-zero bytes past the checkpoint (0 = none)
+		want  string
+	}{
+		{loc: "0/3000028", want: "trimmed"},            // right after a switch
+		{loc: "0/3009010", want: "trimmed"},            // mid-segment, zeros after
+		{loc: "0/3000028", extra: 40000, want: "kept"}, // stale data in the tail
+		{loc: "0/300E028", want: "kept"},               // no tail left to trim
+	} {
+		var seg []byte
+		r := runSettleScriptOn(t, SettleFreeze, "17", true, func(data string) {
+			seg = walSegment(t, data, name, tc.extra)
+		}, "STUB_WAL_FILE="+name, "STUB_WAL_LOC="+tc.loc)
+		if r.failed {
+			t.Fatalf("%s: script failed:\n%s", tc.loc, r.out)
+		}
+		if rep := parseSettleReport(r.out); rep.wal != tc.want {
+			t.Errorf("%s (extra %d): wal = %q, want %q\n%s", tc.loc, tc.extra, rep.wal, tc.want, r.out)
+		}
+		f := filepath.Join(r.data, "pg_wal", name)
+		got, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(seg) {
+			t.Errorf("%s: the segment's content changed (%d bytes, want %d)", tc.loc, len(got), len(seg))
+		}
+		if fi, err := os.Stat(f); err != nil || fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s: segment mode %v (%v), want 0600", tc.loc, fi.Mode(), err)
+		}
+		if left, _ := filepath.Glob(filepath.Join(r.data, "pg_wal", "*.pgoverlay-trim")); len(left) != 0 {
+			t.Errorf("%s: temporary files left: %v", tc.loc, left)
+		}
+		// the switch precedes the clean stop; the trim follows it
+		if order := strings.Join(strings.Fields(r.file(t, "order")), " "); !strings.HasSuffix(order, "checkpoint switch stop sync") {
+			t.Errorf("%s: steps = %s", tc.loc, order)
+		}
+	}
+}
+
+// Segments of the checkpoint's timeline after its segment are preallocated
+// or recycled ones with no WAL of this cluster: trim_wal removes them and
+// nothing else.
+func TestSettleScriptRemovesFutureWALSegments(t *testing.T) {
+	const name = "000000010000000000000003"
+	keep := []string{name, "000000010000000000000002", "000000020000000000000007", "00000002.history", "000000010000000000000004.partial"}
+	drop := []string{"000000010000000000000004", "0000000100000001000000A0"}
+	r := runSettleScriptOn(t, SettleFreeze, "17", true, func(data string) {
+		walSegment(t, data, name, 0)
+		for _, f := range append(append([]string{}, keep[1:]...), drop...) {
+			if err := os.WriteFile(filepath.Join(data, "pg_wal", f), []byte("recycled"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}, "STUB_WAL_FILE="+name, "STUB_WAL_LOC=0/3000028")
+	if r.failed {
+		t.Fatalf("script failed:\n%s", r.out)
+	}
+	if rep := parseSettleReport(r.out); rep.wal != "trimmed" || rep.walRemoved != len(drop) {
+		t.Errorf("report wal=%q removed=%d, want trimmed and %d\n%s", rep.wal, rep.walRemoved, len(drop), r.out)
+	}
+	for _, f := range keep {
+		if _, err := os.Stat(filepath.Join(r.data, "pg_wal", f)); err != nil {
+			t.Errorf("%s was removed: %v", f, err)
+		}
+	}
+	for _, f := range drop {
+		if _, err := os.Stat(filepath.Join(r.data, "pg_wal", f)); err == nil {
+			t.Errorf("%s (after the checkpoint's segment) was kept", f)
+		}
+	}
+}
+
+// Without the control file's WAL fields, or without the segment they name,
+// nothing is touched.
+func TestSettleScriptKeepsWALWhenUnsure(t *testing.T) {
+	r := runSettleScript(t, SettleRecover, "17", true)
+	if rep := parseSettleReport(r.out); r.failed || rep.wal != "kept" {
+		t.Fatalf("no WAL fields: failed=%v wal=%q\n%s", r.failed, rep.wal, r.out)
+	}
+	r = runSettleScript(t, SettleFreeze, "17", true, "STUB_WAL_FILE=000000010000000000000009", "STUB_WAL_LOC=0/9000028")
+	if rep := parseSettleReport(r.out); r.failed || rep.wal != "kept" {
+		t.Fatalf("missing segment: failed=%v wal=%q\n%s", r.failed, rep.wal, r.out)
 	}
 }

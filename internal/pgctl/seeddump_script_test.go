@@ -26,10 +26,32 @@ echo vacuumdb >> "$REC/pg_ctl"
 echo 'vacuumdb: vacuuming database "postgres"'
 if [ -n "${STUB_VACUUM_FAIL:-}" ]; then printf '%s\n' "$STUB_VACUUM_FAIL" >&2; exit 1; fi`,
 	"createdb": `echo "$@" > "$REC/createdb"`,
+	// the WAL trim finds no segment to trim here; settle_script_test covers it
+	"pg_controldata": `echo "pg_control version number:            1700"
+echo "Database cluster state:               shut down"`,
 	"pg_dump": `printf 'PGPASSWORD=%s PGSSLMODE=%s PGCONNECT_TIMEOUT=%s\n' "${PGPASSWORD:-}" "${PGSSLMODE:-}" "${PGCONNECT_TIMEOUT:-}" > "$REC/pg_dump.env"
 echo "$@" > "$REC/pg_dump.args"
 cat "$STUB_DUMP"`,
 	"psql": `case " $* " in
+*" -h /tmp "*" -c "*)
+  db=${PGDATABASE:-} sql=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    -d) db=$2; shift ;;
+    -c) sql=$2; shift ;;
+    esac
+    shift
+  done
+  printf '%s: %s\n' "$db" "$sql" >> "$REC/psql-local-cmds"
+  printf 'PGPASSWORD=%s\n' "${PGPASSWORD:-}" >> "$REC/psql-local-cmds.env"
+  case "$sql" in
+  *pg_database*) printf '%s\n' appdb postgres 'weird=db name' ;;
+  *pg_switch_wal*) echo "switch $db" >> "$REC/pg_ctl" ;;
+  VACUUM*)
+    echo "statistics $db" >> "$REC/pg_ctl"
+    if [ "$db" = "${STUB_STATISTICS_FAIL:-}" ]; then echo 'ERROR:  permission denied' >&2; exit 1; fi ;;
+  esac
+  ;;
 *" -c "*)
   printf 'PGPASSWORD=%s PGSSLMODE=%s\n' "${PGPASSWORD:-}" "${PGSSLMODE:-}" >> "$REC/psql-remote.env"
   case "$*" in
@@ -236,8 +258,25 @@ func TestSeedDumpScriptFreezesBeforeStop(t *testing.T) {
 		t.Fatalf("script failed:\n%s", r.out)
 	}
 	steps := strings.Split(strings.TrimSpace(r.file(t, "pg_ctl")), "\n")
-	if len(steps) != 3 || !strings.HasSuffix(steps[0], " start") || steps[1] != "vacuumdb" || !strings.Contains(steps[2], " stop ") {
-		t.Fatalf("temp server steps = %q, want start, vacuumdb, stop", steps)
+	if len(steps) != 7 || !strings.HasSuffix(steps[0], " start") || steps[1] != "vacuumdb" ||
+		steps[2] != "statistics appdb" || steps[3] != "statistics postgres" || steps[4] != "statistics weird=db name" ||
+		steps[5] != "switch postgres" || !strings.Contains(steps[6], " stop ") {
+		t.Fatalf("temp server steps = %q, want start, vacuumdb, the statistics catalogs of every database, a WAL switch, stop", steps)
+	}
+	// the database list comes from the postgres database; each VACUUM
+	// names its database through PGDATABASE (never parsed as a
+	// connection string, so "weird=db name" stays a name)
+	want := `postgres: SELECT datname FROM pg_database WHERE datallowconn ORDER BY datname
+appdb: VACUUM (FREEZE) pg_catalog.pg_statistic, pg_catalog.pg_statistic_ext_data
+postgres: VACUUM (FREEZE) pg_catalog.pg_statistic, pg_catalog.pg_statistic_ext_data
+weird=db name: VACUUM (FREEZE) pg_catalog.pg_statistic, pg_catalog.pg_statistic_ext_data
+postgres: SELECT pg_switch_wal()
+`
+	if got := r.file(t, "psql-local-cmds"); got != want {
+		t.Errorf("local psql commands =\n%s\nwant\n%s", got, want)
+	}
+	if got := r.file(t, "psql-local-cmds.env"); strings.Contains(got, "pw") {
+		t.Errorf("the statistics step saw the source password: %q", got)
 	}
 	if got := strings.TrimSpace(r.file(t, "vacuumdb")); got != "-h /tmp -U app --all --freeze --analyze" {
 		t.Errorf("vacuumdb args = %q", got)
@@ -247,8 +286,24 @@ func TestSeedDumpScriptFreezesBeforeStop(t *testing.T) {
 	if got := r.file(t, "vacuumdb.env"); got != "PGOPTIONS=-c max_parallel_maintenance_workers=0 PGPASSWORD=\n" {
 		t.Errorf("vacuumdb env = %q", got)
 	}
-	if rep := parseSettleReport(r.out); rep.vacuum != "ok" {
+	if rep := parseSettleReport(r.out); rep.vacuum != "ok" || rep.statistics != "ok" || rep.wal != "kept" {
 		t.Errorf("report = %+v from:\n%s", rep, r.out)
+	}
+}
+
+// The statistics step failing in one database is reported, and the others
+// and the clean stop still run.
+func TestSeedDumpScriptStatisticsFailureKeepsSeed(t *testing.T) {
+	r := runDumpScript(t, scopedSpec(), "STUB_STATISTICS_FAIL=appdb")
+	if r.failed {
+		t.Fatalf("a failed statistics VACUUM failed the dump seed:\n%s", r.out)
+	}
+	if rep := parseSettleReport(r.out); rep.vacuum != "ok" || rep.statistics != "failed" {
+		t.Errorf("report = %+v from:\n%s", rep, r.out)
+	}
+	steps := strings.Split(strings.TrimSpace(r.file(t, "pg_ctl")), "\n")
+	if len(steps) != 7 || steps[3] != "statistics postgres" || !strings.Contains(steps[6], " stop ") {
+		t.Errorf("steps after a failed statistics VACUUM = %q", steps)
 	}
 }
 
@@ -263,8 +318,18 @@ func TestSeedDumpScriptSettleRecoverAndOffSkipVacuum(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(r.rec, "vacuumdb")); err == nil {
 			t.Errorf("%s: vacuumdb ran", mode)
 		}
-		if strings.Contains(r.out, "pgoverlay-settle-") {
+		// recover switches WAL segments and trims the WAL tail, off leaves
+		// the cluster as the restore wrote it
+		report := strings.TrimSpace(r.out)
+		switch {
+		case mode == SettleRecover && report != "pgoverlay-settle-wal=kept\npgoverlay-settle-wal-removed=0":
+			t.Errorf("%s: output %q, want only the WAL report", mode, report)
+		case mode == SettleOff && strings.Contains(r.out, "pgoverlay-settle-"):
 			t.Errorf("%s: settle report in the output:\n%s", mode, r.out)
+		}
+		switched := strings.Contains(r.file(t, "pg_ctl"), "switch")
+		if switched != (mode == SettleRecover) {
+			t.Errorf("%s: WAL switch before the stop = %v", mode, switched)
 		}
 		// the clean stop happens regardless
 		if !strings.Contains(r.file(t, "pg_ctl"), "stop -m fast") {

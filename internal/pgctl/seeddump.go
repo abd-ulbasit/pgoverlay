@@ -85,13 +85,20 @@ func shellQuote(s string) string {
 //     the branch. A VACUUM failure is reported (pgoverlay-settle-vacuum=
 //     failed, the error redacted like psql's) and the seed kept. It runs
 //     without parallel workers: their dynamic shared memory lives in
-//     /dev/shm, 64 MB in Docker.
+//     /dev/shm, 64 MB in Docker. A VACUUM (FREEZE) of pg_statistic and
+//     pg_statistic_ext_data in every database follows it: vacuumdb analyzes
+//     tables after it has vacuumed those catalogs, and their fresh rows
+//     would otherwise get hint bits set (a write) by the first query planned
+//     in each branch (pgoverlay-settle-statistics).
+//   - unless $PGB_SETTLE is off, a switch to a fresh WAL segment precedes
+//     the stop and trim_wal follows it (see walTrimFunction), so a branch's
+//     first WAL write copies a few KiB instead of a whole segment
+//     (pgoverlay-settle-wal).
 //   - pg_ctl stop -m fast leaves a clean-shutdown cluster, so branches start
 //     without crash recovery.
 //
 // The placeholder is the pg_dump -n flags.
-const seedDumpScript = `set -euo pipefail
-remote() {
+const seedDumpScript = "set -euo pipefail\n" + walTrimFunction + `remote() {
   PGPASSWORD="$PGB_PASSWORD" PGSSLMODE="$PGB_SSLMODE" PGCONNECT_TIMEOUT="$PGB_CONNECT_TIMEOUT" \
     "$@" -h "$PGB_REMOTE_HOST" -p "$PGB_REMOTE_PORT" -U "$PGB_USER" -d "$PGB_DB"
 }
@@ -135,8 +142,27 @@ if [ "${PGB_SETTLE:-}" = freeze ]; then
       | sed -e 's/\(ERROR: .*: \)".*/\1"[redacted]"/' -e 's/^/pgoverlay-settle-vacuum-error=/' || true
     echo pgoverlay-settle-vacuum=failed
   fi
+  statistics=ok
+  dbs=$(psql -X -A -t -h /tmp -U "$PGB_USER" -d postgres \
+    -c "SELECT datname FROM pg_database WHERE datallowconn ORDER BY datname" 2>/dev/null) || { dbs=; statistics=failed; }
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    PGDATABASE=$db psql -X -q -h /tmp -U "$PGB_USER" \
+      -c 'VACUUM (FREEZE) pg_catalog.pg_statistic, pg_catalog.pg_statistic_ext_data' >/dev/null 2>&1 || statistics=failed
+  done <<< "$dbs"
+  echo "pgoverlay-settle-statistics=$statistics"
+fi
+if [ "${PGB_SETTLE:-}" != off ]; then
+  psql -X -q -h /tmp -U "$PGB_USER" -d postgres -c 'SELECT pg_switch_wal()' >/dev/null 2>&1 || true
 fi
 pg_ctl -D "$PGB_DATA" -w stop -m fast >/dev/null
+if [ "${PGB_SETTLE:-}" != off ]; then
+  wal=kept walremoved=0
+  trim_wal "$PGB_DATA" || :
+  sync -f "$PGB_DATA" 2>/dev/null || sync
+  echo "pgoverlay-settle-wal=$wal"
+  echo "pgoverlay-settle-wal-removed=$walremoved"
+fi
 `
 
 // SeedDump builds the source volume from a logical dump: initdb a fresh
@@ -200,7 +226,7 @@ func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 	if err != nil {
 		return seedError{fmt.Errorf("pg_dump seed from %s: %w", s.addr(), err)}
 	}
-	if settle == SettleFreeze {
+	if settle != SettleOff {
 		parseSettleReport(out).log("addr", s.addr(), "database", db)
 	}
 	return nil
