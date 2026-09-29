@@ -31,9 +31,9 @@ yet you paid to materialize ten full datasets.
 **The pgoverlay insight:** the dataset is mostly shared and read-only. Don't copy it. *Share the
 base, and copy only what each branch needs its own copy of.* That single idea — copy-on-write —
 is the conceptual heart of the project. A branch becomes near-instant to create and costs almost
-nothing in storage when it starts. (How much it costs later depends on the backend: §3 explains
-why, on the default overlay backend, "needs its own copy of" includes files a branch only
-reads.)
+nothing in storage when it starts. (How much it costs later depends on the backend and the
+filesystem: §3 explains what "needs its own copy of" means on the default overlay backend, and
+§8 how a filesystem that can clone shrinks it from files to blocks.)
 
 ```mermaid
 flowchart LR
@@ -82,7 +82,9 @@ This is why a CoW branch is **instant to create** (you just hand out a fresh bla
 and **near-zero storage at creation** (the transparency is empty until written). In the ideal
 case storage grows only in proportion to what the branch *changes*. Real mechanisms differ in
 what "a particular thing" is: ZFS and most CSI drivers copy **blocks**, OverlayFS copies **whole
-files**, and decides to copy when a file is *opened for writing*, not when it is written (§3).
+files**, and decides to copy when a file is *opened for writing*, not when it is written.
+pgoverlay moves that decision to the first real write (§3), and on a filesystem that can clone
+extents the whole-file copy becomes a clone that shares every block until one is rewritten (§8).
 
 pgoverlay supports three CoW mechanisms behind one abstraction (`internal/cow/plan.go`,
 `Backend`): **overlay** (the default), **zfs**, and **csi**. The rest of this document mostly
@@ -113,20 +115,86 @@ to that copy. The lower layers are never touched.
 Two details of that rule decide what a branch costs:
 
 - **The unit is the file.** A Postgres table or index is stored in segment files of up to
-  1 GiB, so the first write to one row copies the whole segment.
+  1 GiB, so the first write to one row copies the whole segment (unless the filesystem can
+  clone, §8).
 - **The trigger is the open, not the write.** PostgreSQL's storage manager opens every relation
-  segment `O_RDWR`, even for a plain `SELECT` (`src/backend/storage/smgr/md.c`). So the first
-  query of any kind that touches a table copies its files into the branch. A fresh branch is
-  about 33 MiB; after one `SELECT count(*)` on a 489 MB table it was 523 MiB
-  ([measurement](benchmarks.md#reads-copy-up-too)). A branch therefore grows toward the size of
-  the tables it touches, read or write, and the first query on a large table waits for the copy.
+  segment `O_RDWR`, even for a plain `SELECT` (`src/backend/storage/smgr/md.c`). Left alone, the
+  first query of any kind that touches a table copies its files into the branch: before v1.0.0
+  a fresh branch was about 33 MiB, and after one `SELECT count(*)` on a 489 MB table it was
+  523 MiB ([measurement](benchmarks.md#reads-copy-up-too)), and the first query on a large table
+  waited for the copy.
 
 The same rule is behind the project's founding bug: before WAL replay, Postgres's default
 `recovery_init_sync_method=fsync` opens every data file read-write to fsync it, which copied the
 whole database into every new branch.
 The branch entrypoint's `recovery_init_sync_method=syncfs` avoids that pass
-([benchmarks](benchmarks.md#the-fix)); nothing avoids the read path short of a patched Postgres
-or a block-level backend (§7).
+([benchmarks](benchmarks.md#the-fix)). The read path needs more than a flag, because read-write
+opens are how stock Postgres reads; the lazyrw shim below handles it.
+
+### Copy on first write: the lazyrw shim
+
+OverlayFS decides from the open flags, so the fix is to change the flags Postgres opens with,
+without changing Postgres. The branch's Postgres runs with a small `LD_PRELOAD` library, the
+**lazyrw shim** (`internal/cow/lazyrw/lazyrw.c`), which sits between Postgres and libc:
+
+- **Open read-only.** A read-write open (`O_RDWR` or `O_WRONLY`, without `O_CREAT` or `O_TRUNC`)
+  of a relation or transaction-status file under `PGDATA` (`base/`, `global/`, `pg_tblspc/`,
+  `pg_xact/`, `pg_multixact/`, `pg_subtrans/` and the other SLRU directories) is performed
+  `O_RDONLY` instead, and the shim remembers the file descriptor, the path, the flags Postgres
+  asked for and the file's identity. OverlayFS sees a read-only open and copies nothing. The
+  WAL is never touched: it is written anyway.
+- **Upgrade on the first write.** The first write-class call on such a descriptor (`write`,
+  `pwrite*`, `pwritev*`, `ftruncate`, `fallocate`, `copy_file_range`, a shared writable
+  `mmap`, ...) reopens the path with the original flags, which is where OverlayFS copies the
+  file up, and moves the new open file onto the same descriptor number (keeping the offset and
+  close-on-exec flag) before the call proceeds. A backend that only reads never upgrades.
+- **Other backends follow.** Postgres is one process per connection, so other backends may
+  still hold read-only descriptors for the lower file. Since Linux 4.19 OverlayFS re-targets
+  them to the copied-up file (stacked file operations), so they read the new data. Before
+  4.19 they would keep reading the stale lower file, so every branch **self-tests** this at
+  start (below) and does not use the shim where it fails.
+- **Truncation is free.** `TRUNCATE`, `DROP`, `VACUUM FULL`, `CLUSTER` and table rewrites
+  truncate files to zero, and `truncate()` of a lower file copies all of it first. The shim
+  turns `truncate(path, 0)` into an `O_TRUNC` open and `ftruncate(fd, 0)` of a read-only
+  descriptor into an `O_TRUNC` upgrade; OverlayFS copies zero bytes for an `O_TRUNC` open.
+
+It is hardened for being the default: it is active only inside the `postgres` server binary
+with `PGDATA` set (the entrypoint shell, `gosu`, `archive_command` and `COPY ... PROGRAM` get
+pure pass-through wrappers); a descriptor is upgraded only if it is still the file it was (a
+descriptor closed behind the shim's back and reused for a socket is never swapped); a failed
+upgrade fails the write with an error rather than writing through a read-only descriptor; and
+every libc pointer has a raw-syscall fallback for calls made before the shim has initialised.
+CI checks that every write-class libc function the `postgres` binary of each supported image
+imports is either interposed or reviewed (`make pg-import-audit`).
+
+**How a branch turns it on** (`internal/cow/entrypoint.sh`). branchd installs the shim builds
+(glibc and musl, x86_64 and aarch64, committed under `internal/cow/lazyrw/dist` and embedded in
+the binary) into `/pgoverlay/rw/lazyrw/` of each rw volume, next to the entrypoint and outside
+`upper/`, so they are never overlay content. After mounting the overlay the entrypoint:
+
+1. runs the **self-test** on a scratch overlay: a file opened read-only before another open
+   copies it up and rewrites it must read the new data;
+2. picks the build for the image's libc (musl when `/lib/ld-musl-*` exists) and `uname -m`;
+3. **probes** it: `postgres -V`, run as the postgres user with the build preloaded, must print
+   the shim's own "active" line (musl ignores a preload it cannot load without a word, so an
+   empty stderr would prove nothing);
+4. exports `LD_PRELOAD`, and on PG 18 and later appends `-c io_method=worker`: the shim sees
+   libc calls, not `io_uring` submissions;
+5. records the outcome in `/pgoverlay/rw/cow-mode`: `lazyrw`, `eager` (the shim was wanted but a
+   check failed; Postgres copies on open, as before) or `off` (`--lazyrw=off`), with a detail
+   line.
+
+branchd reads that file after every readiness wait (`internal/engine/cowmode.go`), logs it, warns
+on `eager`, and counts ready branches per mode in `pgoverlay_branch_cow_mode`. Nothing else in
+the branch changes: the same stock image, the same privileges, and create time still does not
+depend on the database size.
+
+What a branch of a settled seed still writes after reads: nothing in table or index files, and
+not `pg_statistic` either (the settle freezes it last, below). What remains is constant, not
+proportional to the data read: one page each of `pg_xact`, `pg_subtrans`, `pg_multixact` and
+`pg_control`, about 190 KB of relcache init files, and, the first time the branch writes WAL,
+its copy of the seed's last WAL segment, which the settle has trimmed to about 1 MiB allocated
+(16 MiB apparent) ([benchmarks](benchmarks.md#after-the-release-fixes-the-torture-suite)).
 
 ### Turning a PGDATA into a CoW branch
 
@@ -272,9 +340,60 @@ not dump (Supabase's `auth.uid()`) need that schema in `--dump-schema` too.
 | Version constraint | `--pg-version` must equal the source major (checked) | image major must be ≥ remote server |
 | Speed/fidelity | faster, byte-faithful | slower, but provider-agnostic |
 
+### Seed settle: doing the first reads' writes once
+
+The lazyrw shim makes a read copy nothing only if the read really writes nothing, and on a fresh
+`pg_basebackup` copy it does write:
+
+- an online backup ends with a `backup_label`, so every branch would start with crash recovery,
+  replaying the WAL streamed during the backup and writing the pages it touches;
+- pages carry the source's unset **hint bits**: the first read of a row whose inserting
+  transaction has committed records that fact on the page, which dirties it;
+- reads also prune dead row versions (HOT pruning), and tables with old unfrozen transaction ids
+  get an anti-wraparound autovacuum in every branch.
+
+Each of those is a write, so on the overlay backend it copies the touched segment into every
+branch. **Seed settle** (`internal/pgctl/settle.go`, `Settle`, called from `seedSource` for every
+backend) does that work once, in the seed, right after `pg_basebackup`: a helper on the branch
+image, running as the postgres user, starts Postgres on the seed with a private socket and no
+listener (and with preload libraries, archiving, TLS, the logging collector and other settings
+that cannot start in a throwaway container overridden), which completes the backup's recovery;
+runs `vacuumdb --all --freeze --analyze`, then `VACUUM (FREEZE)` of `pg_statistic` and
+`pg_statistic_ext_data` in every database once more (the ANALYZE wrote their rows after they were
+vacuumed, and the first query planned in a branch would otherwise set hint bits on them and copy
+the catalog up); checkpoints; switches to a fresh WAL segment; and stops it with a fast, clean
+shutdown. The source is never touched. Modes (`--seed-settle`, `PGOVERLAY_SEED_SETTLE`, Helm
+`seedSettle`):
+
+- `freeze` (default): recover, `VACUUM (FREEZE, ANALYZE)` every database, clean shutdown;
+- `recover`: recover and shut down cleanly, no VACUUM; branches skip WAL replay but reads may
+  still set hint bits;
+- `off`: the seed as `pg_basebackup` wrote it.
+
+**The last WAL segment.** A branch appends its WAL to the segment that holds the seed's
+shutdown checkpoint, so its first WAL write copies that segment up. After the clean stop the
+settle trims it: thanks to the switch the checkpoint sits at the start of a zero-filled segment,
+and everything after the first two pages becomes a hole. The file stays byte for byte the same
+(the tail is checked to be zeros and the trimmed copy compared with `cmp` before it replaces the
+original), so recovery reads exactly what it did; unused future segments after it are removed.
+Measured on ext4, a branch's first write went from 46-119 ms and a 16 MiB copy-up to 12-27 ms and
+about 1 MiB. `wal_recycle=off` in branches was measured as an alternative and not adopted: with
+one segment already copied there is no copy-up left for it to save
+([benchmarks](benchmarks.md#after-the-release-fixes-the-torture-suite)).
+
+A dump seed already ends with a clean shutdown; with `freeze` its helper runs the same VACUUMs
+before stopping, and unless `off` it trims the WAL the same way. Every seed helper runs as the
+image's own `postgres` user, so Debian (999:999) and Alpine (70:70) images both work. A VACUUM
+that fails is logged and the seed kept (it is still cleanly shut down); a seed that cannot start
+or stop cleanly fails, because every branch would fail the same way. Settling adds roughly one read of the database, plus a write of its unfrozen pages, to the
+seed time. It runs inside the seed's heartbeat, so a long settle is never mistaken for an
+abandoned seed. The zfs and csi backends gain from it too: their branches start without crash
+recovery.
+
 Both modes are entered from `AddSource` (`internal/engine/engine.go`), which creates the source
-layer, seeds it, and marks the source ready. `RefreshSource` re-seeds into a **new generation**
-volume so existing branches keep their old base and only new branches see fresh data.
+layer, seeds it, settles it, and marks the source ready. `RefreshSource` re-seeds into a **new
+generation** volume so existing branches keep their old base and only new branches see fresh
+data.
 
 ---
 
@@ -406,12 +525,13 @@ gets its own random password applied via the same in-socket `psql` path.
 ## 7. Alternative backends: ZFS and CSI
 
 OverlayFS is the default and needs nothing but the Linux kernel — but it pays for it with
-`CAP_SYS_ADMIN`, (in Kubernetes hostPath mode) node-pinning, and whole-file copy-up on first
-open (§3). Two alternative backends get CoW from the **storage layer** instead, so the branch
-container runs Postgres *directly* on a writable clone with **no overlay assembly**
-(`internal/cow/entrypoint_direct.sh`; the planner returns `EntrypointScriptDirect` for both,
-`internal/cow/plan.go`). Both copy at block granularity, so they are the answer for read-heavy
-branches of large databases.
+`CAP_SYS_ADMIN`, (in Kubernetes hostPath mode) node-pinning, and, on a filesystem that cannot
+clone, whole-file copy-up on first write (§3, §8). Two alternative backends get CoW from the
+**storage layer** instead, so the branch container runs Postgres *directly* on a writable clone
+with **no overlay assembly** and no shim (`internal/cow/entrypoint_direct.sh`; the planner
+returns `EntrypointScriptDirect` for both, `internal/cow/plan.go`). Both copy at block
+granularity whatever the filesystem underneath, which matters for branches that write into many
+large tables on a host whose volumes cannot clone.
 
 ### ZFS — dataset snapshots and clones
 
@@ -452,7 +572,8 @@ that supports clones/snapshots and want to avoid privileged pods.
 | | Overlay (default) | ZFS | CSI (Kubernetes) |
 | --- | --- | --- | --- |
 | CoW source | OverlayFS in-container | ZFS snapshot+clone | PVC clone / VolumeSnapshot |
-| Copy granularity | whole file, on first read-write open (reads included) | block, on write | the CSI driver's (block on EBS/Ceph/zfs-localpv) |
+| Reads copy | nothing (lazyrw shim; every opened file in eager mode) | nothing | nothing, once cloned |
+| Copy granularity | whole file on its first write; an extent clone, then blocks, on XFS/btrfs (§8) | block, on write | the CSI driver's (block on EBS/Ceph/zfs-localpv) |
 | Branch container | assembles overlay | runs directly on clone | runs directly on clone |
 | Privilege | `CAP_SYS_ADMIN` + unconfined AppArmor (and seccomp on K8s) | privileged zfs helpers, **and** `CAP_SYS_ADMIN` branch containers | **none** added; `RuntimeDefault` seccomp |
 | Branch-from-branch | **freeze saga** (frozen layers; parent restarts) | snapshot+clone of clone (no parent interruption) | quiesce parent + clone (parent restarts) |
@@ -463,11 +584,68 @@ that supports clones/snapshots and want to avoid privileged pods.
 
 ---
 
+## 8. Clone or copy: what a copy-up costs
+
+With the shim, a copy-up happens when a branch first writes a file. What that copy costs is
+up to the filesystem that holds the volumes, not to pgoverlay:
+
+- **Copy** (ext4, XFS without reflink, most others): the kernel copies the file's data. A
+  1-row `UPDATE` in a 1 GiB segment copies 1 GiB into the branch, and the write waits for it.
+  That write is Postgres writing the page out, not the `UPDATE` itself, which only changes the
+  page in shared buffers: usually the next checkpoint pays (20 s for a 446 MiB segment on the
+  test host, against 0.18 s for the `UPDATE`), sometimes a backend that evicts the page. With
+  `--lazyrw=off` the `UPDATE` paid, because opening the file copied it. After that, writes to
+  the file go to the branch's copy.
+- **Clone** (XFS with `reflink=1`, btrfs): the kernel clones the file's extents. The copy-up
+  takes milliseconds and no space; the branch's file shares every block with the seed until a
+  block is rewritten, and then only that block is copied. That is block-level copy-on-write:
+  XFS unshares up to 128 KiB around a rewritten page by default (its copy-on-write extent
+  size), 16 KiB with the hint pgoverlay sets on a volume root it manages (`--xfs-cowextsize`),
+  and btrfs about a page.
+
+pgoverlay uses whichever the host gives it; nothing in the branch changes. **branchd probes**
+at startup, in the background (`internal/cow/fsprobe.go`, `internal/engine/cowfs.go`): it
+creates two temporary volumes where every volume goes, writes 64 MiB into one, mounts an overlay
+across them the way a branch does (in a helper with a branch container's privileges), opens the
+file read-write, and measures whether free space dropped and whether the copied-up file shares
+its extents. The result is logged (`copy-up probe: mode=clone fs=xfs ...`) and exported as
+`pgoverlay_cow_copyup_mode`.
+
+Where the volumes live decides the answer:
+
+- **Docker**, by default: Docker's volume store (`/var/lib/docker/volumes`), on whatever
+  filesystem that is. Hosts whose root filesystem is XFS with reflink (current RHEL-family and
+  Amazon Linux installs typically are) or btrfs get clones with no configuration.
+- **Docker with `--volume-root DIR`**: every pgoverlay volume becomes a bind volume over a
+  directory under `DIR`, so a host with an ext4 root and an XFS or btrfs data disk gets clones
+  without moving Docker ([the volume root](reference.md#the-volume-root)).
+- **Kubernetes hostPath**: the node's `--kube-data-root` (Helm `dataRoot`); put it on XFS or
+  btrfs for clones.
+
+The shim stays on either way: with it, a read opens no file read-write, so the page cache stays
+shared between branches and a branch gets its own inode only for files it writes.
+
+### Usage accounting
+
+`pgb branch ls --usage` and `GET /v1/branches/{name}/usage` report the bytes a branch's
+writable layer holds (`BranchUsage`, `internal/engine/engine.go`). In copy mode that is
+`du -sb` of the rw volume, which is exact. In clone mode `du` would count a cloned 1 GiB segment
+with one rewritten page as 1 GiB, so branchd runs `pgoverlay-du` instead
+(`internal/cow/usage/pgoverlay-du.c`, a small static tool embedded in the binary): it walks the
+volume with `FIEMAP` and counts only the extents the branch does not share, the bytes that
+destroying it would free. It falls back to `du -sb` (which only ever over-counts) when the probe
+has not run or failed, when there is no build for the host's architecture, or when the tool
+fails. `pgb` in local mode does not probe, so it always reports `du -sb`.
+
+---
+
 ## Mental model to carry forward
 
-- A **source** is the one expensive thing you build once (§4): a shared, read-only base.
+- A **source** is the one expensive thing you build once (§4): a shared, read-only base,
+  settled so that reading it writes nothing.
 - A **branch** is a cheap private writable layer over that base (§2–§3): instant, near-zero
-  storage at creation, growing by whole files as Postgres opens them on the overlay backend.
+  storage at creation, growing on the overlay backend by the files it writes (by the blocks it
+  writes, where the filesystem can clone, §8).
 - **Branch-from-branch** turns a live writable layer into a frozen shared layer so a child can
   base on it, building a refcounted **DAG of immutable layers** (§5).
 - **Masking** (§6) scrubs each branch's private copy at creation without touching the base.

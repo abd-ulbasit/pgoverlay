@@ -47,9 +47,11 @@ so `node` becomes required and branchd is pinned to it.)
 
 How csi mode works (branchd `--kube-storage csi --csi-storage-class …`,
 which forces the `csi` CoW backend): the source is seeded into a PVC via
-`pg_basebackup`; creating a branch clones that PVC and the branch pod runs
-postgres directly on the clone — no overlay, no node pin, no extra
-capabilities. Branch-from-branch clones the parent's PVC after a CHECKPOINT
+`pg_basebackup` and settled (see [Seed settle](reference.md#seed-settle));
+creating a branch clones that PVC and the branch pod runs postgres directly
+on the clone — no overlay, no lazyrw shim, no node pin, no extra
+capabilities. What a read or a write costs is the CSI driver's business, as
+before. Branch-from-branch clones the parent's PVC after a CHECKPOINT
 and a brief parent stop (CSI drivers don't guarantee crash-consistent clones
 of in-use volumes); the parent pod restarts as soon as the clone is
 provisioned, and the wire router re-resolves it transparently. The same
@@ -90,6 +92,33 @@ helm install pgoverlay deploy/helm/pgoverlay \
 > registry are gone. Branches are disposable by design, so for dev/test the
 > recovery is just re-seed and re-branch ([docs/eks.md](eks.md) walks the
 > procedure); if branch survival across node loss matters, use csi mode.
+
+**Copy-on-write in hostpath mode.** Branch pods run the same entrypoint as
+Docker branches, so they get the same copy-on-write behaviour:
+
+- **The lazyrw shim** is on by default (`cow.lazyrw: true`, branchd
+  `--lazyrw`): reads copy nothing into the branch, and the first write to a
+  table file copies that file once. The install helper pod carries the shim
+  builds in its environment (in its short-lived Secret, like every helper
+  environment) and writes them into the branch's directory; nothing new is
+  granted, since branch pods already have `SYS_ADMIN` for the overlay mount.
+  Each branch checks the node's kernel (4.19 or later) and its image at
+  start, and falls back to copying on open, with a warning in the pod log and
+  in `pgoverlay_branch_cow_mode`, when it cannot use the shim.
+- **Clone copy-up** comes from the node's filesystem. With `dataRoot`
+  (branchd `--kube-data-root`) on XFS with `reflink=1` or on btrfs, a
+  branch's first write to a file clones it instead of copying it, and later
+  writes copy only the blocks they change. branchd detects this at startup
+  (`pgoverlay_cow_copyup_mode`), counts branch usage as the bytes a branch
+  does not share, and on XFS sets a 16 KiB copy-on-write extent size hint on
+  `dataRoot` (`--xfs-cowextsize`; the chart does not expose it yet). Nodes
+  whose root filesystem is XFS with reflink (expected on Amazon Linux 2023,
+  the EKS default; branchd's `copy-up probe` log line tells you) get this
+  with the default `dataRoot`; elsewhere, mount an XFS or btrfs disk at
+  `dataRoot`. See
+  [Core concepts](concepts.md#8-clone-or-copy-what-a-copy-up-costs).
+- **Seed settle** (`seedSettle: freeze`, branchd `--seed-settle`) runs in a
+  helper pod on the branch image after every seed, in both storage modes.
 
 ## Images
 
@@ -165,6 +194,15 @@ branchd itself starts two more kinds of image at runtime:
   client's `SSLRequest` with `N`.
 - **`helperImage`** — the utility helper image override (see
   [Images](#images)).
+- **`cow.lazyrw`** — `true` (default) or `false`: whether hostpath branches
+  preload the lazyrw shim (branchd `--lazyrw`). Branches pick a change up on
+  their next start. csi branches ignore it.
+- **`seedSettle`** — `freeze` (default), `recover` or `off`: how a new seed is
+  prepared before branches start from it (branchd `--seed-settle`, see
+  [Seed settle](reference.md#seed-settle)).
+- **`dataRoot`** — where hostpath data lives on the storage node (default
+  `/var/lib/pgoverlay`); on XFS (`reflink=1`) or btrfs, copy-up clones (see
+  above).
 - **`ghook.apiTokenSecret` / `ghook.apiTokenKey`** — the operator-role token
   the webhook service uses (see [Branch per pull request](#branch-per-pull-request)).
 
@@ -205,6 +243,7 @@ silently falls back to plaintext, so do not rely on it.
 |---|---|---|
 | Branch data | directories under `dataRoot` on ONE node | PersistentVolumeClaims |
 | Branch creation | empty rw dir + in-container OverlayFS | PVC `dataSource` clone (CoW on capable drivers) |
+| What a branch copies | nothing on read (lazyrw shim); a file on its first write, or only its changed blocks when `dataRoot` is on XFS or btrfs | whatever the CSI driver's clone copies |
 | Pod placement | every pod pinned to `node` | any node — the scheduler decides; branchd follows its state PVC |
 | Branch pod privileges | `CAP_SYS_ADMIN` + unconfined seccomp (overlay mount) | none added; RuntimeDefault seccomp |
 | Pod Security level | `privileged` | `baseline` (with persistence) |
@@ -263,8 +302,10 @@ own namespace, both with no ServiceAccount token:
   are plain Pods, labelled with the owning registry's
   `pgoverlay.instance`.
 - **Helper pods** (`pgoverlay.role=helper`, named `pgoverlay-helper-*`) are
-  one-shot: seeding (`pg_basebackup` / `pg_dump`), entrypoint installs, disk
-  usage, and in hostpath mode volume creation, copies and removal.
+  one-shot: seeding (`pg_basebackup` / `pg_dump`) and the seed settle,
+  entrypoint and lazyrw shim installs, disk usage, and in hostpath mode
+  volume creation, copies and removal, the startup copy-up probe and the XFS
+  extent size hint.
 
 A helper's environment — for seeding, the **source database password** — is
 never written into the Pod object. branchd puts it in an immutable Secret
@@ -321,8 +362,13 @@ runtime* (not by this chart) are where the privilege story differs:
   Unconfined on any kubelet without `seccompDefault`). Prefer csi whenever
   the cluster is shared or untrusted.
 - **Helper pods**, in both modes, run with `RuntimeDefault` seccomp and
-  `allowPrivilegeEscalation: false` (the experimental zfs backend's helpers
-  are privileged instead).
+  `allowPrivilegeEscalation: false`, with two exceptions: in hostpath mode
+  the copy-up probe, which mounts an overlay once at branchd startup, runs
+  with exactly a branch pod's settings (`SYS_ADMIN`, seccomp and AppArmor
+  unconfined); and the experimental zfs backend's helpers are privileged.
+- **The lazyrw shim** is an `LD_PRELOAD` library that only the `postgres`
+  server process inside a hostpath branch pod loads. It adds no capability
+  and no volume; see [Security](security.md#branch-instances).
 
 **Pod Security Admission.** Label the release namespace with the level its
 pods need; `helm install` does not check it (Helm does not validate pods), so

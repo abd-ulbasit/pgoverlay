@@ -93,6 +93,22 @@ The build toolchain is pinned by the `go` directive in `go.mod`, and
 bumping it is how standard-library advisories are cleared. The full unit suite
 also runs under the Go race detector.
 
+**Committed binaries.** Two small C programs ship prebuilt so that
+`go install` needs no C toolchain: the lazyrw `LD_PRELOAD` shim
+(`internal/cow/lazyrw/dist`, four builds: glibc and musl, x86_64 and aarch64)
+and the static `pgoverlay-du` usage tool (`internal/cow/usage/dist`, x86_64
+and aarch64). Each directory has a `SHA256SUMS`; the Go code embeds them and
+refuses a build that does not match it, and the overlay install helper checks
+each shim build's SHA-256 again after decoding it in the helper. The builds
+are reproducible: `make lazyrw` rebuilds them in digest-pinned Debian and
+Alpine images with `docker buildx`, and the `lazyrw` CI job (`make
+lazyrw-check`) rebuilds them from source on every pull request and fails on
+any byte of difference. The `pg-import-audit` job checks, for the `postgres`
+binaries of `postgres:14` to `18` and `17-alpine` and weekly, that every
+write-class libc function they import is interposed by the shim or on a
+reviewed list, since a write the shim does not see would hit a read-only file
+descriptor.
+
 ## Accepted advisories
 
 The allowlist names individual advisory IDs, never a whole module, so a new
@@ -178,4 +194,12 @@ NetworkPolicy, RBAC and CSI vs hostPath, and [docs/api.md](docs/api.md) the
 Branch containers are the exception to least privilege: on Docker and in
 Kubernetes hostpath mode they run with `CAP_SYS_ADMIN` and AppArmor
 unconfined for their overlay mount. See
-[docs/security.md](docs/security.md#branch-instances).
+[docs/security.md](docs/security.md#branch-instances). The lazyrw shim adds no
+privilege: it is preloaded only inside the branch container and is active only
+in its `postgres` server process.
+
+On hosts where branch volumes sit on XFS with `reflink=1`, run a kernel with
+the fix for CVE-2026-64600, an XFS copy-on-write race that lets a local user
+write into a file they can only read; in pgoverlay that could be the shared
+seed. Details in
+[docs/security.md](docs/security.md#xfs-reflink-hosts-cve-2026-64600).

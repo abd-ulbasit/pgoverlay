@@ -94,8 +94,10 @@ pgb branch destroy exp
 pgb branch destroy feature-x
 ```
 
-A branch starts at about 33 MiB and grows by every table file it opens,
-reads included ([why](benchmarks.md#reads-copy-up-too)); `pgb branch ls
+A branch starts at about 33 MiB and grows by the table files it writes
+(each copied once, up to 1 GiB per segment; only the changed blocks where the
+volumes sit on XFS or btrfs); reads copy nothing
+([how](concepts.md#copy-on-first-write-the-lazyrw-shim)). `pgb branch ls
 --usage` shows where each one stands. With `--ttl`, branches expire when a
 `branchd` reconcile pass or `pgb gc` runs; local mode does not reap on its
 own. A branch that ends up `failed` can often be brought back with its data:
@@ -292,7 +294,10 @@ shipments  0      1204    +1204
 Only tables whose count changed are listed (`--all` lists every table); a
 schema-only change prints `tables: no row-count changes`. Tables outside
 `public` show as `schema.table`, and a count that is unknown (a table never
-analyzed and larger than 64 MiB) shows as `?`. `--data` adds up to `--sample`
+analyzed and larger than 64 MiB) shows as `?`. Seeds are analyzed when they
+are settled, so a small change to a seeded table appears once the branch has
+analyzed that table: autovacuum does it after enough changed rows, or run
+`ANALYZE` in the branch before the diff. `--data` adds up to `--sample`
 (default 20, at most 500) new rows per grown table, matched by primary key;
 it checks the branch's highest keys, so new rows with random keys (UUIDs) in
 a large table can be missed.

@@ -22,7 +22,8 @@ segments written during crash recovery plus overlay bookkeeping), not a copy
 of the dataset. That was not true before 2026-06-10 (see
 [Before the fix](#before-the-fix-branch-creation-scaled-with-data-size)).
 What a branch costs after it starts serving queries is a different number:
-see [Reads copy up too](#reads-copy-up-too).
+see [Reads copy up too](#reads-copy-up-too) for how it was before v1.0.0, and
+[True copy-on-write (v1.0.0)](#true-copy-on-write-v100) for how it is now.
 
 One number needs honest framing: the **rw layer after the 1% UPDATE probe** is
 now ≈ the full dataset size, where the old table showed only +10–179 MiB.
@@ -32,14 +33,23 @@ OverlayFS copies up whole files, and Postgres heap/index segments are files of
 up to 1 GiB — so a write that touches a segment copies that entire segment
 into the rw layer, and this bulk UPDATE + CHECKPOINT ended up copying up
 essentially the whole pgbench dataset. The cost moved from create time to
-first use, and, as the next section shows, "use" includes reads: a branch
-converges on the size of the tables it touches, not only the ones it writes.
+first use, and, as the next section shows, before v1.0.0 "use" included
+reads: a branch converged on the size of the tables it touched, not only the
+ones it wrote. (This table predates v1.0.0's seed settle and lazyrw shim.
+Writes still copy whole segments on ext4, so the 1% UPDATE column would not
+change much there; on XFS or btrfs it would be a fraction of it.)
 
 10 GiB was not run in this pass; the script's disk check skips any size that
 doesn't fit (each size needs ~2.2× the target free in the Docker VM) and sizes
 are configurable: `BENCH_SIZES_GIB="1 5 10" hack/benchmark.sh`.
 
 ## Reads copy up too
+
+**Fixed in v1.0.0** for the default setup: see
+[True copy-on-write (v1.0.0)](#true-copy-on-write-v100). This section is kept
+as it was measured, because it is the evidence for that work, and because a
+branch whose kernel or image cannot run the lazyrw shim (eager mode) still
+behaves this way.
 
 An earlier version of this page said that branches which mostly read stay
 thin. That was wrong, and the pre-v1 review measured why (issue
@@ -82,17 +92,311 @@ that copy inline. A small table costs almost nothing, which is why the 1-row
 - The first query to touch a large table is slow on a new branch, because it
   waits for the copy.
 - `syncfs` cannot help here: the open flags are how stock Postgres reads.
-  Avoiding the copy would need a patched Postgres or a filesystem that copies
-  blocks instead of files.
+  Avoiding the copy needs either a filesystem that clones instead of copying,
+  or changing the flags Postgres's opens reach the kernel with, which is what
+  v1.0.0 does.
 
-**What to do about it.** For read-heavy branches of large databases, use a
-block-level backend: the [zfs backend](zfs.md) (a clone shares blocks with its
-snapshot and pays only for blocks that change) or Kubernetes
-[csi mode](kubernetes.md#recommended-csi-mode) (the CSI driver's clone
-decides the cost, which is block-level on EBS, Ceph RBD and zfs-localpv). On
-the overlay backend, size the Docker data disk for the tables your branches
-touch rather than for 33 MiB per branch, give branches a TTL, and watch
-`pgb branch ls --usage` and the [disk alerts](observability.md).
+**What the advice was.** Before v1.0.0 this page pointed read-heavy branches
+of large databases at the block-level backends ([zfs](zfs.md), Kubernetes
+[csi mode](kubernetes.md#recommended-csi-mode)). Since v1.0.0 the overlay
+backend reads without copying, so that advice now applies only to branches
+that write into many large tables on a host whose volumes cannot clone; and
+a branch reported as `eager` by `pgoverlay_branch_cow_mode` should be fixed
+([Troubleshooting](troubleshooting.md#a-branch-copies-eagerly)) rather than
+sized for.
+
+## True copy-on-write (v1.0.0)
+
+Issue [#49](https://github.com/abd-ulbasit/pgoverlay/issues/49) set the bar:
+on the default setup (plain Docker on an ext4 host, stock `postgres:14` to
+`18` images) a read-only workload adds approximately nothing to a branch, a
+write copies as little as the mechanism allows, create time stays
+independent of database size, and no new privileges.
+
+### What changed
+
+- **The lazyrw shim, on by default** on the overlay backend (Docker and
+  Kubernetes hostPath). An `LD_PRELOAD` library in the branch's Postgres opens
+  table files read-only and reopens a file read-write on its first write,
+  which is when OverlayFS copies it
+  ([how it works](concepts.md#copy-on-first-write-the-lazyrw-shim)).
+- **Seed settle, on by default.** Each new seed is recovered,
+  `VACUUM (FREEZE, ANALYZE)`d and cleanly shut down once, with its last WAL
+  segment trimmed, so branches start without WAL replay, their reads have no
+  hint bits to set, and their first WAL write copies about 1 MiB
+  ([how it works](concepts.md#seed-settle-doing-the-first-reads-writes-once)).
+- **Block level where the filesystem allows it.** Where the volumes sit on
+  XFS (`reflink=1`) or btrfs, OverlayFS copy-up is an extent clone. branchd
+  detects it, counts usage as exclusive bytes, and `--volume-root` puts the
+  volumes on such a disk on any Docker host
+  ([how it works](concepts.md#8-clone-or-copy-what-a-copy-up-costs)).
+
+### The evaluation
+
+Every option in #49 was measured on one host before anything was built:
+Linux 7.0 (amd64), Docker 29.6.2 with volumes on ext4, PostgreSQL 17, and a
+table of about 500 MB (1.5M rows, 488 MB of heap plus a 32 MB primary key)
+frozen on the source. Branches started with crash recovery, as they did
+then; latencies are with a warm page cache, so the first query's extra time
+is the copy.
+
+| Mechanism | `SELECT count(*)` adds | First query | A write copies | Verdict |
+|---|---|---|---|---|
+| OverlayFS on ext4 (before v1.0.0) | +555 MiB | 20.8 s | the whole file, on open | replaced |
+| OverlayFS with `metacopy=on` | the same bytes | 11.3 s | the whole file, on open | rejected: the kernel copies data on any write-mode open |
+| fuse-overlayfs | the same bytes | 15.8 s | the whole file, on open | rejected |
+| **lazyrw shim + OverlayFS, ext4** | **+0 bytes** | **277 ms** | the touched segment (up to 1 GiB), once | **default** |
+| OverlayFS on XFS `reflink=1` or btrfs | ~0 | ~10 ms per file | blocks | **automatic where the volumes reflink** |
+| Managed loopback XFS pool on ext4 | ~0 | 208 ms | blocks | deferred: fsync ran at 0.4 to 0.6x of ext4, and it needs a privileged loop device lifecycle |
+| btrfs snapshots, dm-thin, qcow2 over nbd | ~0 | about 0.2 s | blocks | rejected: privileged, fragile set-up, extra kernel modules, the slowest fsync |
+| Per-file `FICLONE` backend, no overlay | 0 | | blocks | later: needs a reflink filesystem, and create time grows with the file count |
+
+The raw OverlayFS numbers behind the first rows (bytes of the branch's upper
+directory, `du -sb`): 34,735,718 B fresh, 582,461,030 B after the
+`SELECT count(*)`, and byte for byte the same with `metacopy=on` and with
+fuse-overlayfs; the first `SELECT` took 19.4 s and the second 116 ms in that
+run. With the shim the upper directory stayed at 16.2 MiB across the read.
+
+Two findings from the evaluation shaped the implementation:
+
+- **An unsettled seed still copies on read.** With a seed that was not
+  frozen, the shim's first `SELECT` still copied 68 MiB (PG 14 and 17) and
+  119 MiB (PG 18): reading rows sets their hint bits, which is a real write.
+  pgoverlay's `pg_basebackup` seed is exactly such a copy, hence seed settle.
+- **Select-only throughput is unchanged.** `pgbench -S` gave 27,511 tps in a
+  branch with the shim and 27,007 tps on plain Postgres on ext4. TPC-B numbers from that host were not
+  usable: it was shared with other workloads, and plain ext4 TPC-B fell from
+  925 to 122 tps within 40 minutes. The pgbench run
+  [below](#throughput-and-the-first-write-stall) replaces them, on a host
+  that was not quiet either.
+  `pg_test_fsync` (8 kB write plus `fdatasync`, interleaved) is the
+  comparison that held: 670/757/621 ops/s on ext4, 429/275/251 on XFS on a
+  loop device, 170/117/95 on btrfs on a loop device, which is why the loop
+  pool is deferred.
+
+### Measured on the implementation
+
+The integrated tree (`v1-cow` at `65372f9`), built with `make build` and run
+with default settings on the same host: a `postgres:17` source with a
+200 MiB table that was never vacuumed, seeded with `--seed-settle=freeze`,
+once with Docker's own volumes (ext4) and once with `--volume-root` on an
+XFS `reflink=1` disk. Branch usage is what `pgb branch ls --usage` reports.
+
+| Check | ext4 (Docker volumes) | XFS `--volume-root` |
+|---|---|---|
+| seed including settle | 22.8 s (settle 6.6 s) | 17.9 s (settle 6.2 s) |
+| branch create | 2.9 s | 3.5 s |
+| copy-up probe (`pgoverlay_cow_copyup_mode`) | `copy` | `clone`, 16 KiB `cowextsize` hint set |
+| `cow-mode` | `lazyrw` | `lazyrw` |
+| seq scan of the table after settle | 25,408 pages read, 0 dirtied | same |
+| first read pass (count, `EXPLAIN`, `pg_relation_size`, full read), then `CHECKPOINT` | data +0.24 MiB, WAL +16 MiB | same |
+| second read pass | +0 bytes | +0 bytes |
+| 1-row `UPDATE` of a small table | +0.08 MiB | +0.08 MiB |
+| 1-row `UPDATE` of the 200 MiB table | +200 MiB (its segment, once) | +0.02 MiB exclusive (`du -sb`: +200 MiB) |
+| the same read with `--lazyrw=off` | +201.5 MiB, `cow-mode` `off` | same |
+
+At that commit the first read pass still copied a constant amount, not
+proportional to the data read: 224 KiB of `pg_statistic` (hint bits on the
+rows `ANALYZE` wrote after `pg_statistic` itself was vacuumed) plus 8 KiB each
+of `pg_xact`, `pg_subtrans` and `pg_multixact`, and the whole current 16 MiB
+WAL segment the first time the branch wrote WAL (a clone on XFS). Both were
+fixed before release; see the next section. Reset, branch-from-branch (the
+child reads the parent's writes; the parent does not see the child's) and
+destroy behaved the same in both runs.
+
+Other measurements from the pull requests that built it (same host):
+
+- a read of a frozen 196 MB table in a branch created by the engine: +0 bytes
+  in about 200 ms with the shim, +207 MB in 3.5 s with `--lazyrw=off`
+  ([#53](https://github.com/abd-ulbasit/pgoverlay/pull/53)); PG 18 and a
+  `postgres:17-alpine` (musl) branch also came up `lazyrw` with reads adding
+  0 bytes;
+- a 1-row `UPDATE` of a ~56 MiB table: +58 MiB with Docker's volumes on ext4,
+  +44 KiB of exclusive bytes with `--volume-root` on XFS `reflink=1` and on
+  btrfs ([#51](https://github.com/abd-ulbasit/pgoverlay/pull/51));
+- a branch of a settled seed starts with no redo, and a sequential scan of a
+  never-vacuumed table dirties 0 buffers, on PG 14, 16-alpine, 17 and 18
+  ([#52](https://github.com/abd-ulbasit/pgoverlay/pull/52)).
+
+### After the release fixes: the torture suite
+
+[#56](https://github.com/abd-ulbasit/pgoverlay/pull/56) removed the two
+constants above and made Alpine sources seedable;
+[#57](https://github.com/abd-ulbasit/pgoverlay/pull/57) added the
+copy-on-write torture suite (`internal/engine/cow_it_test.go`) and ran the
+version matrix with the shim. Measured on `v1-cow` at `a77c260`, same host,
+ext4 Docker volumes, `postgres:17`, a 226.6 MB frozen table and a 226.6 MB
+table that was never vacuumed:
+
+| Check | Result |
+|---|---|
+| read pass on either table (count, `EXPLAIN`, `pg_relation_size`, full scan), then `CHECKPOINT` | +0 bytes of data; a second pass +0; neither the table, its index nor `pg_statistic` is copied (before #56: `pg_statistic`, 224 KiB) |
+| the same read with `--lazyrw=off` | +258,129,920 bytes |
+| 1-row `UPDATE` of the 226.6 MB table | +226,598,912 bytes, the touched segment, in 12 to 18 s including the checkpoints that write it; a second `UPDATE` of it +0 |
+| 1-row `UPDATE` of a small table | +90,112 bytes |
+| `TRUNCATE` / `DROP` of a seed table | 42 ms / 69 to 102 ms, +1.29 MB of catalog pages, no table data |
+| `CREATE INDEX` (8.24 MB index) | data +9.47 MB |
+| `VACUUM FULL` (255.8 MB rewrite) | data +256.2 MB; the old file is not copied |
+| `CREATE DATABASE`, `FILE_COPY` and `WAL_LOG` | both work |
+| TPC-B killed with `SIGKILL`, then a restart by reconcile | balances add up, `pg_amcheck --heapallindexed` clean, still `lazyrw` |
+| branch-from-branch | the child reads the parent's writes; its own reads +0 |
+| reset | reads afterwards under 2 MiB |
+| `--volume-root` on XFS `reflink=1` | probe `clone`; read +0; a 1-row `UPDATE` of a 113 MB table +40,960 bytes of exclusive usage (`du -sb`: +113 MB) |
+| version matrix: 14, 15, 16, 17, 18 and `17-alpine` (musl) | all `lazyrw`, every read +0 bytes |
+
+**The WAL segment.** A branch appends its WAL to the segment that holds the
+seed's shutdown checkpoint, so its first WAL write used to copy that whole
+16 MiB segment. Measured for #56 on ext4 Docker volumes with `postgres:17`,
+5 fresh branches per variant: the first one-row `INSERT` in a branch took 46
+to 119 ms (median 56 ms), the second about 1 ms. The settle, and the dump
+helper unless `--seed-settle=off`, now switch to a fresh segment just before
+the clean stop, so the shutdown checkpoint sits at the start of a zero-filled
+segment, and turn everything after its first two pages into a hole. The file
+stays byte for byte the same (the tail is checked to be zeros and the copy
+compared with `cmp` before the rename), so crash recovery is unaffected; the
+torture suite's `SIGKILL` and `pg_amcheck` runs use such seeds. Unused future
+segments after it are removed too (a dump seed had carried 4 to 15 of them,
+up to 240 MiB). With GNU tools and with busybox (the Alpine seeds are trimmed
+as well):
+
+| | first write in a branch | the branch's copy of the segment |
+|---|---|---|
+| before | 46 to 119 ms (median 56) | 16,384 KiB allocated |
+| after, `pg_basebackup` seed | 12 to 27 ms | about 1,024 KiB allocated |
+| after, dump seed | 20 to 24 ms | about 1,024 KiB allocated |
+
+Branch usage counts apparent bytes (`du -sb`), so it still shows that segment
+as 16 MiB. `wal_recycle=off` was measured as an alternative and not adopted:
+a settled seed has a single segment, which the branch's first write has
+already copied, so there is no copy-up left for it to save; it only keeps
+fewer recycled segments (16 to 32 MiB less after 45 MiB of WAL) at the cost of
+zero-filling every new one. It stays available as the experimental
+`--wal-recycle=off`.
+
+What a branch of a settled seed still writes, whatever it reads: about 1 MiB
+allocated for that WAL segment, 8 KiB each of `pg_xact`, `pg_subtrans`,
+`pg_multixact` and `pg_control`, and about 190 KB of relcache init files.
+Other timings from the same runs: a seed plus settle of 2 × 226 MB took 38 to
+41 s (the settle alone 4.7 to 8.6 s on a 250 MB seed, with the extra
+`pg_statistic` VACUUM), a branch create 2.4 to 3.2 s, and a branch-from-branch
+9.4 s.
+
+### Throughput and the first-write stall
+
+Measured with
+[`hack/bench-cow.sh`](https://github.com/abd-ulbasit/pgoverlay/blob/main/hack/bench-cow.sh)
+([#58](https://github.com/abd-ulbasit/pgoverlay/pull/58)), built with
+`make build` from `v1-cow` at `a77c260` and driving a real `pgb` in local
+mode (and `branchd`, for the copy-up probe). Every configuration gets the same
+data: `postgres:17`, pgbench scale 50 (about 750 MiB) plus `stall_big`, a
+949 MiB table in a single segment, seeded and settled with `freeze`:
+
+- **A**: plain Postgres on a Docker volume (ext4), no branch; the baseline.
+- **B**: a branch with `--lazyrw=off`, which copies a file when it is opened,
+  as releases before v1.0.0 did.
+- **C**: a branch with the shim on Docker's volumes (ext4); the default.
+- **D**: a branch with the shim and `--volume-root` on XFS `reflink=1`.
+
+Each round creates the branch, runs pgbench select-only (`-S`) and TPC-B at
+`-c 8 -j 4 -T 60` once cold (right after create) and once warm (after the cold
+run), and then times the first one-row `UPDATE` of `stall_big`. The rounds run
+A, B, C, D in turn, so that load spikes fall on all four. Two runs were
+pooled: 6 samples each for A, B and C, 3 for D. Cells are medians, with the
+range (min to max) where the spread matters.
+
+**The host was shared, and not quiet.** A ThinkPad with Linux 7.0 x86_64,
+4 × Core i3-7100U at 2.4 GHz, 7,305 MiB of RAM and Docker 29.6.2, which ran
+a k3s node, a kind cluster and other containers throughout: the 1-minute load
+average was 3 to 16 during the runs, recorded per run below. It also has two
+storage tiers. Docker's volumes (A, B, C) are on an SSD with ext4; the XFS
+disk behind D's `--volume-root` is a spinning disk. **D's throughput
+measures that disk, not reflink**, and cannot be compared with A, B and C;
+D is in the table for usage and the stall. The copy-up probe of the real
+`branchd` reported `mode=copy` on ext4 (the 64 MiB probe file used 64 MiB)
+and `mode=clone` on the XFS disk (0 bytes used, 64 MiB shared).
+
+| | A: plain | B: eager | C: lazyrw, ext4 | D: lazyrw, XFS (spinning disk) |
+|---|---|---|---|---|
+| branch create (s; A: container start) | 1.77 (0.54-1.84) | 2.72 (2.55-2.82) | 2.80 (2.53-3.29) | 3.41 (3.30-3.45) |
+| branch after create (MiB, `du -sb`) | n/a | 1.3 | 0.4 | 0.3 |
+| **after a select-only run** (MiB, `du -sb`) | n/a | **768.0** | **16.5** | 16.5 |
+| after a select-only run (MiB, allocated and not shared) | n/a | 753.0 | **1.6** | **0.5** |
+| after TPC-B (MiB, `du -sb`) | n/a | 1,118.3 | 1,008.2 | 689.6 |
+| after TPC-B (MiB, allocated and not shared) | n/a | 1,110.3 | 1,008.3 | **49.2** |
+| select-only tps, cold | 24,617 (21,222-26,396) | 12,726 (11,506-17,065) | 22,700 (21,527-26,725) | 92 (86-94) |
+| **select-only tps, warm** | **26,422** | **25,967** | **26,107** | 137 |
+| TPC-B tps, cold | 801 (412-1,135) | 635 (518-846) | 391 (215-641) | 53 |
+| **TPC-B tps, warm** | 1,051 (825-1,130) | **927 (695-1,145)** | **840 (647-1,096)** | 55 |
+| first one-row `UPDATE` of `stall_big` (s) | 0.19 | **46.36** | 0.16 | 0.23 |
+| 1-minute load average during the runs | 4.51 (3.06-7.37) | 6.03 | 5.09 | 4.78 |
+
+"Allocated and not shared" is what `pgoverlay-du` counts: on XFS the bytes a
+branch does not share with the seed, which is what branch usage reports in
+clone mode; on ext4, where nothing is shared, the allocated size.
+
+What it shows:
+
+- **Reads copy nothing.** A select-only run grew the eager branch by
+  768 MiB, all of `pgbench_accounts` and its index, copied on the read's
+  read-write open; it grew C by 16.5 MiB, of which 1.6 MiB is allocated. The
+  difference is the branch's WAL segment, 16 MiB long but mostly a hole since
+  the settle trims it. D grew by 0.5 MiB of exclusive bytes.
+- **Clones are counted as clones.** After TPC-B, D's branch is 690 MiB by
+  `du -sb` but owns 49 MiB; `du` over-counts it 14 times. On ext4 the two
+  numbers agree for C (1,008 MiB): a copy is a copy.
+- **Select-only throughput is unchanged once warm**: C is 1.2% below A and
+  0.5% above B, within the noise of 6 samples. Cold, B pays for its copies
+  inside the reads (12,726 tps, about half of C's 22,700).
+- **The copy moved from the first read to the first write.** Cold TPC-B is
+  where C pays it: 391 tps against B's 635, which had paid during the
+  select-only run.
+- **The first write to a 949 MiB segment.** B's `UPDATE` took 46 s, because
+  opening the segment copied it. C's and D's took 0.16 s and 0.23 s, but that
+  does not mean C's copy was fast: the `UPDATE` changes the page in shared
+  buffers, and the file is first written, and copied, when Postgres writes
+  the page out, at the next checkpoint or when a backend or the background
+  writer evicts it. A separate check on the same host (`v1-cow` at `87a7ec2`,
+  a 446 MiB single-segment table, load average 3 to 5) showed it: with the
+  shim the `UPDATE` took 0.18 s and the branch grew by 16 MiB (its WAL
+  segment), then `CHECKPOINT` took 20.1 s and the branch grew by 455 MiB;
+  with `--lazyrw=off` the `UPDATE` took 21.0 s and the `CHECKPOINT` 0.22 s.
+  On ext4 the stall is still there, once per segment of at most 1 GiB, but
+  it lands on whatever writes the page out; on XFS or btrfs the copy is a
+  clone. See [Troubleshooting](troubleshooting.md#the-first-write-to-a-large-table-is-slow).
+
+**Release gate.** v1.0.0's gate for #49 is select-only throughput within
+noise of the eager branch and plain Postgres, and TPC-B within 5% of the
+eager branch once warm.
+
+- **Select-only, warm: passes.** C 26,107 tps against A 26,422 (-1.2%) and
+  B 25,967 (+0.5%).
+- **TPC-B, warm: not cleanly met, and inconclusive on this host.** C's median
+  of 840 tps is 9.4% below B's 927, over the 5% bar. But the two ranges
+  overlap by about 85% (C 647 to 1,096, B 695 to 1,145), the ratio of C to B
+  within a round swung from 57% to 158%, and the 87 tps gap is about a fifth
+  of the spread within either configuration: it is dominated by the other
+  workloads' I/O on the same SSD, not a demonstrated regression. Once a
+  segment has been copied the shim adds a constant-time check per call and
+  copies nothing.
+
+So on this host the read gate passes and the write gate is not settled. A
+rerun on a quiet host whose volumes are on an SSD with a reflink filesystem
+(which also makes D's throughput comparable) is needed to settle it:
+
+```sh
+make build
+BENCH_VOLUME_ROOT=/path/on/xfs-or-btrfs BENCH_OUT=results.md hack/bench-cow.sh
+```
+
+### Not measured
+
+Every number above is from linux/amd64 on kernel 7.0. arm64 runs in CI: the
+shim's C tests and the copy-on-write torture suite pass on `ubuntu-24.04-arm`
+with the aarch64 glibc build. Docker Desktop, Colima and OrbStack run recent
+kernels and arm64 or amd64 images, so the shim is expected to work there, but
+they have not been measured; Kubernetes hostPath runs the same entrypoint and
+install path as Docker and was not measured either. No throughput number here
+comes from a quiet host.
 
 ## The fix
 
@@ -227,7 +531,9 @@ of the five.
 **Branch rw overhead.** `du -sb` of the branch's rw volume (upper + work
 dirs) via a one-shot `alpine:3.21` container, immediately after create — the
 same measurement `GET /v1/branches/{name}/usage` and `pgb branch ls --usage`
-perform.
+perform where copy-up copies data (on a volume root where it clones, branchd
+reports exclusive bytes instead; see
+[usage accounting](concepts.md#usage-accounting)).
 
 **Write amplification.** On the still-running branch:
 `UPDATE pgbench_accounts SET abalance = abalance + 1 WHERE aid <= <scale*1000>`

@@ -115,6 +115,19 @@ own Postgres.
     and no AppArmor profile, which makes escaping to the host much easier.
     Treat superuser on a branch as close to root on the Docker host or storage
     node, and do not run untrusted code in branches.
+- **The lazyrw shim** (overlay backend, on by default) is an `LD_PRELOAD`
+  library that the branch entrypoint exports inside the branch container
+  only; nothing on the host or in other containers loads it. Within the
+  container it is active only in the `postgres` server process (it checks the
+  program name and `PGDATA` once, at load): the entrypoint shell, `gosu`,
+  `archive_command` and `COPY ... PROGRAM` children get pass-through wrappers.
+  It changes how Postgres opens its own data files, adds no capability, and
+  runs as the postgres user. It is installed from builds embedded in the
+  pgoverlay binary and checked against their SHA-256 on the way in; a user
+  who can write the branch's volume can replace it, but such a user can
+  already change the branch's data and entrypoint. The builds are committed
+  to the repository, and CI rebuilds them from source and fails on any byte
+  of difference (see [SECURITY.md](https://github.com/abd-ulbasit/pgoverlay/blob/main/SECURITY.md#supply-chain-scanning)).
 - pgoverlay never connects a branch to the source, but the network may allow
   it. On Docker, branch containers join the source's `--network` (or the
   default bridge), so code running in a branch can open connections to
@@ -126,13 +139,24 @@ own Postgres.
 
 ### Helper containers
 
-One-shot helpers seed sources, install entrypoints, measure disk usage and,
-in Kubernetes hostpath mode, create and remove volume directories.
+One-shot helpers seed and settle sources, install entrypoints and the lazyrw
+shim, measure disk usage, probe the copy-up mode at branchd startup and, in
+Kubernetes hostpath mode or with a docker `--volume-root`, create and remove
+volume directories.
 
 - On Kubernetes every helper runs with `RuntimeDefault` seccomp and
   `allowPrivilegeEscalation: false`, except the zfs backend's, which are
-  privileged and see `/dev/zfs`. In hostpath mode the file helpers run as
+  privileged and see `/dev/zfs`, and the copy-up probe, which mounts an
+  overlay and so gets exactly a hostpath branch pod's settings (`SYS_ADMIN`,
+  seccomp and AppArmor unconfined). In hostpath mode the file helpers run as
   root with the whole data root mounted.
+- On Docker the copy-up probe likewise runs with a branch container's
+  settings (`CAP_SYS_ADMIN`, `apparmor=unconfined`). With `--volume-root DIR`,
+  the helpers that create and remove volume directories, and the one that
+  sets the XFS extent size hint, run as root with `DIR` mounted.
+- The settle helper runs the source's image as the postgres user, starts
+  Postgres on pgoverlay's copy with a private socket and no TCP listener, and
+  never connects to the source.
 - The **source password** reaches a seed helper through its environment. On
   Docker, anyone who can run `docker inspect` on the host can read it while the
   helper exists. On Kubernetes it lives in a short-lived Secret, created just
@@ -155,10 +179,31 @@ election). It never reads Secrets back.
 ### The storage node and volumes
 
 - Overlay on Docker: the seed and every branch layer are Docker volumes under
-  the engine's data root. Kubernetes hostpath: plain directories under
-  `dataRoot` (default `/var/lib/pgoverlay`) on one node. Anyone with root on
-  that host or node can read every branch and seed, unmasked seed included.
+  the engine's data root, or directories under `--volume-root` when it is
+  set. Kubernetes hostpath: plain directories under `dataRoot` (default
+  `/var/lib/pgoverlay`) on one node. Anyone with root on that host or node can
+  read every branch and seed, unmasked seed included.
 - csi: PVCs; access follows your storage system.
+
+### XFS reflink hosts (CVE-2026-64600)
+
+Where the volumes sit on XFS with `reflink=1` (branchd logs
+`copy-up probe: mode=clone fs=xfs`), OverlayFS copy-up clones files, so every
+file a branch writes shares blocks with the seed. CVE-2026-64600 ("RefluXFS",
+published July 2026) is a race in the Linux XFS copy-on-write path, present
+since 4.11: two concurrent `O_DIRECT` writes to a reflinked file can land in
+the physical blocks of the file it was cloned from, so a local user can
+overwrite a file they can only read. The fix was merged upstream on
+2026-07-16 and distributions ship it as kernel updates.
+
+pgoverlay does not create the bug: any local user or container with a
+writable directory on such a filesystem can use it. But it matters here,
+because code running in a branch (a superuser's `COPY ... PROGRAM`, as the
+postgres user) can read the shared seed, and on an unpatched kernel could
+write into it, changing the data every branch of that source reads. On XFS
+reflink hosts (RHEL-family and Amazon Linux roots, or a `--volume-root` or
+`dataRoot` on such a disk), run a kernel with the fix and reboot into it.
+ext4, btrfs and XFS without reflink are not affected.
 
 ### The registry and the at-rest key
 
@@ -236,6 +281,8 @@ Everywhere:
       superuser on a branch as privileged access to that host.
 - [ ] Alert on the [metrics](observability.md), and review `pgb history` for
       unexpected actors.
+- [ ] Where branch volumes sit on XFS with `reflink=1`, run a kernel with
+      the fix for [CVE-2026-64600](#xfs-reflink-hosts-cve-2026-64600).
 
 On Kubernetes, additionally:
 
@@ -268,6 +315,10 @@ On Kubernetes, additionally:
   runs.
 - A rotated branch password travels in the command line of the exec that sets
   it (visible in `pods/exec` audit logs on Kubernetes).
+- The lazyrw shim and `pgoverlay-du` ship as prebuilt binaries committed to
+  the repository and embedded in the pgoverlay binaries, not built on your
+  machine. CI rebuilds them from source and fails on any difference, and
+  pgoverlay checks each against its committed SHA-256 before use.
 
 ## Reporting a vulnerability
 

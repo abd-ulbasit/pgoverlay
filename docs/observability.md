@@ -81,9 +81,11 @@ resource. The leader alerts matter only with `--leader-elect` (see
 ## Running out of disk (ENOSPC)
 
 On the overlay backend every branch shares one filesystem (the Docker data
-root, or the storage node's data root), so a full disk is a fleet-wide, not
-per-branch, failure. A write copies the whole file it touches (a table
-segment, up to 1 GiB) into the branch the first time. Branches in eager mode
+root or `--volume-root`, or the storage node's data root), so a full disk is
+a fleet-wide, not per-branch, failure. A write copies the whole file it
+touches (a table segment, up to 1 GiB) into the branch the first time; where
+copy-up clones (`pgoverlay_cow_copyup_mode{mode="clone"}`), only the blocks
+it rewrites take new space. Branches in eager mode
 (`pgoverlay_branch_cow_mode{mode="eager"}` or `off`) grow on **reads** too:
 there the first time Postgres opens a table file, OverlayFS copies it whole
 into the branch ([Reads copy up too](benchmarks.md#reads-copy-up-too)), so a
