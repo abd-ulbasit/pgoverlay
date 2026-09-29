@@ -166,9 +166,9 @@ Two findings from the evaluation shaped the implementation:
 - **Select-only throughput is unchanged.** `pgbench -S` gave 27,511 tps in a
   branch with the shim and 27,007 tps on plain Postgres on ext4. TPC-B numbers from that host were not
   usable: it was shared with other workloads, and plain ext4 TPC-B fell from
-  925 to 122 tps within 40 minutes. The pgbench run
-  [below](#throughput-and-the-first-write-stall) replaces them, on a host
-  that was not quiet either.
+  925 to 122 tps within 40 minutes. The pgbench runs
+  [below](#throughput-and-the-first-write-stall) replace them: one on a host
+  that was not quiet either, and one on dedicated GitHub-hosted runners.
   `pg_test_fsync` (8 kB write plus `fdatasync`, interleaved) is the
   comparison that held: 670/757/621 ops/s on ext4, 429/275/251 on XFS on a
   loop device, 170/117/95 on btrfs on a loop device, which is why the loop
@@ -285,11 +285,11 @@ Other timings from the same runs: a seed plus settle of 2 × 226 MB took 38 to
 
 Measured with
 [`hack/bench-cow.sh`](https://github.com/abd-ulbasit/pgoverlay/blob/main/hack/bench-cow.sh)
-([#58](https://github.com/abd-ulbasit/pgoverlay/pull/58)), built with
-`make build` from `v1-cow` at `a77c260` and driving a real `pgb` in local
-mode (and `branchd`, for the copy-up probe). Every configuration gets the same
-data: `postgres:17`, pgbench scale 50 (about 750 MiB) plus `stall_big`, a
-949 MiB table in a single segment, seeded and settled with `freeze`:
+([#58](https://github.com/abd-ulbasit/pgoverlay/pull/58)), driving a real
+`pgb` in local mode (and `branchd`, for the copy-up probe). Every
+configuration gets the same data: `postgres:17`, pgbench scale 50 (about
+750 MiB) plus `stall_big`, a 949 MiB table in a single segment, seeded and
+settled with `freeze`:
 
 - **A**: plain Postgres on a Docker volume (ext4), no branch; the baseline.
 - **B**: a branch with `--lazyrw=off`, which copies a file when it is opened,
@@ -299,10 +299,151 @@ data: `postgres:17`, pgbench scale 50 (about 750 MiB) plus `stall_big`, a
 
 Each round creates the branch, runs pgbench select-only (`-S`) and TPC-B at
 `-c 8 -j 4 -T 60` once cold (right after create) and once warm (after the cold
-run), and then times the first one-row `UPDATE` of `stall_big`. The rounds run
-A, B, C, D in turn, so that load spikes fall on all four. Two runs were
-pooled: 6 samples each for A, B and C, 3 for D. Cells are medians, with the
+run), and then times the first one-row `UPDATE` of `stall_big`. Rounds run
+every configuration once, interleaved, so that anything else happening on the
+host falls on all of them. It ran twice: on dedicated GitHub-hosted runners,
+which decided the release gate, and before that on a shared host, where the
+write half of the gate could not be decided. Cells are medians, with the
 range (min to max) where the spread matters.
+
+"Allocated and not shared" is what `pgoverlay-du` counts: on XFS the bytes a
+branch does not share with the seed, which is what branch usage reports in
+clone mode; on ext4, where nothing is shared, the allocated size.
+
+#### On a quiet host: GitHub-hosted runners
+
+The [`bench-cow`](https://github.com/abd-ulbasit/pgoverlay/blob/main/.github/workflows/bench-cow.yml)
+workflow ran `hack/bench-cow.sh` on two fresh GitHub-hosted VMs that ran
+nothing else ([run 36541991870](https://github.com/abd-ulbasit/pgoverlay/actions/runs/36541991870),
+commit `a1507f4`: `v1-cow` at `6df469b` plus the workflow and the harness
+changes described below):
+
+- **amd64**: `ubuntu-24.04`, 4 vCPUs (AMD EPYC 9V45), 15,989 MiB of RAM,
+  Linux 6.17.0-1022-azure, Docker 28.0.4, Docker's volumes on ext4 on the
+  VM's NVMe disk. A, B, C and D.
+- **arm64**: `ubuntu-24.04-arm`, 4 vCPUs (Neoverse-N2), 15,947 MiB, the same
+  kernel and Docker, ext4. A, B and C, with the shim's aarch64 glibc build.
+
+Five rounds on each. The order rotated every round (A B C D, then B C D A,
+and so on), so no configuration always ran right after another one's
+copy-up. The 1-minute load average was 6 to 9 during the runs: that is the
+benchmark itself, 8 pgbench clients and 8 backends on 4 vCPUs (it was 2.6
+before the first round). The `UPDATE` of `stall_big` is followed by a timed
+`CHECKPOINT`, after an untimed one that flushes the TPC-B runs, because with
+the shim the page is written out, and the segment copied, there and not in
+the `UPDATE` (see the first-write item below).
+
+D's `--volume-root` is the only XFS a hosted runner can have: a sparse 24 GiB
+file on the same ext4 NVMe filesystem as Docker's volumes, attached as a loop
+device with direct I/O and formatted `mkfs.xfs -m reflink=1`. The copy-up
+probe reported `mode=clone` on it (the 64 MiB probe file used 0 bytes) and
+`mode=copy` on ext4. **D's throughput is XFS on a loop device on ext4**: two
+filesystems and a loop device on every write and `fsync`, not an XFS disk.
+
+amd64:
+
+| | A: plain | B: eager | C: lazyrw, ext4 | D: lazyrw, XFS on a loop device |
+|---|---|---|---|---|
+| branch create (s; A: container start) | 0.14 | 1.37 | 1.36 | 1.49 |
+| branch after create (MiB, `du -sb`) | n/a | 1.3 | 0.4 | 0.3 |
+| **after a select-only run** (MiB, `du -sb`) | n/a | **768.0** | **16.5** | 16.5 |
+| after a select-only run (MiB, allocated and not shared) | n/a | 753.1 | **1.6** | **0.5** |
+| after TPC-B (MiB, `du -sb`) | n/a | 1,821.4 | 1,812.9 | 1,806.7 |
+| after TPC-B (MiB, allocated and not shared) | n/a | 1,821.4 | 1,812.9 | 1,818.3 |
+| select-only tps, cold | 126,069 (121,218-129,754) | 115,788 (115,648-119,876) | 124,938 (122,669-126,613) | 122,551 (120,991-124,535) |
+| **select-only tps, warm** | 119,174 (117,673-120,951) | **118,064 (115,678-119,835)** | **116,833 (115,758-120,181)** | 117,029 (114,787-117,367) |
+| TPC-B tps, cold | 10,392 (10,359-10,927) | 10,499 (10,303-10,567) | 9,865 (9,687-10,171) | 7,834 (7,429-8,037) |
+| **TPC-B tps, warm** | 11,781 (11,495-11,828) | **11,823 (11,649-11,949)** | **11,648 (11,522-11,911)** | 9,175 (8,985-9,358) |
+| first one-row `UPDATE` of `stall_big` (s) | 0.05 | **3.95 (3.89-5.20)** | 0.05 | 0.05 |
+| the `CHECKPOINT` after it (s) | 0.08 | 0.26 | **5.51 (4.20-5.79)** | **0.13 (0.12-0.15)** |
+
+arm64:
+
+| | A: plain | B: eager | C: lazyrw, ext4 |
+|---|---|---|---|
+| branch create (s; A: container start) | 0.17 | 1.45 | 1.44 |
+| after a select-only run (MiB, `du -sb`) | n/a | 768.0 | 16.5 |
+| after TPC-B (MiB, `du -sb`) | n/a | 1,783.4 | 1,779.1 |
+| select-only tps, cold | 40,169 (38,505-40,687) | 36,292 (35,297-37,390) | 38,846 (37,238-41,553) |
+| **select-only tps, warm** | 37,840 (35,724-38,666) | **36,824 (35,585-39,721)** | **37,326 (35,802-40,747)** |
+| TPC-B tps, cold | 4,287 (3,975-4,533) | 4,158 (3,691-4,303) | 4,075 (3,957-4,115) |
+| **TPC-B tps, warm** | 4,601 (4,414-4,680) | **4,644 (4,357-4,936)** | **4,721 (4,380-4,911)** |
+| first one-row `UPDATE` of `stall_big` (s) | 0.06 | 4.06 (3.56-4.20) | 0.06 |
+| the `CHECKPOINT` after it (s) | 0.09 | 0.21 | 4.09 (3.31-4.34) |
+
+Within a round the configurations ran minutes apart on the same VM, so the
+ratio of two of them in one round cancels most of whatever drifts on the
+host. Ratios of warm throughput, median (min to max) over the 5 rounds:
+
+| | amd64 select-only | amd64 TPC-B | arm64 select-only | arm64 TPC-B |
+|---|---|---|---|---|
+| **C / B** (the shim's cost) | **1.006 (0.970-1.018)** | **0.984 (0.974-1.021)** | **1.026 (0.975-1.061)** | **1.014 (0.990-1.017)** |
+| C / A | 0.989 (0.957-1.008) | 0.995 (0.984-1.013) | 1.005 (0.946-1.086) | 1.026 (0.939-1.101) |
+| B / A (the overlay's cost) | 0.987 (0.975-1.015) | 1.012 (0.986-1.016) | 0.980 (0.934-1.058) | 1.009 (0.944-1.112) |
+| D / C | 0.998 (0.974-1.007) | 0.789 (0.771-0.796) | n/a | n/a |
+
+Warm TPC-B round by round on amd64:
+
+| round | order | A | B | C | D | C / B |
+|---|---|---|---|---|---|---|
+| 1 | A B C D | 11,781 | 11,858 | 11,588 | 9,145 | 0.977 |
+| 2 | B C D A | 11,632 | 11,823 | 11,522 | 9,175 | 0.974 |
+| 3 | C D A B | 11,495 | 11,649 | 11,648 | 8,985 | 1.000 |
+| 4 | D A B C | 11,828 | 11,666 | 11,911 | 9,242 | 1.021 |
+| 5 | A B C D | 11,807 | 11,949 | 11,752 | 9,358 | 0.984 |
+
+**Release gate: passes on both architectures.** v1.0.0's gate for #49 is
+select-only throughput within noise of the eager branch and plain Postgres,
+and TPC-B within 5% of the eager branch once warm.
+
+- **Select-only, warm: passes.** amd64: C is 1.0% below B on medians and
+  0.6% above it paired (1.006), inside a noise band of ±3.5% (A's and B's own
+  spread across rounds). Against A, C is 2.0% lower on medians and 1.1%
+  paired (0.989), the same as B (B / A 0.987): that is the overlay's cost,
+  with or without the shim.
+  arm64: C is 1.4% above B and 1.4% below A.
+- **TPC-B, warm: passes.** amd64: C 11,648 tps against B 11,823, 1.5% lower
+  on medians; paired C / B 0.984, and no round below 0.974. B's own warm
+  TPC-B varied by 2.5% from round to round. arm64: C 4,721 against B 4,644,
+  1.7% higher; paired 1.014 (0.990 to 1.017).
+
+The 9.4% gap on the shared host below was the other workloads' I/O: with
+nothing else on the machine, B's warm TPC-B spread fell from 48.6% of its
+median to 2.5%, and C stayed within 2.6% of B in every paired round. No change
+to the shim was needed.
+
+What else it shows:
+
+- **Reads copy nothing**, as on the shared host: a select-only run grew B by
+  768 MiB and C by 16.5 MiB (1.6 MiB allocated; the rest is the branch's
+  trimmed WAL segment). D grew by 0.5 MiB of exclusive bytes.
+- **The first write to a 949 MiB segment, with the checkpoint timed.** B
+  pays in the `UPDATE` (3.95 s: opening the segment copies it). C's
+  `UPDATE` takes 0.05 s and its `CHECKPOINT` 5.51 s: the copy happens when
+  the page is written out. D's `CHECKPOINT` takes 0.13 s, because there the
+  copy-up is a clone.
+- **Clones save the pages that are not written.** D's cold TPC-B run is
+  about 470,000 transactions, each updating a random one of the 5 million
+  `pgbench_accounts` rows, so it writes nearly every page of the table; the
+  rest of the 1.8 GiB is what the run added (WAL, new row versions,
+  `pgbench_history`), which no seed shares. After it, D owns as much as C.
+  On the shared host's spinning disk the same run managed 53 tps, and D
+  owned 49 MiB of 690.
+- **The copy moved from the first read to the first write.** Cold
+  select-only, B is 7% below C (it copies `pgbench_accounts` during the
+  reads); cold TPC-B, C is 6% below B (it copies it at the first write).
+  Once warm, both are the same.
+- **D**: select-only throughput is C's (0.998), and warm TPC-B is 21% lower.
+  That is the loop device and the second filesystem under every `fsync`
+  (the evaluation's `pg_test_fsync` on XFS on a loop device also ran at 0.4
+  to 0.6 of ext4); it says nothing about XFS on a real disk, which was not
+  measured.
+
+#### On a shared host (the first run, kept as measured)
+
+Built with `make build` from `v1-cow` at `a77c260`. The rounds ran A, B, C, D
+in the same order every time, and the stall timed only the `UPDATE`. Two runs
+were pooled: 6 samples each for A, B and C, 3 for D.
 
 **The host was shared, and not quiet.** A ThinkPad with Linux 7.0 x86_64,
 4 × Core i3-7100U at 2.4 GHz, 7,305 MiB of RAM and Docker 29.6.2, which ran
@@ -330,11 +471,7 @@ and `mode=clone` on the XFS disk (0 bytes used, 64 MiB shared).
 | first one-row `UPDATE` of `stall_big` (s) | 0.19 | **46.36** | 0.16 | 0.23 |
 | 1-minute load average during the runs | 4.51 (3.06-7.37) | 6.03 | 5.09 | 4.78 |
 
-"Allocated and not shared" is what `pgoverlay-du` counts: on XFS the bytes a
-branch does not share with the seed, which is what branch usage reports in
-clone mode; on ext4, where nothing is shared, the allocated size.
-
-What it shows:
+What it showed:
 
 - **Reads copy nothing.** A select-only run grew the eager branch by
   768 MiB, all of `pgbench_accounts` and its index, copied on the read's
@@ -363,40 +500,50 @@ What it shows:
   On ext4 the stall is still there, once per segment of at most 1 GiB, but
   it lands on whatever writes the page out; on XFS or btrfs the copy is a
   clone. See [Troubleshooting](troubleshooting.md#the-first-write-to-a-large-table-is-slow).
+  (The quiet-host run above times that `CHECKPOINT` too.)
 
-**Release gate.** v1.0.0's gate for #49 is select-only throughput within
-noise of the eager branch and plain Postgres, and TPC-B within 5% of the
-eager branch once warm.
+The release gate on this host: select-only passed (C 26,107 tps against
+A 26,422, -1.2%, and B 25,967, +0.5%). Warm TPC-B was not cleanly met and was
+inconclusive: C's median of 840 tps was 9.4% below B's 927, but the two ranges
+overlapped by about 85% (C 647 to 1,096, B 695 to 1,145), the ratio of C to B
+within a round swung from 57% to 158%, and the 87 tps gap was about a fifth
+of the spread within either configuration. The quiet-host run above settled
+it: the gap was the other workloads' I/O on the same SSD.
 
-- **Select-only, warm: passes.** C 26,107 tps against A 26,422 (-1.2%) and
-  B 25,967 (+0.5%).
-- **TPC-B, warm: not cleanly met, and inconclusive on this host.** C's median
-  of 840 tps is 9.4% below B's 927, over the 5% bar. But the two ranges
-  overlap by about 85% (C 647 to 1,096, B 695 to 1,145), the ratio of C to B
-  within a round swung from 57% to 158%, and the 87 tps gap is about a fifth
-  of the spread within either configuration: it is dominated by the other
-  workloads' I/O on the same SSD, not a demonstrated regression. Once a
-  segment has been copied the shim adds a constant-time check per call and
-  copies nothing.
+#### Running it
 
-So on this host the read gate passes and the write gate is not settled. A
-rerun on a quiet host whose volumes are on an SSD with a reflink filesystem
-(which also makes D's throughput comparable) is needed to settle it:
+On any Linux host with a local Docker engine:
 
 ```sh
 make build
-BENCH_VOLUME_ROOT=/path/on/xfs-or-btrfs BENCH_OUT=results.md hack/bench-cow.sh
+BENCH_ROUNDS=5 BENCH_VOLUME_ROOT=/path/on/xfs-or-btrfs BENCH_OUT=results.md \
+  BENCH_JSON=results.jsonl hack/bench-cow.sh
 ```
+
+Without `BENCH_VOLUME_ROOT`, D is skipped. The other knobs are
+`BENCH_DURATION`, `BENCH_CLIENTS`, `BENCH_JOBS`, `BENCH_SCALE`,
+`BENCH_STALL_ROWS`, `BENCH_CONFIGS` and `BENCH_ROTATE`. The table ends with
+the per-round ratios and the gate's verdict: PASS, FAIL (which needs the
+medians, the paired median and at least 80% of the paired rounds below 0.95),
+or INCONCLUSIVE.
+
+On GitHub-hosted runners, run the `bench-cow` workflow from the Actions tab
+(inputs: rounds, duration, scale), or push a branch named `bench/<anything>`,
+which runs it with the defaults. Each job records the host, puts the table and
+the raw per-run JSON in the job summary, and uploads them as the
+`bench-cow-amd64` and `bench-cow-arm64` artifacts.
 
 ### Not measured
 
-Every number above is from linux/amd64 on kernel 7.0. arm64 runs in CI: the
-shim's C tests and the copy-on-write torture suite pass on `ubuntu-24.04-arm`
-with the aarch64 glibc build. Docker Desktop, Colima and OrbStack run recent
-kernels and arm64 or amd64 images, so the shim is expected to work there, but
-they have not been measured; Kubernetes hostPath runs the same entrypoint and
-install path as Docker and was not measured either. No throughput number here
-comes from a quiet host.
+The numbers above are from linux/amd64 on kernel 7.0 (the shared host) and
+from GitHub-hosted amd64 and arm64 VMs on kernel 6.17 (the pgbench gate run).
+arm64 also runs in CI: the shim's C tests and the copy-on-write torture suite
+pass on `ubuntu-24.04-arm` with the aarch64 glibc build. Docker Desktop,
+Colima and OrbStack run recent kernels and arm64 or amd64 images, so the shim
+is expected to work there, but they have not been measured; Kubernetes
+hostPath runs the same entrypoint and install path as Docker and was not
+measured either. Neither was XFS or btrfs on a real disk under pgbench: the
+only reflink throughput here is a spinning disk and a loop device.
 
 ## The fix
 
