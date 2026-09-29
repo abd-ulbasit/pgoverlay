@@ -29,7 +29,9 @@ concurrency:
 # unit/vuln/js/images/integration/helm are fast. The `kube` job stands up a
 # kind cluster and runs the Kubernetes + HA-failover suites (CSI best-effort).
 # `pg-matrix` runs the Postgres 14-18 version matrix on the weekly schedule
-# (and on demand).
+# (and on demand). `lazyrw`, `pg-import-audit` and `integration-arm64` guard
+# the copy-on-write shim (internal/cow/lazyrw): its committed builds, the
+# libc functions Postgres writes through, and arm64.
 jobs:
   unit:
     if: github.event_name != 'schedule'
@@ -137,6 +139,67 @@ jobs:
       # daemon races those ports ("address already in use"). Serializing trades
       # a little speed for determinism. `make it` runs the same command.
       - run: make it
+
+  # The lazyrw LD_PRELOAD shim's four builds (glibc and musl, amd64 and
+  # arm64) are committed so `go install` needs no C toolchain. Rebuild them
+  # from source and fail on any byte of difference, then run the C tests on a
+  # real OverlayFS mount (amd64 here, arm64 natively in integration-arm64).
+  # The build uses a docker-container buildx builder whose bundled QEMU
+  # covers arm64, so no binfmt set-up is needed.
+  lazyrw:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: committed builds are reproducible from source
+        run: make lazyrw-check
+      - name: C tests on a real overlay (linux/amd64, glibc and musl)
+        run: make lazyrw-test
+
+  # Every write-class libc function the postgres binary of postgres:14-18 and
+  # 17-alpine imports must be interposed by the shim or be on the reviewed
+  # allowlist (internal/cow/lazyrw/audit): a write the shim does not see hits
+  # a read-only fd. Also weekly, because new postgres images are published
+  # without a commit here.
+  pg-import-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: postgres imports vs the shim (linux/amd64 and linux/arm64)
+        env:
+          PG_AUDIT_PLATFORMS: linux/amd64 linux/arm64
+        run: make pg-import-audit
+
+  # arm64: Apple Silicon Docker Desktop, Colima and OrbStack run arm64
+  # postgres images. The shim's arm64 builds get their C tests natively here,
+  # then the copy-on-write integration tests (internal/engine, names matching
+  # Cow) run against arm64 postgres; while none exist the step runs nothing
+  # and passes.
+  integration-arm64:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: lazyrw C tests on a real overlay (linux/arm64, glibc and musl)
+        run: make lazyrw-test
+      - name: pre-pull images
+        run: |
+          docker pull -q postgres:17
+          docker pull -q alpine:3.21
+      - name: copy-on-write integration tests (arm64)
+        run: PGOVERLAY_IT=1 go test ./internal/engine/ -run Cow -count=1 -p 1 -timeout 30m -v
 
   pg-matrix:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
