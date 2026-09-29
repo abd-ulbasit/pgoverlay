@@ -4,7 +4,7 @@
 
 `git branch` for Postgres: seed once from any running database, then spin up isolated, writable copies that never write back to it.
 
-Each branch is its own Postgres container whose data directory is an **OverlayFS copy-on-write** mount over one shared, read-only seed of the source. Creating a branch mounts that seed instead of copying it: a 5 GiB database branches in **1.89 s**, and the fresh branch holds **33.1 MiB** of its own data. Branches run side by side, can be reset, diffed against their base, and branched again.
+Each branch is its own Postgres container whose data directory is an **OverlayFS copy-on-write** mount over one shared, read-only seed of the source. Creating a branch mounts that seed instead of copying it: a 5 GiB database branches in **1.89 s**, and the fresh branch holds **33.1 MiB** of its own data. After that, **reads copy nothing** into the branch, and a write copies the file it touches once, or only the blocks it changes where the volumes sit on XFS or btrfs. Branches run side by side, can be reset, diffed against their base, and branched again.
 
 ![pgoverlay demo](docs/demo.gif)
 
@@ -66,7 +66,8 @@ docker rm -f -v demo-src
 >
 > - **It is a dev/test tool.** Branches are disposable Postgres instances for development, CI, review apps and migration rehearsal. There are no backups, no replication of branches and no merge-back, and a branch never follows its source after seeding.
 > - **Branch containers are privileged.** On Docker and in Kubernetes hostpath mode every branch container gets `CAP_SYS_ADMIN` with AppArmor unconfined (and seccomp unconfined on Kubernetes), because it mounts its own overlay. Do not give branches to untrusted code. Kubernetes csi mode adds no capabilities. See [docs/security.md](docs/security.md).
-> - **Reads copy data too.** A fresh branch costs about 33 MiB, but Postgres opens table files read-write even to read them, and OverlayFS copies a file whole into the branch the first time that happens. A `SELECT count(*)` on a 489 MB table grew a branch from 33 MiB to 523 MiB ([measurement](docs/benchmarks.md#reads-copy-up-too)). Branches grow toward the size of the tables they touch; for read-heavy branches of large databases use the [zfs](docs/zfs.md) or [csi](docs/kubernetes.md) backend, which copy blocks, not files.
+> - **On ext4, a write copies the whole file.** Reads copy nothing, but the first write to a table or index file copies that file (a segment, up to 1 GiB) into the branch, and that write waits for the copy. A branch grows by the segments it writes. Where the volumes live on XFS (`reflink=1`) or btrfs, the copy is an extent clone and a write copies only the blocks it changes: branchd detects this at startup, and `--volume-root` puts the volumes on such a disk on any Docker host ([how](docs/concepts.md#8-clone-or-copy-what-a-copy-up-costs)).
+> - **Linux 4.19 or later for copy-free reads.** Each branch checks at start that its kernel and image can run the lazyrw shim that keeps reads from copying. Where they cannot, the branch copies every table file it opens, as releases before v1.0.0 did, and says so in its log and in the `pgoverlay_branch_cow_mode` metric ([Troubleshooting](docs/troubleshooting.md#a-branch-copies-eagerly)).
 > - **Postgres 14 to 18, Linux containers.** Seeding with `pg_basebackup` needs a `REPLICATION` user and `wal_level=replica` on the source; managed Postgres needs `--via dump`.
 > - **One writer.** The registry is a SQLite file owned by one `branchd`. More replicas give failover through leader election, not more throughput.
 
@@ -206,11 +207,13 @@ The first real benchmark said branching a 5 GiB database took **61.9 s** and lef
 
 Creation no longer depends on database size (1.90 s at 1 GiB, 1.89 s at 5 GiB). The long-form write-up is [**Postgres copied 5 GiB before recovery started**](https://www.basit.engineer/posts/postgres-copied-5gb-before-recovery-started.html).
 
-**The same mechanism is still on the read path.** Postgres opens relation files `O_RDWR` for every access (`src/backend/storage/smgr/md.c`; checked in `REL_14_STABLE` and `REL_17_STABLE`), so the first query that touches a table copies its files up whole, reads included. The pre-v1 review measured it: a fresh branch at 33.1 MiB, a 1-row `UPDATE` on a small table at 33.5 MiB, and a `SELECT count(*)` on a 489 MB frozen table at 523.1 MiB. `syncfs` fixed branch creation; it cannot fix this, because it is how stock Postgres reads. That is why the zfs and csi backends exist. [docs/benchmarks.md](docs/benchmarks.md) has every number, the methodology, and the pre-fix results kept as they were.
+**The same mechanism was on the read path, until v1.0.0.** Postgres opens relation files `O_RDWR` for every access (`src/backend/storage/smgr/md.c`; checked in `REL_14_STABLE` and `REL_17_STABLE`), so the first query that touched a table copied its files up whole, reads included. The pre-v1 review measured it: a fresh branch at 33.1 MiB, a 1-row `UPDATE` on a small table at 33.5 MiB, and a `SELECT count(*)` on a 489 MB frozen table at 523.1 MiB. `syncfs` fixed branch creation; it could not fix this, because it is how stock Postgres reads.
+
+v1.0.0 fixes it without patching Postgres ([#49](https://github.com/abd-ulbasit/pgoverlay/issues/49)). A small `LD_PRELOAD` library in the branch's Postgres, the lazyrw shim ([`internal/cow/lazyrw`](internal/cow/lazyrw/lazyrw.c)), opens table files read-only and reopens a file read-write on its first write, which is when OverlayFS copies it. And every new seed is recovered, frozen and cleanly shut down once (seed settle), so a read in a branch finds no hint bits to set and no WAL to replay. In the evaluation (Linux 7.0, Docker 29.6.2 on ext4, PostgreSQL 17), a `SELECT count(*)` of a 521 MB frozen table added 555 MiB to a branch and took 20.8 s without the shim, and **0 bytes and 277 ms** with it. A write still copies the file it touches on ext4; on XFS and btrfs that copy is a clone. [docs/benchmarks.md](docs/benchmarks.md) has every number, the methodology, and the earlier results kept as they were.
 
 ## How it works
 
-`pgb source add` runs `pg_basebackup` (or `pg_dump` with `--via dump`) in a one-shot helper container and writes the seed into a volume. That volume becomes the read-only lower layer of every branch of the source.
+`pgb source add` runs `pg_basebackup` (or `pg_dump` with `--via dump`) in a one-shot helper container and writes the seed into a volume. It then settles the seed once: another helper starts Postgres on the copy (never on the source), which finishes the backup's recovery, runs `VACUUM (FREEZE, ANALYZE)` on every database, and shuts it down cleanly (`--seed-settle`, default `freeze`). That volume becomes the read-only lower layer of every branch of the source.
 
 `pgb branch create` makes an empty volume for the branch and starts a stock `postgres` container whose entrypoint mounts the overlay **inside the container**, so the same code works on Colima, Docker Desktop and bare Linux:
 
@@ -222,10 +225,12 @@ Creation no longer depends on database size (1.90 s at 1 GiB, 1.89 s at 5 GiB). 
  │     ├──────────────────────┤                                │
  │     │ lower (read-only)    │  volume: pgoverlay-src-main ────┼─▶ shared by
  │     └──────────────────────┘  (the seed)                    │   all branches
+ │   postgres + LD_PRELOAD=liblazyrw: table files are opened   │
+ │   read-only until their first write                         │
  └─────────────────────────────────────────────────────────────┘
 ```
 
-Postgres boots on the merged view and runs ordinary crash recovery, as if the machine had lost power at backup time. Postgres opens table and index files read-write even to read them, and the first such open of a file from the shared seed makes OverlayFS copy that whole file (a relation segment is up to 1 GiB) into the branch's own volume. Files a branch never touches stay shared. Branches are isolated from the source and from each other.
+Postgres boots on the merged view from the settled seed's clean shutdown, so there is no WAL to replay. Stock Postgres opens table and index files read-write even to read them, and OverlayFS copies a lower file whole into the branch's own volume on its first read-write open. So the entrypoint preloads the lazyrw shim into Postgres, which opens those files read-only and reopens one read-write only when Postgres first writes to it. A read falls through to the shared seed and copies nothing; the first write to a file copies that file (a relation segment, up to 1 GiB) once. When the volumes sit on XFS (`reflink=1`) or btrfs, that copy is an extent clone, taking milliseconds and no space, and later writes copy only the blocks they change. Files a branch never writes stay shared. Each branch checks at start that its kernel and image can use the shim and falls back to copying on open, loudly, when they cannot. Branches are isolated from the source and from each other.
 
 Branching from a branch (`pgb branch create child --from-branch parent`) freezes the parent's writable layer into an immutable shared layer, so the parent is checkpointed, stopped and restarted (about twice the create time of a plain branch). The zfs backend snapshots the parent instead, with no interruption; the csi backend clones the parent's volume after a brief checkpoint and stop.
 
@@ -237,7 +242,7 @@ All of these give you production-shaped databases faster than a full copy. They 
 
 | | What it needs | A branch is | Notes |
 |---|---|---|---|
-| **pgoverlay** (overlay backend) | Docker, or Kubernetes with one storage node | a Postgres container on an OverlayFS view of a shared seed | Any Postgres 14 to 18 as the source; stock images; copies whole files on first open (see limits) |
+| **pgoverlay** (overlay backend) | Docker, or Kubernetes with one storage node | a Postgres container on an OverlayFS view of a shared seed | Any Postgres 14 to 18 as the source; stock images; reads copy nothing, a write copies the file it touches once (only the changed blocks on XFS or btrfs; see limits) |
 | **pgoverlay** (zfs / csi backends) | a ZFS pool, or a CSI driver that clones volumes | a Postgres container on a block-level clone | zfs is experimental |
 | [DBLab Engine](https://github.com/postgres-ai/database-lab-engine) | a ZFS (or LVM) pool on the host | a Postgres container on a thin clone | Mature, self-hosted, block-level CoW |
 | [Neon](https://neon.com) | Neon's service | a copy-on-write branch in Neon's storage engine | The storage is open source, but there is no supported self-hosted path; your data lives in Neon |
@@ -246,7 +251,7 @@ All of these give you production-shaped databases faster than a full copy. They 
 | PostgreSQL 18 `file_copy_method = clone` | a filesystem that can clone files (reflinks: XFS, Btrfs, ...) | a database cloned inside the same instance | No extra software, but every branch shares one server, and the template database must have no other connections while it is copied |
 | `pg_dump` / `createdb -T` | nothing | a full copy | Minutes to hours for real datasets; N copies cost N times the disk |
 
-pgoverlay's niche is the middle: plain Docker and stock Postgres images, against the Postgres you already run, with no special filesystem. If you already operate ZFS, DBLab Engine or pgoverlay's zfs backend will use less disk for read-heavy branches.
+pgoverlay's niche is the middle: plain Docker and stock Postgres images, against the Postgres you already run, with no special filesystem, and block-level copy-on-write when the volumes happen to sit on XFS or btrfs. If you already operate ZFS, DBLab Engine or pgoverlay's zfs backend copy blocks rather than files on any host, which uses less disk for branches that write into many large tables.
 
 ## Supported Postgres versions
 
@@ -255,6 +260,8 @@ pgoverlay's niche is the middle: plain Docker and stock Postgres images, against
 | Supported | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 Declare the source's major with `--pg-version` (`"pg_version"` over the API); branches run `postgres:<major>`, and a seed whose data directory reports a different major is refused. A source that needs extensions or locales the stock image lacks names its own image with `--image` (for example `postgis/postgis:17-3.5`). PG 13 and older are unsupported because branch startup relies on `recovery_init_sync_method=syncfs`, added in PG 14. `make matrix` runs seed, branch, verify and destroy per major, and CI runs 14 through 18 weekly.
+
+The lazyrw shim is built for glibc and musl on x86_64 and aarch64, so it loads into the stock Debian and Alpine images and into custom images derived from them. A branch whose image cannot load it copies on open instead and reports why. On PG 18 the branch pins `io_method=worker` while the shim is active, because the shim sees libc calls and not `io_uring` submissions.
 
 ## Documentation
 
@@ -267,7 +274,7 @@ The docs are a MkDocs site, built in CI and published at [abd-ulbasit.github.io/
 - [Troubleshooting](docs/troubleshooting.md): failed branches, recovery, reachability, common errors.
 - [Security](docs/security.md): threat model and hardening checklist.
 - [Benchmarks](docs/benchmarks.md), [Core concepts](docs/concepts.md), [Architecture](docs/architecture.md), [Code tour](docs/code-tour.md), [Design decisions](docs/DESIGN-DECISIONS.md), [Deep dives](docs/deep-dives.md).
-- [Kubernetes](docs/kubernetes.md), [Running on EKS](docs/eks.md), [High availability](docs/ha.md), [Observability](docs/observability.md), [GitHub App](docs/github-app.md), [Testing](docs/testing.md), [ZFS backend](docs/zfs.md), [Upgrading to v1.0](docs/upgrading.md).
+- [Kubernetes](docs/kubernetes.md), [Running on EKS](docs/eks.md), [High availability](docs/ha.md), [Observability](docs/observability.md), [GitHub App](docs/github-app.md), [Testing](docs/testing.md), [ZFS backend](docs/zfs.md), [Upgrading to v1.0](docs/upgrading.md), [Changelog](CHANGELOG.md).
 
 ## Development
 
