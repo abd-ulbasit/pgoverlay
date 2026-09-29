@@ -71,6 +71,7 @@ for platform in $PLATFORMS; do
     defined "$so" > "$tmp/interposed"
 
     out=$tmp/bin-$arch-${image//[:\/]/_}
+    # shellcheck disable=SC2016 # the command substitution runs in the build
     printf 'FROM %s AS src\nRUN cp "$(command -v postgres)" /postgres\nFROM scratch\nCOPY --from=src /postgres /\n' "$image" |
       docker buildx build --quiet --platform "$platform" --output "type=local,dest=$out" - >/dev/null ||
       die "could not extract postgres from $image ($platform)"

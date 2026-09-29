@@ -73,8 +73,9 @@ build_dist() {
   buildx_out dist "$PLATFORMS" "$dest"
   chmod 0644 "$dest"/*.so
   if compgen -G "$dest/pgoverlay-du-*" >/dev/null; then chmod 0755 "$dest"/pgoverlay-du-*; fi
-  (cd "$dest" && find . -maxdepth 1 -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort |
-    while read -r f; do sha256 "$f"; done > SHA256SUMS)
+  (cd "$dest" && find . -maxdepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort |
+    while read -r f; do sha256 "$f"; done > "$tmp/SHA256SUMS")
+  mv "$tmp/SHA256SUMS" "$dest/SHA256SUMS"
 }
 
 cmd=${1:-build}
