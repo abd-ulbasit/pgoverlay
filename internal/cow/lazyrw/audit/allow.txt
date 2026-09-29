@@ -1,0 +1,7 @@
+# Write-class functions (write-class.txt) the postgres binary may import
+# although the lazyrw shim does not interpose them, each with the reason that
+# is safe. Format: <symbol> <reason>. Only what a supported image actually
+# imports belongs here, so anything new is reviewed; re-check every entry on
+# each new PostgreSQL major.
+
+io_uring_submit PG18's AIO submits only reads to io_uring (relation writes stay synchronous pwrite/pwritev, which the shim sees), the branch entrypoint pins io_method=worker whenever lazyrw is active, and Docker's default seccomp profile blocks io_uring. Re-check when a major starts submitting writes.
