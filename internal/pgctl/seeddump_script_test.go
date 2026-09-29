@@ -19,7 +19,12 @@ mkdir -p "$d"
 : > "$d/postgresql.conf"
 for a in "$@"; do case "$a" in --pwfile=*) cat "${a#--pwfile=}" > "$REC/pwfile";; esac; done
 echo "initdb chatter that would crowd the error tail"`,
-	"pg_ctl":   `echo "$@" >> "$REC/pg_ctl"`,
+	"pg_ctl": `echo "$@" >> "$REC/pg_ctl"`,
+	"vacuumdb": `echo "$@" > "$REC/vacuumdb"
+printf 'PGOPTIONS=%s PGPASSWORD=%s\n' "${PGOPTIONS:-}" "${PGPASSWORD:-}" > "$REC/vacuumdb.env"
+echo vacuumdb >> "$REC/pg_ctl"
+echo 'vacuumdb: vacuuming database "postgres"'
+if [ -n "${STUB_VACUUM_FAIL:-}" ]; then printf '%s\n' "$STUB_VACUUM_FAIL" >&2; exit 1; fi`,
 	"createdb": `echo "$@" > "$REC/createdb"`,
 	"pg_dump": `printf 'PGPASSWORD=%s PGSSLMODE=%s PGCONNECT_TIMEOUT=%s\n' "${PGPASSWORD:-}" "${PGSSLMODE:-}" "${PGCONNECT_TIMEOUT:-}" > "$REC/pg_dump.env"
 echo "$@" > "$REC/pg_dump.args"
@@ -220,5 +225,71 @@ func TestSeedDumpScriptRedactsRowData(t *testing.T) {
 	}
 	if !strings.Contains(r.out, `ERROR:  invalid input syntax for type integer: "[redacted]"`) {
 		t.Errorf("error lost its non-data part:\n%s", r.out)
+	}
+}
+
+// Settling a dump seed: VACUUM (FREEZE, ANALYZE) on the restored cluster,
+// over the local socket, after the restore and before the clean stop.
+func TestSeedDumpScriptFreezesBeforeStop(t *testing.T) {
+	r := runDumpScript(t, scopedSpec())
+	if r.failed {
+		t.Fatalf("script failed:\n%s", r.out)
+	}
+	steps := strings.Split(strings.TrimSpace(r.file(t, "pg_ctl")), "\n")
+	if len(steps) != 3 || !strings.HasSuffix(steps[0], " start") || steps[1] != "vacuumdb" || !strings.Contains(steps[2], " stop ") {
+		t.Fatalf("temp server steps = %q, want start, vacuumdb, stop", steps)
+	}
+	if got := strings.TrimSpace(r.file(t, "vacuumdb")); got != "-h /tmp -U app --all --freeze --analyze" {
+		t.Errorf("vacuumdb args = %q", got)
+	}
+	// no parallel workers (/dev/shm), and the source password stays on the
+	// remote leg
+	if got := r.file(t, "vacuumdb.env"); got != "PGOPTIONS=-c max_parallel_maintenance_workers=0 PGPASSWORD=\n" {
+		t.Errorf("vacuumdb env = %q", got)
+	}
+	if rep := parseSettleReport(r.out); rep.vacuum != "ok" {
+		t.Errorf("report = %+v from:\n%s", rep, r.out)
+	}
+}
+
+func TestSeedDumpScriptSettleRecoverAndOffSkipVacuum(t *testing.T) {
+	for _, mode := range []SettleMode{SettleRecover, SettleOff} {
+		spec := scopedSpec()
+		spec.Settle = mode
+		r := runDumpScript(t, spec)
+		if r.failed {
+			t.Fatalf("%s: script failed:\n%s", mode, r.out)
+		}
+		if _, err := os.Stat(filepath.Join(r.rec, "vacuumdb")); err == nil {
+			t.Errorf("%s: vacuumdb ran", mode)
+		}
+		if strings.Contains(r.out, "pgoverlay-settle-") {
+			t.Errorf("%s: settle report in the output:\n%s", mode, r.out)
+		}
+		// the clean stop happens regardless
+		if !strings.Contains(r.file(t, "pg_ctl"), "stop -m fast") {
+			t.Errorf("%s: no clean stop", mode)
+		}
+	}
+}
+
+// A failed VACUUM keeps the seed (it is restored and still stopped cleanly)
+// and reports the error without the row value the server quoted.
+func TestSeedDumpScriptVacuumFailureKeepsSeed(t *testing.T) {
+	r := runDumpScript(t, scopedSpec(),
+		"STUB_VACUUM_FAIL=vacuumdb: error: processing of database \"appdb\" failed: ERROR:  invalid input syntax for type integer: \"4111 1111 1111 1111\"\n"+
+			"CONTEXT:  SQL function \"f\" statement 1: \"s3cr3t-row\"")
+	if r.failed {
+		t.Fatalf("a failed VACUUM failed the dump seed:\n%s", r.out)
+	}
+	if strings.Contains(r.out, "4111") || strings.Contains(r.out, "s3cr3t") {
+		t.Errorf("row data in the helper output:\n%s", r.out)
+	}
+	rep := parseSettleReport(r.out)
+	if rep.vacuum != "failed" || len(rep.errors) != 1 || !strings.HasSuffix(rep.errors[0], `integer: "[redacted]"`) {
+		t.Errorf("report = %+v from:\n%s", rep, r.out)
+	}
+	if steps := strings.Split(strings.TrimSpace(r.file(t, "pg_ctl")), "\n"); !strings.Contains(steps[len(steps)-1], " stop ") {
+		t.Errorf("no clean stop after the failed VACUUM: %q", steps)
 	}
 }

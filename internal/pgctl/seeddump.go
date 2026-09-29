@@ -76,6 +76,16 @@ func shellQuote(s string) string {
 //     row data never passes through the expression.
 //   - psql reports errors tersely (no DETAIL/CONTEXT lines, which quote
 //     whole rows) and redact masks the one value a data error still quotes.
+//   - with $PGB_SETTLE=freeze (the default settle mode) vacuumdb runs VACUUM
+//     (FREEZE, ANALYZE) on every database before the stop. Rows a restore
+//     just loaded carry no hint bits and the tables no statistics, so the
+//     first read of each page in a branch would set hint bits, and
+//     autovacuum in every branch would vacuum and analyze the freshly loaded
+//     tables; on the overlay backend both are writes that copy data into
+//     the branch. A VACUUM failure is reported (pgoverlay-settle-vacuum=
+//     failed, the error redacted like psql's) and the seed kept. It runs
+//     without parallel workers: their dynamic shared memory lives in
+//     /dev/shm, 64 MB in Docker.
 //   - pg_ctl stop -m fast leaves a clean-shutdown cluster, so branches start
 //     without crash recovery.
 //
@@ -116,6 +126,16 @@ remote pg_dump --no-owner --no-acl%s \
   | schema_filter \
   | temp_psql -v ON_ERROR_STOP=1 -v SHOW_CONTEXT=never 2>&1 >/dev/null \
   | redact >&2
+if [ "${PGB_SETTLE:-}" = freeze ]; then
+  if vacuum_err=$(PGOPTIONS='-c max_parallel_maintenance_workers=0' \
+    vacuumdb -h /tmp -U "$PGB_USER" --all --freeze --analyze 2>&1 >/dev/null); then
+    echo pgoverlay-settle-vacuum=ok
+  else
+    printf '%%s\n' "$vacuum_err" | grep '^vacuumdb:' | tail -n 3 \
+      | sed -e 's/\(ERROR: .*: \)".*/\1"[redacted]"/' -e 's/^/pgoverlay-settle-vacuum-error=/' || true
+    echo pgoverlay-settle-vacuum=failed
+  fi
+fi
 pg_ctl -D "$PGB_DATA" -w stop -m fast >/dev/null
 `
 
@@ -151,8 +171,12 @@ func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 	if len(s.Schemas) > 0 {
 		scoped = "1"
 	}
-	slog.Info("seed: running pg_dump against the source", "addr", s.addr(), "user", s.User, "database", db, "sslmode", s.sslMode())
-	_, err := d.RunHelper(ctx, runtime.HelperSpec{
+	// Validate has vetted the mode. recover needs no step of its own here:
+	// the dump's cluster is a fresh initdb that the script shuts down
+	// cleanly either way.
+	settle, _ := ParseSettleMode(string(s.Settle))
+	slog.Info("seed: running pg_dump against the source", "addr", s.addr(), "user", s.User, "database", db, "sslmode", s.sslMode(), "settle", settle)
+	out, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image: s.Image,
 		User:  "postgres",
 		Cmd:   []string{"bash", "-c", fmt.Sprintf(seedDumpScript, schemaFlags.String())},
@@ -168,12 +192,16 @@ func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 			// needs neither)
 			"PGB_SSLMODE=" + s.sslMode(),
 			"PGB_CONNECT_TIMEOUT=" + strconv.Itoa(int(ConnectTimeout/time.Second)),
+			"PGB_SETTLE=" + string(settle),
 		},
 		Mounts:  []runtime.Mount{seedMount},
 		Network: s.Network,
 	})
 	if err != nil {
 		return seedError{fmt.Errorf("pg_dump seed from %s: %w", s.addr(), err)}
+	}
+	if settle == SettleFreeze {
+		parseSettleReport(out).log("addr", s.addr(), "database", db)
 	}
 	return nil
 }

@@ -37,6 +37,7 @@ import (
 	"github.com/abd-ulbasit/pgoverlay/internal/engine"
 	"github.com/abd-ulbasit/pgoverlay/internal/ha"
 	"github.com/abd-ulbasit/pgoverlay/internal/metrics"
+	"github.com/abd-ulbasit/pgoverlay/internal/pgctl"
 	"github.com/abd-ulbasit/pgoverlay/internal/pgproxy"
 	"github.com/abd-ulbasit/pgoverlay/internal/registry"
 	"github.com/abd-ulbasit/pgoverlay/internal/runtime"
@@ -92,6 +93,15 @@ func envDuration(key string, def time.Duration) time.Duration {
 		log.Fatalf("invalid %s=%q: %v", key, v, err)
 	}
 	return d
+}
+
+// envString reads a string env var as a flag default; an unset/empty var
+// keeps def (the flag's own parsing validates the value).
+func envString(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // tlsConfigFromFlags loads an optional PEM cert/key flag pair (--<name>-tls-cert
@@ -329,6 +339,7 @@ func run() error {
 	defaultTTL := flag.Duration("default-ttl", envDuration("PGOVERLAY_DEFAULT_TTL", 0), "TTL applied to branches created without one, e.g. 24h (0 = no default, branches never expire; env PGOVERLAY_DEFAULT_TTL)")
 	maxTTL := flag.Duration("max-ttl", envDuration("PGOVERLAY_MAX_TTL", 0), "upper bound on any requested branch TTL; longer TTLs are capped to this, e.g. 168h (0 = no cap; env PGOVERLAY_MAX_TTL)")
 	maxLayerDepth := flag.Int("max-layer-depth", envInt("PGOVERLAY_MAX_LAYER_DEPTH", engine.DefaultMaxLayerDepth), "overlay backend: cap on a branch's frozen layer chain; branching from a branch at the cap returns 403 (env PGOVERLAY_MAX_LAYER_DEPTH)")
+	seedSettle := flag.String("seed-settle", envString(pgctl.SettleEnv, string(pgctl.DefaultSettleMode)), "how a new seed (source add or refresh) is prepared before branches start from it: freeze (recover the copy once, VACUUM (FREEZE, ANALYZE) every database, shut down cleanly, so branches start without WAL replay and their reads write nothing), recover (recover and shut down cleanly, no VACUUM) or off (env PGOVERLAY_SEED_SETTLE)")
 	apiTLSCert := flag.String("api-tls-cert", "", "PEM certificate for the REST API (TLS off when unset; requires --api-tls-key)")
 	apiTLSKey := flag.String("api-tls-key", "", "PEM private key for the REST API (requires --api-tls-cert)")
 	pgTLSCert := flag.String("pg-tls-cert", "", "PEM certificate for the Postgres router (SSLRequest answered 'N' when unset; requires --pg-tls-key)")
@@ -365,6 +376,10 @@ func run() error {
 	proxyHost, proxyPort, err := advertisedProxy(*advertiseProxyAddr, *pgAddr)
 	if err != nil {
 		return err
+	}
+	settle, err := pgctl.ParseSettleMode(*seedSettle)
+	if err != nil {
+		return fmt.Errorf("--seed-settle (or $%s): %w", pgctl.SettleEnv, err)
 	}
 
 	token := os.Getenv("PGOVERLAY_TOKEN")
@@ -480,6 +495,8 @@ func run() error {
 	}
 	engOpts = append(engOpts, engine.WithMaxLayerDepth(*maxLayerDepth))
 	engOpts = append(engOpts, cowOpts...)
+	log.Printf("new seeds are settled with --seed-settle=%s", settle)
+	engOpts = append(engOpts, engine.WithSeedSettle(settle))
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
 		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")}, engOpts...)
 	if backend == cow.BackendOverlay {

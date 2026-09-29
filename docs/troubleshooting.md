@@ -145,6 +145,26 @@ whose configuration lives outside the data directory (Debian and Ubuntu
 packages) get minimal generated `postgresql.conf`, `pg_hba.conf` and
 `pg_ident.conf` files.
 
+**Seed settle.** After `pg_basebackup`, the seed is started once in a helper
+on the branch image, which completes the backup's recovery, then
+`VACUUM (FREEZE, ANALYZE)` runs on every database and the seed is shut down
+cleanly (`--seed-settle=freeze`, the default; `recover` skips the VACUUM,
+`off` skips the step). Branches then start without WAL replay, and their reads
+do not write: there are no hint bits to set, nothing to prune and no
+anti-wraparound VACUUM due. Only pgoverlay's copy is touched, never the source.
+The helper overrides whatever in the source's configuration cannot start in a
+throwaway container (listeners, sockets, `hba_file`, TLS, logging collector,
+archiving, `shared_preload_libraries`, `shared_buffers`, `huge_pages`, login
+event triggers), so those do not fail the settle. What still does, fails the
+seed with the server log's last lines: an `include` of a file that is not in
+the data directory, a syntax error, or a setting this image does not know.
+Every branch would fail the same way; fix the source's configuration, or use
+`--seed-settle=off` to seed anyway. A VACUUM that fails (or finds no role
+with `SUPERUSER` and `LOGIN`) is logged as a warning and the seed kept, still
+cleanly shut down. The settle adds roughly one read of the database plus a
+write of its unfrozen pages to the seed time; `--via dump` seeds only add the
+VACUUM, run before the dump helper's own clean shutdown.
+
 **Masking and credential rotation connect over the local socket.** They run
 `psql` inside the branch as the source's connection user, through the
 `local` lines of the source's `pg_hba.conf`. On Docker these commands run as

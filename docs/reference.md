@@ -107,6 +107,7 @@ success and `1` on any error.
 | `PGOVERLAY_SECRET_KEY`, `PGOVERLAY_SECRET_KEY_FILE`, `PGOVERLAY_SECRET_KEY_PREVIOUS` | local mode | the at-rest key, read the same way branchd reads it, to decrypt rotated passwords; `pgb` never generates a key |
 | `PGOVERLAY_SEED_SSLMODE` | local mode | `sslmode` of seed connections (default `prefer`) |
 | `PGOVERLAY_LAZYRW`, `PGOVERLAY_WAL_RECYCLE` | local mode | `on` or `off`, as branchd's `--lazyrw` and `--wal-recycle`: how the branches `pgb` starts copy files up (default `on` for both) |
+| `PGOVERLAY_SEED_SETTLE` | local mode | how `source add` and `source refresh` settle a new seed: `freeze` (default), `recover` or `off`; see [`--seed-settle`](#seed-settle) |
 | `PGPASSWORD` | `source add`, `source refresh` | the source password, unless `--password-env` names another variable |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` | local mode | the Docker endpoint, resolved like the `docker` CLI does, including a context's TLS material. `ssh://` endpoints are not supported: run branchd on the Docker host and use `--server`, or forward the socket (`ssh -NL /tmp/pgoverlay-docker.sock:/var/run/docker.sock HOST` and `DOCKER_HOST=unix:///tmp/pgoverlay-docker.sock`). Branch ports are published on the Docker host's `127.0.0.1`, so direct connection strings only work on that host |
 
@@ -144,6 +145,7 @@ state. A second signal exits immediately.
 | `--max-layer-depth` | `100` | `PGOVERLAY_MAX_LAYER_DEPTH` | overlay backend: cap on a branch's frozen layer chain; branching from a branch at the cap returns `403` (see [Troubleshooting](troubleshooting.md#layer-chains-and-max-layer-depth)) |
 | `--lazyrw` | `on` | `PGOVERLAY_LAZYRW` | overlay backend: `on` preloads the lazyrw shim into branch Postgres, so a table file is copied into the branch on its first write, not when it is read; a branch whose kernel (below 4.19) or image cannot use it copies on open and says so ([Troubleshooting](troubleshooting.md#a-branch-copies-eagerly)); `off` always copies on open. Branches pick a change up when they next start |
 | `--wal-recycle` | `on` | `PGOVERLAY_WAL_RECYCLE` | overlay backend, experimental: `off` starts branch Postgres with `wal_recycle=off`, so a checkpoint removes a WAL segment that came from the seed instead of copying it up to rename it |
+| `--seed-settle` | `freeze` | `PGOVERLAY_SEED_SETTLE` | how a new seed (source add or refresh) is prepared before branches start from it: `freeze`, `recover` or `off`; see [below](#seed-settle) |
 | `--disk-root` | see [Observability](observability.md#metrics) | | path whose filesystem the `pgoverlay_disk_bytes_*` gauges measure |
 | `--runtime` | `docker` | | `docker` or `kube` |
 | `--cow` | `overlay` | | copy-on-write backend: `overlay`, `zfs` ([experimental](zfs.md)) or `csi` (forced by `--kube-storage csi`) |
@@ -182,6 +184,28 @@ legitimately that slow (a long masking script is the usual case), raise
 environment variable for it. Operations `pgb` runs in local mode have no such
 bound.
 
+#### Seed settle
+
+A `pg_basebackup` copy is an online backup: every branch started from it
+would replay the WAL streamed during the backup, and its pages carry the
+source's unset hint bits, dead tuples and unfrozen transaction ids, so reads
+in a branch write (hint bits, pruning, anti-wraparound autovacuum) and, on the
+overlay backend, copy the touched files into the branch. `--seed-settle` does
+that work once, in the seed:
+
+- `freeze` (default): start the seed once in a helper on the branch image,
+  which completes the backup's recovery; run `VACUUM (FREEZE, ANALYZE)` on
+  every database; `CHECKPOINT`; stop it cleanly.
+- `recover`: the same without the VACUUM. Branches start without WAL replay,
+  but reads may still set hint bits.
+- `off`: leave the seed as `pg_basebackup` wrote it.
+
+`--via dump` seeds end with a clean shutdown anyway; with `freeze` their
+helper runs the VACUUM first. The source is never touched. The settle server
+listens on a private socket only and ignores the parts of the source's
+configuration that cannot start in a throwaway container; see
+[Troubleshooting](troubleshooting.md#seeding) for what can still fail it.
+
 #### The at-rest key
 
 With `--rotate-branch-credentials`, branch passwords are stored encrypted
@@ -204,7 +228,7 @@ previous key automatically. Back the key up with the registry. Details in
 | `PGOVERLAY_SECRET_KEY` | the at-rest key itself; wins over the key file |
 | `PGOVERLAY_SECRET_KEY_PREVIOUS` | retired keys, comma-separated, decrypt-only |
 | `PGOVERLAY_SEED_SSLMODE` | `sslmode` of seed connections: `disable`, `allow`, `prefer` (default), `require`, `verify-ca` or `verify-full` |
-| `PGOVERLAY_MAX_BRANCHES`, `PGOVERLAY_DEFAULT_TTL`, `PGOVERLAY_MAX_TTL`, `PGOVERLAY_MAX_LAYER_DEPTH`, `PGOVERLAY_SHUTDOWN_TIMEOUT`, `PGOVERLAY_SECRET_KEY_FILE`, `PGOVERLAY_LAZYRW`, `PGOVERLAY_WAL_RECYCLE` | defaults for the flags above |
+| `PGOVERLAY_MAX_BRANCHES`, `PGOVERLAY_DEFAULT_TTL`, `PGOVERLAY_MAX_TTL`, `PGOVERLAY_MAX_LAYER_DEPTH`, `PGOVERLAY_SHUTDOWN_TIMEOUT`, `PGOVERLAY_SECRET_KEY_FILE`, `PGOVERLAY_LAZYRW`, `PGOVERLAY_WAL_RECYCLE`, `PGOVERLAY_SEED_SETTLE` | defaults for the flags above |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` | Docker endpoint (docker runtime), as for `pgb` |
 | `POD_NAMESPACE`, `POD_NAME`, `PGOVERLAY_POD_NAME`, `PGOVERLAY_POD_UID` | set by the Helm chart: the namespace, the leader-election identity (and leader label), and the pod that owns helper pods |
 
@@ -215,7 +239,7 @@ documents every value; [Kubernetes](kubernetes.md) explains the ones that
 matter. The chart maps these to branchd flags: `reconcileInterval`,
 `stuckTimeout`, `shutdownTimeout` (seconds; the pod's grace period is this
 plus 30), `rotateBranchCredentials`, `cow.lazyrw` (`--lazyrw`, `true` or
-`false`), `helperImage`, `dataRoot`, `node`,
+`false`), `seedSettle`, `helperImage`, `dataRoot`, `node`,
 `storage.*`, `proxy.tls.certSecret`, `replicaCount` and
 `leaderElection.enabled`. It does not yet expose `--max-branches`,
 `--default-ttl`, `--max-ttl`, `--max-layer-depth`, `--advertise-proxy-addr`,
