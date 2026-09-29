@@ -271,10 +271,12 @@ jobs:
           printf '%s  kind\n%s  kubectl\n' "$KIND_SHA256" "$KUBECTL_SHA256" | sha256sum --check --strict
           chmod +x kind kubectl && sudo mv kind kubectl /usr/local/bin/
       # Gate: the Kubernetes runtime-driver suite (hostPath volumes, helper
-      # pods, branch pods, overlay-in-pod). It bootstraps the kind cluster
-      # (hack/kind-up.sh) and loads its images itself.
+      # pods, branch pods, overlay-in-pod, and the lazyrw copy-on-write check
+      # of #49). It bootstraps the kind cluster (hack/kind-up.sh) and loads
+      # its images itself. -v keeps the measured numbers (cow-mode, read
+      # growth with lazyrw on and off) in the log when the suite passes.
       - name: Kubernetes runtime ITs (kind, hostPath)
-        run: PGOVERLAY_K8S_IT=1 go test ./internal/runtime/ -count=1 -timeout 25m
+        run: PGOVERLAY_K8S_IT=1 go test ./internal/runtime/ -count=1 -timeout 25m -v
       # Gate: the end-to-end helm-deploy and HA-failover suites. Every
       # port-forward in them waits for its pod to be Running and Ready first
       # (waitPodReady): the HA suite once forwarded to a replacement pod that
