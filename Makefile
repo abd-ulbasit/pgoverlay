@@ -1,4 +1,4 @@
-.PHONY: build test it k8s-it csi-it matrix lint vuln vuln-test check-toolchain docker-build docker-build-ghook helm-test js-sdk-test release-check
+.PHONY: build test it k8s-it csi-it matrix lint vuln vuln-test check-toolchain docker-build docker-build-ghook helm-test js-sdk-test release-check lazyrw lazyrw-check lazyrw-test pg-import-audit
 
 # Build identity stamped into every binary (`pgb version`, `branchd -version`,
 # `pgoverlay-github -version`). Override for release builds, e.g.
@@ -43,6 +43,28 @@ matrix:
 
 lint:
 	go vet ./...
+
+# The lazyrw LD_PRELOAD shim (internal/cow/lazyrw), which makes a branch copy a
+# relation file up on its first write instead of its first read. Its glibc and
+# musl builds for amd64 and arm64 are committed (go:embed, so `go install`
+# needs no C toolchain); these targets need Docker with buildx.
+#   lazyrw        rebuild internal/cow/lazyrw/dist and its SHA256SUMS
+#   lazyrw-check  fail unless dist/ is byte-identical to a fresh build (CI)
+#   lazyrw-test   the C tests on a real OverlayFS mount (privileged containers)
+lazyrw:
+	hack/build-lazyrw.sh build
+
+lazyrw-check:
+	hack/build-lazyrw.sh check
+
+lazyrw-test:
+	hack/build-lazyrw.sh test
+
+# Every write-class libc function the postgres binary of postgres:14-18 and
+# 17-alpine imports must be interposed by the shim, or be on the reviewed
+# allowlist (internal/cow/lazyrw/audit). Pulls the images; needs nm.
+pg-import-audit:
+	hack/pg-import-audit.sh
 
 # The CI supply-chain gate, verbatim: govulncheck (pinned in the script) in
 # binary mode against the three shipped binaries, with the per-advisory

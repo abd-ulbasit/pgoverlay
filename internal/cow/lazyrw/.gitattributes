@@ -1,0 +1,4 @@
+# Committed build outputs: never diffed, merged or line-ending converted.
+dist/*.so binary
+dist/pgoverlay-du-* binary
+dist/SHA256SUMS text eol=lf
