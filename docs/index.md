@@ -17,8 +17,10 @@ branch "pr-1" ready in 2.482s (port 34467)
 ```
 
 **Measured:** a 1 GiB and a 5 GiB database both branch in ~1.9 s (p50 of 5
-runs), and a fresh branch holds 33.1 MiB of its own data, not a copy of the
-dataset. Full results and methodology in [Benchmarks](benchmarks.md).
+runs), and a fresh branch holds its own changes, not a copy of the dataset:
+under 1 MiB since v1.0.0 settles the seed. A 60 s pgbench select-only run grew
+a branch by 16.5 MiB (1.6 MiB allocated), where copying files on open grew it
+by 768 MiB. Full results and methodology in [Benchmarks](benchmarks.md).
 
 !!! warning "Honest limits"
     - **A dev/test tool.** Branches are disposable Postgres instances for
@@ -30,8 +32,10 @@ dataset. Full results and methodology in [Benchmarks](benchmarks.md).
       unconfined, for its overlay mount. Kubernetes csi mode adds no
       capabilities. See [Security](security.md).
     - **On ext4, a write copies the whole file.** Reads copy nothing, but the
-      first write to a table or index file copies that file (a segment, up to
-      1 GiB) into the branch, and that write waits for the copy. Where the
+      first time Postgres writes to a table or index file, that file (a
+      segment, up to 1 GiB) is copied into the branch, and the write waits for
+      the copy: usually a checkpoint's write rather than the `UPDATE`'s
+      ([measured](benchmarks.md#throughput-and-the-first-write-stall)). Where the
       volumes live on XFS (`reflink=1`) or btrfs, the copy is an extent clone
       and a write copies only the blocks it changes; branchd detects this, and
       `--volume-root` puts the volumes on such a disk
