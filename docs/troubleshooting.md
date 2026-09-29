@@ -218,9 +218,11 @@ read-write even to read them, and OverlayFS copies a file whole into the
 branch on a read-write open. With `--lazyrw=on` (the default) the lazyrw
 shim in the branch's Postgres opens them read-only until the first write, so
 a read copies nothing and a write copies the file it touches (one segment, at
-most 1 GiB) once. A branch in eager mode (below) copies every table it
-reads. The `pgoverlay_disk_bytes_*` gauges and the alert in
-[Observability](observability.md) watch the filesystem.
+most 1 GiB) once. Where copy-up clones (XFS with `reflink=1` or btrfs,
+`pgoverlay_cow_copyup_mode{mode="clone"}`), that copy shares its blocks with
+the seed and only rewritten blocks take space. A branch in eager mode
+(below) copies every table it reads. The `pgoverlay_disk_bytes_*` gauges and
+the alert in [Observability](observability.md) watch the filesystem.
 
 ### A branch copies eagerly
 
@@ -238,14 +240,53 @@ docker exec pgoverlay-br-NAME cat /pgoverlay/rw/cow-mode   # or kubectl exec
 | Reason | What to do |
 |---|---|
 | `self-test failed` | The kernel does not re-target a read-only file to the copied-up file when another process writes it (OverlayFS stacked file operations, Linux 4.19 and later). The shim would serve stale data there, so it stays off. Run branches on a newer kernel (or Docker VM). |
-| `no lazyrw build for LIBC-ARCH` | The image runs on an architecture the shim is not built for (it is built for x86_64 and aarch64, glibc and musl). |
+| `no lazyrw build for LIBC-ARCH` | The image runs on an architecture the shim is not built for (it is built for x86_64 and aarch64, glibc and musl), for example an `armv7l` or `ppc64le` host. |
 | `... did not load into postgres` | The image's Postgres could not load the build: a libc older than glibc 2.31, a 32-bit or statically linked `postgres`, or a custom image the probe does not recognise. |
-| `the branch's entrypoint predates lazyrw` | The branch was created by an earlier pgoverlay. `pgb branch reset NAME` (or `recover` for a failed branch) installs the current entrypoint; the reset discards the branch's writes. |
+| `postgres -V with ... preloaded failed` or `... wrote to stderr` | `postgres -V`, run as the postgres user with the shim preloaded, failed or printed something other than the shim's own line. Something else in the image reacts to the preload (another `LD_PRELOAD` it sets, a loader warning). Reproduce it with `docker exec pgoverlay-br-NAME sh -c 'PGOVERLAY_LAZYRW_DEBUG=1 LD_PRELOAD=/pgoverlay/rw/lazyrw/liblazyrw-glibc-x86_64.so postgres -V'` (pick the build for the image). |
+| `the branch's entrypoint predates lazyrw` | The branch was created by an earlier pgoverlay. `pgb branch reset NAME` (or `recover` for a failed branch) installs the current entrypoint; the reset discards the branch's writes. See [Upgrading](upgrading.md#copy-on-write). |
+
+The mode is decided each time the branch's container starts. Once the cause
+is fixed, start the branch again: `pgb branch reset NAME` (discards its
+writes), or remove its container and let reconcile start a new one on the
+same data (`docker rm -f pgoverlay-br-NAME`, `kubectl delete pod`); branchd
+reads the mode again when it starts a branch, and at its own startup.
+`pgoverlay_branch_cow_mode{mode="unknown"}` counts ready branches whose mode
+branchd could not read (the exec into the branch failed); its log says why.
 
 `--lazyrw=off` (Helm `cow.lazyrw: false`, `PGOVERLAY_LAZYRW=off` for `pgb`)
 turns the shim off on purpose; those branches count as `off`. A change
 reaches existing branches when they next start (a reset, a recover, or a
 restart by reconcile).
+
+### The first write to a large table is slow
+
+On a host where copy-up copies (`pgoverlay_cow_copyup_mode{mode="copy"}`,
+ext4 for most Docker hosts), the first write to each table or index segment
+in a branch waits while OverlayFS copies that segment, up to 1 GiB, into the
+branch. The statement that triggers it (often a one-row `UPDATE`, or an
+autovacuum of the table) takes as long as the copy, which runs at the disk's
+copy speed: 87 to 140 MB/s in the VM of the [June benchmark](benchmarks.md#before-the-fix-branch-creation-scaled-with-data-size),
+about 20 s for 500 MB on the loaded host where #49 was evaluated. Later writes to the same file are normal speed, and every branch
+pays for its own copy once. `TRUNCATE`, `DROP` and table rewrites copy
+nothing.
+
+To avoid it, put the volumes where copy-up clones: `--volume-root` on an XFS
+(`reflink=1`) or btrfs disk for Docker, `dataRoot` on such a disk for
+Kubernetes hostpath (see [the volume root](reference.md#the-volume-root)).
+There the first write takes milliseconds and copies only the blocks it
+changes. Existing volumes stay where they are, and a clone cannot cross
+filesystems, so after moving the root run `pgb source refresh NAME`: new
+branches start from the new generation, on the new root.
+
+### Branch usage looks too large on XFS or btrfs
+
+`du` counts a cloned file in full, although it shares every block it has not
+rewritten with the seed. branchd counts exclusive bytes instead once its
+startup probe has found `clone` (see [copy-up mode](reference.md#copy-up-mode)).
+If `pgoverlay_cow_copyup_mode` says `unknown`, the probe has not finished or
+failed: its warning in branchd's log says why, and usage falls back to
+`du -sb`. `pgb` in local mode never probes, so its `--usage` is always
+`du -sb`.
 
 ### Layer chains and `--max-layer-depth`
 
