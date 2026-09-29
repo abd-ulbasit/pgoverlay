@@ -50,6 +50,12 @@ type fakeDockerAPI struct {
 	execInspectN int
 
 	calls []string
+
+	// volumeRemoveErr, when set, fails every volume removal with it (as the
+	// daemon refuses to remove a volume a container uses).
+	volumeRemoveErr string
+	// volumeCreateErr, when set, fails every volume create with it.
+	volumeCreateErr string
 }
 
 type fakeContainer struct {
@@ -137,18 +143,36 @@ func (f *fakeDockerAPI) serveVolumes(w http.ResponseWriter, r *http.Request, par
 	defer f.mu.Unlock()
 	switch {
 	case len(parts) == 1 && r.Method == http.MethodGet:
+		// honour label filters ({"label":{"k=v":true}}) as the daemon does
+		var flt map[string]map[string]bool
+		if q := r.URL.Query().Get("filters"); q != "" {
+			json.Unmarshal([]byte(q), &flt)
+		}
 		var out []*volume.Volume
 		for _, v := range f.volumes {
 			v := v
-			out = append(out, &v)
+			match := true
+			for kv := range flt["label"] {
+				k, val, _ := strings.Cut(kv, "=")
+				if got, ok := v.Labels[k]; !ok || got != val {
+					match = false
+				}
+			}
+			if match {
+				out = append(out, &v)
+			}
 		}
 		writeJSON(w, http.StatusOK, volume.ListResponse{Volumes: out})
 	case len(parts) == 2 && parts[1] == "create" && r.Method == http.MethodPost:
 		var body volume.CreateOptions
 		json.NewDecoder(r.Body).Decode(&body)
+		if f.volumeCreateErr != "" {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"message": f.volumeCreateErr})
+			return
+		}
 		v, ok := f.volumes[body.Name]
 		if !ok { // the real daemon returns the existing volume unchanged
-			v = volume.Volume{Name: body.Name, Labels: body.Labels, Driver: "local",
+			v = volume.Volume{Name: body.Name, Labels: body.Labels, Driver: "local", Options: body.DriverOpts,
 				CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 			f.volumes[body.Name] = v
 		}
@@ -161,6 +185,10 @@ func (f *fakeDockerAPI) serveVolumes(w http.ResponseWriter, r *http.Request, par
 		}
 		writeJSON(w, http.StatusOK, v)
 	case len(parts) == 2 && r.Method == http.MethodDelete:
+		if f.volumeRemoveErr != "" {
+			writeJSON(w, http.StatusConflict, map[string]string{"message": f.volumeRemoveErr})
+			return
+		}
 		delete(f.volumes, parts[1])
 		w.WriteHeader(http.StatusNoContent)
 	default:

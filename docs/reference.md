@@ -108,6 +108,7 @@ success and `1` on any error.
 | `PGOVERLAY_SEED_SSLMODE` | local mode | `sslmode` of seed connections (default `prefer`) |
 | `PGOVERLAY_LAZYRW`, `PGOVERLAY_WAL_RECYCLE` | local mode | `on` or `off`, as branchd's `--lazyrw` and `--wal-recycle`: how the branches `pgb` starts copy files up (default `on` for both) |
 | `PGOVERLAY_SEED_SETTLE` | local mode | how `source add` and `source refresh` settle a new seed: `freeze` (default), `recover` or `off`; see [`--seed-settle`](#seed-settle) |
+| `PGOVERLAY_VOLUME_ROOT` | local mode | directory on the Docker host to create volumes under, as branchd's `--volume-root`; use the same value as a branchd sharing the state directory |
 | `PGPASSWORD` | `source add`, `source refresh` | the source password, unless `--password-env` names another variable |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` | local mode | the Docker endpoint, resolved like the `docker` CLI does, including a context's TLS material. `ssh://` endpoints are not supported: run branchd on the Docker host and use `--server`, or forward the socket (`ssh -NL /tmp/pgoverlay-docker.sock:/var/run/docker.sock HOST` and `DOCKER_HOST=unix:///tmp/pgoverlay-docker.sock`). Branch ports are published on the Docker host's `127.0.0.1`, so direct connection strings only work on that host |
 
@@ -147,6 +148,8 @@ state. A second signal exits immediately.
 | `--wal-recycle` | `on` | `PGOVERLAY_WAL_RECYCLE` | overlay backend, experimental: `off` starts branch Postgres with `wal_recycle=off`, so a checkpoint removes a WAL segment that came from the seed instead of copying it up to rename it |
 | `--seed-settle` | `freeze` | `PGOVERLAY_SEED_SETTLE` | how a new seed (source add or refresh) is prepared before branches start from it: `freeze`, `recover` or `off`; see [below](#seed-settle) |
 | `--disk-root` | see [Observability](observability.md#metrics) | | path whose filesystem the `pgoverlay_disk_bytes_*` gauges measure |
+| `--volume-root` | | `PGOVERLAY_VOLUME_ROOT` | docker runtime, overlay backend: create every pgoverlay volume as a local bind volume over `<dir>/<volume>` on the Docker host instead of in Docker's own volume store; see [the volume root](#the-volume-root) |
+| `--xfs-cowextsize` | `16k` | | overlay backend: when copy-up clones on XFS, the copy-on-write extent size hint set on the volume root (`--volume-root`, or `--kube-data-root`); `0` leaves the filesystem default (128 KiB) |
 | `--runtime` | `docker` | | `docker` or `kube` |
 | `--cow` | `overlay` | | copy-on-write backend: `overlay`, `zfs` ([experimental](zfs.md)) or `csi` (forced by `--kube-storage csi`) |
 | `--zfs-dataset` | | | dataset prefix pgoverlay owns, e.g. `tank/pgoverlay` (required with `--cow zfs`) |
@@ -206,6 +209,67 @@ listens on a private socket only and ignores the parts of the source's
 configuration that cannot start in a throwaway container; see
 [Troubleshooting](troubleshooting.md#seeding) for what can still fail it.
 
+#### Copy-up mode
+
+On the overlay backend branchd probes, once at startup and in the
+background, what an OverlayFS copy-up costs on the filesystem that holds the
+volumes: it copies a 64 MiB file up through an overlay across two temporary
+volumes, in a helper with the privileges a branch container already has
+(`CAP_SYS_ADMIN`). The result is logged (`copy-up probe: mode=clone fs=xfs
+...`) and exported as `pgoverlay_cow_copyup_mode`:
+
+- `clone`: the filesystem reflinks (XFS with `reflink=1`, btrfs). Copy-up
+  clones extents in milliseconds, and the copy shares every block with the
+  source until one is rewritten, which is block-level copy-on-write. Branch
+  usage is counted as the bytes the branch owns alone (a small static tool,
+  `pgoverlay-du`, reads the extent map), because `du` would count a cloned
+  1 GiB segment with one changed page as 1 GiB.
+- `copy`: copy-up copies data (ext4, XFS without reflink, most others);
+  usage is `du -sb`.
+- `unknown`: not probed yet, or the probe failed; usage is `du -sb`.
+
+On XFS, branchd also sets a copy-on-write extent size hint
+(`--xfs-cowextsize`, 16 KiB) on the volume root, so the first write to a
+cloned block copies 16 KiB rather than 128 KiB. Volumes created afterwards
+inherit it. Docker's own volume directories are never touched, so the hint
+needs `--volume-root` on the docker runtime.
+
+#### The volume root
+
+By default the docker runtime keeps pgoverlay's volumes in Docker's volume
+store (`/var/lib/docker/volumes`), on whatever filesystem that is: usually
+ext4, where copy-up copies. `--volume-root DIR` (or `PGOVERLAY_VOLUME_ROOT`)
+creates every volume instead as a local-driver bind volume over `DIR/<volume>`
+(`type=none,o=bind,device=DIR/<volume>`): source generations, writable
+layers, frozen layers and diff throwaways alike. Point it at a directory on an
+XFS (`reflink=1`) or btrfs disk and branches get block-level copy-on-write
+without moving Docker. Volumes are still named volumes, mounted, listed and
+labelled by name; `docker volume ls` shows them.
+
+- `DIR` is a path on the Docker host, which is not this machine when
+  `DOCKER_HOST` points elsewhere (it is inside the VM for Docker Desktop,
+  Colima and OrbStack). It must exist; branchd checks it at startup and never
+  creates it, so a disk that failed to mount cannot turn into a directory on
+  the root filesystem.
+- pgoverlay creates and deletes the directories itself, in helper containers
+  that mount `DIR`, and records each volume's labels in
+  `DIR/<volume>/.pgoverlay-labels.json`. Removing a volume deletes its
+  directory. A directory whose volume is gone (a removal cut short, or a
+  `docker volume rm`) is found and deleted by reconcile.
+- Set the same value for `pgb` in local mode (`PGOVERLAY_VOLUME_ROOT`); both
+  share the registry and the volumes.
+- Changing or dropping it later is safe: existing volumes stay where they
+  were created, keep working, and are removed from there.
+- On SELinux-enforcing hosts (RHEL, Fedora) containers may only use
+  directories labelled for them: `chcon -Rt container_file_t DIR`, or a
+  matching `semanage fcontext` rule.
+- Keep `DIR` on one filesystem: an extent clone cannot cross filesystems, so
+  copy-up between two of them copies. Subvolumes of one btrfs filesystem are
+  fine: copy-up between two subvolumes mounted separately still clones
+  (measured on Linux 7.0).
+- Every volume create and remove runs one short helper container (about a
+  second on a busy host), in addition to what the operation already does.
+
 #### The at-rest key
 
 With `--rotate-branch-credentials`, branch passwords are stored encrypted
@@ -228,7 +292,7 @@ previous key automatically. Back the key up with the registry. Details in
 | `PGOVERLAY_SECRET_KEY` | the at-rest key itself; wins over the key file |
 | `PGOVERLAY_SECRET_KEY_PREVIOUS` | retired keys, comma-separated, decrypt-only |
 | `PGOVERLAY_SEED_SSLMODE` | `sslmode` of seed connections: `disable`, `allow`, `prefer` (default), `require`, `verify-ca` or `verify-full` |
-| `PGOVERLAY_MAX_BRANCHES`, `PGOVERLAY_DEFAULT_TTL`, `PGOVERLAY_MAX_TTL`, `PGOVERLAY_MAX_LAYER_DEPTH`, `PGOVERLAY_SHUTDOWN_TIMEOUT`, `PGOVERLAY_SECRET_KEY_FILE`, `PGOVERLAY_LAZYRW`, `PGOVERLAY_WAL_RECYCLE`, `PGOVERLAY_SEED_SETTLE` | defaults for the flags above |
+| `PGOVERLAY_MAX_BRANCHES`, `PGOVERLAY_DEFAULT_TTL`, `PGOVERLAY_MAX_TTL`, `PGOVERLAY_MAX_LAYER_DEPTH`, `PGOVERLAY_SHUTDOWN_TIMEOUT`, `PGOVERLAY_SECRET_KEY_FILE`, `PGOVERLAY_LAZYRW`, `PGOVERLAY_WAL_RECYCLE`, `PGOVERLAY_SEED_SETTLE`, `PGOVERLAY_VOLUME_ROOT` | defaults for the flags above |
 | `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` | Docker endpoint (docker runtime), as for `pgb` |
 | `POD_NAMESPACE`, `POD_NAME`, `PGOVERLAY_POD_NAME`, `PGOVERLAY_POD_UID` | set by the Helm chart: the namespace, the leader-election identity (and leader label), and the pod that owns helper pods |
 

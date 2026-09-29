@@ -21,6 +21,11 @@ type Config struct {
 	// ($PGOVERLAY_WAL_RECYCLE; "" = on; branchd --wal-recycle overrides it).
 	// Experimental.
 	WALRecycle string
+	// VolumeRoot is a directory on the Docker host under which the docker
+	// runtime creates every volume, as a bind volume, instead of letting
+	// Docker store them ($PGOVERLAY_VOLUME_ROOT; branchd --volume-root
+	// overrides it). "" = docker-managed volumes. See runtime.WithVolumeRoot.
+	VolumeRoot string
 }
 
 // The environment variables behind Config.LazyRW and Config.WALRecycle, read
@@ -43,6 +48,11 @@ func ParseOnOff(s string, def bool) (bool, error) {
 	return false, fmt.Errorf("%q is not on or off", s)
 }
 
+// VolumeRootEnv names the environment variable that sets Config.VolumeRoot,
+// for branchd and for pgb in local mode alike (both must agree: they share
+// the registry and the volumes).
+const VolumeRootEnv = "PGOVERLAY_VOLUME_ROOT"
+
 func Load() (*Config, error) {
 	home := os.Getenv("PGOVERLAY_HOME")
 	if home == "" {
@@ -58,6 +68,7 @@ func Load() (*Config, error) {
 		PostgresImage: "postgres:17",
 		LazyRW:        os.Getenv(LazyRWEnv),
 		WALRecycle:    os.Getenv(WALRecycleEnv),
+		VolumeRoot:    os.Getenv(VolumeRootEnv),
 	}, nil
 }
 

@@ -148,6 +148,9 @@ func helperObjectMeta(namespace, name, instanceID string, owner *metav1.OwnerRef
 // Unconfined on any kubelet without seccompDefault. Privileged helpers (the
 // zfs backend) get privileged mode instead, which implies an unconfined
 // profile and cannot be combined with allowPrivilegeEscalation=false.
+// SysAdmin helpers (the copy-up probe, which mounts an overlay) get exactly
+// what a hostPath branch container has: SYS_ADMIN with seccomp and AppArmor
+// unconfined.
 //
 // HelperSpec.User maps to a numeric runAs identity. Docker resolves names via
 // the image's /etc/passwd; K8s cannot, so the one name pgoverlay uses
@@ -155,9 +158,17 @@ func helperObjectMeta(namespace, name, instanceID string, owner *metav1.OwnerRef
 // numeric strings pass through. "" means the image default.
 func helperSecurityContext(spec HelperSpec) *corev1.SecurityContext {
 	sc := &corev1.SecurityContext{}
-	if spec.Privileged {
+	switch {
+	case spec.Privileged:
 		sc.Privileged = boolPtr(true)
-	} else {
+	case spec.SysAdmin:
+		// the hostPath branch container's posture (hostPathStorage.
+		// branchSecurityContext), for helpers that mount an overlay
+		unconfined := corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined}
+		sc.Capabilities = &corev1.Capabilities{Add: []corev1.Capability{"SYS_ADMIN"}}
+		sc.SeccompProfile = &unconfined
+		sc.AppArmorProfile = &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeUnconfined}
+	default:
 		sc.AllowPrivilegeEscalation = boolPtr(false)
 		sc.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
 	}

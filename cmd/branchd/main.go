@@ -349,6 +349,8 @@ func run() error {
 	diskRoot := flag.String("disk-root", "", "path whose filesystem the pgoverlay_disk_bytes_free/_total gauges measure (default: the filesystem holding the branch data, see docs/observability.md)")
 	lazyrw := flag.String("lazyrw", cmp.Or(os.Getenv(config.LazyRWEnv), "on"), "overlay backend: on preloads the lazyrw shim into branch Postgres, so a relation file is copied into the branch on its first write instead of when it is read; each branch checks its kernel (4.19+) and image at start and copies on open, with a warning, when it cannot use it (pgoverlay_branch_cow_mode reports which); off always copies on open. Branches pick a change up when they next start (env PGOVERLAY_LAZYRW)")
 	walRecycle := flag.String("wal-recycle", cmp.Or(os.Getenv(config.WALRecycleEnv), "on"), "overlay backend, experimental: off starts branch Postgres with wal_recycle=off, so a WAL segment from the seed is removed instead of being copied up and renamed when a checkpoint recycles it (env PGOVERLAY_WAL_RECYCLE)")
+	volumeRoot := flag.String("volume-root", os.Getenv(config.VolumeRootEnv), "docker runtime: create every pgoverlay volume as a local bind volume over a directory under this path on the Docker host instead of in Docker's own volume store, e.g. a directory on an XFS (reflink=1) or btrfs disk, where overlay copy-up clones extents (block-level copy-on-write). The directory must exist; existing volumes stay where they are. Set the same value for pgb in local mode (env PGOVERLAY_VOLUME_ROOT)")
+	xfsCowExtSize := flag.String("xfs-cowextsize", "16k", "overlay backend: when copy-up clones on XFS, set this copy-on-write extent size hint on the volume root (--volume-root, or --kube-data-root), so a write into a cloned block copies this much instead of the filesystem default of 128 KiB; accepts a byte count with an optional k or m suffix (0 = leave the default)")
 	showVersion := flag.Bool("version", false, "print the branchd version and exit")
 	flag.Parse()
 
@@ -423,11 +425,28 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if err := checkVolumeRootFlag(*volumeRoot, *runtimeName, backend); err != nil {
+		return err
+	}
+	cowExtSize, err := parseByteSize(*xfsCowExtSize)
+	if err != nil {
+		return fmt.Errorf("--xfs-cowextsize: %w", err)
+	}
 	var drv runtime.Driver
 	var kubeNS string // resolved branchd namespace (kube runtime); also the Lease namespace
 	switch *runtimeName {
 	case "docker":
-		drv, err = runtime.NewDockerDriver()
+		var dd *runtime.DockerDriver
+		dd, err = runtime.NewDockerDriver(runtime.WithVolumeRoot(*volumeRoot))
+		if err == nil && *volumeRoot != "" {
+			checkCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			err = dd.CheckVolumeRoot(checkCtx)
+			cancel()
+			if err == nil {
+				log.Printf("volumes are created as bind volumes under %s on the Docker host", *volumeRoot)
+			}
+		}
+		drv = dd
 	case "kube":
 		ns := *kubeNamespace
 		if ns == "" {
@@ -468,7 +487,7 @@ func run() error {
 	// (see storageRoot). CSI gives each branch its own PVC with no single
 	// shared local root to statfs, so the gauges are wired only for the
 	// local-FS modes.
-	if root := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home, *diskRoot); root != "" {
+	if root := storageRoot(*runtimeName, *kubeStorage, *kubeDataRoot, cfg.Home, diskRootOverride(*diskRoot, *volumeRoot, isLocalDir)); root != "" {
 		m.SetDiskRoot(root)
 		log.Printf("disk gauges measure the filesystem of %s", root)
 	}
@@ -544,10 +563,28 @@ func run() error {
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	// Overlay branches that were already running when branchd started report
-	// their copy-on-write mode here; later starts report it themselves.
+	// Overlay backend: branches that were already running when branchd
+	// started report their copy-on-write mode here (later starts report it
+	// themselves), and a background probe works out once whether copy-up on
+	// the volumes' filesystem copies data or clones extents; branch usage is
+	// counted accordingly, and pgoverlay_cow_copyup_mode reports it.
 	if backend == cow.BackendOverlay {
 		go eng.RefreshCowModes(ctx)
+		m.SetCopyUpMode(func() string { return string(eng.CopyUpMode()) })
+		opts := engine.CopyUpOptions{Root: probeRoot(*runtimeName, *volumeRoot, *kubeDataRoot), CowExtSize: cowExtSize}
+		go func() {
+			pctx, cancel := context.WithTimeout(ctx, copyUpProbeTimeout)
+			defer cancel()
+			res, err := eng.DetectCopyUp(pctx, opts)
+			if err != nil {
+				slog.Warn("copy-up probe", "err", err)
+			}
+			if res.Mode != cow.CopyUpUnknown {
+				log.Printf("copy-up probe: %s", res)
+			} else {
+				slog.Warn("copy-up probe could not tell whether copy-up copies or clones; branch usage is counted with du -sb, which is exact unless the filesystem reflinks")
+			}
+		}()
 	}
 
 	// Leader election runs on its own context: on shutdown the Lease is
