@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -244,13 +245,19 @@ func layerVolumes(chain []registry.Layer) []string {
 	return out
 }
 
-// installOverlayEntrypoint writes the overlay entrypoint script into a rw
-// volume and prepares its upper/work dirs.
+// installOverlayEntrypoint writes the overlay entrypoint script and the
+// lazyrw shim builds into a rw volume and prepares its upper/work dirs (see
+// cow.OverlayInstall). Docker and Kubernetes helpers take the same command
+// and environment. Every path that starts an overlay branch on a volume it
+// has not started on before runs it first: provision (create, reset), the
+// freeze saga's fresh parent and child volumes, and RecoverBranch. Restarts
+// on existing data (restoreParent, reconcile) find it already there.
 func (e *Engine) installOverlayEntrypoint(ctx context.Context, rwVolume string) error {
+	cmd, env := cow.OverlayInstall()
 	_, err := e.drv.RunHelper(ctx, runtime.HelperSpec{
 		Image:  runtime.UtilityImage,
-		Cmd:    []string{"sh", "-c", `printf '%s' "$PGOVERLAY_ENTRYPOINT" > /pgoverlay/rw/entrypoint.sh && chmod 0755 /pgoverlay/rw/entrypoint.sh && mkdir -p /pgoverlay/rw/upper /pgoverlay/rw/work`},
-		Env:    []string{"PGOVERLAY_ENTRYPOINT=" + cow.EntrypointScript},
+		Cmd:    cmd,
+		Env:    slices.Clone(env),
 		Mounts: []runtime.Mount{{Volume: rwVolume, Target: cow.RWPath}},
 	})
 	return err
@@ -260,6 +267,8 @@ func (e *Engine) installOverlayEntrypoint(ctx context.Context, rwVolume string) 
 // from plan: source volume ro at lower0, frozen layer volumes (newest first)
 // ro at lower1..N, the rw volume at RWPath. PGOVERLAY_LOWERS lists the overlay
 // lowerdirs newest-first with the source last (see cow.PlanBranch).
+// PGOVERLAY_LAZYRW (and PGOVERLAY_WAL_RECYCLE) carry the engine's settings to
+// the entrypoint, so a restart on existing data picks up the current ones.
 func (e *Engine) startOverlayBranch(ctx context.Context, name string, plan cow.Plan, image string, labels map[string]string) (string, error) {
 	mounts := make([]runtime.Mount, 0, len(plan.LayerVolumes)+2)
 	mounts = append(mounts, runtime.Mount{Volume: plan.SourceVolume, Target: cow.LowerMountTarget(0), ReadOnly: true})
@@ -270,10 +279,10 @@ func (e *Engine) startOverlayBranch(ctx context.Context, name string, plan cow.P
 	return e.drv.StartBranch(ctx, runtime.BranchSpec{
 		Name:  "pgoverlay-br-" + name,
 		Image: image,
-		Env: []string{
+		Env: append([]string{
 			"PGDATA=" + cow.MergedPath,
 			"PGOVERLAY_LOWERS=" + plan.LowerEnv(),
-		},
+		}, e.overlayBranchEnv()...),
 		Mounts:     mounts,
 		Entrypoint: []string{"/bin/sh", cow.RWPath + "/entrypoint.sh"},
 		Labels:     labels,
@@ -389,6 +398,7 @@ func (e *Engine) awaitAndMark(ctx context.Context, b *registry.Branch, src *regi
 	if err := e.waitReady(ctx, cid, 90*time.Second); err != nil {
 		return fmt.Errorf("instance never became ready: %w", err)
 	}
+	e.observeCowMode(ctx, b, cid)
 	if err := e.applyMasking(ctx, cid, src); err != nil {
 		return err
 	}
@@ -764,6 +774,7 @@ func (e *Engine) DestroyBranch(ctx context.Context, name string) (err error) {
 		}
 		return err
 	}
+	e.cowModes.forget(b.ID)
 	// the destroyed branch may have been the last reference to its frozen
 	// layer chain and/or an old-generation source volume
 	e.gcLayers(td, chain)

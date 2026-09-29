@@ -48,6 +48,13 @@ type Engine struct {
 	// seeding, branches reconcile is restarting, and the endpoint-refresh
 	// rate limit (see reconcile.go).
 	rs reconcileState
+	// lazyrwOff turns the lazyrw shim off for overlay branches and
+	// walRecycleOff starts them with wal_recycle=off (WithLazyRW,
+	// WithWALRecycle); cowModes is the copy-on-write mode each one reported
+	// at its last start (see cowmode.go).
+	lazyrwOff     bool
+	walRecycleOff bool
+	cowModes      cowModeState
 }
 
 // parentStepTimeout bounds a parent-affecting step (stopping a freeze or

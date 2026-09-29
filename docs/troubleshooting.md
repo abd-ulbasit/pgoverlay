@@ -193,12 +193,39 @@ branchd's environment (or `pgb`'s in local mode), default `prefer`. Use
 
 ## Disk and layers
 
-**Branches grow when they read.** Postgres opens table files read-write even
-for reads, and OverlayFS copies a file whole into the branch on the first
-such open. See [Reads copy up too](benchmarks.md#reads-copy-up-too) for the
-numbers, and use the zfs or csi backend for read-heavy branches of large
-databases. The `pgoverlay_disk_bytes_*` gauges and the alert in
+**What a branch's writable layer holds.** Postgres opens table files
+read-write even to read them, and OverlayFS copies a file whole into the
+branch on a read-write open. With `--lazyrw=on` (the default) the lazyrw
+shim in the branch's Postgres opens them read-only until the first write, so
+a read copies nothing and a write copies the file it touches (one segment, at
+most 1 GiB) once. A branch in eager mode (below) copies every table it
+reads. The `pgoverlay_disk_bytes_*` gauges and the alert in
 [Observability](observability.md) watch the filesystem.
+
+### A branch copies eagerly
+
+`pgoverlay_branch_cow_mode{mode="eager"}` counts branches in which the shim
+is not active although `--lazyrw=on`; branchd logs a warning with the reason
+when such a branch starts, and so does the branch container itself
+(`pgoverlay: WARN: lazyrw is not active ...`, in `docker logs` or
+`kubectl logs`). The branch works, it just copies every table it reads. To
+see the reason for one branch:
+
+```sh
+docker exec pgoverlay-br-NAME cat /pgoverlay/rw/cow-mode   # or kubectl exec
+```
+
+| Reason | What to do |
+|---|---|
+| `self-test failed` | The kernel does not re-target a read-only file to the copied-up file when another process writes it (OverlayFS stacked file operations, Linux 4.19 and later). The shim would serve stale data there, so it stays off. Run branches on a newer kernel (or Docker VM). |
+| `no lazyrw build for LIBC-ARCH` | The image runs on an architecture the shim is not built for (it is built for x86_64 and aarch64, glibc and musl). |
+| `... did not load into postgres` | The image's Postgres could not load the build: a libc older than glibc 2.31, a 32-bit or statically linked `postgres`, or a custom image the probe does not recognise. |
+| `the branch's entrypoint predates lazyrw` | The branch was created by an earlier pgoverlay. `pgb branch reset NAME` (or `recover` for a failed branch) installs the current entrypoint; the reset discards the branch's writes. |
+
+`--lazyrw=off` (Helm `cow.lazyrw: false`, `PGOVERLAY_LAZYRW=off` for `pgb`)
+turns the shim off on purpose; those branches count as `off`. A change
+reaches existing branches when they next start (a reset, a recover, or a
+restart by reconcile).
 
 ### Layer chains and `--max-layer-depth`
 

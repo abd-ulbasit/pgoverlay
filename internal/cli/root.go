@@ -198,6 +198,10 @@ func open() (*engine.Engine, *registry.Registry, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	opts, err := cowOptions(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
 	reg, err := openRegistryAt(cfg)
 	if err != nil {
 		return nil, nil, err
@@ -207,5 +211,5 @@ func open() (*engine.Engine, *registry.Registry, error) {
 		reg.Close()
 		return nil, nil, err
 	}
-	return engine.New(reg, drv, cfg.PostgresImage), reg, nil
+	return engine.New(reg, drv, cfg.PostgresImage, opts...), reg, nil
 }

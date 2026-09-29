@@ -12,6 +12,35 @@ type Config struct {
 	Home          string // state directory, default ~/.pgoverlay
 	RegistryPath  string // SQLite file
 	PostgresImage string // default image for helpers/branches when source has no version
+	// LazyRW is whether overlay branches use the lazyrw shim, which copies a
+	// relation file into the branch on its first write instead of on open:
+	// "on" or "off" ($PGOVERLAY_LAZYRW; "" = on; branchd --lazyrw overrides
+	// it). Parse it with ParseOnOff.
+	LazyRW string
+	// WALRecycle "off" starts overlay branches with wal_recycle=off
+	// ($PGOVERLAY_WAL_RECYCLE; "" = on; branchd --wal-recycle overrides it).
+	// Experimental.
+	WALRecycle string
+}
+
+// The environment variables behind Config.LazyRW and Config.WALRecycle, read
+// by branchd (as its flags' defaults) and pgb in local mode alike.
+const (
+	LazyRWEnv     = "PGOVERLAY_LAZYRW"
+	WALRecycleEnv = "PGOVERLAY_WAL_RECYCLE"
+)
+
+// ParseOnOff parses an on|off setting such as Config.LazyRW; "" gives def.
+func ParseOnOff(s string, def bool) (bool, error) {
+	switch s {
+	case "":
+		return def, nil
+	case "on":
+		return true, nil
+	case "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("%q is not on or off", s)
 }
 
 func Load() (*Config, error) {
@@ -27,6 +56,8 @@ func Load() (*Config, error) {
 		Home:          home,
 		RegistryPath:  filepath.Join(home, "pgoverlay.db"),
 		PostgresImage: "postgres:17",
+		LazyRW:        os.Getenv(LazyRWEnv),
+		WALRecycle:    os.Getenv(WALRecycleEnv),
 	}, nil
 }
 

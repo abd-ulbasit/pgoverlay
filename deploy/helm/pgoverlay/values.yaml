@@ -22,6 +22,15 @@ dataRoot: /var/lib/pgoverlay
 # zfs backend (branchd --cow zfs --zfs-dataset ...) needs a zpool on the
 # storage node and privileged helper pods; it is not wired into chart values
 # yet — see docs/zfs.md to run it by hand.
+cow:
+  # lazyrw (branchd --lazyrw, hostpath storage): branch Postgres opens a
+  # table file read-only until its first write, so a read copies nothing into
+  # the branch and a write copies the file it touches. Each branch checks the
+  # node's kernel (4.19+) and its image at start and otherwise copies on open,
+  # as with false, logging a warning; pgoverlay_branch_cow_mode reports which.
+  # Branches pick a change up when they next start. csi branches are block
+  # clones and ignore it.
+  lazyrw: true
 
 # Branch data storage (see docs/kubernetes.md):
 #  - hostpath (default): plain directories under dataRoot on `node`; branch

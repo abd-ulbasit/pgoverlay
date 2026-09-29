@@ -10,6 +10,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -335,6 +336,8 @@ func run() error {
 	leaderElect := flag.Bool("leader-elect", false, "HA: contend for a coordination.k8s.io Lease (pgoverlay-branchd) so only the leader runs reconcile and accepts mutating /v1 requests (kube runtime only; off = single-instance, always leader)")
 	shutdownTimeout := flag.Duration("shutdown-timeout", envDuration("PGOVERLAY_SHUTDOWN_TIMEOUT", defaultShutdownTimeout), "on SIGINT/SIGTERM, how long in-flight requests and the sagas behind them get to finish before they are cancelled and rolled back (keep it below the pod's terminationGracePeriodSeconds minus ~20s; env PGOVERLAY_SHUTDOWN_TIMEOUT)")
 	diskRoot := flag.String("disk-root", "", "path whose filesystem the pgoverlay_disk_bytes_free/_total gauges measure (default: the filesystem holding the branch data, see docs/observability.md)")
+	lazyrw := flag.String("lazyrw", cmp.Or(os.Getenv(config.LazyRWEnv), "on"), "overlay backend: on preloads the lazyrw shim into branch Postgres, so a relation file is copied into the branch on its first write instead of when it is read; each branch checks its kernel (4.19+) and image at start and copies on open, with a warning, when it cannot use it (pgoverlay_branch_cow_mode reports which); off always copies on open. Branches pick a change up when they next start (env PGOVERLAY_LAZYRW)")
+	walRecycle := flag.String("wal-recycle", cmp.Or(os.Getenv(config.WALRecycleEnv), "on"), "overlay backend, experimental: off starts branch Postgres with wal_recycle=off, so a WAL segment from the seed is removed instead of being copied up and renamed when a checkpoint recycles it (env PGOVERLAY_WAL_RECYCLE)")
 	showVersion := flag.Bool("version", false, "print the branchd version and exit")
 	flag.Parse()
 
@@ -400,6 +403,10 @@ func run() error {
 	}
 	if backend == cow.BackendZFS && *zfsDataset == "" {
 		return errors.New("--zfs-dataset is required with --cow zfs (the dataset prefix pgoverlay owns, e.g. tank/pgoverlay)")
+	}
+	cowOpts, err := lazyrwOptions(*lazyrw, *walRecycle, backend)
+	if err != nil {
+		return err
 	}
 	var drv runtime.Driver
 	var kubeNS string // resolved branchd namespace (kube runtime); also the Lease namespace
@@ -472,8 +479,14 @@ func run() error {
 		return errors.New("--max-layer-depth must be >= 1")
 	}
 	engOpts = append(engOpts, engine.WithMaxLayerDepth(*maxLayerDepth))
+	engOpts = append(engOpts, cowOpts...)
 	eng := engine.NewWithPlanner(reg, drv, cfg.PostgresImage,
 		cow.Planner{Backend: backend, Dataset: strings.Trim(*zfsDataset, "/")}, engOpts...)
+	if backend == cow.BackendOverlay {
+		// pgoverlay_branch_cow_mode: which branches the lazyrw shim is
+		// active in (engine.CowModeCounts)
+		m.SetCowModes(eng.CowModeCounts)
+	}
 
 	// readiness: the registry is reachable (trivial query) and the driver
 	// responds (cheap ListManaged). branchd's liveness stays /healthz.
@@ -513,6 +526,12 @@ func run() error {
 	defer stop()
 
 	g, ctx := errgroup.WithContext(ctx)
+
+	// Overlay branches that were already running when branchd started report
+	// their copy-on-write mode here; later starts report it themselves.
+	if backend == cow.BackendOverlay {
+		go eng.RefreshCowModes(ctx)
+	}
 
 	// Leader election runs on its own context: on shutdown the Lease is
 	// released (ReleaseOnCancel) only after the API has drained, so no other

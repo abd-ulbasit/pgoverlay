@@ -167,6 +167,7 @@ func (e *Engine) restartOnOwnData(ctx context.Context, b *registry.Branch, src *
 		cleanup()
 		return "", runtime.ContainerInfo{}, fmt.Errorf("instance never became ready: %w", err)
 	}
+	e.observeCowMode(ctx, b, cid)
 	info, err := e.inspectAddr(ctx, cid)
 	if err != nil {
 		cleanup()
