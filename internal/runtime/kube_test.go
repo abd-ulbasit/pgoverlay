@@ -224,6 +224,30 @@ func TestBuildHelperPodPrivileged(t *testing.T) {
 	}
 }
 
+// The copy-up probe mounts an overlay: its helper gets what a hostPath branch
+// pod has, SYS_ADMIN with seccomp and AppArmor unconfined, and nothing more.
+func TestBuildHelperPodSysAdmin(t *testing.T) {
+	st := &hostPathStorage{node: "node-1", dataRoot: "/var/lib/pgoverlay"}
+	pod := buildHelperPod(helperObjectMeta("pgb", "pgoverlay-helper-x", "", nil), st, HelperSpec{
+		Image: UtilityImage, Cmd: []string{"sh", "-c", "mount -t overlay ..."}, SysAdmin: true,
+	})
+	got := pod.Spec.Containers[0].SecurityContext
+	want := st.branchSecurityContext()
+	if got == nil || got.Privileged != nil || got.AllowPrivilegeEscalation != nil {
+		t.Fatalf("SecurityContext = %+v, want the branch pod's, unprivileged", got)
+	}
+	if got.Capabilities == nil || len(got.Capabilities.Add) != 1 || got.Capabilities.Add[0] != want.Capabilities.Add[0] ||
+		got.SeccompProfile == nil || got.SeccompProfile.Type != want.SeccompProfile.Type ||
+		got.AppArmorProfile == nil || got.AppArmorProfile.Type != want.AppArmorProfile.Type {
+		t.Fatalf("SecurityContext = %+v, want %+v", got, want)
+	}
+	// Privileged wins over SysAdmin
+	pod = buildHelperPod(helperObjectMeta("pgb", "pgoverlay-helper-x", "", nil), st, HelperSpec{Image: UtilityImage, SysAdmin: true, Privileged: true})
+	if sc := pod.Spec.Containers[0].SecurityContext; sc.Privileged == nil || !*sc.Privileged || sc.Capabilities != nil {
+		t.Fatalf("SecurityContext = %+v, want privileged only", sc)
+	}
+}
+
 func TestBuildHelperPodHostPathMount(t *testing.T) {
 	// MountHostPath mounts an absolute host path (a zfs dataset mountpoint)
 	// directly — not a dataRoot subdirectory — and requires it to exist.

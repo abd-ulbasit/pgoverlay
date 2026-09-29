@@ -63,6 +63,11 @@ type HelperSpec struct {
 	// explicitly; on kube a privileged container sees host devices anyway.
 	Privileged  bool
 	HostDevices []string
+	// SysAdmin runs the helper with the privileges an overlay branch
+	// container has, and no more: CAP_SYS_ADMIN (to mount an overlay) with
+	// the AppArmor profile, and on kube the seccomp profile, unconfined. The
+	// copy-up probe uses it. Ignored when Privileged is set.
+	SysAdmin bool
 }
 
 // BranchSpec is a long-running branch Postgres container.

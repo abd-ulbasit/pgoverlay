@@ -131,12 +131,17 @@ func toMounts(ms []Mount) []mount.Mount {
 
 // helperHostConfig renders the host-side container config for a helper:
 // mounts, network, and — for zfs helpers — privileged mode with the host
-// devices mapped in.
+// devices mapped in. A SysAdmin helper (the copy-up probe) gets what a branch
+// container gets for its overlay mount: CAP_SYS_ADMIN and AppArmor unconfined.
 func helperHostConfig(spec HelperSpec) *container.HostConfig {
 	host := &container.HostConfig{
 		Mounts:      toMounts(spec.Mounts),
 		NetworkMode: container.NetworkMode(spec.Network),
 		Privileged:  spec.Privileged,
+	}
+	if spec.SysAdmin && !spec.Privileged {
+		host.CapAdd = []string{"SYS_ADMIN"}
+		host.SecurityOpt = []string{"apparmor=unconfined"} // no-op where AppArmor is absent
 	}
 	for _, dev := range spec.HostDevices {
 		host.Resources.Devices = append(host.Resources.Devices,
