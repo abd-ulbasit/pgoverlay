@@ -12,7 +12,17 @@ type Config struct {
 	Home          string // state directory, default ~/.pgoverlay
 	RegistryPath  string // SQLite file
 	PostgresImage string // default image for helpers/branches when source has no version
+	// VolumeRoot is a directory on the Docker host under which the docker
+	// runtime creates every volume, as a bind volume, instead of letting
+	// Docker store them ($PGOVERLAY_VOLUME_ROOT; branchd --volume-root
+	// overrides it). "" = docker-managed volumes. See runtime.WithVolumeRoot.
+	VolumeRoot string
 }
+
+// VolumeRootEnv names the environment variable that sets Config.VolumeRoot,
+// for branchd and for pgb in local mode alike (both must agree: they share
+// the registry and the volumes).
+const VolumeRootEnv = "PGOVERLAY_VOLUME_ROOT"
 
 func Load() (*Config, error) {
 	home := os.Getenv("PGOVERLAY_HOME")
@@ -27,6 +37,7 @@ func Load() (*Config, error) {
 		Home:          home,
 		RegistryPath:  filepath.Join(home, "pgoverlay.db"),
 		PostgresImage: "postgres:17",
+		VolumeRoot:    os.Getenv(VolumeRootEnv),
 	}, nil
 }
 

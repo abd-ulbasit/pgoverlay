@@ -31,6 +31,24 @@ func TestHomeOverride(t *testing.T) {
 	}
 }
 
+func TestVolumeRootFromEnv(t *testing.T) {
+	t.Setenv(VolumeRootEnv, "")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.VolumeRoot != "" {
+		t.Fatalf("VolumeRoot = %q, want empty (docker-managed volumes) by default", c.VolumeRoot)
+	}
+	t.Setenv(VolumeRootEnv, "/data/pgoverlay")
+	if c, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if c.VolumeRoot != "/data/pgoverlay" {
+		t.Fatalf("VolumeRoot = %q, want /data/pgoverlay from $%s", c.VolumeRoot, VolumeRootEnv)
+	}
+}
+
 func perm(t *testing.T, path string) os.FileMode {
 	t.Helper()
 	fi, err := os.Stat(path)

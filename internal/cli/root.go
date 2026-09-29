@@ -202,7 +202,9 @@ func open() (*engine.Engine, *registry.Registry, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	drv, err := runtime.NewDockerDriver()
+	// $PGOVERLAY_VOLUME_ROOT, as branchd reads it: local mode creates its
+	// volumes where a branchd on the same registry would
+	drv, err := runtime.NewDockerDriver(runtime.WithVolumeRoot(cfg.VolumeRoot))
 	if err != nil {
 		reg.Close()
 		return nil, nil, err
