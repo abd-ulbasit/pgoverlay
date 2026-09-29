@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/abd-ulbasit/pgoverlay/internal/cow"
@@ -48,6 +49,9 @@ type Engine struct {
 	// seeding, branches reconcile is restarting, and the endpoint-refresh
 	// rate limit (see reconcile.go).
 	rs reconcileState
+	// copyUp is the last copy-up probe's result (DetectCopyUp); nil until
+	// one has measured. BranchUsage picks its measurement by it.
+	copyUp atomic.Pointer[cow.ProbeResult]
 }
 
 // parentStepTimeout bounds a parent-affecting step (stopping a freeze or
@@ -437,22 +441,31 @@ func failureReason(err error) string {
 }
 
 // BranchUsage measures a branch's copy-on-write layer in bytes (the branch's
-// own writes, not the shared source data). Overlay: `du -sb` on the rw
-// volume; zfs: the clone's `used` property (space unique to the clone). It
-// is a helper-container roundtrip — cheap, but not free.
+// own writes, not the shared source data). Overlay: the rw volume's size,
+// counted with `du -sb` where copy-up copies, and as exclusive bytes with
+// pgoverlay-du where it clones extents (see DetectCopyUp and usageHelpers);
+// zfs: the clone's `used` property (space unique to the clone). It is a
+// helper-container roundtrip — cheap, but not free.
 func (e *Engine) BranchUsage(ctx context.Context, name string) (int64, error) {
 	b, err := e.reg.GetBranchByName(name)
 	if err != nil {
 		return 0, err
 	}
-	spec := runtime.HelperSpec{
-		Image:  runtime.UtilityImage,
-		Cmd:    []string{"du", "-sb", cow.RWPath},
-		Mounts: []runtime.Mount{{Volume: b.RWVolume, Target: cow.RWPath, ReadOnly: true}},
+	specs := e.usageHelpers(b.RWVolume)
+	var n int64
+	for i, spec := range specs {
+		if n, err = e.measureUsage(ctx, name, spec); err == nil || i == len(specs)-1 {
+			break
+		}
+		slog.Warn("measuring branch usage with pgoverlay-du failed; falling back to du -sb, which counts cloned extents as the branch's own",
+			"branch", name, "err", err)
 	}
-	if e.zfs() {
-		spec = zfsHelperSpec(e.planner.ZFSUsed(b.RWVolume))
-	}
+	return n, err
+}
+
+// measureUsage runs one usage helper and reads the byte count it prints
+// first (du -sb, pgoverlay-du and zfs list -Hp all lead with it).
+func (e *Engine) measureUsage(ctx context.Context, name string, spec runtime.HelperSpec) (int64, error) {
 	out, err := e.drv.RunHelper(ctx, spec)
 	if err != nil {
 		return 0, fmt.Errorf("measure branch %q usage: %w", name, err)
