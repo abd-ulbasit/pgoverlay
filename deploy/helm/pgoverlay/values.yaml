@@ -178,7 +178,7 @@ rotateBranchCredentials: false
 # How a new seed (source add or refresh) is prepared before branches start
 # from it (branchd --seed-settle): freeze recovers the copy once, runs VACUUM
 # (FREEZE, ANALYZE) on every database and shuts it down cleanly, so branches
-# start without WAL replay and their reads write (and copy) nothing; recover
+# start without WAL replay and their reads write nothing; recover
 # only recovers and shuts down; off leaves the seed as pg_basebackup or
 # pg_dump wrote it. Settling works on pgoverlay's copy, never on the source.
 seedSettle: freeze
