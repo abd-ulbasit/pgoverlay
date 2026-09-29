@@ -55,14 +55,17 @@ whose entrypoint assembles an OverlayFS mount *inside the container*:
  │     │ upper+work (writes)  │  volume: pgoverlay-br-pr-1-rw   │
  │     ├──────────────────────┤                                │
  │     │ lower (read-only)    │  volume: pgoverlay-src-main ────┼─▶ shared by
- │     └──────────────────────┘  (pg_basebackup snapshot)      │   all branches
- │   entrypoint.sh: mount overlay → exec docker-entrypoint.sh  │
+ │     └──────────────────────┘  (settled pg_basebackup copy)  │   all branches
+ │   entrypoint.sh: mount overlay → lazyrw self-test + probe → │
+ │     LD_PRELOAD=liblazyrw → exec docker-entrypoint.sh        │
  └─────────────────────────────────────────────────────────────┘
 ```
 
 Mounting in-container (not on the host) is what makes the same code work on
-Colima/macOS and bare Linux. Postgres boots on the merged view and performs
-ordinary WAL crash recovery, as if the machine power-cycled at backup time.
+Colima/macOS and bare Linux. Postgres boots on the merged view. A settled
+seed (the default, below) was shut down cleanly, so the branch starts
+without recovery; an unsettled one (`--seed-settle=off`) gets ordinary WAL
+crash recovery, as if the machine power-cycled at backup time.
 
 One non-obvious flag is load-bearing: the entrypoint execs postgres with
 `-c recovery_init_sync_method=syncfs`. The default (`fsync`) opens every data
@@ -72,12 +75,44 @@ the branch's rw layer. `syncfs` replaces that per-file pass with one syscall
 and copies nothing up; it's what makes branch creation O(1) in data size
 (measured in [Benchmarks](benchmarks.md)).
 
-The same rule still applies after startup. Postgres opens every relation
-segment read-write, for reads too (`md.c`), so the first query that touches a
-table copies each of its segment files (up to 1 GiB) whole into the branch's
-rw layer. A branch's disk therefore grows toward the size of the tables it
-touches, read or write ([Reads copy up too](benchmarks.md#reads-copy-up-too));
-the zfs and csi backends copy blocks instead.
+The same rule applies after startup. Postgres opens every relation segment
+read-write, for reads too (`md.c`), so on its own the first query that
+touches a table would copy each of its segment files (up to 1 GiB) whole into
+the branch's rw layer ([Reads copy up too](benchmarks.md#reads-copy-up-too)).
+Three pieces keep a branch's cost to what it writes:
+
+- **The lazyrw shim** (`internal/cow/lazyrw`), an `LD_PRELOAD` library the
+  entrypoint loads into the branch's Postgres, opens relation and
+  transaction-status files read-only and reopens a file read-write on its
+  first write-class call, which is when OverlayFS copies it up. Reads copy
+  nothing; a write copies the file it touches once. The builds (glibc and
+  musl, x86_64 and aarch64) are committed with their SHA-256 sums, embedded
+  with `go:embed`, and installed into `/pgoverlay/rw/lazyrw/` by the same
+  helper that writes the entrypoint (base64 in its environment, checked after
+  decoding), on create, reset, both freeze volumes and recover. Before
+  exporting `LD_PRELOAD` the entrypoint self-tests the kernel (a read-only
+  descriptor opened before a copy-up must see the data written after it,
+  which OverlayFS guarantees since Linux 4.19) and probes the build against
+  the image's `postgres`; it pins `io_method=worker` on PG 18 and later. It
+  writes `lazyrw`, `eager` or `off` to `/pgoverlay/rw/cow-mode`, and the
+  engine reads that after every readiness wait, logs it (a warning for
+  `eager` while `--lazyrw=on`) and exports `pgoverlay_branch_cow_mode`
+  (`internal/engine/cowmode.go`). `--lazyrw=off` turns it off; the setting
+  travels as `PGOVERLAY_LAZYRW` in the branch's environment, so a branch picks
+  a change up on its next start.
+- **Seed settle** (`internal/pgctl/settle.go`) makes reads write nothing: see
+  [below](#seeding-basebackup-vs-dump).
+- **Copy-up detection** (`internal/cow/fsprobe.go`, `internal/engine/cowfs.go`):
+  on a filesystem that reflinks (XFS `reflink=1`, btrfs) the kernel turns a
+  copy-up into an extent clone, which is block-level copy-on-write. branchd
+  probes which one it has at startup, exports `pgoverlay_cow_copyup_mode`,
+  sets an XFS copy-on-write extent size hint on a volume root it manages,
+  and in clone mode counts branch usage as exclusive bytes with the embedded
+  `pgoverlay-du` instead of `du -sb`. `--volume-root DIR` (docker) creates
+  every volume as a bind volume under `DIR`
+  (`internal/runtime/docker_volumeroot.go`), so any host with such a disk
+  gets clones without moving Docker. See
+  [Core concepts](concepts.md#8-clone-or-copy-what-a-copy-up-costs).
 
 Every branch container gets `CAP_SYS_ADMIN` and `apparmor=unconfined` for the
 mount, on Docker whatever the backend. Branch ports are published on the
@@ -90,8 +125,9 @@ Docker and host restarts.
 The seed itself has two methods. `pg_basebackup` (default) is a physical,
 crash-consistent copy: fast at size, but it requires `REPLICATION` privilege
 and a physical replication connection, which managed providers (Supabase,
-Neon, RDS, Cloud SQL) don't offer — and branches replay WAL on first start,
-as if the machine power-cycled at backup time. `--via dump` is a logical
+Neon, RDS, Cloud SQL) don't offer — and, left as it is, it makes every
+branch replay WAL on first start, as if the machine power-cycled at backup
+time (the settle below does that once instead). `--via dump` is a logical
 copy: a helper container runs `initdb` into the seed volume and pipes
 `pg_dump` from the remote into it, needing only a normal user, optionally
 scoped to schemas (`--dump-schema`). It is slower for large databases (full
@@ -99,6 +135,20 @@ SQL restore, index rebuilds), but the resulting layer is a clean-shutdown
 cluster, so branches skip crash recovery entirely. Either way the seed is
 just a data dir in the source layer — everything downstream (overlay/zfs/csi
 branching, refresh generations, masking) is identical.
+
+After either method the seed is **settled** (`--seed-settle`, default
+`freeze`), on every backend. For a basebackup seed a helper on the branch
+image starts Postgres once on the copy (socket only, with the source's
+preload libraries, archiving, TLS and other settings that cannot start in a
+throwaway container overridden), which completes the backup's recovery; runs
+`VACUUM (FREEZE, ANALYZE)` on every database; checkpoints; and stops it
+cleanly. A dump seed runs the same VACUUM before its own clean stop. Branches
+then start from a clean shutdown, and a read in a branch has no hint bits to
+set, nothing to prune and no anti-wraparound VACUUM due, so it writes
+nothing and, with the shim, copies nothing. `recover` skips the VACUUM and
+`off` skips the step. The settle is part of the seed: it runs under the seed's
+heartbeat and fails the seed only if the copy cannot start or stop cleanly
+(a failed VACUUM is a warning).
 
 A basebackup of a standby is made safe to boot: the seed deletes the standby
 and recovery signal files and strips the recovery settings, and the branch
@@ -113,7 +163,7 @@ image (`--image`) for extensions, locales or libc the stock
 
 `branchd --cow zfs --zfs-dataset tank/pgoverlay` swaps the layer mechanics:
 sources seed into datasets (`<prefix>/src-<name>-gN`), branch create is
-`zfs snapshot` + `zfs clone` (block-level CoW — no copy-up problem, no
+`zfs snapshot` + `zfs clone` (block-level CoW — no copy-up, no shim, no
 overlay assembly; the entrypoint shrinks to perms + pid cleanup + exec), and
 zfs commands run in privileged helpers with `/dev/zfs` mapped in. Same
 engine, same sagas — `cow.Planner` decides what the driver is asked to do.
@@ -236,6 +286,10 @@ What "the base" is depends on the backend:
 Row counts are planner estimates (`pg_class.reltuples`); a table never
 analyzed is counted exactly when its heap is 64 MiB or less, and otherwise
 reported as unknown. Deltas show direction and magnitude, not an audit.
+Because the default seed settle runs `ANALYZE`, every table in a settled seed
+has an estimate, so a change too small to trigger the branch's autovacuum
+`ANALYZE` shows as no change until the table is analyzed in the branch;
+tables the branch created are always counted exactly (while small).
 Tables are keyed by schema and name. Optional sampling
 (`?data=N`, at most 500 rows per table) returns branch-only rows of grown
 tables by primary key.
@@ -306,7 +360,11 @@ The kube driver has two storage strategies. **hostPath** (default) maps
 "volumes" to subdirectories of a data root (default `/var/lib/pgoverlay`) on
 one designated **storage node**; helpers are one-shot pods and branches are
 plain pods, all pinned with `nodeName`, branch pods carrying `SYS_ADMIN` (and
-unconfined seccomp and AppArmor) for the overlay mount. **csi**
+unconfined seccomp and AppArmor) for the overlay mount. hostPath branches run
+the same entrypoint as Docker branches, lazyrw shim included (the install
+helper carries the builds in its environment, which on Kubernetes travels in
+the helper's short-lived Secret), and a data root on XFS or btrfs gives clone
+copy-up. **csi**
 (`--kube-storage csi`) makes every volume a PVC and every branch a PVC
 *clone* (`dataSource`, or VolumeSnapshot+restore when a snapshot class is
 configured): branch pods need no `SYS_ADMIN`, no node pin — they schedule
@@ -327,8 +385,10 @@ Kubernetes garbage-collects them if branchd dies mid-seed.
 |---|---|
 | data files | only ever touched **inside containers** (helpers/entrypoints) |
 | host Go code | pure control plane: registry, sagas, driver API calls |
-| seeding | `pg_basebackup` or `pg_dump` helper, runs as uid 999 (postgres) |
+| seeding | `pg_basebackup` or `pg_dump` helper, runs as uid 999 (postgres); then the settle helper on the branch image, as postgres |
+| copy-on-write in the branch | the lazyrw shim, preloaded into the branch's Postgres only (overlay backend) |
+| copy-up probe | a helper with a branch container's privileges, once at branchd startup |
 | masking, credential rotation, diff dumps | exec into the branch (as `postgres` on Docker, as root on Kubernetes) |
-| disk usage | `du -sb` helper on the rw layer (zfs: `zfs list -o used`) |
+| disk usage | `du -sb` helper on the rw layer, or `pgoverlay-du` (exclusive bytes) when copy-up clones (zfs: `zfs list -o used`) |
 | web UI | single static page, `go:embed`, no build toolchain |
 | GitHub App | separate `pgoverlay-github` service driving the REST API |
