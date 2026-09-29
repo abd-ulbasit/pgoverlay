@@ -165,6 +165,12 @@ cleanly shut down. The settle adds roughly one read of the database plus a
 write of its unfrozen pages to the seed time; `--via dump` seeds only add the
 VACUUM, run before the dump helper's own clean shutdown.
 
+**Seeding a custom or Alpine image.** The seed helpers look up the image's
+`postgres` user (`id -u postgres`, `id -g postgres`) and write the seed as it:
+999:999 in the Debian images, 70:70 in the Alpine ones. An image without a
+`postgres` user fails the seed with "find the postgres user in image ...";
+branches start the image's own entrypoint, which needs that user too.
+
 **Masking and credential rotation connect over the local socket.** They run
 `psql` inside the branch as the source's connection user, through the
 `local` lines of the source's `pg_hba.conf`. On Docker these commands run as

@@ -160,3 +160,54 @@ func TestAddSourceSettleFailureFailsTheSeed(t *testing.T) {
 		t.Errorf("layer %s kept after the settle failed", s.Volume)
 	}
 }
+
+// ownerDriver answers the image's postgres user lookup like an Alpine image.
+type ownerDriver struct {
+	*fakeDriver
+	owner string
+}
+
+func (f *ownerDriver) RunHelper(ctx context.Context, s runtime.HelperSpec) (string, error) {
+	out, err := f.fakeDriver.RunHelper(ctx, s)
+	if len(s.Cmd) == 3 && strings.Contains(s.Cmd[2], "id -u postgres") {
+		return "pgoverlay-owner=" + f.owner + "\n", nil
+	}
+	return out, err
+}
+
+// The seed belongs to the image's own postgres user: the engine looks it up
+// in the source's image first, then chowns the layer to it and runs every
+// seed helper (copy, fixup, settle; the dump) as it.
+func TestSeedRunsAsTheImagesPostgresUser(t *testing.T) {
+	for _, via := range []string{registry.SeedViaBasebackup, registry.SeedViaDump} {
+		d := &ownerDriver{fakeDriver: newFake(), owner: "70:70"}
+		e, _ := testEngine(t, d)
+		s := basebackupSource("alpine")
+		s.Image, s.SeedVia = "postgres:17-alpine", via
+		if err := e.AddSource(context.Background(), s, "pw"); err != nil {
+			t.Fatal(err)
+		}
+		if len(d.helpers) < 3 || !strings.Contains(helperCmd(d.helpers[0]), "id -u postgres") || d.helpers[0].Image != "postgres:17-alpine" {
+			t.Fatalf("%s: the first helper is not the owner lookup in the source's image: %+v", via, d.helpers)
+		}
+		var ran []string
+		for _, h := range d.helpers[1:] {
+			cmd := helperCmd(h)
+			switch {
+			case strings.Contains(cmd, "chown"):
+				if !strings.HasSuffix(cmd, "chown 70:70 /seed") || h.User != "" {
+					t.Errorf("%s: prepare = %q as %q", via, cmd, h.User)
+				}
+			case h.Image == "postgres:17-alpine":
+				ran = append(ran, h.Cmd[0])
+				if h.User != "70:70" {
+					t.Errorf("%s: %q runs as %q, want 70:70", via, cmd, h.User)
+				}
+			}
+		}
+		want := map[string]int{registry.SeedViaBasebackup: 3, registry.SeedViaDump: 1}[via]
+		if len(ran) != want {
+			t.Errorf("%s: seed helpers in the image = %v, want %d", via, ran, want)
+		}
+	}
+}

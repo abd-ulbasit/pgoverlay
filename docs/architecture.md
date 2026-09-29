@@ -327,7 +327,7 @@ Kubernetes garbage-collects them if branchd dies mid-seed.
 |---|---|
 | data files | only ever touched **inside containers** (helpers/entrypoints) |
 | host Go code | pure control plane: registry, sagas, driver API calls |
-| seeding | `pg_basebackup` or `pg_dump` helper, runs as uid 999 (postgres) |
+| seeding | `pg_basebackup` or `pg_dump` helper, runs as the image's `postgres` uid:gid (999:999 Debian, 70:70 Alpine) |
 | masking, credential rotation, diff dumps | exec into the branch (as `postgres` on Docker, as root on Kubernetes) |
 | disk usage | `du -sb` helper on the rw layer (zfs: `zfs list -o used`) |
 | web UI | single static page, `go:embed`, no build toolchain |

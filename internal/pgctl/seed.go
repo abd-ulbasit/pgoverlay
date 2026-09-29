@@ -74,6 +74,66 @@ type SeedSpec struct {
 	// pg_basebackup wrote it and the caller runs Settle next; SeedDump
 	// applies the mode inside its own helper.
 	Settle SettleMode
+	// Owner is the numeric "uid:gid" of the postgres user in Image (see
+	// DetectOwner): the seed volume is chowned to it and every seed helper
+	// runs as it, so the files belong to the user the image's postgres runs
+	// as. "" keeps the official Debian images' identity: the volume is
+	// chowned to 999:999 and helpers run as the user named postgres.
+	Owner string
+}
+
+// DefaultOwner is the postgres user of the official Debian-based images,
+// used when SeedSpec.Owner is empty. The Alpine images use 70:70.
+const DefaultOwner = "999:999"
+
+// owner is the chown target for the seed volume.
+func (s SeedSpec) owner() string {
+	if s.Owner != "" {
+		return s.Owner
+	}
+	return DefaultOwner
+}
+
+// helperUser is the identity the seed helpers run as: the detected owner,
+// else the image's postgres user by name (which Kubernetes maps to 999).
+func (s SeedSpec) helperUser() string {
+	if s.Owner != "" {
+		return s.Owner
+	}
+	return "postgres"
+}
+
+// ownerScript prints the uid and gid of the postgres user as
+// pgoverlay-owner=uid:gid, and fails when the image has no such user.
+const ownerScript = `set -e
+u=$(id -u postgres)
+g=$(id -g postgres)
+echo "pgoverlay-owner=$u:$g"`
+
+var ownerRe = regexp.MustCompile(`(?m)^pgoverlay-owner=(\d+):(\d+)\s*$`)
+
+// DetectOwner asks image for the uid and gid of its postgres user, which the
+// official images do not agree on: 999:999 in the Debian ones, 70:70 in the
+// Alpine ones; custom images may use anything. Seeding writes the cluster
+// as that user (SeedSpec.Owner), because the image's postgres runs as it
+// in every branch. An image without a postgres user cannot be seeded or
+// branched: that is an ErrSeedFailed naming the image. Output that does not
+// parse (it never should) returns "", which keeps the Debian identity.
+func DetectOwner(ctx context.Context, d runtime.Driver, image string) (string, error) {
+	out, err := d.RunHelper(ctx, runtime.HelperSpec{
+		Image: image,
+		Cmd:   []string{"sh", "-c", ownerScript},
+	})
+	if err != nil {
+		return "", seedError{fmt.Errorf("find the postgres user in image %s (seeding and branches run as it): %w", image, err)}
+	}
+	m := ownerRe.FindStringSubmatch(out)
+	if m == nil {
+		slog.Warn("seed: could not read the postgres user's uid and gid from the image; seeding as 999:999, the official Debian images' postgres",
+			"image", image, "output", out)
+		return "", nil
+	}
+	return m[1] + ":" + m[2], nil
 }
 
 // sslMode resolves the effective sslmode.
@@ -110,8 +170,13 @@ func (s SeedSpec) Validate() error {
 	if _, err := ParseSettleMode(string(s.Settle)); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSpec, err)
 	}
+	if s.Owner != "" && !ownerSpecRe.MatchString(s.Owner) {
+		return fmt.Errorf("%w: owner %q is not a numeric uid:gid", ErrInvalidSpec, s.Owner)
+	}
 	return nil
 }
+
+var ownerSpecRe = regexp.MustCompile(`^\d+:\d+$`)
 
 // addr is host:port for messages.
 func (s SeedSpec) addr() string {
@@ -197,11 +262,11 @@ func parseSeededCluster(out string) seededCluster {
 }
 
 // Seed runs pg_basebackup into the source volume. The helper runs as the
-// in-image postgres user (uid 999) so file ownership matches branch
-// containers. Data lands in <volume>/data because pg_basebackup insists on
-// creating the target dir itself with 0700; the volume root is first chowned
-// to uid 999 so it can. Requires REPLICATION privilege on the source
-// (superuser works).
+// image's postgres user (SeedSpec.Owner, 999:999 when unset) so file
+// ownership matches branch containers. Data lands in <volume>/data because
+// pg_basebackup insists on creating the target dir itself with 0700; the
+// volume root is first chowned to that user so it can. Requires REPLICATION
+// privilege on the source (superuser works).
 //
 // A standby works as a source: its recovery state is removed from the copy
 // (basebackupFixupScript) so branches start as independent, writable
@@ -214,7 +279,7 @@ func Seed(ctx context.Context, d runtime.Driver, s SeedSpec) error {
 	seedMount := runtime.Mount{Kind: s.MountKind, Volume: s.Volume, Target: "/seed"}
 	if _, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image:  runtime.UtilityImage,
-		Cmd:    []string{"sh", "-c", "mkdir -p /seed && chown 999:999 /seed"},
+		Cmd:    []string{"sh", "-c", "mkdir -p /seed && chown " + s.owner() + " /seed"},
 		Mounts: []runtime.Mount{seedMount},
 	}); err != nil {
 		return fmt.Errorf("prepare seed volume: %w", err)
@@ -222,7 +287,7 @@ func Seed(ctx context.Context, d runtime.Driver, s SeedSpec) error {
 	slog.Info("seed: running pg_basebackup against the source", "addr", s.addr(), "user", s.User, "sslmode", s.sslMode())
 	_, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image: s.Image,
-		User:  "postgres",
+		User:  s.helperUser(),
 		Cmd: []string{"pg_basebackup",
 			"-h", s.Host, "-p", strconv.Itoa(s.Port), "-U", s.User,
 			"-D", "/seed/data", "-X", "stream", "--checkpoint=fast", "--no-password"},
@@ -235,7 +300,7 @@ func Seed(ctx context.Context, d runtime.Driver, s SeedSpec) error {
 	}
 	out, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image:  s.Image,
-		User:   "postgres",
+		User:   s.helperUser(),
 		Cmd:    []string{"sh", "-c", basebackupFixupScript, "pgoverlay-seed-fixup", "/seed/data"},
 		Mounts: []runtime.Mount{seedMount},
 	})
