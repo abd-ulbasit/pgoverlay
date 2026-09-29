@@ -31,6 +31,7 @@ probes don't authenticate, and neither endpoint leaks secrets.
 | `pgoverlay_leader_transitions_total` | counter | — | Times this replica gained or lost leadership. |
 | `pgoverlay_disk_bytes_free` | gauge | — | Free bytes on the measured filesystem (read via `statfs` on every scrape; see below). |
 | `pgoverlay_disk_bytes_total` | gauge | — | Total bytes on the measured filesystem. |
+| `pgoverlay_cow_copyup_mode` | gauge | `mode` | Overlay backend: `1` for what an OverlayFS copy-up costs where the volumes live, as probed at startup, `0` for the other modes. `clone` (XFS `reflink=1`, btrfs: extents are shared, block-level copy-on-write), `copy` (data is copied), `unknown` (not probed yet, or the probe failed). See [copy-up mode](reference.md#copy-up-mode). |
 
 **What the disk gauges measure.** They `statfs` one path on every scrape, and
 that path is not always where branch data lives:
@@ -38,6 +39,7 @@ that path is not always where branch data lives:
 | Setup | Path measured by default | Is branch data there? |
 |---|---|---|
 | Docker runtime | `PGOVERLAY_HOME` (`~/.pgoverlay`) | **No.** Branch and seed volumes are Docker volumes under the engine's data root (`/var/lib/docker/volumes`, inside the VM on Colima or Docker Desktop, or on another machine for a remote engine). The gauges cover the registry's filesystem only, unless both happen to be the same filesystem |
+| Docker runtime with `--volume-root` | the volume root, when it is a directory on branchd's machine; else `PGOVERLAY_HOME` | **Yes** when branchd runs on the Docker host. A volume root on a remote Docker host cannot be measured from branchd |
 | Kubernetes hostpath, chart layout (`PGOVERLAY_HOME` inside `--kube-data-root`) | the mounted state directory, `<dataRoot>/state` | **Yes** when the state directory is the hostPath (`persistence` off, the default in hostpath mode), since it sits on the data root's filesystem. With `persistence.enabled=true` it is the registry PVC instead |
 | Kubernetes hostpath, branchd running on the storage node itself | `--kube-data-root` | **Yes** |
 | Kubernetes csi | not emitted | Each branch is its own PVC; watch the CSI driver's capacity metrics |
