@@ -35,9 +35,10 @@ k8s-it:
 csi-it:
 	PGOVERLAY_CSI_IT=1 go test ./internal/runtime/ -run TestKubeCSI -count=1 -v -timeout 40m
 
-# Postgres version matrix: seed -> branch -> verify -> destroy per major
-# (default "14 18"; override with PGOVERLAY_MATRIX_VERSIONS="14 15 16 17 18").
-# Pulls one postgres:<major> image per version.
+# Postgres version matrix: seed -> branch -> verify -> destroy per major, with
+# the lazyrw shim (default "14 18"; override with
+# PGOVERLAY_MATRIX_VERSIONS="14 15 16 17 18 17-alpine").
+# Pulls one postgres:<tag> image per version.
 matrix:
 	PGOVERLAY_MATRIX_IT=1 go test ./internal/engine/ -run Matrix -count=1 -v -timeout 25m
 

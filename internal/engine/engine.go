@@ -298,10 +298,16 @@ func WithSeedSettle(m pgctl.SettleMode) Option {
 // not write.
 func (e *Engine) seedSource(ctx context.Context, s *registry.Source, layer, password string) error {
 	seedVol, seedKind := e.seedTarget(layer)
+	// the seed's files belong to the image's own postgres user (999 in the
+	// Debian images, 70 in the Alpine ones), which branches run as
+	owner, err := pgctl.DetectOwner(ctx, e.drv, e.image(s))
+	if err != nil {
+		return err
+	}
 	spec := pgctl.SeedSpec{
 		Image: e.image(s), Volume: seedVol, MountKind: seedKind, Network: s.Network,
 		Host: s.ConnHost, Port: s.ConnPort, User: s.ConnUser, Password: password,
-		Settle: e.seedSettle,
+		Settle: e.seedSettle, Owner: owner,
 	}
 	if s.SeedVia == registry.SeedViaDump {
 		return pgctl.SeedDump(ctx, e.drv, pgctl.SeedDumpSpec{

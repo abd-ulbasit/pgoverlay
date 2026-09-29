@@ -154,8 +154,10 @@ func helperObjectMeta(namespace, name, instanceID string, owner *metav1.OwnerRef
 //
 // HelperSpec.User maps to a numeric runAs identity. Docker resolves names via
 // the image's /etc/passwd; K8s cannot, so the one name pgoverlay uses
-// ("postgres", uid/gid 999 in the official images) is mapped explicitly and
-// numeric strings pass through. "" means the image default.
+// ("postgres", uid/gid 999 in the official Debian images) is mapped
+// explicitly, a numeric "uid" runs as uid:uid and a numeric "uid:gid" (the
+// seed helpers' detected owner, e.g. 70:70 in the Alpine images) as given.
+// "" means the image default.
 func helperSecurityContext(spec HelperSpec) *corev1.SecurityContext {
 	sc := &corev1.SecurityContext{}
 	switch {
@@ -173,13 +175,28 @@ func helperSecurityContext(spec HelperSpec) *corev1.SecurityContext {
 		sc.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
 	}
 	if spec.User != "" {
-		uid := int64(999)
-		if n, err := strconv.ParseInt(spec.User, 10, 64); err == nil {
-			uid = n
-		}
-		sc.RunAsUser, sc.RunAsGroup = &uid, &uid
+		uid, gid := runAsIDs(spec.User)
+		sc.RunAsUser, sc.RunAsGroup = &uid, &gid
 	}
 	return sc
+}
+
+// runAsIDs maps a HelperSpec.User to a uid and gid (see
+// helperSecurityContext): "uid:gid", "uid" (gid = uid), anything else 999.
+func runAsIDs(user string) (uid, gid int64) {
+	u, g, hasGroup := strings.Cut(user, ":")
+	uid, uerr := strconv.ParseInt(u, 10, 64)
+	if uerr != nil || uid < 0 {
+		return 999, 999
+	}
+	if !hasGroup {
+		return uid, uid
+	}
+	gid, gerr := strconv.ParseInt(g, 10, 64)
+	if gerr != nil || gid < 0 {
+		return 999, 999
+	}
+	return uid, gid
 }
 
 // buildHelperPod renders a one-shot helper pod (pinned to the storage node in

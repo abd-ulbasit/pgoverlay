@@ -385,7 +385,7 @@ Kubernetes garbage-collects them if branchd dies mid-seed.
 |---|---|
 | data files | only ever touched **inside containers** (helpers/entrypoints) |
 | host Go code | pure control plane: registry, sagas, driver API calls |
-| seeding | `pg_basebackup` or `pg_dump` helper, runs as uid 999 (postgres); then the settle helper on the branch image, as postgres |
+| seeding | `pg_basebackup` or `pg_dump` helper, runs as the image's `postgres` uid:gid (999:999 Debian, 70:70 Alpine); then the settle helper on the branch image, as the same user |
 | copy-on-write in the branch | the lazyrw shim, preloaded into the branch's Postgres only (overlay backend) |
 | copy-up probe | a helper with a branch container's privileges, once at branchd startup |
 | masking, credential rotation, diff dumps | exec into the branch (as `postgres` on Docker, as root on Kubernetes) |

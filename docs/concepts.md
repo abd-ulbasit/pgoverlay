@@ -305,7 +305,8 @@ Two seeding modes (`internal/engine/engine.go`, `seedSource`, selected by `Sourc
   fails the seed on a major-version mismatch.
 - **It requires a `REPLICATION` connection** on the source (superuser qualifies). Data lands in
   `<volume>/data` because `pg_basebackup` creates that dir itself at `0700`; the helper runs as
-  the in-image `postgres` user (uid 999) so ownership matches branch containers. The connection
+  the image's own `postgres` user (999:999 in the Debian images, 70:70 in the Alpine ones,
+  looked up in the image first) so ownership matches branch containers. The connection
   uses `PGOVERLAY_SEED_SSLMODE` (default `prefer`) and times out after 10 s.
 
 Use this when you control the source Postgres and can grant replication.
