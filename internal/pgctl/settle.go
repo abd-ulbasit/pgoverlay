@@ -281,7 +281,7 @@ func Settle(ctx context.Context, d runtime.Driver, s SeedSpec) error {
 	start := time.Now()
 	out, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image: s.Image,
-		User:  "postgres",
+		User:  s.helperUser(),
 		Cmd:   []string{"sh", "-c", settleScript, "pgoverlay-settle", "/seed/data"},
 		Env: []string{"PGB_SETTLE=" + string(mode), "PGB_USER=" + s.User,
 			"PGCTLTIMEOUT=" + strconv.Itoa(settleWaitSeconds)},

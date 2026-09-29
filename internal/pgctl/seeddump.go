@@ -141,7 +141,7 @@ pg_ctl -D "$PGB_DATA" -w stop -m fast >/dev/null
 
 // SeedDump builds the source volume from a logical dump: initdb a fresh
 // cluster, then pg_dump | psql from the remote — all inside one helper
-// container running as the in-image postgres user (uid 999), so file
+// container running as the image's postgres user (SeedSpec.Owner), so file
 // ownership matches branch containers. Unlike Seed it needs only a normal
 // user on the remote (no REPLICATION privilege), which makes managed
 // providers usable as sources. The helper image's major version must be >=
@@ -154,7 +154,7 @@ func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 	seedMount := runtime.Mount{Kind: s.MountKind, Volume: s.Volume, Target: "/seed"}
 	if _, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image:  runtime.UtilityImage,
-		Cmd:    []string{"sh", "-c", "mkdir -p /seed && chown 999:999 /seed"},
+		Cmd:    []string{"sh", "-c", "mkdir -p /seed && chown " + s.owner() + " /seed"},
 		Mounts: []runtime.Mount{seedMount},
 	}); err != nil {
 		return fmt.Errorf("prepare seed volume: %w", err)
@@ -178,7 +178,7 @@ func SeedDump(ctx context.Context, d runtime.Driver, s SeedDumpSpec) error {
 	slog.Info("seed: running pg_dump against the source", "addr", s.addr(), "user", s.User, "database", db, "sslmode", s.sslMode(), "settle", settle)
 	out, err := d.RunHelper(ctx, runtime.HelperSpec{
 		Image: s.Image,
-		User:  "postgres",
+		User:  s.helperUser(),
 		Cmd:   []string{"bash", "-c", fmt.Sprintf(seedDumpScript, schemaFlags.String())},
 		Env: []string{
 			"PGB_DATA=/seed/data",
