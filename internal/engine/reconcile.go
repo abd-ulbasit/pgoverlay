@@ -827,6 +827,7 @@ func (e *Engine) restartBranch(ctx context.Context, b *registry.Branch, why stri
 	if err := e.waitReady(ctx, cid, restartReadyTimeout); err != nil {
 		return notReady(fmt.Errorf("never became ready: %w", err))
 	}
+	e.observeCowMode(ctx, b, cid)
 	info, err := e.inspectAddr(ctx, cid)
 	if err != nil {
 		return notReady(err)
