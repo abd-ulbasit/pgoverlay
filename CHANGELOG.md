@@ -4,7 +4,7 @@ Notable changes to pgoverlay. Each release's GitHub page also lists every
 commit since the previous tag. Upgrading from a release candidate:
 [docs/upgrading.md](docs/upgrading.md).
 
-## v1.0.0 (unreleased)
+## v1.0.0 (2026-09-29)
 
 ### True copy-on-write ([#49](https://github.com/abd-ulbasit/pgoverlay/issues/49))
 
