@@ -4,15 +4,6 @@
 # reported in, a reason, and an expiry after which the job fails again until
 # someone re-reviews the entry. Targets are relative to the scanned directory.
 misconfigurations:
-  - id: KSV-0118
-    paths:
-      - templates/deployment.yaml
-    statement: >-
-      branchd runs as root (values.yaml runAsUser 0) to write its registry on a
-      root-owned hostPath state directory. The container drops every capability,
-      cannot escalate privileges, has a read-only root filesystem and the
-      RuntimeDefault seccomp profile; hack/helm-test.sh asserts all four.
-    expired_at: 2027-04-30
   - id: KSV-0053
     paths:
       - templates/rbac.yaml

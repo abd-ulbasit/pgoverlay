@@ -126,8 +126,9 @@ Two more gates run on every pull request and push, and the second weekly:
   GitHub's secret scanning recognises. Test placeholders are allowlisted in
   [`.gitleaks.toml`](.gitleaks.toml), each by path and pattern together.
 - **Misconfiguration** (the `iac` job, `make misconfig` and `make tf-test`):
-  `trivy config` over the Helm chart, rendered with the default and the
-  production values, and over the EKS Terraform, failing on HIGH and
+  `trivy config` over the Helm chart, rendered with the default values,
+  with ghook enabled (it is off by default) and with the production values,
+  and over the EKS Terraform, failing on HIGH and
   CRITICAL; accepted findings, each with a reason and an expiry, are in
   [`.trivyignore.yaml`](.trivyignore.yaml). The Terraform is also
   format-checked, validated and tested offline against a mocked AWS

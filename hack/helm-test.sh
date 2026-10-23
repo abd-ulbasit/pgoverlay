@@ -65,6 +65,13 @@ hardened() { # render label
   has "$1" 'type: RuntimeDefault' "$2" # seccompProfile
   hasnt "$1" 'privileged: true' "$2"
   hasnt "$1" 'add:' "$2" # no capability is ever added back
+  # and a pod-level securityContext with RuntimeDefault seccomp, so a
+  # container that sets none (an injected sidecar) does not fall back to the
+  # runtime's defaults (trivy KSV-0118)
+  grep -qE -- '^      securityContext:$' <<<"$1" ||
+    { echo "FAIL: no pod-level securityContext in $2 render" >&2; exit 1; }
+  [ "$(grep -cF -- 'type: RuntimeDefault' <<<"$1")" -ge 2 ] ||
+    { echo "FAIL: RuntimeDefault seccomp not set on both pod and container in $2 render" >&2; exit 1; }
 }
 out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret \
   --show-only templates/deployment.yaml)
@@ -80,6 +87,7 @@ out=$(helm template rel "$CHART" --set node=n --set token=t \
 hardened "$out" ghook-deployment
 has "$out" 'runAsNonRoot: true' ghook-deployment
 has "$out" 'runAsUser: 65532' ghook-deployment # matches Dockerfile.ghook's USER
+has "$out" 'runAsGroup: 65532' ghook-deployment # pod level, the USER's group
 
 # The local-build path stays available: --set image.tag=dev must still reach
 # the image `make docker-build` produces and side-loads (README, docs).

@@ -27,6 +27,13 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: {{ include "pgoverlay.fullname" . }}
+      # Pod-level baseline, so nothing in the pod falls back to the runtime's
+      # default profile. The branchd container below repeats it and adds the
+      # rest; runAsNonRoot is not set because branchd runs as runAsUser
+      # (root by default, see values.yaml).
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       {{- if eq (include "pgoverlay.pinNode" .) "true" }}
       # Pinned to the storage node: in hostpath mode the CoW volumes live on
       # its disk, and without persistence so does branchd's sqlite state.

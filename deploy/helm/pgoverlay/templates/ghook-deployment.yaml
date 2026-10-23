@@ -29,6 +29,15 @@ spec:
       # Kubernetes API: a ServiceAccount token in this internet-facing pod
       # would only be one more credential to steal.
       automountServiceAccountToken: false
+      # Pod-level baseline as well as the container's, so every container in
+      # the pod (a sidecar added by a mutating webhook included) inherits a
+      # non-root UID and RuntimeDefault seccomp.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: ghook
           image: {{ include "pgoverlay.imageRef" (dict "image" .Values.ghook.image "appVersion" .Chart.AppVersion "name" "ghook.image") | quote }}

@@ -108,9 +108,10 @@ jobs:
           sudo mv "$RUNNER_TEMP/gitleaks" /usr/local/bin/gitleaks
       - run: make secrets
 
-  # Misconfiguration scan of the Helm chart (default and production values)
-  # and the EKS Terraform (make misconfig; accepted findings, with reasons and
-  # expiry dates, in .trivyignore.yaml), and the Terraform's offline checks
+  # Misconfiguration scan of the Helm chart (default values, with ghook on,
+  # and the production values) and the EKS Terraform (make misconfig;
+  # accepted findings, with reasons and expiry dates, in .trivyignore.yaml),
+  # and the Terraform's offline checks
   # (make tf-test: fmt, validate, and tests against a mocked AWS provider, so
   # no credentials). Weekly too: trivy fetches its checks at run time, so a
   # new check can fail with no commit here. trivy is installed as in

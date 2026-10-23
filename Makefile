@@ -89,16 +89,23 @@ vuln-test:
 secrets:
 	gitleaks git --redact --no-banner --exit-code 1 --config .gitleaks.toml .
 
-# Misconfiguration scan of the Helm chart (default and production values)
-# and the EKS Terraform, HIGH and CRITICAL. Accepted findings, each with a
-# reason and an expiry, are in .trivyignore.yaml. CI's `misconfig` job runs
-# this. Trivy fetches its checks at run time, so a new check can fail a run
-# with no commit here, which is the point of the weekly schedule.
+# Misconfiguration scan of the Helm chart and the EKS Terraform, HIGH and
+# CRITICAL. The chart is rendered three ways: default values, default values
+# with ghook on, and the production values with ghook on. ghook is off by
+# default, so without the last two its internet-facing Deployment would never
+# be scanned. Its values here are placeholders (existingSecret names a
+# Secret; no value is set). Accepted findings, each with a reason and an
+# expiry, are in .trivyignore.yaml. CI's `iac` job runs this. Trivy fetches
+# its checks at run time, so a new check can fail a run with no commit here,
+# which is the point of the weekly schedule.
 TRIVY_CONFIG = trivy config --quiet --severity HIGH,CRITICAL --exit-code 1 --ignorefile .trivyignore.yaml
+TRIVY_GHOOK = ghook.enabled=true,ghook.source=ci-source,ghook.existingSecret=ci-ghook-secret
 misconfig:
 	$(TRIVY_CONFIG) --helm-set node=ci-node,token=ci-placeholder-token deploy/helm/pgoverlay
+	$(TRIVY_CONFIG) --helm-set node=ci-node,token=ci-placeholder-token \
+	  --helm-set $(TRIVY_GHOOK) deploy/helm/pgoverlay
 	$(TRIVY_CONFIG) --helm-values deploy/helm/pgoverlay/values-production.yaml \
-	  --helm-set storage.storageClass=ci-class deploy/helm/pgoverlay
+	  --helm-set storage.storageClass=ci-class --helm-set $(TRIVY_GHOOK) deploy/helm/pgoverlay
 	$(TRIVY_CONFIG) --skip-dirs deploy/terraform/eks/.terraform deploy/terraform/eks
 
 # The EKS Terraform, offline: format, validate, and the mocked-provider tests
