@@ -1,13 +1,13 @@
 # branchd container image (what the Helm chart runs). pgb stays a host CLI.
 # Pure-Go build (modernc.org/sqlite): CGO off, static binary, tiny runtime image.
 # Base images pinned by digest (resolved from Docker Hub; supply-chain hygiene).
-# Refresh with: docker buildx imagetools inspect golang:1.26.6-alpine (and alpine:3.24).
+# Refresh with: docker buildx imagetools inspect golang:1.26.10-alpine (and alpine:3.24).
 #
 # Multi-arch: the build stage always runs on the builder's own platform and
 # cross-compiles for TARGETOS/TARGETARCH, so `docker buildx build --platform
 # linux/amd64,linux/arm64` needs no emulation. A plain `docker build` sets both
 # to the daemon's platform.
-FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

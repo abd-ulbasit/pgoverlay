@@ -34,6 +34,14 @@ Added:
   it requires `budget_alert_emails`. Changing an existing cluster's root
   volume replaces its node, and with it every hostpath branch.
 
+Changed:
+
+- Built with Go 1.26.10, now also the minimum for `go install`, and
+  golang.org/x/net v0.60.0. govulncheck found standard-library advisories
+  reachable from all three binaries (net/http, crypto/tls, net/textproto,
+  and GO-2026-6809, crypto/x509's distrust of compromised intermediate
+  certificates), and GO-2026-6610 in x/net's HTTP/2 transport in branchd.
+
 Documentation:
 
 - [What masking leaves behind](docs/security.md#what-masking-leaves-behind)
