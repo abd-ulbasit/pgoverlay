@@ -64,7 +64,32 @@ commit, after the full CI suite passes at that commit:
 - The images `ghcr.io/abd-ulbasit/pgoverlay-branchd` and
   `ghcr.io/abd-ulbasit/pgoverlay-ghook` are multi-arch (linux/amd64,
   linux/arm64), tagged with the release tag, and carry an SBOM and build
-  provenance. Their base images are pinned by digest.
+  provenance. Their base images are pinned by digest. Before anything is
+  pushed, each platform's image is scanned with Trivy, and the release stops
+  on a HIGH or CRITICAL vulnerability in an OS package that has a fix (Go
+  code is gated by `govulncheck`, below). Once pushed, each image is signed
+  with cosign (keyless, through GitHub's OIDC identity) and gets a SLSA
+  provenance attestation stored in the registry next to it, both bound to
+  the digest. Verify an image, then pin the verified digest (the Helm
+  chart's `image.digest`):
+
+  ```bash
+  IMG=ghcr.io/abd-ulbasit/pgoverlay-branchd
+  DIGEST=$(docker buildx imagetools inspect "$IMG:<tag>" --format '{{.Manifest.Digest}}')
+  cosign verify "$IMG@$DIGEST" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity "https://github.com/abd-ulbasit/pgoverlay/.github/workflows/release.yml@refs/tags/<tag>"
+  gh attestation verify "oci://$IMG@$DIGEST" --repo abd-ulbasit/pgoverlay
+  ```
+
+  Images published before this was added (v1.0.0 and earlier) are not
+  signed and have no registry attestation.
+
+Every publishing job runs in the `release` GitHub environment. Its protection
+rules (a required reviewer, and a deployment rule that admits only `v*`
+tags) are what stand between a pushed tag and a published release, together
+with tag protection on `v*`: anyone who can push a tag the rules admit can
+otherwise publish, and move `v1`.
 
 ## Supply-chain scanning
 
