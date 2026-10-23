@@ -274,7 +274,7 @@ Everywhere:
 - [ ] Seed with a dedicated role limited in `pg_hba.conf` to the branchd
       host, preferably from a standby, with `PGOVERLAY_SEED_SSLMODE=verify-full`.
 - [ ] Bound what clients can create: `--default-ttl`, `--max-ttl`,
-      `--max-branches`.
+      `--max-branches` (Helm `limits.*`).
 - [ ] Back up `secret.key` with the registry, or supply the key from a secret
       manager.
 - [ ] Run branchd on a host (or in a namespace) dedicated to it, and treat
@@ -286,9 +286,13 @@ Everywhere:
 
 On Kubernetes, additionally:
 
+- [ ] Start from `deploy/helm/pgoverlay/values-production.yaml` rather than
+      the single-node defaults in `values.yaml`.
 - [ ] Prefer `storage.mode=csi`: branch pods get no added capabilities and the
       namespace can enforce Pod Security `baseline`. Hostpath needs
       `privileged`.
+- [ ] Give branch pods resource defaults with `namespaceLimitRange.enabled`
+      (branchd sets no requests or limits on the pods it creates).
 - [ ] Set `networkPolicy.enabled=true` with `allowedClients`, `metricsFrom`
       and `sourceEgress`, so only seed helpers can reach the source.
 - [ ] Pre-create Secrets and use `existingSecret` / `ghook.existingSecret`;

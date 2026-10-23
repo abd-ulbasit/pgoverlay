@@ -63,6 +63,13 @@ SECURITY — read before exposing pgoverlay beyond a single trusted node:
       client CIDRs that need it (CI egress, VPN), or make it internal with
       proxy.service.annotations.
 {{- end }}
+{{- if and .Values.ghook.enabled (not (gt (int (dig "maxBranches" 0 (.Values.limits | default dict))) 0)) }}
+
+  [!] ghook creates a branch for every pull request in the allowed
+      repositories, fork pull requests included, and limits.maxBranches is 0
+      (unlimited). Set limits.maxBranches and limits.maxTTL so pull requests
+      cannot create Postgres pods without bound.
+{{- end }}
 {{- if not .Values.networkPolicy.enabled }}
 
   [i] NetworkPolicies are disabled. On a shared/multi-tenant cluster set

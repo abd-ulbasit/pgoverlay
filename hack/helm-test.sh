@@ -106,6 +106,39 @@ if helm template "$CHART" --set node=n --set token=t --set ghook.enabled=true \
   echo "FAIL: a malformed ghook.image.digest must fail" >&2; exit 1
 fi
 
+# branch limits: unset by default (branchd's unlimited defaults), passed
+# through when set; a negative cap fails the render
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret)
+hasnt "$out" '--max-branches' default
+hasnt "$out" '--default-ttl' default
+hasnt "$out" '--max-ttl' default
+hasnt "$out" 'kind: LimitRange' default
+out=$(helm template rel "$CHART" --set node=n --set token=t --set limits.maxBranches=25 \
+  --set limits.defaultTTL=24h --set limits.maxTTL=72h --set namespaceLimitRange.enabled=true)
+has "$out" '--max-branches=25' limits
+has "$out" '--default-ttl=24h' limits
+has "$out" '--max-ttl=72h' limits
+has "$out" 'kind: LimitRange' limits
+has "$out" 'memory: 1Gi' limits
+if helm template "$CHART" --set node=n --set token=t --set limits.maxBranches=-1 >/dev/null 2>&1; then
+  echo "FAIL: a negative limits.maxBranches must fail" >&2; exit 1
+fi
+
+# values-production.yaml stays a valid, hardened starting point
+out=$(helm template rel "$CHART" -f "$CHART/values-production.yaml" --set storage.storageClass=fast-clone)
+has "$out" '--kube-storage=csi' production
+has "$out" '--rotate-branch-credentials' production
+has "$out" '--pg-tls-cert=/etc/pgoverlay/proxy-tls/tls.crt' production
+has "$out" '--max-branches=50' production
+has "$out" 'kind: NetworkPolicy' production
+has "$out" 'kind: LimitRange' production
+has "$out" 'name: pgoverlay-token' production
+hasnt "$out" 'kind: Secret' production # existingSecret: no token in the release
+hasnt "$out" 'SYS_ADMIN' production
+if helm template rel "$CHART" -f "$CHART/values-production.yaml" >/dev/null 2>&1; then
+  echo "FAIL: values-production.yaml without storage.storageClass must fail" >&2; exit 1
+fi
+
 # custom values: existing secret, custom data root, NodePort proxy
 out=$(helm template rel "$CHART" --set node=worker-9 --set existingSecret=my-token \
   --set dataRoot=/mnt/pgoverlay --set proxy.service.type=NodePort --set proxy.service.nodePort=30432)

@@ -107,6 +107,20 @@ spec:
             {{- fail "seedSettle must be freeze, recover or off" }}
             {{- end }}
             - --seed-settle={{ .Values.seedSettle }}
+            {{- $limits := .Values.limits | default dict }}
+            {{- $maxBranches := int (dig "maxBranches" 0 $limits) }}
+            {{- if lt $maxBranches 0 }}
+            {{- fail "limits.maxBranches must be >= 0 (0 = unlimited)" }}
+            {{- end }}
+            {{- if gt $maxBranches 0 }}
+            - --max-branches={{ $maxBranches }}
+            {{- end }}
+            {{- with dig "defaultTTL" "" $limits }}
+            - --default-ttl={{ . }}
+            {{- end }}
+            {{- with dig "maxTTL" "" $limits }}
+            - --max-ttl={{ . }}
+            {{- end }}
             {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
             # HA: contend for the pgoverlay-branchd Lease; only the leader
             # reconciles + accepts mutating /v1 requests (see docs/ha.md).

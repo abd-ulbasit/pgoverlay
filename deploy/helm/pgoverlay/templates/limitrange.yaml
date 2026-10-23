@@ -1,0 +1,23 @@
+{{- $lr := .Values.namespaceLimitRange | default dict }}
+{{- if dig "enabled" false $lr }}
+# Defaults for containers that set no requests or limits of their own: the
+# branch and helper pods branchd creates at runtime never do (see
+# values.yaml namespaceLimitRange). Namespace-wide by nature.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "pgoverlay.fullname" . }}-defaults
+  labels:
+    {{- include "pgoverlay.labels" . | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      {{- with $lr.defaultRequest }}
+      defaultRequest:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $lr.default }}
+      default:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

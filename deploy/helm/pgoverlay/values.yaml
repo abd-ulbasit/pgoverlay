@@ -189,6 +189,36 @@ shutdownTimeout: 60
 # that need every branch to accept the same source password.
 rotateBranchCredentials: false
 
+# Bounds on what API clients (CI, ghook, the GitHub Action) can create. The
+# defaults (0 / "") are branchd's own: unlimited, so that an upgrade never
+# starts refusing branches. Set them whenever branch creation is driven by
+# something you do not fully control, such as ghook on a repository that
+# takes outside pull requests: every branch is a Postgres pod.
+limits:
+  # branchd --max-branches: creates past this many live branches get 403.
+  maxBranches: 0
+  # branchd --default-ttl: TTL for branches created without one (e.g. 72h).
+  defaultTTL: ""
+  # branchd --max-ttl: cap on any requested TTL (e.g. 168h).
+  maxTTL: ""
+
+# Optional LimitRange for the release namespace (templates/limitrange.yaml).
+# The branch and helper pods branchd creates at runtime carry no CPU or
+# memory requests or limits of their own; a LimitRange is how Kubernetes
+# gives them defaults, so one runaway branch cannot starve the node (in
+# hostpath mode, the node every branch shares). It applies to every container
+# in the namespace that sets none itself, branchd and ghook included while
+# their resources are empty, so use it in a namespace dedicated to pgoverlay.
+# Off by default because a memory limit changes failure mode: a branch over
+# it is OOM-killed instead of slowing down.
+namespaceLimitRange:
+  enabled: false
+  defaultRequest:
+    cpu: 100m
+    memory: 256Mi
+  default:
+    memory: 1Gi
+
 # How a new seed (source add or refresh) is prepared before branches start
 # from it (branchd --seed-settle): freeze recovers the copy once, runs VACUUM
 # (FREEZE, ANALYZE) on every database and shuts it down cleanly, so branches

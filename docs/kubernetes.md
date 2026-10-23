@@ -215,6 +215,21 @@ branchd itself starts two more kinds of image at runtime:
   above).
 - **`ghook.apiTokenSecret` / `ghook.apiTokenKey`** — the operator-role token
   the webhook service uses (see [Branch per pull request](#branch-per-pull-request)).
+- **`limits.maxBranches` / `limits.defaultTTL` / `limits.maxTTL`** — branchd
+  `--max-branches`, `--default-ttl` and `--max-ttl`. Unset by default
+  (unlimited, branchd's own defaults); set them whenever something you do not
+  fully control creates branches, ghook on a repository that takes outside
+  pull requests above all. NOTES warn when ghook is on without a cap.
+- **`namespaceLimitRange.*`** — an optional LimitRange that gives default
+  CPU and memory requests and a memory limit to every container in the
+  namespace that sets none, which includes every branch and helper pod
+  branchd creates. Off by default (a memory limit turns an oversized branch
+  into an OOM kill); use it in a namespace dedicated to pgoverlay.
+
+The defaults above suit a single trusted node. `deploy/helm/pgoverlay/values-production.yaml`
+is the starting point for a shared cluster: csi storage, an out-of-band token
+Secret, rotated branch credentials, proxy TLS, NetworkPolicy, branch limits
+and the LimitRange, each commented with why.
 
 ## Proxy TLS (cert-manager)
 
