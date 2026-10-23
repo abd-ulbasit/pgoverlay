@@ -157,9 +157,10 @@ are the ghook equivalents. For a private registry, override
 
 To pin what runs rather than what a tag points at, set `image.digest` (and
 `ghook.image.digest`) to a `sha256:` digest. The chart then pulls
-`repository@digest` and ignores the tag. Release images are signed with
-cosign and carry a provenance attestation in the registry, both bound to the
-digest, so verify the digest first and pin the one you verified
+`repository@digest` and ignores the tag. Release images published after
+v1.0.0 are signed with cosign and carry a provenance attestation in the
+registry, both bound to the digest, so verify the digest first and pin the
+one you verified
 ([SECURITY.md](https://github.com/abd-ulbasit/pgoverlay/blob/main/SECURITY.md#release-integrity)).
 
 branchd itself starts two more kinds of image at runtime:

@@ -4,6 +4,38 @@ Notable changes to pgoverlay. Each release's GitHub page also lists every
 commit since the previous tag. Upgrading from a release candidate:
 [docs/upgrading.md](docs/upgrading.md).
 
+## Unreleased
+
+Security hardening from the October 2026 audit. Nothing changes for an
+existing install that does not opt in, except as noted.
+
+Added:
+
+- Helm: `image.digest` and `ghook.image.digest` pull images by digest;
+  `limits.maxBranches`, `limits.defaultTTL` and `limits.maxTTL` pass
+  branchd's limits; `namespaceLimitRange` gives the runtime-created branch
+  and helper pods CPU and memory defaults; `ghook.requireMask`; and
+  `values-production.yaml`, a commented starting point for shared clusters.
+- `GHOOK_REQUIRE_MASK`: ghook refuses to create or reset a pull request's
+  branch while its source has no masking scripts (fails closed).
+- Release images are scanned with Trivy before they are pushed, signed with
+  cosign (keyless) and get a provenance attestation in the registry; the
+  publishing jobs run in the `release` environment.
+- CI: a gitleaks secret scan over the full history, and `trivy config` over
+  the chart and the Terraform with a reviewed, expiring exceptions file.
+- Terraform (the EKS demo): pinned Terraform, module and providers (the lock
+  file is committed), offline tests, an account budget alarm, and a private
+  API endpoint unless `cluster_endpoint_public_access_cidrs` is set. Applying
+  it now requires `budget_alert_emails`.
+
+Documentation:
+
+- [What masking leaves behind](docs/security.md#what-masking-leaves-behind)
+  and how to close it; ADR-12 (masking, with a design for masking the seed)
+  and ADR-13 (the chart's first-run defaults).
+- The EKS, GitHub App, Kubernetes and HA guides keep secrets out of
+  `helm --set`, and the EKS upgrade no longer uses `-auto-approve`.
+
 ## v1.0.0 (2026-09-29)
 
 ### True copy-on-write ([#49](https://github.com/abd-ulbasit/pgoverlay/issues/49))
