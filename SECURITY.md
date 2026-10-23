@@ -154,7 +154,11 @@ each shim build's SHA-256 again after decoding it in the helper. The builds
 are reproducible: `make lazyrw` rebuilds them in digest-pinned Debian and
 Alpine images with `docker buildx`, and the `lazyrw` CI job (`make
 lazyrw-check`) rebuilds them from source on every pull request and fails on
-any byte of difference. The `pg-import-audit` job checks, for the `postgres`
+any byte of difference. Alpine's mirror keeps only the newest build of each
+package, so the musl toolchain's packages are held to their upstream versions
+rather than to one Alpine build: a new build that changes the output fails
+the check until `make lazyrw` is rerun and its result reviewed and committed.
+The `pg-import-audit` job checks, for the `postgres`
 binaries of `postgres:14` to `18` and `17-alpine` and weekly, that every
 write-class libc function they import is interposed by the shim or on a
 reviewed list, since a write the shim does not see would hit a read-only file

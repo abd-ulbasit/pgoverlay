@@ -4,8 +4,9 @@
 #
 # The same source must always give the same bytes: CI rebuilds and diffs
 # against the committed dist/. So the base images are pinned by index digest,
-# the toolchain packages by version, and the compiler is told to leave out
-# everything host- or run-specific (build ID, ident string, source paths).
+# the toolchain packages by version (on Alpine, by upstream version: see the
+# musl-toolchain stage), and the compiler is told to leave out everything
+# host- or run-specific (build ID, ident string, source paths).
 #
 # glibc builds on Debian 11 (glibc 2.31) so the result loads on every newer
 # glibc: postgres:14-18 are Debian 12 and 13. Debian 11 is past its LTS window,
@@ -37,7 +38,17 @@ RUN set -eu; \
     rm -rf /var/lib/apt/lists/* /tmp/sources.default
 
 FROM ${ALPINE_IMAGE} AS musl-toolchain
-RUN apk add --no-cache gcc=14.2.0-r4 musl-dev=1.2.5-r11 binutils=2.43.1-r3 linux-headers=6.6-r1
+# Alpine's mirror serves only the newest build of each package on a release
+# branch, and there is no snapshot archive to fall back to as there is for
+# Debian: an exact `musl-dev=1.2.5-r11` stops resolving the day the branch
+# ships -r12. So each package is held with `~` to its upstream version: any
+# Alpine rebuild (-rN) of gcc 14.2.0, musl 1.2.5, binutils 2.43.1 or the 6.6
+# headers on the 3.21 branch satisfies it; a new upstream version does not.
+# The image itself stays pinned by digest. If a rebuild changes the output,
+# `make lazyrw-check` fails with a diff (rebuild with `make lazyrw` and commit
+# dist/) rather than every build failing at install; apk's log names the
+# exact builds it installed.
+RUN apk add --no-cache 'gcc~14.2.0' 'musl-dev~1.2.5' 'binutils~2.43.1' 'linux-headers~6.6'
 
 # ---- the shim -----------------------------------------------------------------
 # -fno-ident drops the compiler's version string, --build-id=none the hash of
