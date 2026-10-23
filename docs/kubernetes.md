@@ -149,6 +149,13 @@ are the ghook equivalents. For a private registry, override
 `image.repository`/`ghook.image.repository` too and attach an
 `imagePullSecret` ([docs/eks.md](eks.md#images) shows the EKS version).
 
+To pin what runs rather than what a tag points at, set `image.digest` (and
+`ghook.image.digest`) to a `sha256:` digest. The chart then pulls
+`repository@digest` and ignores the tag. Release images are signed with
+cosign and carry a provenance attestation in the registry, both bound to the
+digest, so verify the digest first and pin the one you verified
+([SECURITY.md](https://github.com/abd-ulbasit/pgoverlay/blob/main/SECURITY.md#release-integrity)).
+
 branchd itself starts two more kinds of image at runtime:
 
 - **postgres:&lt;major&gt;** for branch pods and the seeding helpers, following
@@ -177,9 +184,12 @@ branchd itself starts two more kinds of image at runtime:
   for the branchd pod. Unpinned HA replicas (csi with persistence and
   `replicaCount > 1`) get a required `podAffinity` so they share the
   ReadWriteOnce state volume's node; setting `affinity` replaces it.
-- **`token` / `existingSecret`** — the REST API bearer token. Either let the
-  chart render a Secret from `token`, or point `existingSecret` at a
-  pre-created Secret with key `token`.
+- **`image.digest` / `ghook.image.digest`** — pull the image by content
+  digest (`repository@sha256:...`) instead of by tag (see [Images](#images)).
+- **`token` / `existingSecret`** — the REST API bearer token. Point
+  `existingSecret` at a pre-created Secret with key `token` (preferred), or
+  let the chart render a Secret from `token`, which leaves the value in
+  cleartext in the Helm release history.
 - **`proxy.service.type`** — set to `NodePort` (with
   `proxy.service.nodePort`) to reach branches from outside the cluster
   without a port-forward. With `LoadBalancer`, restrict who can connect with

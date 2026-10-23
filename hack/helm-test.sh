@@ -87,6 +87,25 @@ out=$(helm template pgoverlay "$CHART" --set node=n --set token=t --set image.ta
 has "$out" 'ghcr.io/abd-ulbasit/pgoverlay-branchd:dev' local-tag
 hasnt "$out" "pgoverlay-branchd:$APPVERSION" local-tag
 
+# image digests: repository@digest wins over the tag (nothing else names the
+# image), for both deployments; a malformed digest fails the render
+DIGEST=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set image.digest=$DIGEST --set image.tag=ignored \
+  --set ghook.enabled=true --set ghook.webhookSecret=w --set ghook.source=main \
+  --set ghook.image.digest=$DIGEST)
+has "$out" "image: \"ghcr.io/abd-ulbasit/pgoverlay-branchd@$DIGEST\"" digest
+has "$out" "image: \"ghcr.io/abd-ulbasit/pgoverlay-ghook@$DIGEST\"" digest
+hasnt "$out" 'pgoverlay-branchd:' digest
+hasnt "$out" 'pgoverlay-ghook:' digest
+if helm template "$CHART" --set node=n --set token=t --set image.digest=sha256:abc >/dev/null 2>&1; then
+  echo "FAIL: a malformed image.digest must fail" >&2; exit 1
+fi
+if helm template "$CHART" --set node=n --set token=t --set ghook.enabled=true \
+  --set ghook.webhookSecret=w --set ghook.source=main --set ghook.image.digest=latest >/dev/null 2>&1; then
+  echo "FAIL: a malformed ghook.image.digest must fail" >&2; exit 1
+fi
+
 # custom values: existing secret, custom data root, NodePort proxy
 out=$(helm template rel "$CHART" --set node=worker-9 --set existingSecret=my-token \
   --set dataRoot=/mnt/pgoverlay --set proxy.service.type=NodePort --set proxy.service.nodePort=30432)

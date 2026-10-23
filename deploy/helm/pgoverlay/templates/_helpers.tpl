@@ -84,6 +84,25 @@ false
 {{- end -}}
 {{- end -}}
 
+{{/* Container image reference for an image block (repository, tag, digest).
+     A digest wins: the image is pulled as repository@digest and the tag is
+     not rendered, because a digest names exactly one image and a tag next to
+     it would only suggest a version that might not match. Without a digest
+     it is repository:tag, the tag defaulting to the chart's appVersion.
+     Called with (dict "image" <block> "appVersion" .Chart.AppVersion
+     "name" "<values path, for the error>"). */}}
+{{- define "pgoverlay.imageRef" -}}
+{{- $img := .image -}}
+{{- if $img.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $img.digest) -}}
+{{- fail (printf "%s.digest must be sha256:<64 lowercase hex characters>, got %q" .name $img.digest) -}}
+{{- end -}}
+{{- printf "%s@%s" $img.repository $img.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $img.repository ($img.tag | default .appVersion) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Secret holding the API bearer token (key "token"). */}}
 {{- define "pgoverlay.tokenSecretName" -}}
 {{- .Values.existingSecret | default (printf "%s-token" (include "pgoverlay.fullname" .)) -}}

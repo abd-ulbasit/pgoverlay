@@ -109,6 +109,11 @@ image:
   # For the local build path pass --set image.tag=dev, after side-loading that
   # image into the cluster (`kind load docker-image ...`) or pushing it.
   tag: ""
+  # Optional content digest (sha256:<64 hex>). When set, the image is pulled
+  # as repository@digest and tag is ignored, so a re-pointed tag cannot change
+  # what runs. Release images are signed and attested by digest: verify one
+  # (SECURITY.md, "Release integrity") and pin the digest you verified.
+  digest: ""
   pullPolicy: IfNotPresent
 
 # Image for the file-level helper pods branchd starts at runtime (seed-volume
@@ -271,6 +276,8 @@ ghook:
     # Empty means the chart's appVersion, same as the branchd image block
     # above; --set ghook.image.tag=dev for a `make docker-build-ghook` build.
     tag: ""
+    # Optional content digest, as image.digest above.
+    digest: ""
     pullPolicy: IfNotPresent
   # Webhook HMAC secret (X-Hub-Signature-256). Exactly one is required when
   # enabled:

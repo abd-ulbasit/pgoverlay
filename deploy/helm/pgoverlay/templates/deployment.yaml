@@ -61,7 +61,7 @@ spec:
       {{- end }}
       containers:
         - name: branchd
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "pgoverlay.imageRef" (dict "image" .Values.image "appVersion" .Chart.AppVersion "name" "image") | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if not (has .Values.storage.mode (list "hostpath" "csi")) }}
           {{- fail "storage.mode must be hostpath or csi" }}

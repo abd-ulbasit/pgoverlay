@@ -46,7 +46,8 @@ import (
 const localTag = "dev"
 
 // followChartTag is the values.yaml sentinel meaning "use Chart.yaml's
-// appVersion". Rendered by `{{ .Values.image.tag | default .Chart.AppVersion }}`.
+// appVersion". Rendered by the pgoverlay.imageRef helper (_helpers.tpl) as
+// `tag | default appVersion` whenever image.digest is empty.
 const followChartTag = ""
 
 // makefileImages returns every image reference passed to `docker build -t` in
