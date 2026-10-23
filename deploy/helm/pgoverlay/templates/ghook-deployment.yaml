@@ -68,6 +68,10 @@ spec:
             - name: GHOOK_RESET_ON_PUSH
               value: "true"
             {{- end }}
+            {{- if .Values.ghook.requireMask }}
+            - name: GHOOK_REQUIRE_MASK
+              value: "true"
+            {{- end }}
             {{- if .Values.ghook.diffOnPush }}
             - name: GHOOK_DIFF_ON_PUSH
               value: "true"

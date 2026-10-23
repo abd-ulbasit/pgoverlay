@@ -252,7 +252,12 @@ across any network you do not control, set `verify-full` or at least
   branch of the source to be created, and the PR comment shows the router
   address and the branch's database name (never a password). On a public
   repository, mask the source and use rotated credentials, or keep the router
-  unreachable from the internet.
+  unreachable from the internet. `GHOOK_REQUIRE_MASK=true` (Helm
+  `ghook.requireMask`) makes the masking part a check rather than a
+  convention: ghook then refuses to create or reset a branch while the
+  source has no masking scripts, and refuses when it cannot read them. It
+  checks that scripts exist, not what they mask, and it binds ghook only:
+  an operator token used directly can still branch an unmasked source.
 - Public commit-status text never includes internal errors; they read "see
   the pgoverlay-github logs (delivery <id>)".
 
@@ -297,8 +302,8 @@ On Kubernetes, additionally:
       and `sourceEgress`, so only seed helpers can reach the source.
 - [ ] Pre-create Secrets and use `existingSecret` / `ghook.existingSecret`;
       `--set token=` stores secrets in the Helm release history.
-- [ ] Give ghook an operator token (`ghook.apiTokenSecret`) and set
-      `ghook.repos`.
+- [ ] Give ghook an operator token (`ghook.apiTokenSecret`), set
+      `ghook.repos`, and set `ghook.requireMask=true`.
 - [ ] For a `LoadBalancer`, set `proxy.service.loadBalancerSourceRanges` and
       `ghook.service.loadBalancerSourceRanges` (GitHub's hook ranges), or make
       the load balancer internal.

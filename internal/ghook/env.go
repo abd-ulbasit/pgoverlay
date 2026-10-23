@@ -84,6 +84,13 @@ func LoadEnv(getenv func(string) string) (*EnvConfig, error) {
 		}
 		ec.DiffOnPush = b
 	}
+	if v := getenv("GHOOK_REQUIRE_MASK"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("GHOOK_REQUIRE_MASK: invalid bool %q", v)
+		}
+		ec.RequireMask = b
+	}
 	for _, r := range strings.Split(getenv("GHOOK_REPOS"), ",") {
 		if r = strings.TrimSpace(r); r != "" {
 			ec.Repos = append(ec.Repos, r)

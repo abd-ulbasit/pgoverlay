@@ -45,6 +45,8 @@ type fakePG struct {
 	createStarted chan struct{}
 	createRelease chan struct{}
 	diff          *engine.DiffResult // served by GET .../diff when set
+	masks         []api.MaskScript   // served by GET /v1/sources/{name}/mask
+	maskErr       int                // non-zero: that route fails with this status
 	diffData      string             // last ?data query seen on the diff route
 	srv           *httptest.Server
 }
@@ -131,6 +133,21 @@ func newFakePG(t *testing.T, exists bool) *fakePG {
 		}
 		f.exists, f.state = false, ""
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /v1/sources/{name}/mask", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		record(r)
+		if f.maskErr != 0 {
+			w.WriteHeader(f.maskErr)
+			json.NewEncoder(w).Encode(map[string]string{"error": "internal server error"})
+			return
+		}
+		masks := f.masks
+		if masks == nil {
+			masks = []api.MaskScript{}
+		}
+		json.NewEncoder(w).Encode(masks)
 	})
 	mux.HandleFunc("GET /v1/branches/{name}/diff", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -646,4 +663,55 @@ func TestQueueRetiredWhenWaitReturns(t *testing.T) {
 			t.Fatalf("iteration %d: %d queue(s) left after Wait returned", i, n)
 		}
 	}
+}
+
+// GHOOK_REQUIRE_MASK: a source with no masking scripts is never branched for
+// a pull request, and the refusal is a public-safe failure status.
+func TestRequireMaskRefusesAnUnmaskedSource(t *testing.T) {
+	pg := newFakePG(t, false)
+	gh := newFakeGitHub(t)
+	svc := newService(Config{Source: "prod", RequireMask: true}, pg.srv.URL, gh.client())
+
+	deliver(t, svc, fixture(t, "pr_opened.json"))
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "GET /v1/sources/prod/mask") // no create
+	last := gh.statuses[len(gh.statuses)-1]
+	if last.State != "failure" || !strings.Contains(last.Description, "no masking scripts") {
+		t.Errorf("last status = %+v, want a failure naming the missing masking scripts", last)
+	}
+}
+
+func TestRequireMaskCreatesFromAMaskedSource(t *testing.T) {
+	pg := newFakePG(t, false)
+	pg.masks = []api.MaskScript{{Name: "pii.sql", SQL: "UPDATE customers SET email = NULL"}}
+	svc := newService(Config{Source: "prod", RequireMask: true}, pg.srv.URL, nil)
+
+	deliver(t, svc, fixture(t, "pr_opened.json"))
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "GET /v1/sources/prod/mask", "POST /v1/branches")
+}
+
+// A reset re-clones the unmasked seed, so it is checked as well: masking
+// removed after the branch was created stops the next reset.
+func TestRequireMaskIsCheckedBeforeAReset(t *testing.T) {
+	pg := newFakePG(t, true)
+	svc := newService(Config{Source: "prod", ResetOnPush: true, RequireMask: true}, pg.srv.URL, nil)
+
+	deliver(t, svc, fixture(t, "pr_synchronize.json"))
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "GET /v1/sources/prod/mask") // no reset
+}
+
+// Not knowing whether the source is masked is a refusal, not a pass.
+func TestRequireMaskFailsClosed(t *testing.T) {
+	pg := newFakePG(t, false)
+	pg.maskErr = http.StatusInternalServerError
+	svc := newService(Config{Source: "prod", RequireMask: true}, pg.srv.URL, nil)
+
+	deliver(t, svc, fixture(t, "pr_opened.json"))
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "GET /v1/sources/prod/mask")
+}
+
+// Off (the default), nothing reads the masking scripts.
+func TestRequireMaskOffDoesNotCheck(t *testing.T) {
+	pg := newFakePG(t, false)
+	deliver(t, newService(Config{Source: "prod"}, pg.srv.URL, nil), fixture(t, "pr_opened.json"))
+	pg.assertCalls("GET /v1/branches/"+pr7Branch, "POST /v1/branches")
 }

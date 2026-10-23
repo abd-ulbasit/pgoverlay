@@ -55,6 +55,14 @@ type Config struct {
 	// they already know (Vercel's VERCEL_GIT_COMMIT_REF is present from the
 	// very first build, before the PR association exists).
 	BranchNaming string
+	// RequireMask, when true, refuses to create or reset a branch while the
+	// source has no masking scripts (GHOOK_REQUIRE_MASK). Anyone who can open
+	// a pull request in an allowed repository causes a branch, so this turns
+	// "PR branches are masked" from an operator checklist item into a checked
+	// property. It is checked before every create and every reset, because
+	// both start from the unmasked seed and run whatever scripts the source
+	// has at that moment; a failed read of the scripts refuses too.
+	RequireMask bool
 }
 
 // Service handles pull_request deliveries. Branch operations run detached
@@ -493,6 +501,9 @@ func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload
 			log.Debug("branch already exists")
 			return b, false, nil
 		}
+		if err := s.checkMasked(ctx, log); err != nil {
+			return nil, false, err
+		}
 		if b, err = s.pg.ResetBranch(ctx, branch); err != nil {
 			return nil, false, &opError{op: "reset branch " + branch, err: err}
 		}
@@ -512,6 +523,9 @@ func (s *Service) ensureBranch(ctx context.Context, log *slog.Logger, p *payload
 }
 
 func (s *Service) createBranch(ctx context.Context, log *slog.Logger, branch string) (*api.Branch, error) {
+	if err := s.checkMasked(ctx, log); err != nil {
+		return nil, err
+	}
 	b, err := s.pg.CreateBranch(ctx, api.CreateBranchRequest{
 		Name: branch, Source: s.cfg.Source, TTLSeconds: s.cfg.TTLSeconds,
 	})
@@ -520,6 +534,25 @@ func (s *Service) createBranch(ctx context.Context, log *slog.Logger, branch str
 	}
 	log.Info("branch created", "source", s.cfg.Source)
 	return s.requireReady(ctx, branch, b)
+}
+
+// checkMasked enforces Config.RequireMask before a create or a reset: it
+// refuses when the source has no masking scripts, and fails closed when they
+// cannot be read. The scripts are read with ghook's own token, which needs
+// only the viewer role for that (an operator token has it).
+func (s *Service) checkMasked(ctx context.Context, log *slog.Logger) error {
+	if !s.cfg.RequireMask {
+		return nil
+	}
+	scripts, err := s.pg.GetMaskScripts(ctx, s.cfg.Source)
+	if err != nil {
+		return &opError{op: "read the masking scripts of source " + s.cfg.Source, err: err}
+	}
+	if len(scripts) == 0 {
+		log.Warn("refusing to branch a source with no masking scripts (GHOOK_REQUIRE_MASK)", "source", s.cfg.Source)
+		return &policyError{msg: fmt.Sprintf("source %s has no masking scripts; GHOOK_REQUIRE_MASK refuses to branch it", s.cfg.Source)}
+	}
+	return nil
 }
 
 // requireReady returns b when it is ready; otherwise it waits for the
@@ -592,19 +625,26 @@ func (e *stateError) Error() string {
 	return fmt.Sprintf("branch %s is %s, not ready", e.branch, e.state)
 }
 
+// policyError is a branch operation ghook itself refused by configuration.
+// Its wording is ghook's own.
+type policyError struct{ msg string }
+
+func (e *policyError) Error() string { return e.msg }
+
 // publicReason is the commit-status description for a failed operation.
 // Commit statuses are public on public repositories, so only messages whose
-// wording is known are passed through: ghook's own state errors and
-// branchd's deliberate 4xx answers (an invalid name, a quota, a conflict).
+// wording is known are passed through: ghook's own state and policy errors
+// and branchd's deliberate 4xx answers (an invalid name, a quota, a conflict).
 // Anything else, such as a transport error that names branchd's in-cluster
 // address, stays in the log; the status points there by delivery id.
 func publicReason(err error, delivery string) string {
 	var (
 		ste *stateError
+		pe  *policyError
 		se  *apiclient.StatusError
 		oe  *opError
 	)
-	if errors.As(err, &ste) || (errors.As(err, &se) && se.StatusCode >= 400 && se.StatusCode < 500) {
+	if errors.As(err, &ste) || errors.As(err, &pe) || (errors.As(err, &se) && se.StatusCode >= 400 && se.StatusCode < 500) {
 		return err.Error()
 	}
 	op := "branch operation"

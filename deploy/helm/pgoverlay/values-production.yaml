@@ -50,6 +50,14 @@ limits:
 namespaceLimitRange:
   enabled: true
 
+# Inert until ghook.enabled=true. Then its secrets come from Secrets created
+# out of band too, it uses an operator token, and it refuses to branch a
+# source with no masking scripts.
+ghook:
+  existingSecret: pgoverlay-ghook
+  apiTokenSecret: pgoverlay-ghook-api
+  requireMask: true
+
 resources:
   requests:
     cpu: 100m

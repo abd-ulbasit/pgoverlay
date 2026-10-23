@@ -63,6 +63,12 @@ SECURITY — read before exposing pgoverlay beyond a single trusted node:
       client CIDRs that need it (CI egress, VPN), or make it internal with
       proxy.service.annotations.
 {{- end }}
+{{- if and .Values.ghook.enabled (not .Values.ghook.requireMask) }}
+
+  [!] ghook branches source "{{ .Values.ghook.source }}" for every pull request
+      whether or not it is masked. Set `ghook.requireMask: true` so a source
+      without masking scripts gets no PR branches (docs/security.md).
+{{- end }}
 {{- if and .Values.ghook.enabled (not (gt (int (dig "maxBranches" 0 (.Values.limits | default dict))) 0)) }}
 
   [!] ghook creates a branch for every pull request in the allowed

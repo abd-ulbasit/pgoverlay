@@ -12,7 +12,9 @@ service that gives every pull request its own Postgres branch:
 So anyone who can open a pull request in an allowed repository can cause a
 branch of your source to be created, with the router address and the
 branch's database name posted on the PR (never a password). On a public
-repository, mask the source and read [Security](security.md) first.
+repository, mask the source, set `GHOOK_REQUIRE_MASK=true` (Helm
+`ghook.requireMask`) so an unmasked source is never branched for a PR, and
+read [Security](security.md) first.
 
 With GitHub credentials configured, the service also reports back to the PR:
 
@@ -204,6 +206,7 @@ differ by the repository key.
 | `GHOOK_TTL` | no | none | branch TTL as a Go duration, e.g. `72h` |
 | `GHOOK_RESET_ON_PUSH` | no | `false` | reset the branch on every push (synchronize) |
 | `GHOOK_DIFF_ON_PUSH` | no | `false` | post the schema/data diff comment after opened/synchronize (needs GitHub credentials) |
+| `GHOOK_REQUIRE_MASK` | no | `false` | refuse to create or reset a branch while `GHOOK_SOURCE` has no masking scripts (fails closed if they cannot be read); the PR gets a `failure` status saying why |
 | `GHOOK_BRANCH_NAMING` | no | `pr-number` | `pr-number` or `git-branch`; see [Branch names](#branch-names) |
 | `GHOOK_REPOS` | no | allow all | comma-separated `owner/name` allow-list |
 | `GHOOK_GITHUB_API` | no | `https://api.github.com` | GitHub API base (GitHub Enterprise) |

@@ -135,6 +135,11 @@ has "$out" 'kind: LimitRange' production
 has "$out" 'name: pgoverlay-token' production
 hasnt "$out" 'kind: Secret' production # existingSecret: no token in the release
 hasnt "$out" 'SYS_ADMIN' production
+out=$(helm template rel "$CHART" -f "$CHART/values-production.yaml" --set storage.storageClass=fast-clone \
+  --set ghook.enabled=true --set ghook.source=main)
+has "$out" 'name: GHOOK_REQUIRE_MASK' production-ghook
+has "$out" 'name: pgoverlay-ghook-api' production-ghook
+hasnt "$out" 'webhook-secret: ' production-ghook # no ghook Secret in the release
 if helm template rel "$CHART" -f "$CHART/values-production.yaml" >/dev/null 2>&1; then
   echo "FAIL: values-production.yaml without storage.storageClass must fail" >&2; exit 1
 fi
@@ -227,6 +232,12 @@ has "$out" 'GHOOK_REPOS' ghook
 has "$out" 'GHOOK_PROXY_HOST' ghook
 has "$out" 'GHOOK_TTL' ghook
 hasnt "$out" 'SYS_ADMIN' ghook
+
+# ghook.requireMask: off by default, GHOOK_REQUIRE_MASK=true when on
+hasnt "$out" 'GHOOK_REQUIRE_MASK' ghook
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set ghook.enabled=true --set ghook.webhookSecret=w --set ghook.source=main --set ghook.requireMask=true)
+has "$out" 'name: GHOOK_REQUIRE_MASK' ghook-require-mask
 
 # ghook existingSecret suppresses the rendered ghook Secret
 out=$(helm template rel "$CHART" --set node=n --set token=t \

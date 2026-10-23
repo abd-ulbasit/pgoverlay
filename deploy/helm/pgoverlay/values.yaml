@@ -355,6 +355,14 @@ ghook:
   ttl: 72h
   # Reset the branch to the source snapshot on every push (synchronize).
   resetOnPush: false
+  # Refuse to create or reset a PR branch while `source` has no masking
+  # scripts (GHOOK_REQUIRE_MASK). Anyone who can open a pull request in an
+  # allowed repository causes a branch, fork PRs included; with this on, a
+  # source that loses its masking (pgb source clear-mask) stops getting PR
+  # branches instead of quietly serving unmasked copies. Off by default only
+  # so an upgrade does not stop existing installs; turn it on unless every
+  # PR author may see the source's data unmasked.
+  requireMask: false
   # Post a schema/data diff comment on the PR after the branch is ready
   # (opt-in; requires GitHub credentials). The comment carries its own marker,
   # separate from the live connect-info comment.
