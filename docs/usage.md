@@ -103,7 +103,7 @@ volumes sit on XFS or btrfs); reads copy nothing
 own. A branch that ends up `failed` can often be brought back with its data:
 see [Troubleshooting](troubleshooting.md).
 
-Scrub PII once on the source and every branch inherits the masking:
+Register PII masking once on the source and every branch runs it:
 
 ```bash
 pgb source set-mask prod mask-pii.sql      # SQL run before a branch is ready
@@ -117,7 +117,11 @@ idempotent (a branch of a branch runs them again on already-masked data), and
 the source's `pg_hba.conf` must let the connection user in over the local
 socket without a password (see [Troubleshooting](troubleshooting.md#seeding)).
 The seed itself stays unmasked, so masking protects the branches, not the
-host they run on.
+host they run on. Masking with `UPDATE` also leaves the old values where a
+superuser, and through `pg_stats` any reader of the column, can still find
+them: end with a `VACUUM (FULL, ANALYZE)` script over the masked tables and
+connect as a role that is not a superuser
+([Security](security.md#what-masking-leaves-behind)).
 
 ## 2. A database per test
 

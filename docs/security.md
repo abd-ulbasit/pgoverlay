@@ -17,7 +17,9 @@ hostile code running inside a branch.
 
 - **The data in branches.** Every branch is a copy of the source as of its
   seed, unmasked unless the source has masking scripts
-  ([`pgb source set-mask`](usage.md#1-local-development)).
+  ([`pgb source set-mask`](usage.md#1-local-development)), and even then
+  the pre-mask values stay reachable in ways described in
+  [What masking leaves behind](#what-masking-leaves-behind).
 - **The source database.** Seeding connects to it with a replication (or
   `pg_dump`) credential that can read everything.
 - **Credentials pgoverlay holds.** API tokens, rotated branch passwords, the
@@ -134,8 +136,64 @@ own Postgres.
   anything those containers can reach, the source included. On Kubernetes
   with `networkPolicy.enabled`, branch pods may only reach cluster DNS.
 - Masking scripts run inside each new or reset branch before it is marked
-  ready, so a masked source never serves unmasked data. They run on the branch,
-  not the source: the seed volume itself holds unmasked data.
+  ready, and the router refuses a branch that is not ready, so nobody
+  reaches a branch through the router before its masking has run. They run
+  on the branch, not the source: the seed volume itself holds unmasked data,
+  and masking with `UPDATE` hides the old values from ordinary queries
+  without removing them (next section). On Kubernetes without
+  `networkPolicy.enabled`, any pod in the cluster can also connect to a
+  branch pod's own address directly, past the router, masking or not.
+
+### What masking leaves behind
+
+A masking script is SQL that runs in the branch, typically `UPDATE`s, after
+seed settle has already run `VACUUM (FREEZE, ANALYZE)` on the unmasked seed.
+An `UPDATE` writes a new row version and leaves the old one in place, so
+after masking the pre-mask values are still in the branch:
+
+| Where | Who can read it |
+|---|---|
+| Statistics from the seed's `ANALYZE`: `pg_stats.histogram_bounds` and `most_common_vals` (and `pg_stats_ext`) keep up to about 100 real values per column, e.g. sample emails | **any role with `SELECT` on the column**, until the table is analyzed again |
+| Old row versions (dead tuples) in the heap pages of masked tables, and their TOAST chunks | a superuser (`pageinspect`), or anyone who can read the files |
+| Old entries in indexes on masked columns (e.g. the `UNIQUE` index on `email`) | a superuser (`pageinspect`), or anyone who can read the files |
+| Full-page images in the branch's WAL (`pg_wal`), written by the masking `UPDATE`s | a superuser or a member of `pg_read_server_files` (`pg_read_binary_file`) |
+| The whole unmasked seed, mounted read-only at `/pgoverlay/lower0` in every overlay branch container (Docker, Kubernetes hostpath) | a superuser (`pg_read_binary_file`, `COPY ... PROGRAM`) or a member of `pg_read_server_files` / `pg_execute_server_program`: the files belong to the `postgres` user the server runs as |
+
+csi branches have no lower mount, but the other rows apply to their cloned
+volumes too. The seed itself is unmasked on the storage node (or in its PVC)
+in every backend.
+
+What to do, in this order:
+
+1. **Never give branch consumers a superuser.** Connect applications, CI and
+   people with a role that is not a superuser and is not a member of
+   `pg_read_server_files`, `pg_execute_server_program` or
+   `pg_write_server_files`. That closes every row above except the first.
+   Branches carry the source's roles. With rotated credentials, consumers
+   get the source's connection role (`pgb source add --user`, which the
+   masking scripts also run as), so that role must not be a superuser
+   either; for step 2 it then has to own the masked tables (or, from
+   Postgres 17, hold `MAINTAIN` on them).
+2. **End masking by rewriting and re-analyzing what it changed.** Add a
+   last masking script holding one statement,
+   `VACUUM (FULL, ANALYZE) customers, orders;` with your masked tables (a
+   script runs as one `psql -c` command, and `VACUUM` refuses to run inside
+   a multi-statement one, so it must be a script of its own). `VACUUM FULL`
+   rewrites each table and its indexes without the dead row versions, and
+   `ANALYZE` replaces the statistics, which closes the first row. It copies
+   the masked tables into the branch and takes a little longer to provision.
+3. **When even that is not enough**, because branch users need superuser or
+   the unmasked data must not exist on the branch host at all, mask before
+   the seed: point the source at a database that is already masked (a
+   masked replica or restore of your own), so that what pgoverlay seeds is
+   masked. Masking the seed inside pgoverlay is a proposed design,
+   [ADR-12](DESIGN-DECISIONS.md#adr-12-masking-mask-each-branch-not-the-seed).
+
+Deterministic masking (the same input always maps to the same output, so
+duplicates stay duplicates) is linkable: anyone who can guess an input can
+confirm it against the masked value unless the function is keyed, and any
+key in the masking SQL is readable by every API token, viewer included
+(`pgb source get-mask`).
 
 ### Helper containers
 
@@ -270,6 +328,9 @@ Everywhere:
       for CI and ghook, `viewer` for dashboards and connect helpers.
 - [ ] Mask the source (`pgb source set-mask`) before anyone outside the data's
       normal audience can reach a branch. Remember the seed itself is unmasked.
+- [ ] End masking with a `VACUUM (FULL, ANALYZE)` script over the masked
+      tables, and connect consumers with a role that is not a superuser
+      ([What masking leaves behind](#what-masking-leaves-behind)).
 - [ ] Turn on `--rotate-branch-credentials` whenever branches are reachable
       from beyond the machines that already hold the production password.
 - [ ] Serve the API and the router over TLS (`--api-tls-*`, `--pg-tls-*`),
@@ -320,6 +381,10 @@ On Kubernetes, additionally:
 - No rate limiting of failed API authentication.
 - Branch containers on Docker and Kubernetes hostpath hold `CAP_SYS_ADMIN`.
 - In inherit mode a branch accepts the source's passwords.
+- Masking by `UPDATE` leaves the pre-mask values in statistics, dead row
+  versions, index entries and WAL, and overlay branches mount the unmasked
+  seed; see [What masking leaves behind](#what-masking-leaves-behind) for
+  who can read each and the mitigation.
 - On Docker, the seed password is visible to `docker inspect` while the seed
   runs.
 - A rotated branch password travels in the command line of the exec that sets

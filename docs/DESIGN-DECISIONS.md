@@ -1,11 +1,14 @@
 # Design decisions (ADRs)
 
-Eleven decisions that shaped pgoverlay, each recorded in the same four parts:
+Thirteen decisions that shaped pgoverlay, each recorded in the same four parts:
 
 - **Context** — the problem and the competing pressures.
 - **Decision** — what was chosen, and where it lives in the code.
 - **Alternatives considered** — the roads not taken, and why.
 - **Consequences / trade-offs** — what this buys, and what it costs.
+
+ADR-12 and ADR-13 also carry a **Status** line, because part of each is a
+proposal rather than a decision already in the code.
 
 File paths are cited throughout so every claim is checkable against the source.
 Where the implementation ended up subtler than the original intent, these
@@ -472,3 +475,168 @@ before v1.0.0 stay eager until they are reset. Masking still runs in every
 branch and so still copies the segments it rewrites. Only linux/amd64 on one
 kernel was measured; arm64 is covered by CI, Docker Desktop, Colima and
 OrbStack are expected to work but were not measured.
+
+---
+
+## ADR-12: Masking: mask each branch, not the seed
+
+**Status.** The per-branch design is what v1 ships. The ghook guard below is
+implemented (`GHOOK_REQUIRE_MASK`). Masking the seed and a branchd-side
+require-mask policy are proposed and not implemented; this record is their
+design note.
+
+**Context.** Branches are copies of production, and masking is what makes
+them safe to hand to CI and developers. Masking scripts are SQL registered
+per source (`pgb source set-mask`) and run inside every new or reset branch
+before it is marked ready (`applyMasking` in `internal/engine/saga.go`, via
+`psql -c` over the branch's local socket as the source's connection role).
+Three things turned out to matter more than the timing:
+
+- **Residue.** A masking `UPDATE` writes new row versions and leaves the old
+  ones. The seed was already analyzed by seed settle
+  (`internal/pgctl/settle.go`), so after masking the pre-mask values are
+  still in `pg_stats` (readable by any role that can `SELECT` the column),
+  in dead tuples and index entries (`pageinspect`), in the WAL's full-page
+  images, and, on overlay backends, in the unmasked seed mounted read-only
+  at `/pgoverlay/lower0` in every branch container. The router's "not
+  ready, not served" rule says nothing about any of these.
+  [Security](security.md#what-masking-leaves-behind) lists who can read each.
+- **Nothing requires masking.** ghook branches its source for every pull
+  request, fork PRs included, masked or not; an operator token can do the
+  same through the API. Whether PR branches are masked was a checklist item.
+- **The scripts are not secret.** `GET /v1/sources/{name}/mask` is a viewer
+  route, so a key for deterministic (keyed) masking is readable by every
+  token.
+
+**Decision.** Keep masking per branch in v1, and make its limits explicit
+and checkable:
+
+- Document the residue and the mitigation: consumers never get a superuser
+  (or `pg_read_server_files` / `pg_execute_server_program`), and the last
+  masking script is a single `VACUUM (FULL, ANALYZE)` over the masked tables,
+  which drops dead tuples and old index entries from the branch and
+  replaces the statistics.
+- `GHOOK_REQUIRE_MASK` (Helm `ghook.requireMask`, `internal/ghook/service.go`
+  `checkMasked`): ghook reads the source's masking scripts before every
+  create and every reset, refuses when there are none, and fails closed when
+  it cannot read them. Off by default so that an upgrade does not stop
+  branch creation on existing installs; NOTES warn when it is off and
+  `values-production.yaml` turns it on.
+
+**Alternatives considered.**
+
+- *Mask the seed (proposed).* The settle helper already starts Postgres on
+  pgoverlay's private copy of every new seed, with no listener, before any
+  branch exists. It could run the masking scripts there, then
+  `VACUUM (FULL, ANALYZE)` the masked tables, checkpoint and switch WAL as it
+  does today, so the seed, every branch's lower layer and its statistics
+  hold masked data only. Costs: a masking change takes effect only on the
+  next `pgb source refresh`; masking needs a running server, so a source
+  with masking cannot use `--seed-settle=off`; a failing script fails the
+  seed rather than one branch; seeding takes longer; and unmasked data still
+  passes through the seed helper and can survive in the storage node's free
+  blocks (root on the node can read those anyway). `pgb diff` compares a
+  branch with its seed and would then compare masked with masked, which is
+  what a reviewer wants.
+- *Mask at the source.* Point the source at a database that is already
+  masked (a masked replica or restore). Works today without any change and
+  is the recommendation when branch users need superuser. It moves the
+  masking pipeline out of pgoverlay.
+- *Hide instead of mask.* Column privileges or row-level security on the
+  source's roles. The data stays in the files; superuser and the statistics
+  ignore them.
+- *Keep per-branch masking without documenting residue* (the v1.0.0 state).
+  The docs said a masked branch "never serves unmasked data", which was true
+  of the router only.
+
+**Proposed design and migration.**
+
+1. Registry schema v16 adds two source fields, `mask_stage` (`branch`, the
+   default, or `seed`) and `require_mask` (bool), and `GET /v1/sources`
+   reports them with a `mask_scripts` count, which viewers may see. Adding
+   fields is allowed within `/v1`.
+2. With `require_mask`, branchd refuses to create, reset or diff a branch of
+   a source that has no masking scripts (`422`), and refuses
+   `pgb source clear-mask` while it is set. This binds every client, not only
+   ghook; ghook then checks the source field instead of reading the scripts.
+3. With `mask_stage=seed`, `Settle` runs the scripts and the vacuum on the
+   seed; `set-mask` marks the source as needing a refresh, and branchd
+   reports that state until `pgb source refresh` re-seeds it.
+4. In v2, reading the script text (`GET .../mask`) becomes admin-only, so a
+   masking key is no longer readable by viewer and operator tokens; ghook and
+   the UI use the count from step 1.
+
+**Consequences / trade-offs.** v1 keeps its behaviour and its latency
+(masking stays off the seed's critical path and per-branch scripts take
+effect immediately), at the price of residue that only role hygiene and an
+extra script close. The ghook guard turns "PR branches are masked" into a
+checked property, but only for ghook, and only "has scripts", not "masks the
+right columns". Masking the seed would remove the SQL-reachable residue at
+its root; it is deferred because it changes when masking takes effect and
+needs a schema migration.
+
+---
+
+## ADR-13: Chart defaults favour the first run, and say so
+
+**Status.** Describes the v1 defaults. The production values file and the
+NOTES warnings are implemented; flipping defaults is proposed for v2.
+
+**Context.** Four defaults in `deploy/helm/pgoverlay/values.yaml` are the
+security-relevant ones, and each trades safety for a first install that
+works on any cluster:
+
+- **`storage.mode: hostpath`**. Works on any cluster, kind included, with no
+  CSI driver. Branch pods then get `CAP_SYS_ADMIN` with seccomp and AppArmor
+  unconfined (`internal/runtime/kube_podspec.go`), the namespace must allow
+  Pod Security `privileged`, and everything is pinned to one node that also
+  holds the unmasked seed. csi mode needs none of that, but needs a CSI
+  driver that can clone volumes, which most development clusters lack.
+- **`rotateBranchCredentials: false`** (inherit). A branch accepts the
+  source's passwords, so any number of branches can share one static
+  credential: what preview platforms that template one environment for every
+  deployment need (Vercel; the demo switched to inherit for exactly this).
+  It also makes every branch connection string a production credential.
+- **`networkPolicy.enabled: false`**. A policy needs a CNI that enforces it;
+  on one that does not, it silently does nothing, and turning it on by
+  default would cut off clients of existing installs.
+- **The router authenticates nothing itself** (ADR-04). It routes on the
+  database name before authentication and lets the branch's own Postgres
+  authenticate, so it never handles credentials. It can confirm that a ready
+  branch exists, and it is pre-authentication denial-of-service surface,
+  bounded by the timeouts and caps in `internal/pgproxy`.
+
+**Decision.** Keep the first-run defaults in v1, and make the secure path
+one flag away and impossible to miss:
+
+- `values-production.yaml` (csi, out-of-band Secrets, rotated credentials,
+  proxy TLS, NetworkPolicy, branch limits, a LimitRange, and
+  `ghook.requireMask`), rendered by `make helm-test` and scanned by
+  `make misconfig` so it stays valid.
+- NOTES print a warning for every risky default actually in effect
+  (plaintext proxy, inherited credentials on an exposed proxy, an open load
+  balancer, chart-rendered secrets, ghook with the admin token, without a
+  branch cap or without `requireMask`).
+- Limits that change behaviour (`limits.*`, `namespaceLimitRange`) are
+  opt-in, so an upgrade never starts refusing branches.
+
+**Alternatives considered.**
+
+- *Secure by default* (csi, rotation, NetworkPolicy on). The chart would
+  fail on kind and on most laptops' clusters at the first install, the
+  quickstart would need a CSI driver, and static-environment previews would
+  break on upgrade. Rejected for v1; partly proposed for v2 below.
+- *A separate `values-dev.yaml` with secure defaults in `values.yaml`*. The
+  same compatibility break for existing installs, which upgrade with the
+  chart's defaults.
+- *Router-side authentication* to close the existence oracle: the router
+  would need branch credentials, which rotation keeps only encrypted in the
+  registry; on the roadmap ([Security](security.md#known-limitations)).
+
+**Consequences / trade-offs.** A copied quickstart is the insecure path, and
+the NOTES are the only thing that says so at install time. In exchange the
+default install works everywhere and existing installs keep working. For
+v2, flip `rotateBranchCredentials` to `true` (static-environment previews
+then opt back in) and `ghook.requireMask` to `true`; leave the storage mode,
+which depends on what the cluster can do.
+
