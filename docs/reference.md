@@ -70,7 +70,7 @@ mode: the age past which a `creating` or `resetting` row counts as abandoned.
 | `--pg-version` | `17` | the source's major, `14` to `18`. For `basebackup` it must equal the source's major (a mismatch fails the seed with the right version in the message); for `dump` it must be at least the source's major |
 | `--via` | `basebackup` | `basebackup` (physical) or `dump` (logical, for managed Postgres) |
 | `--dump-schema` | whole database | schema to dump, repeatable (`--via dump` only) |
-| `--image` | `postgres:<pg-version>` | image for the seed helpers and every branch; must carry the source's extensions, locales and libc, e.g. `postgis/postgis:17-3.5` or `pgvector/pgvector:pg17` |
+| `--image` | `postgres:<pg-version>` | image for the seed helpers and every branch; must carry the source's extensions, locales and libc, e.g. `postgis/postgis:17-3.5` or `pgvector/pgvector:pg17`. A reference with a digest (`postgres:17@sha256:…`) pins it; the default follows the Docker Hub tag ([Security](security.md#branch-instances)) |
 | `--network` | | Docker network the source is reachable on |
 | `--password-env` | `PGPASSWORD` | environment variable holding the source password |
 | `--no-password` | | connect without a password (trust, peer or certificate auth); exclusive with `--password-env` |

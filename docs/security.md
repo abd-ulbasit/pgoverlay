@@ -99,6 +99,18 @@ own Postgres.
   requests contain it.
 - On Docker, branch ports are published on `127.0.0.1` of the Docker host
   only. Reach them through the router from anywhere else.
+- **The image is pulled by tag unless you pin it.** Branches and seed
+  helpers run the source's `--image`, by default `postgres:<pg_version>`
+  from Docker Hub. Following the tag is deliberate: Postgres minor releases
+  and base-image fixes reach new branches without a pgoverlay release, and
+  the weekly `pg-import-audit` CI job checks what the tags currently point
+  at. The cost is that whoever controls the tag, or a pull-through mirror,
+  decides what code runs against a copy of production, as root in the
+  entrypoint and, on overlay backends, with `CAP_SYS_ADMIN`. To pin it,
+  register the source with a digest
+  (`pgb source add ... --image postgres:17@sha256:<digest>`) and move it
+  deliberately; `pgb source add` accepts any reference with a digest. The
+  utility helper image is pinned by digest in the code.
 - **Privileges depend on the backend.**
 
     | Runtime / backend | Branch container |

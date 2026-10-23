@@ -149,6 +149,19 @@ write-class libc function they import is interposed by the shim or on a
 reviewed list, since a write the shim does not see would hit a read-only file
 descriptor.
 
+## What the automated checks cover, and what they do not
+
+| Layer | Check | Catches | Does not catch |
+|---|---|---|---|
+| Go code in `pgb`, `branchd`, `pgoverlay-github` | `vuln` (govulncheck, binary mode), every push, PR, release and weekly | known advisories in code reachable from the binaries, standard library included | advisories in unreachable code (deliberately), anything not yet in the Go vulnerability database |
+| The two release images | release `images` job (Trivy, before push) | HIGH and CRITICAL vulnerabilities with a fix in their Alpine packages | unfixed and lower-severity ones; anything published after the release (images are scanned when built, so a later CVE waits for the next release) |
+| Images branchd runs: `postgres:<major>` or a source's `--image`, a mirrored helper image | nothing in this repository | | everything: they are the operator's choice; scan and pin them where they are mirrored ([docs/security.md](docs/security.md#branch-instances)) |
+| Secrets in commits | `secrets` (gitleaks, full history) | provider tokens, private keys, high-entropy assignments | low-entropy passwords, and secrets outside git: CI logs, Helm release history, container environments |
+| Helm chart and Terraform | `iac` (`trivy config`, rendered chart and Terraform), `helm-test`, `tf-test` | known misconfiguration patterns at HIGH and CRITICAL, the chart's hardening fields, invalid Terraform inputs | the branch and helper pods branchd builds at runtime in Go (covered by unit tests in `internal/runtime` and `internal/deploy`), and anything about a live cluster or account |
+| Committed C binaries | `lazyrw` (byte-for-byte rebuild), `pg-import-audit` | any difference from the source; write paths the shim does not interpose | a compromised toolchain image (pinned by digest; the glibc one is Debian 11, past its LTS) |
+| Release integrity | checksums, provenance and cosign signatures | tampering after the build, and where an artifact came from | a bad change merged to `main` or a tag pushed by someone with write access: that is branch protection, tag rules and the `release` environment's reviewers, which are repository settings |
+| Data in branches | nothing automated | | whether masking covers every sensitive column, and what masking leaves behind ([docs/security.md](docs/security.md#what-masking-leaves-behind)) |
+
 ## Accepted advisories
 
 The allowlist names individual advisory IDs, never a whole module, so a new

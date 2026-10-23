@@ -165,7 +165,9 @@ digest, so verify the digest first and pin the one you verified
 branchd itself starts two more kinds of image at runtime:
 
 - **postgres:&lt;major&gt;** for branch pods and the seeding helpers, following
-  each source's `pg_version`.
+  each source's `pg_version`, by tag. To pin it, register the source with
+  `--image postgres:<major>@sha256:<digest>` ([why it is a tag by
+  default](security.md#branch-instances)).
 - **the utility helper image** for file-level helper pods (seed-volume prep,
   entrypoint installs, disk usage, hostPath volume copies). It defaults to
   alpine **pinned by digest** — the same base the pgoverlay images build on
