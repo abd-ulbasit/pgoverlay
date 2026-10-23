@@ -18,9 +18,11 @@ Added:
   `values-production.yaml`, a commented starting point for shared clusters.
 - `GHOOK_REQUIRE_MASK`: ghook refuses to create or reset a pull request's
   branch while its source has no masking scripts (fails closed).
-- Release images are scanned with Trivy before they are pushed, signed with
-  cosign (keyless) and get a provenance attestation in the registry; the
-  publishing jobs run in the `release` environment.
+- Releases: both images are scanned with Trivy before anything (binaries or
+  images) is published; images are signed with cosign (keyless) and get a
+  provenance attestation in the registry; the publishing jobs run in the
+  `release` environment, whose protection rules still have to be set up
+  (SECURITY.md, "Release integrity").
 - CI: a gitleaks secret scan over the full history, and `trivy config` over
   the chart and the Terraform with a reviewed, expiring exceptions file.
 - Terraform (the EKS demo): pinned Terraform, module and providers (the lock

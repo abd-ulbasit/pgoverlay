@@ -65,9 +65,10 @@ commit, after the full CI suite passes at that commit:
   `ghcr.io/abd-ulbasit/pgoverlay-ghook` are multi-arch (linux/amd64,
   linux/arm64), tagged with the release tag, and carry an SBOM and build
   provenance. Their base images are pinned by digest. Before anything is
-  pushed, each platform's image is scanned with Trivy, and the release stops
-  on a HIGH or CRITICAL vulnerability in an OS package that has a fix (Go
-  code is gated by `govulncheck`, below). Once pushed, each image is signed
+  published, binaries or images, the `scan` job builds each image for each
+  platform and scans it with Trivy, and the release stops on a HIGH or
+  CRITICAL vulnerability in an OS package that has a fix (Go code is gated
+  by `govulncheck`, below). Once pushed, each image is signed
   with cosign (keyless, through GitHub's OIDC identity) and gets a SLSA
   provenance attestation stored in the registry next to it, both bound to
   the digest. Verify an image, then pin the verified digest (the Helm
@@ -85,11 +86,20 @@ commit, after the full CI suite passes at that commit:
   Images published before this was added (v1.0.0 and earlier) are not
   signed and have no registry attestation.
 
-Every publishing job runs in the `release` GitHub environment. Its protection
-rules (a required reviewer, and a deployment rule that admits only `v*`
-tags) are what stand between a pushed tag and a published release, together
-with tag protection on `v*`: anyone who can push a tag the rules admit can
-otherwise publish, and move `v1`.
+Every publishing job runs in the `release` GitHub environment, so that the
+environment's protection rules, not only who can push a tag, decide whether
+a release ships. **Those rules are repository settings and are not
+configured yet.** Until they are, GitHub creates `release` with no rules on
+the first tag push, and anyone who can push a `v*` tag can publish a release
+and move `v1`. The owner needs to:
+
+- create the `release` environment with a required reviewer and a
+  deployment-tag rule that admits only `v*` tags;
+- add a tag ruleset for `v*.*.*` that limits who can create those tags and
+  blocks updating and deleting them (`v1` itself must stay movable by the
+  release workflow, so it is not in the pattern);
+- then do a dry run with an `-rc` tag: the scan, signing, attestation and
+  environment steps have not run in a real release yet.
 
 ## Supply-chain scanning
 
@@ -155,12 +165,12 @@ descriptor.
 | Layer | Check | Catches | Does not catch |
 |---|---|---|---|
 | Go code in `pgb`, `branchd`, `pgoverlay-github` | `vuln` (govulncheck, binary mode), every push, PR, release and weekly | known advisories in code reachable from the binaries, standard library included | advisories in unreachable code (deliberately), anything not yet in the Go vulnerability database |
-| The two release images | release `images` job (Trivy, before push) | HIGH and CRITICAL vulnerabilities with a fix in their Alpine packages | unfixed and lower-severity ones; anything published after the release (images are scanned when built, so a later CVE waits for the next release) |
+| The two release images | release `scan` job (Trivy, before anything is published) | HIGH and CRITICAL vulnerabilities with a fix in their Alpine packages | unfixed and lower-severity ones; anything published after the release (images are scanned when built, so a later CVE waits for the next release) |
 | Images branchd runs: `postgres:<major>` or a source's `--image`, a mirrored helper image | nothing in this repository | | everything: they are the operator's choice; scan and pin them where they are mirrored ([docs/security.md](docs/security.md#branch-instances)) |
 | Secrets in commits | `secrets` (gitleaks, full history) | provider tokens, private keys, high-entropy assignments | low-entropy passwords, and secrets outside git: CI logs, Helm release history, container environments |
 | Helm chart and Terraform | `iac` (`trivy config`, rendered chart and Terraform), `helm-test`, `tf-test` | known misconfiguration patterns at HIGH and CRITICAL, the chart's hardening fields, invalid Terraform inputs | the branch and helper pods branchd builds at runtime in Go (covered by unit tests in `internal/runtime` and `internal/deploy`), and anything about a live cluster or account |
 | Committed C binaries | `lazyrw` (byte-for-byte rebuild), `pg-import-audit` | any difference from the source; write paths the shim does not interpose | a compromised toolchain image (pinned by digest; the glibc one is Debian 11, past its LTS) |
-| Release integrity | checksums, provenance and cosign signatures | tampering after the build, and where an artifact came from | a bad change merged to `main` or a tag pushed by someone with write access: that is branch protection, tag rules and the `release` environment's reviewers, which are repository settings |
+| Release integrity | checksums, provenance and cosign signatures | tampering after the build, and where an artifact came from | a bad change merged to `main` or a tag pushed by someone with write access: that is branch protection, tag rules and the `release` environment's reviewers, which are repository settings (the last two not configured yet) |
 | Data in branches | nothing automated | | whether masking covers every sensitive column, and what masking leaves behind ([docs/security.md](docs/security.md#what-masking-leaves-behind)) |
 
 ## Accepted advisories
