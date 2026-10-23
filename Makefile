@@ -1,4 +1,4 @@
-.PHONY: build test it k8s-it csi-it matrix lint vuln vuln-test check-toolchain docker-build docker-build-ghook helm-test js-sdk-test release-check lazyrw lazyrw-check lazyrw-test pg-import-audit
+.PHONY: build test it k8s-it csi-it matrix lint vuln vuln-test secrets misconfig tf-test check-toolchain docker-build docker-build-ghook helm-test js-sdk-test release-check lazyrw lazyrw-check lazyrw-test pg-import-audit
 
 # Build identity stamped into every binary (`pgb version`, `branchd -version`,
 # `pgoverlay-github -version`). Override for release builds, e.g.
@@ -82,6 +82,31 @@ vuln:
 # through its pass, fail and fail-closed paths.
 vuln-test:
 	hack/vulncheck_test.sh
+
+# Secrets in the git history: gitleaks with the default rules and the narrow
+# test-placeholder allowlist in .gitleaks.toml. CI's `secrets` job runs this
+# (it installs a pinned, checksum-verified gitleaks first).
+secrets:
+	gitleaks git --redact --no-banner --exit-code 1 --config .gitleaks.toml .
+
+# Misconfiguration scan of the Helm chart (default and production values)
+# and the EKS Terraform, HIGH and CRITICAL. Accepted findings, each with a
+# reason and an expiry, are in .trivyignore.yaml. CI's `misconfig` job runs
+# this. Trivy fetches its checks at run time, so a new check can fail a run
+# with no commit here, which is the point of the weekly schedule.
+TRIVY_CONFIG = trivy config --quiet --severity HIGH,CRITICAL --exit-code 1 --ignorefile .trivyignore.yaml
+misconfig:
+	$(TRIVY_CONFIG) --helm-set node=ci-node,token=ci-placeholder-token deploy/helm/pgoverlay
+	$(TRIVY_CONFIG) --helm-values deploy/helm/pgoverlay/values-production.yaml \
+	  --helm-set storage.storageClass=ci-class deploy/helm/pgoverlay
+	$(TRIVY_CONFIG) --skip-dirs deploy/terraform/eks/.terraform deploy/terraform/eks
+
+# The EKS Terraform, offline: format, validate, and the mocked-provider tests
+# in deploy/terraform/eks/tests (no AWS credentials, no AWS API calls).
+tf-test:
+	cd deploy/terraform/eks && terraform fmt -check -recursive && \
+	  terraform init -backend=false -input=false >/dev/null && \
+	  terraform validate && terraform test
 
 # Asserts the Dockerfiles' golang base image matches go.mod's `go` directive,
 # and that the goreleaser release-check builds needs no newer Go (and matches

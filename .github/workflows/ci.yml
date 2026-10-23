@@ -26,7 +26,7 @@ concurrency:
 # and their version comments current). Downloaded tools are pinned to a
 # version and, where they are not installed by a pinned action, a sha256.
 #
-# unit/vuln/js/images/integration/helm are fast. The `kube` job stands up a
+# unit/vuln/secrets/iac/js/images/integration/helm are fast. The `kube` job stands up a
 # kind cluster and runs the Kubernetes + HA-failover suites (CSI best-effort).
 # `pg-matrix` runs the Postgres 14-18 version matrix on the weekly schedule
 # (and on demand). `lazyrw`, `pg-import-audit` and `integration-arm64` guard
@@ -80,6 +80,64 @@ jobs:
         run: make vuln-test
       - name: govulncheck (binary mode, per-advisory allowlist)
         run: make vuln
+
+  # Secrets anywhere in the history (make secrets): gitleaks' default rules,
+  # so generic API keys, private keys and high-entropy assignments (a
+  # PGOVERLAY_TOKEN, a webhook secret) are caught, not only the provider token
+  # formats GitHub's secret scanning knows. Test placeholders are allowlisted
+  # narrowly in .gitleaks.toml. Installed from the release tarball and checked
+  # against the sha256 written here; bump version and checksum together.
+  secrets:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # every commit: a secret deleted later is still published
+          persist-credentials: false
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          tgz="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL -o "$tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "$tgz" | sha256sum --check --strict
+          tar -xzf "$tgz" -C "$RUNNER_TEMP" gitleaks
+          sudo mv "$RUNNER_TEMP/gitleaks" /usr/local/bin/gitleaks
+      - run: make secrets
+
+  # Misconfiguration scan of the Helm chart (default and production values)
+  # and the EKS Terraform (make misconfig; accepted findings, with reasons and
+  # expiry dates, in .trivyignore.yaml), and the Terraform's offline checks
+  # (make tf-test: fmt, validate, and tests against a mocked AWS provider, so
+  # no credentials). Weekly too: trivy fetches its checks at run time, so a
+  # new check can fail with no commit here. trivy is installed as in
+  # release.yml (keep the two pins in step), not through trivy-action.
+  iac:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.14.8
+          terraform_wrapper: false
+      - name: Install trivy
+        env:
+          TRIVY_VERSION: 0.76.1
+          TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+        run: |
+          tgz="$RUNNER_TEMP/trivy.tar.gz"
+          curl -fsSL -o "$tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          printf '%s  %s\n' "$TRIVY_SHA256" "$tgz" | sha256sum --check --strict
+          tar -xzf "$tgz" -C "$RUNNER_TEMP" trivy
+          sudo mv "$RUNNER_TEMP/trivy" /usr/local/bin/trivy
+      - run: make misconfig
+      - run: make tf-test
 
   js:
     if: github.event_name != 'schedule'

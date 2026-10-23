@@ -118,6 +118,21 @@ The build toolchain is pinned by the `go` directive in `go.mod`, and
 bumping it is how standard-library advisories are cleared. The full unit suite
 also runs under the Go race detector.
 
+Two more gates run on every pull request and push, and the second weekly:
+
+- **Secrets** (the `secrets` job, `make secrets`): gitleaks over the whole git
+  history with its default rules, which include generic API keys, private
+  keys and high-entropy assignments, not only the provider token formats
+  GitHub's secret scanning recognises. Test placeholders are allowlisted in
+  [`.gitleaks.toml`](.gitleaks.toml), each by path and pattern together.
+- **Misconfiguration** (the `iac` job, `make misconfig` and `make tf-test`):
+  `trivy config` over the Helm chart, rendered with the default and the
+  production values, and over the EKS Terraform, failing on HIGH and
+  CRITICAL; accepted findings, each with a reason and an expiry, are in
+  [`.trivyignore.yaml`](.trivyignore.yaml). The Terraform is also
+  format-checked, validated and tested offline against a mocked AWS
+  provider.
+
 **Committed binaries.** Two small C programs ship prebuilt so that
 `go install` needs no C toolchain: the lazyrw `LD_PRELOAD` shim
 (`internal/cow/lazyrw/dist`, four builds: glibc and musl, x86_64 and aarch64)
