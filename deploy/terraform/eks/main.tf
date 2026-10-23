@@ -1,12 +1,20 @@
 # Minimal single-node EKS cluster for running the pgoverlay stack
 # (branchd + ghook + prod postgres + branch pods, hostpath storage mode).
 #
-#   terraform init && terraform apply
+#   terraform init
+#   terraform apply \
+#     -var 'budget_alert_emails=["you@example.com"]' \
+#     -var 'cluster_endpoint_public_access_cidrs=["203.0.113.7/32"]'
 #   aws eks update-kubeconfig --name pgoverlay --region ap-south-1
 #
+# Without cluster_endpoint_public_access_cidrs the API endpoint is private
+# (reachable from inside the VPC only).
+#
 # Cost while running: EKS control plane (~$0.10/h) + 1× t3.large (~$0.09/h)
-# + NLBs for the proxy/webhook services. `terraform destroy` removes it all
-# (delete the LoadBalancer Services first so the NLBs go away).
+# + the Classic ELBs Kubernetes creates for the proxy/webhook Services.
+# `terraform destroy` removes only what this state holds: delete the
+# LoadBalancer Services (and, in csi mode, the PVCs) first, then check for
+# leftovers as docs/eks.md "Teardown" shows.
 
 terraform {
   # 1.11 is the floor for S3-native state locking (use_lockfile, see the
@@ -76,8 +84,66 @@ variable "cluster_version" {
   }
 }
 
+# The Kubernetes API endpoint is public only for these CIDRs. The default,
+# none, makes it private-only: reachable from inside the VPC (the node, a
+# bastion, a VPN into the VPC) and not from the internet. Give your own
+# egress address as a /32 to run kubectl from a laptop. 0.0.0.0/0 is refused:
+# the endpoint authenticates, but an internet-wide endpoint is exposed to
+# every pre-auth bug and credential-stuffing attempt there is.
+variable "cluster_endpoint_public_access_cidrs" {
+  description = "CIDRs allowed to reach the public EKS API endpoint; empty (the default) keeps the endpoint private."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for c in var.cluster_endpoint_public_access_cidrs :
+      can(cidrhost(c, 0)) && !endswith(c, "/0")
+    ])
+    error_message = "cluster_endpoint_public_access_cidrs must be valid CIDRs and none may be /0 (the whole internet)."
+  }
+}
+
+variable "monthly_budget_usd" {
+  description = "Monthly AWS cost (USD, whole account) above which the budget alerts."
+  type        = number
+  default     = 50
+
+  validation {
+    condition     = var.monthly_budget_usd > 0
+    error_message = "monthly_budget_usd must be greater than 0."
+  }
+}
+
+# Required, with no default: a cluster nobody is told about is how a demo
+# keeps billing for months.
+variable "budget_alert_emails" {
+  description = "Email addresses AWS Budgets notifies at 80% of actual and 100% of forecast monthly spend."
+  type        = list(string)
+
+  validation {
+    condition = length(var.budget_alert_emails) > 0 && alltrue([
+      for e in var.budget_alert_emails : can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", e))
+    ])
+    error_message = "budget_alert_emails needs at least one email address."
+  }
+}
+
 provider "aws" {
   region = var.region
+
+  # Every resource Terraform creates says who owns it and where it is
+  # defined, budget included. The load balancers and security groups that
+  # Kubernetes creates for LoadBalancer Services are not Terraform's and do
+  # not get these: they carry kubernetes.io/cluster/<cluster_name> instead
+  # (docs/eks.md, Teardown, finds them by that tag).
+  default_tags {
+    tags = {
+      project    = "pgoverlay-demo"
+      managed-by = "terraform"
+      repository = "github.com/abd-ulbasit/pgoverlay"
+    }
+  }
 }
 
 # Default VPC + its subnets: this is throwaway demo infra; a real deployment
@@ -102,7 +168,13 @@ module "eks" {
   cluster_name    = var.cluster_name
   cluster_version = var.cluster_version
 
-  cluster_endpoint_public_access           = true
+  cluster_endpoint_private_access      = true
+  cluster_endpoint_public_access       = length(var.cluster_endpoint_public_access_cidrs) > 0
+  cluster_endpoint_public_access_cidrs = var.cluster_endpoint_public_access_cidrs
+
+  # The identity that runs `apply` gets cluster-admin through an EKS access
+  # entry. Fine for a single-operator demo; a shared cluster should list its
+  # admins in access_entries instead.
   enable_cluster_creator_admin_permissions = true
 
   vpc_id     = data.aws_vpc.default.id
@@ -112,15 +184,50 @@ module "eks" {
     main = {
       # one node: pgoverlay hostpath mode pins all data here anyway
       instance_types = ["t3.large"]
-      min_size       = 1
-      max_size       = 1
-      desired_size   = 1
-      disk_size      = 50
+      # Amazon Linux 2023, whose root filesystem is XFS with reflink, so the
+      # node kernel is a security dependency of hostpath mode
+      # (docs/security.md, CVE-2026-64600). The node group takes the newest
+      # AMI release when it is created and on each version upgrade; between
+      # those, roll it with `aws eks update-nodegroup-version`.
+      ami_type     = "AL2023_x86_64_STANDARD"
+      min_size     = 1
+      max_size     = 1
+      desired_size = 1
+      disk_size    = 50
     }
   }
 
   tags = {
     project = "pgoverlay-demo"
+  }
+}
+
+# Whole-account on purpose: what outlives a `terraform destroy` here (the
+# ELBs and security groups Kubernetes created, EBS volumes from csi PVCs) is
+# outside this state and untagged by it, so a budget filtered on this
+# project's tags would miss exactly the spend that matters. On an account
+# that runs other things, raise the limit or filter it in the console.
+resource "aws_budgets_budget" "monthly" {
+  name         = "${var.cluster_name}-account-monthly"
+  budget_type  = "COST"
+  limit_amount = tostring(var.monthly_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 80
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "ACTUAL"
+    subscriber_email_addresses = var.budget_alert_emails
+  }
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_email_addresses = var.budget_alert_emails
   }
 }
 

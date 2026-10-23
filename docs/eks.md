@@ -22,16 +22,43 @@ sources) dump-based seeding. In-cluster, all of that disappears:
 ## Provision
 
 `deploy/terraform/eks` holds a minimal single-node cluster (default VPC,
-one `t3.large`, managed node group):
+one `t3.large`, managed node group). Two inputs have no safe default and
+are asked for: who gets the budget alerts, and, optionally, which addresses
+may reach the Kubernetes API. Without
+`cluster_endpoint_public_access_cidrs` the API endpoint is private, so
+`kubectl` works only from inside the VPC; give your own egress address as a
+`/32` to run it from a laptop (`0.0.0.0/0` is refused):
 
 ```bash
 cd deploy/terraform/eks
-terraform init && terraform apply
+terraform init
+terraform plan -out tfplan \
+  -var 'budget_alert_emails=["you@example.com"]' \
+  -var "cluster_endpoint_public_access_cidrs=[\"$(curl -fsS https://checkip.amazonaws.com)/32\"]"
+terraform apply tfplan
 aws eks update-kubeconfig --name pgoverlay --region ap-south-1
 ```
 
+The provider and Terraform versions are pinned (`.terraform.lock.hcl` is
+committed). State is local: this is a single-operator demo, and the
+`backend` comment in `main.tf` shows the S3 set-up (with `use_lockfile`) to
+use for anything shared. `make tf-test` checks the configuration offline.
+
+**What is not in Terraform.** Only the cluster and the budget are. The Helm
+release, the GHCR pull secret, cert-manager and the Secrets below are applied
+by hand from this page, and the load balancers and their security groups are
+created by Kubernetes for the `LoadBalancer` Services; none of it is in the
+state, so neither `plan` nor `destroy` sees it (see [Teardown](#teardown)).
+A deployment that has to be reproducible would manage the Helm release with
+Terraform's `helm` provider or a GitOps controller, in separate staging and
+production roots with remote state.
+
 **Cost while running:** control plane ~$0.10/h, node ~$0.09/h, plus ~$0.03/h
-per LoadBalancer Service (two here). Mind the Kubernetes version: clusters
+per LoadBalancer Service (two here). An AWS Budgets alert
+(`monthly_budget_usd`, default 50 USD) mails `budget_alert_emails` at 80% of
+actual and 100% of forecast monthly spend. It covers the whole account on
+purpose: what outlives a teardown (load balancers, EBS volumes) is exactly
+what a budget filtered on this project's tags would miss. Mind the Kubernetes version: clusters
 on versions past their standard-support window are billed AWS *extended
 support* (~6× the control-plane rate). Check what's current:
 
@@ -241,8 +268,30 @@ branchd is not pinned, so it comes back on a new node by itself.
 
 ```bash
 kubectl -n pgoverlay delete svc pgoverlay-proxy pgoverlay-ghook   # release the ELBs
-terraform -chdir=deploy/terraform/eks destroy
+kubectl -n pgoverlay delete pvc --all                              # csi mode: release the EBS volumes
+terraform -chdir=deploy/terraform/eks destroy \
+  -var 'budget_alert_emails=["you@example.com"]'
 ```
+
+`destroy` removes only what is in the state. Check that nothing Kubernetes
+created outlived it: the in-tree cloud provider tags the load balancers and
+security groups it creates, and the EBS CSI driver its volumes, with the
+cluster name.
+
+```bash
+aws resourcegroupstaggingapi get-resources --region ap-south-1 \
+  --tag-filters Key=kubernetes.io/cluster/pgoverlay \
+  --query 'ResourceTagMappingList[].ResourceARN'
+aws ec2 describe-volumes --region ap-south-1 \
+  --filters Name=tag-key,Values=kubernetes.io/cluster/pgoverlay \
+  --query 'Volumes[].VolumeId'
+```
+
+Both should print `[]`. Then remove what pointed at the cluster from
+outside: the GitHub webhook to the ghook load balancer, CI variables and
+secrets holding its addresses or tokens, and preview-platform environment
+variables. Destroying the budget with the cluster is deliberate; keep an
+account-level budget of your own.
 
 ## What deploying here taught us (three real bugs)
 
