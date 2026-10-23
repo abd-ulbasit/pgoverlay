@@ -493,9 +493,10 @@ before it is marked ready (`applyMasking` in `internal/engine/saga.go`, via
 Three things turned out to matter more than the timing:
 
 - **Residue.** A masking `UPDATE` writes new row versions and leaves the old
-  ones. The seed was already analyzed by seed settle
-  (`internal/pgctl/settle.go`), so after masking the pre-mask values are
-  still in `pg_stats` (readable by any role that can `SELECT` the column),
+  ones. The seed's statistics come from unmasked data (a basebackup seed
+  copies the source's own, and seed settle in `internal/pgctl/settle.go`
+  re-analyzes), so after masking the pre-mask values are still in
+  `pg_stats` (readable by any role that can `SELECT` the column),
   in dead tuples and index entries (`pageinspect`), in the WAL's full-page
   images, and, on overlay backends, in the unmasked seed mounted read-only
   at `/pgoverlay/lower0` in every branch container. The router's "not
@@ -512,7 +513,8 @@ Three things turned out to matter more than the timing:
 and checkable:
 
 - Document the residue and the mitigation: consumers never get a superuser
-  (or `pg_read_server_files` / `pg_execute_server_program`), and the last
+  (or `pg_read_server_files` / `pg_execute_server_program`, or `EXECUTE` on
+  the server file functions such as `pg_read_binary_file`), and the last
   masking script is a single `VACUUM (FULL, ANALYZE)` over the masked tables,
   which drops dead tuples and old index entries from the branch and
   replaces the statistics.

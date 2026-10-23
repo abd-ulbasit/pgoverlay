@@ -158,18 +158,20 @@ own Postgres.
 
 ### What masking leaves behind
 
-A masking script is SQL that runs in the branch, typically `UPDATE`s, after
-seed settle has already run `VACUUM (FREEZE, ANALYZE)` on the unmasked seed.
-An `UPDATE` writes a new row version and leaves the old one in place, so
-after masking the pre-mask values are still in the branch:
+A masking script is SQL that runs in the branch, typically `UPDATE`s, on a
+seed made from unmasked data: a `--via basebackup` seed is a physical copy
+that brings the source's own planner statistics with it, and seed settle
+(`freeze`, the default) then runs `VACUUM (FREEZE, ANALYZE)` on it. An
+`UPDATE` writes a new row version and leaves the old one in place, so after
+masking the pre-mask values are still in the branch:
 
 | Where | Who can read it |
 |---|---|
-| Statistics from the seed's `ANALYZE`: `pg_stats.histogram_bounds` and `most_common_vals` (and `pg_stats_ext`) keep up to about 100 real values per column, e.g. sample emails | **any role with `SELECT` on the column**, until the table is analyzed again |
+| Planner statistics: `pg_stats.histogram_bounds` and `most_common_vals` (and `pg_stats_ext`) keep up to about 100 real values per column, e.g. sample emails. A basebackup seed carries the source's own statistics whatever `--seed-settle` is, `off` included; settle's `ANALYZE` replaces them with new ones, also from unmasked data | **any role with `SELECT` on the column**, until the table is analyzed again |
 | Old row versions (dead tuples) in the heap pages of masked tables, and their TOAST chunks | a superuser (`pageinspect`), or anyone who can read the files |
 | Old entries in indexes on masked columns (e.g. the `UNIQUE` index on `email`) | a superuser (`pageinspect`), or anyone who can read the files |
-| Full-page images in the branch's WAL (`pg_wal`), written by the masking `UPDATE`s | a superuser or a member of `pg_read_server_files` (`pg_read_binary_file`) |
-| The whole unmasked seed, mounted read-only at `/pgoverlay/lower0` in every overlay branch container (Docker, Kubernetes hostpath) | a superuser (`pg_read_binary_file`, `COPY ... PROGRAM`) or a member of `pg_read_server_files` / `pg_execute_server_program`: the files belong to the `postgres` user the server runs as |
+| Full-page images in the branch's WAL (`pg_wal`), written by the masking `UPDATE`s | a superuser, or any role granted `EXECUTE` on `pg_read_binary_file` (superuser-only unless granted; `pg_wal` is inside the data directory, so no predefined role is needed on top) |
+| The whole unmasked seed, mounted read-only at `/pgoverlay/lower0` in every overlay branch container (Docker, Kubernetes hostpath) | a superuser; a member of `pg_execute_server_program` (`COPY ... FROM PROGRAM`); a member of `pg_read_server_files`, which lifts the data-directory restriction for `COPY ... FROM` a file and, with `EXECUTE` on `pg_read_binary_file`, for that function too. The files belong to the `postgres` user the server runs as |
 
 csi branches have no lower mount, but the other rows apply to their cloned
 volumes too. The seed itself is unmasked on the storage node (or in its PVC)
@@ -178,9 +180,13 @@ in every backend.
 What to do, in this order:
 
 1. **Never give branch consumers a superuser.** Connect applications, CI and
-   people with a role that is not a superuser and is not a member of
+   people with a role that is not a superuser, is not a member of
    `pg_read_server_files`, `pg_execute_server_program` or
-   `pg_write_server_files`. That closes every row above except the first.
+   `pg_write_server_files`, and has not been granted `EXECUTE` on
+   `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir` or `pg_stat_file`
+   (all superuser-only unless granted; check with
+   `\df+ pg_read_binary_file` or `has_function_privilege`). That closes
+   every row above except the first.
    Branches carry the source's roles. With rotated credentials, consumers
    get the source's connection role (`pgb source add --user`, which the
    masking scripts also run as), so that role must not be a superuser

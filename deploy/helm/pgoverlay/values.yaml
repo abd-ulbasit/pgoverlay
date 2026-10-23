@@ -211,7 +211,9 @@ limits:
 # in the namespace that sets none itself, branchd and ghook included while
 # their resources are empty, so use it in a namespace dedicated to pgoverlay.
 # Off by default because a memory limit changes failure mode: a branch over
-# it is OOM-killed instead of slowing down.
+# it is OOM-killed instead of slowing down. A basebackup-seeded branch runs
+# the source's postgresql.conf, so default.memory has to cover the source's
+# shared_buffers plus work_mem headroom.
 namespaceLimitRange:
   enabled: false
   defaultRequest:
