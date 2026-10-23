@@ -36,21 +36,17 @@ mock_provider "aws" {
   }
 }
 
-variables {
-  budget_alert_emails = ["owner@example.com"]
-}
-
-run "defaults_plan_with_a_budget" {
+run "defaults_plan_a_private_endpoint" {
   command = plan
 
   assert {
-    condition     = aws_budgets_budget.monthly.limit_amount == "50"
-    error_message = "the default monthly budget should be 50 USD"
+    condition     = output.cluster_endpoint_public == false
+    error_message = "with no CIDRs the API endpoint should be private"
   }
 
   assert {
-    condition     = length(var.cluster_endpoint_public_access_cidrs) == 0
-    error_message = "the API endpoint should be private unless CIDRs are given"
+    condition     = output.node_root_volume.volume_size == 50 && output.node_root_volume.encrypted
+    error_message = "the node's root volume should be 50 GiB and encrypted"
   }
 }
 
@@ -59,6 +55,11 @@ run "endpoint_open_to_one_address" {
 
   variables {
     cluster_endpoint_public_access_cidrs = ["203.0.113.7/32"]
+  }
+
+  assert {
+    condition     = output.cluster_endpoint_public == true
+    error_message = "with a CIDR the API endpoint should be public"
   }
 }
 
@@ -80,14 +81,4 @@ run "malformed_cidr_is_refused" {
   }
 
   expect_failures = [var.cluster_endpoint_public_access_cidrs]
-}
-
-run "budget_needs_a_recipient" {
-  command = plan
-
-  variables {
-    budget_alert_emails = []
-  }
-
-  expect_failures = [var.budget_alert_emails]
 }

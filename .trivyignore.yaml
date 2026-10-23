@@ -1,5 +1,5 @@
 # Accepted misconfiguration findings for the `misconfig` CI job
-# (`trivy config` over the Helm chart and the EKS Terraform). The same rules
+# (`trivy config` over the Helm chart and the Terraform). The same rules
 # as hack/vuln-allowlist.txt: one check per entry, scoped to the file it is
 # reported in, a reason, and an expiry after which the job fails again until
 # someone re-reviews the entry. Targets are relative to the scanned directory.

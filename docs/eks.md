@@ -21,28 +21,54 @@ sources) dump-based seeding. In-cluster, all of that disappears:
 
 ## Provision
 
-`deploy/terraform/eks` holds a minimal single-node cluster (default VPC,
-one `t3.large`, managed node group). Two inputs have no safe default and
-are asked for: who gets the budget alerts, and, optionally, which addresses
-may reach the Kubernetes API. Without
-`cluster_endpoint_public_access_cidrs` the API endpoint is private, so
-`kubectl` works only from inside the VPC; give your own egress address as a
-`/32` to run it from a laptop (`0.0.0.0/0` is refused):
+Two Terraform roots, applied in this order:
+
+- `deploy/terraform/account`: an AWS Budgets alarm for the whole account.
+  Apply it once and leave it. It is kept out of the cluster's root so that
+  destroying the cluster does not destroy it, and it can still alert on
+  whatever a teardown leaves behind.
+- `deploy/terraform/eks`: a minimal single-node cluster (default VPC, one
+  `t3.large` with a 50 GiB encrypted gp3 root volume, managed node group).
+
+Each root reads its inputs from a `terraform.tfvars` next to it, which is
+gitignored (it holds your email address and egress IP). Every later `plan`,
+upgrade and `destroy` then sees the same values with no `-var` flags to
+repeat. Leave an input out and Terraform plans its default instead: for the
+endpoint CIDRs, that is a private endpoint, which cuts off the `kubectl` you
+are using.
+
+Without `cluster_endpoint_public_access_cidrs` the API endpoint is private,
+so `kubectl` works only from inside the VPC; give your own egress address as
+a `/32` to run it from a laptop (`0.0.0.0/0` is refused):
 
 ```bash
-cd deploy/terraform/eks
+cd deploy/terraform/account
+cat > terraform.tfvars <<'EOF'
+budget_alert_emails = ["you@example.com"]
+EOF
 terraform init
-terraform plan -out tfplan \
-  -var 'budget_alert_emails=["you@example.com"]' \
-  -var "cluster_endpoint_public_access_cidrs=[\"$(curl -fsS https://checkip.amazonaws.com)/32\"]"
+terraform plan -out tfplan
+terraform apply tfplan
+
+cd ../eks
+cat > terraform.tfvars <<EOF
+cluster_version                      = "1.36"
+cluster_endpoint_public_access_cidrs = ["$(curl -fsS https://checkip.amazonaws.com)/32"]
+EOF
+terraform init
+terraform plan -out tfplan
 terraform apply tfplan
 aws eks update-kubeconfig --name pgoverlay --region ap-south-1
 ```
 
-The provider and Terraform versions are pinned (`.terraform.lock.hcl` is
-committed). State is local: this is a single-operator demo, and the
-`backend` comment in `main.tf` shows the S3 set-up (with `use_lockfile`) to
-use for anything shared. `make tf-test` checks the configuration offline.
+If your address changes, edit `terraform.tfvars` and plan again; the plan
+should change the endpoint's CIDRs and nothing else.
+
+The provider and Terraform versions are pinned (each root commits its
+`.terraform.lock.hcl`). State is local: this is a single-operator demo, and
+the `backend` comment in `eks/main.tf` shows the S3 set-up (with
+`use_lockfile`) to use for anything shared. Keep the account root's state
+for as long as the budget exists. `make tf-test` checks both roots offline.
 
 **What is not in Terraform.** Only the cluster and the budget are. The Helm
 release, the GHCR pull secret, cert-manager and the Secrets below are applied
@@ -54,13 +80,14 @@ Terraform's `helm` provider or a GitOps controller, in separate staging and
 production roots with remote state.
 
 **Cost while running:** control plane ~$0.10/h, node ~$0.09/h, plus ~$0.03/h
-per LoadBalancer Service (two here). An AWS Budgets alert
+per LoadBalancer Service (two here). The account root's AWS Budgets alert
 (`monthly_budget_usd`, default 50 USD) mails `budget_alert_emails` at 80% of
 actual and 100% of forecast monthly spend. It covers the whole account on
-purpose: what outlives a teardown (load balancers, EBS volumes) is exactly
-what a budget filtered on this project's tags would miss. Mind the Kubernetes version: clusters
-on versions past their standard-support window are billed AWS *extended
-support* (~6× the control-plane rate). Check what's current:
+purpose: what outlives a teardown (load balancers, EBS volumes) carries none
+of this project's tags, so a budget filtered on them would miss exactly that
+spend. Mind the Kubernetes version: clusters on versions past their
+standard-support window are billed AWS *extended support* (~6× the
+control-plane rate). Check what's current:
 
 ```bash
 aws eks describe-cluster-versions \
@@ -283,14 +310,18 @@ and nothing else.
 
 ## Upgrading Kubernetes
 
-EKS moves one minor version at a time. `cluster_version` is a Terraform
-variable for exactly this: plan one step, read it, apply that plan, then do
-the next version.
+EKS moves one minor version at a time. `cluster_version` in
+`deploy/terraform/eks/terraform.tfvars` records the cluster's version: raise
+it one step, plan, read the plan, apply that plan, then do the next version.
+The other inputs come from the same file, so the plan does not quietly reset
+them (a plan without your endpoint CIDRs would make the endpoint private and
+cut off `kubectl` in the middle of the upgrade).
 
 ```bash
+cd deploy/terraform/eks
 v=1.34   # then 1.35, then 1.36: one minor version per step
-terraform plan -out "k8s-$v.tfplan" -var cluster_version=$v \
-  -var 'budget_alert_emails=["you@example.com"]'
+sed -i.bak "s/^cluster_version *=.*/cluster_version = \"$v\"/" terraform.tfvars
+terraform plan -out "k8s-$v.tfplan"
 terraform apply "k8s-$v.tfplan"
 ```
 
@@ -316,30 +347,44 @@ branchd is not pinned, so it comes back on a new node by itself.
 
 ```bash
 kubectl -n pgoverlay delete svc pgoverlay-proxy pgoverlay-ghook   # release the ELBs
-kubectl -n pgoverlay delete pvc --all                              # csi mode: release the EBS volumes
-terraform -chdir=deploy/terraform/eks destroy \
-  -var 'budget_alert_emails=["you@example.com"]'
+kubectl -n pgoverlay delete pvc --all                              # csi mode: release the volumes
+terraform -chdir=deploy/terraform/eks destroy                      # reads eks/terraform.tfvars
 ```
 
 `destroy` removes only what is in the state. Check that nothing Kubernetes
-created outlived it: the in-tree cloud provider tags the load balancers and
-security groups it creates, and the EBS CSI driver its volumes, with the
-cluster name.
+created outlived it. On EKS the load balancers for `LoadBalancer` Services
+come from the AWS cloud controller (cloud-provider-aws), which tags them and
+their security groups with the cluster name:
 
 ```bash
 aws resourcegroupstaggingapi get-resources --region ap-south-1 \
   --tag-filters Key=kubernetes.io/cluster/pgoverlay \
   --query 'ResourceTagMappingList[].ResourceARN'
-aws ec2 describe-volumes --region ap-south-1 \
-  --filters Name=tag-key,Values=kubernetes.io/cluster/pgoverlay \
-  --query 'Volumes[].VolumeId'
 ```
 
-Both should print `[]`. Then remove what pointed at the cluster from
-outside: the GitHub webhook to the ghook load balancer, CI variables and
-secrets holding its addresses or tokens, and preview-platform environment
-variables. Destroying the budget with the cluster is deliberate; keep an
-account-level budget of your own.
+This Terraform installs no CSI driver, so csi mode runs on one you
+installed. The EBS CSI driver does not tag volumes with the cluster name; it
+tags them `ebs.csi.aws.com/cluster=true` (and, if its provisioner passes PVC
+metadata, `kubernetes.io/created-for/pvc/namespace`). List the unattached
+ones:
+
+```bash
+aws ec2 describe-volumes --region ap-south-1 \
+  --filters Name=tag:ebs.csi.aws.com/cluster,Values=true Name=status,Values=available \
+  --query 'Volumes[].[VolumeId,Size,Tags[?Key==`kubernetes.io/created-for/pvc/namespace`]|[0].Value]'
+```
+
+Both should print `[]`. The second lists unattached EBS CSI volumes from
+every cluster in the account and region; one tagged with the `pgoverlay`
+namespace is this cluster's. With another CSI driver, look for its volumes
+the same way. Then remove what pointed at the
+cluster from outside: the GitHub webhook to the ghook load balancer, CI
+variables and secrets holding its addresses or tokens, and preview-platform
+environment variables.
+
+The budget in `deploy/terraform/account` stays: it is what tells you if
+something was missed. Destroy it (`terraform -chdir=deploy/terraform/account
+destroy`) only when you are done with the account.
 
 ## What deploying here taught us (three real bugs)
 

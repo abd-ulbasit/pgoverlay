@@ -109,12 +109,12 @@ jobs:
       - run: make secrets
 
   # Misconfiguration scan of the Helm chart (default values, with ghook on,
-  # and the production values) and the EKS Terraform (make misconfig;
-  # accepted findings, with reasons and expiry dates, in .trivyignore.yaml),
-  # and the Terraform's offline checks
-  # (make tf-test: fmt, validate, and tests against a mocked AWS provider, so
-  # no credentials). Weekly too: trivy fetches its checks at run time, so a
-  # new check can fail with no commit here. trivy is installed by
+  # and the production values) and the Terraform (make misconfig; accepted
+  # findings, with reasons and expiry dates, in .trivyignore.yaml), and the
+  # Terraform's offline checks (make tf-test, both roots: fmt, validate
+  # against the committed lock files, and tests against a mocked AWS
+  # provider, so no credentials). Weekly too: trivy fetches its checks at run
+  # time, so a new check can fail with no commit here. trivy is installed by
   # hack/install-trivy.sh (signed checksums plus a committed sha256, the same
   # pin release.yml uses), not through trivy-action.
   iac:

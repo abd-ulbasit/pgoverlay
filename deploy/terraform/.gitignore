@@ -4,3 +4,8 @@
 *.tfstate.backup
 # .terraform.lock.hcl is committed on purpose: it pins the exact provider
 # builds and their hashes, so every `init` installs what was reviewed.
+# inputs (alert addresses, your egress IP) and saved plans, which contain them
+*.tfvars
+*.tfvars.bak
+*.tfplan
+tfplan

@@ -89,7 +89,7 @@ vuln-test:
 secrets:
 	gitleaks git --redact --no-banner --exit-code 1 --config .gitleaks.toml .
 
-# Misconfiguration scan of the Helm chart and the EKS Terraform, HIGH and
+# Misconfiguration scan of the Helm chart and the Terraform, HIGH and
 # CRITICAL. The chart is rendered three ways: default values, default values
 # with ghook on, and the production values with ghook on. ghook is off by
 # default, so without the last two its internet-facing Deployment would never
@@ -107,13 +107,19 @@ misconfig:
 	$(TRIVY_CONFIG) --helm-values deploy/helm/pgoverlay/values-production.yaml \
 	  --helm-set storage.storageClass=ci-class --helm-set $(TRIVY_GHOOK) deploy/helm/pgoverlay
 	$(TRIVY_CONFIG) --skip-dirs deploy/terraform/eks/.terraform deploy/terraform/eks
+	$(TRIVY_CONFIG) --skip-dirs deploy/terraform/account/.terraform deploy/terraform/account
 
-# The EKS Terraform, offline: format, validate, and the mocked-provider tests
-# in deploy/terraform/eks/tests (no AWS credentials, no AWS API calls).
+# The Terraform roots (eks: the cluster; account: the budget that outlives
+# it), offline: format, validate, and the mocked-provider tests in each
+# root's tests/ (no AWS credentials, no AWS API calls).
+TF_ROOTS = deploy/terraform/account deploy/terraform/eks
 tf-test:
-	cd deploy/terraform/eks && terraform fmt -check -recursive && \
-	  terraform init -backend=false -input=false >/dev/null && \
-	  terraform validate && terraform test
+	set -e; for root in $(TF_ROOTS); do \
+	  echo "== $$root"; \
+	  (cd $$root && terraform fmt -check -recursive && \
+	    terraform init -backend=false -input=false -lockfile=readonly >/dev/null && \
+	    terraform validate && terraform test); \
+	done
 
 # Asserts the Dockerfiles' golang base image matches go.mod's `go` directive,
 # and that the goreleaser release-check builds needs no newer Go (and matches

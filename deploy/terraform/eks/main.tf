@@ -1,17 +1,24 @@
 # Minimal single-node EKS cluster for running the pgoverlay stack
 # (branchd + ghook + prod postgres + branch pods, hostpath storage mode).
+# docs/eks.md walks through it; in short, keep the inputs in a
+# terraform.tfvars here (gitignored) so plan, upgrade and destroy all see the
+# same values:
 #
+#   cat > terraform.tfvars <<'EOF'
+#   cluster_version                      = "1.36"
+#   cluster_endpoint_public_access_cidrs = ["203.0.113.7/32"]
+#   EOF
 #   terraform init
-#   terraform apply \
-#     -var 'budget_alert_emails=["you@example.com"]' \
-#     -var 'cluster_endpoint_public_access_cidrs=["203.0.113.7/32"]'
+#   terraform plan -out tfplan && terraform apply tfplan
 #   aws eks update-kubeconfig --name pgoverlay --region ap-south-1
 #
 # Without cluster_endpoint_public_access_cidrs the API endpoint is private
 # (reachable from inside the VPC only).
 #
 # Cost while running: EKS control plane (~$0.10/h) + 1× t3.large (~$0.09/h)
-# + the Classic ELBs Kubernetes creates for the proxy/webhook Services.
+# + the Classic ELBs Kubernetes creates for the proxy/webhook Services. The
+# budget alarm is NOT here: it lives in ../account, which is not destroyed
+# with the cluster, so it still sees whatever outlives `terraform destroy`.
 # `terraform destroy` removes only what this state holds: delete the
 # LoadBalancer Services (and, in csi mode, the PVCs) first, then check for
 # leftovers as docs/eks.md "Teardown" shows.
@@ -104,28 +111,22 @@ variable "cluster_endpoint_public_access_cidrs" {
   }
 }
 
-variable "monthly_budget_usd" {
-  description = "Monthly AWS cost (USD, whole account) above which the budget alerts."
-  type        = number
-  default     = 50
+locals {
+  # Public endpoint only when someone is allowed in. A local, and an output,
+  # so the tests assert on what the module is given rather than on the
+  # variable's default.
+  endpoint_public = length(var.cluster_endpoint_public_access_cidrs) > 0
 
-  validation {
-    condition     = var.monthly_budget_usd > 0
-    error_message = "monthly_budget_usd must be greater than 0."
-  }
-}
-
-# Required, with no default: a cluster nobody is told about is how a demo
-# keeps billing for months.
-variable "budget_alert_emails" {
-  description = "Email addresses AWS Budgets notifies at 80% of actual and 100% of forecast monthly spend."
-  type        = list(string)
-
-  validation {
-    condition = length(var.budget_alert_emails) > 0 && alltrue([
-      for e in var.budget_alert_emails : can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", e))
-    ])
-    error_message = "budget_alert_emails needs at least one email address."
+  # The node's root volume, which in hostpath mode holds every branch, the
+  # seed and the registry. It goes on the launch template: the module uses a
+  # custom launch template by default and then ignores `disk_size`, so the
+  # node would get the AMI's 20 GiB. An output too, for the tests (a test
+  # cannot read the launch template inside the module).
+  node_root_volume = {
+    volume_size           = 50
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
   }
 }
 
@@ -133,8 +134,8 @@ provider "aws" {
   region = var.region
 
   # Every resource Terraform creates says who owns it and where it is
-  # defined, budget included. The load balancers and security groups that
-  # Kubernetes creates for LoadBalancer Services are not Terraform's and do
+  # defined. The load balancers and security groups that the AWS cloud
+  # controller creates for LoadBalancer Services are not Terraform's and do
   # not get these: they carry kubernetes.io/cluster/<cluster_name> instead
   # (docs/eks.md, Teardown, finds them by that tag).
   default_tags {
@@ -169,7 +170,7 @@ module "eks" {
   cluster_version = var.cluster_version
 
   cluster_endpoint_private_access      = true
-  cluster_endpoint_public_access       = length(var.cluster_endpoint_public_access_cidrs) > 0
+  cluster_endpoint_public_access       = local.endpoint_public
   cluster_endpoint_public_access_cidrs = var.cluster_endpoint_public_access_cidrs
 
   # The identity that runs `apply` gets cluster-admin through an EKS access
@@ -193,41 +194,18 @@ module "eks" {
       min_size     = 1
       max_size     = 1
       desired_size = 1
-      disk_size    = 50
+      # AL2023's root device; see local.node_root_volume
+      block_device_mappings = {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs         = local.node_root_volume
+        }
+      }
     }
   }
 
   tags = {
     project = "pgoverlay-demo"
-  }
-}
-
-# Whole-account on purpose: what outlives a `terraform destroy` here (the
-# ELBs and security groups Kubernetes created, EBS volumes from csi PVCs) is
-# outside this state and untagged by it, so a budget filtered on this
-# project's tags would miss exactly the spend that matters. On an account
-# that runs other things, raise the limit or filter it in the console.
-resource "aws_budgets_budget" "monthly" {
-  name         = "${var.cluster_name}-account-monthly"
-  budget_type  = "COST"
-  limit_amount = tostring(var.monthly_budget_usd)
-  limit_unit   = "USD"
-  time_unit    = "MONTHLY"
-
-  notification {
-    comparison_operator        = "GREATER_THAN"
-    threshold                  = 80
-    threshold_type             = "PERCENTAGE"
-    notification_type          = "ACTUAL"
-    subscriber_email_addresses = var.budget_alert_emails
-  }
-
-  notification {
-    comparison_operator        = "GREATER_THAN"
-    threshold                  = 100
-    threshold_type             = "PERCENTAGE"
-    notification_type          = "FORECASTED"
-    subscriber_email_addresses = var.budget_alert_emails
   }
 }
 
@@ -241,4 +219,14 @@ output "cluster_endpoint" {
 
 output "node_group_role_arn" {
   value = module.eks.eks_managed_node_groups["main"].iam_role_arn
+}
+
+output "cluster_endpoint_public" {
+  description = "Whether the API endpoint is reachable from the internet (only from cluster_endpoint_public_access_cidrs)."
+  value       = local.endpoint_public
+}
+
+output "node_root_volume" {
+  description = "The node's root EBS volume as set on its launch template."
+  value       = local.node_root_volume
 }

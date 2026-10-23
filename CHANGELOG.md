@@ -26,9 +26,13 @@ Added:
 - CI: a gitleaks secret scan over the full history, and `trivy config` over
   the chart and the Terraform with a reviewed, expiring exceptions file.
 - Terraform (the EKS demo): pinned Terraform, module and providers (the lock
-  file is committed), offline tests, an account budget alarm, and a private
-  API endpoint unless `cluster_endpoint_public_access_cidrs` is set. Applying
-  it now requires `budget_alert_emails`.
+  files are committed), offline tests, a private API endpoint unless
+  `cluster_endpoint_public_access_cidrs` is set, and the node's 50 GiB
+  encrypted gp3 root volume set on its launch template (`disk_size` had been
+  ignored, leaving the AMI's 20 GiB). A new root, `deploy/terraform/account`,
+  holds an account-wide budget alarm that is not destroyed with the cluster;
+  it requires `budget_alert_emails`. Changing an existing cluster's root
+  volume replaces its node, and with it every hostpath branch.
 
 Documentation:
 
