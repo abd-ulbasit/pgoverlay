@@ -222,20 +222,27 @@ The pgoverlay chart ships the service as an optional sub-deployment
 (`deploy/helm/pgoverlay`, image `ghcr.io/abd-ulbasit/pgoverlay-ghook` — `make docker-build-ghook`):
 
 ```sh
+# Secrets from files, so no value lands in the Helm release history
+# (`helm get values`) or in shell history; see docs/eks.md for creating them.
+kubectl create secret generic pgoverlay-token --from-file=token=api-token
+kubectl create secret generic pgoverlay-ghook \
+  --from-file=webhook-secret=webhook-secret --from-file=app-private-key=app.pem
 helm upgrade --install pgoverlay deploy/helm/pgoverlay \
-  --set node=storage-1 --set token=$PGOVERLAY_TOKEN \
+  --set node=storage-1 --set existingSecret=pgoverlay-token \
   --set ghook.enabled=true \
-  --set ghook.webhookSecret=$WEBHOOK_SECRET \
+  --set ghook.existingSecret=pgoverlay-ghook \
   --set ghook.appId=12345 \
-  --set-file ghook.appPrivateKey=app.pem \
-  --set ghook.source=main \
+  --set ghook.source=main --set ghook.requireMask=true \
   --set ghook.repos=acme/widgets \
   --set ghook.proxyHost=pg.example.com:30432
 ```
 
-(PAT mode: replace the two `app*` values with
-`--set ghook.githubToken=$GITHUB_TOKEN`. The chart refuses to render with
-both set.)
+(PAT mode: store a fine-grained token for the repository under the key
+`github-token` instead of `app-private-key`, and drop `ghook.appId`. The
+chart refuses to render with both. The `ghook.webhookSecret`,
+`ghook.githubToken` and `ghook.appPrivateKey` values exist for local
+experiments; anything set through them is kept in cleartext in the release
+history.)
 
 It talks to branchd over the in-cluster `…-api` Service (which, with leader
 election, routes to the leader). Give it an **operator-role token** rather

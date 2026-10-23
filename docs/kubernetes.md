@@ -14,12 +14,18 @@ schedule on any node and need no extra capabilities:
 ```bash
 kubectl create namespace pgoverlay-system
 kubectl label namespace pgoverlay-system pod-security.kubernetes.io/enforce=baseline
+# the API token as a Secret of its own, so it never enters Helm values
+openssl rand -hex 32 | tr -d '\n' |
+  kubectl -n pgoverlay-system create secret generic pgoverlay-token --from-file=token=/dev/stdin
 helm install pgoverlay deploy/helm/pgoverlay \
   --namespace pgoverlay-system \
-  --set token=$(openssl rand -hex 16) \
+  --set existingSecret=pgoverlay-token \
   --set storage.mode=csi \
   --set storage.storageClass=<class-with-clone-support>
 ```
+
+For a shared cluster, start from `deploy/helm/pgoverlay/values-production.yaml`
+instead (see [Values that matter](#values-that-matter)).
 
 Nothing needs building first: the chart pulls a published image (see
 [Images](#images) below).
@@ -513,9 +519,9 @@ operator-role token rather than branchd's admin token (which also manages
 sources, credentials and tokens):
 
 ```bash
-pgb token create ghook --role operator            # prints the token once
-kubectl -n pgoverlay-system create secret generic pgoverlay-ghook-api \
-  --from-literal=token=<the printed token>
+# straight from pgb into the Secret: not on screen, not in shell history
+pgb token create ghook --role operator | tr -d '\n' |
+  kubectl -n pgoverlay-system create secret generic pgoverlay-ghook-api --from-file=token=/dev/stdin
 helm upgrade pgoverlay deploy/helm/pgoverlay -n pgoverlay-system --reuse-values \
   --set ghook.apiTokenSecret=pgoverlay-ghook-api
 ```

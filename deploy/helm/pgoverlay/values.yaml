@@ -323,8 +323,8 @@ ghook:
   # Token ghook uses against branchd's REST API. ghook only creates, resets
   # and destroys branches, so give it an operator-role token rather than the
   # admin one (which also manages sources, credentials and tokens):
-  #   pgb token create ghook --role operator          # prints the token once
-  #   kubectl -n <ns> create secret generic pgoverlay-ghook-api --from-literal=token=<it>
+  #   pgb token create ghook --role operator | tr -d '\n' |
+  #     kubectl -n <ns> create secret generic pgoverlay-ghook-api --from-file=token=/dev/stdin
   #   helm upgrade ... --set ghook.apiTokenSecret=pgoverlay-ghook-api
   # Empty = fall back to branchd's admin token (token/existingSecret above);
   # NOTES.txt warns when that happens.
