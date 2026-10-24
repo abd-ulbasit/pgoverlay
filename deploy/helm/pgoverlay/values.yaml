@@ -109,6 +109,12 @@ image:
   # For the local build path pass --set image.tag=dev, after side-loading that
   # image into the cluster (`kind load docker-image ...`) or pushing it.
   tag: ""
+  # Optional content digest (sha256:<64 hex>). When set, the image is pulled
+  # as repository@digest and tag is ignored, so a re-pointed tag cannot change
+  # what runs. Releases after v1.0.0 sign and attest their images by digest:
+  # verify one (SECURITY.md, "Release integrity") and pin the digest you
+  # verified.
+  digest: ""
   pullPolicy: IfNotPresent
 
 # Image for the file-level helper pods branchd starts at runtime (seed-volume
@@ -183,6 +189,38 @@ shutdownTimeout: 60
 # off for static-credential preview flows (e.g. Vercel-style env templating)
 # that need every branch to accept the same source password.
 rotateBranchCredentials: false
+
+# Bounds on what API clients (CI, ghook, the GitHub Action) can create. The
+# defaults (0 / "") are branchd's own: unlimited, so that an upgrade never
+# starts refusing branches. Set them whenever branch creation is driven by
+# something you do not fully control, such as ghook on a repository that
+# takes outside pull requests: every branch is a Postgres pod.
+limits:
+  # branchd --max-branches: creates past this many live branches get 403.
+  maxBranches: 0
+  # branchd --default-ttl: TTL for branches created without one (e.g. 72h).
+  defaultTTL: ""
+  # branchd --max-ttl: cap on any requested TTL (e.g. 168h).
+  maxTTL: ""
+
+# Optional LimitRange for the release namespace (templates/limitrange.yaml).
+# The branch and helper pods branchd creates at runtime carry no CPU or
+# memory requests or limits of their own; a LimitRange is how Kubernetes
+# gives them defaults, so one runaway branch cannot starve the node (in
+# hostpath mode, the node every branch shares). It applies to every container
+# in the namespace that sets none itself, branchd and ghook included while
+# their resources are empty, so use it in a namespace dedicated to pgoverlay.
+# Off by default because a memory limit changes failure mode: a branch over
+# it is OOM-killed instead of slowing down. A basebackup-seeded branch runs
+# the source's postgresql.conf, so default.memory has to cover the source's
+# shared_buffers plus work_mem headroom.
+namespaceLimitRange:
+  enabled: false
+  defaultRequest:
+    cpu: 100m
+    memory: 256Mi
+  default:
+    memory: 1Gi
 
 # How a new seed (source add or refresh) is prepared before branches start
 # from it (branchd --seed-settle): freeze recovers the copy once, runs VACUUM
@@ -271,6 +309,8 @@ ghook:
     # Empty means the chart's appVersion, same as the branchd image block
     # above; --set ghook.image.tag=dev for a `make docker-build-ghook` build.
     tag: ""
+    # Optional content digest, as image.digest above.
+    digest: ""
     pullPolicy: IfNotPresent
   # Webhook HMAC secret (X-Hub-Signature-256). Exactly one is required when
   # enabled:
@@ -286,8 +326,8 @@ ghook:
   # Token ghook uses against branchd's REST API. ghook only creates, resets
   # and destroys branches, so give it an operator-role token rather than the
   # admin one (which also manages sources, credentials and tokens):
-  #   pgb token create ghook --role operator          # prints the token once
-  #   kubectl -n <ns> create secret generic pgoverlay-ghook-api --from-literal=token=<it>
+  #   pgb token create ghook --role operator | tr -d '\n' |
+  #     kubectl -n <ns> create secret generic pgoverlay-ghook-api --from-file=token=/dev/stdin
   #   helm upgrade ... --set ghook.apiTokenSecret=pgoverlay-ghook-api
   # Empty = fall back to branchd's admin token (token/existingSecret above);
   # NOTES.txt warns when that happens.
@@ -318,6 +358,14 @@ ghook:
   ttl: 72h
   # Reset the branch to the source snapshot on every push (synchronize).
   resetOnPush: false
+  # Refuse to create or reset a PR branch while `source` has no masking
+  # scripts (GHOOK_REQUIRE_MASK). Anyone who can open a pull request in an
+  # allowed repository causes a branch, fork PRs included; with this on, a
+  # source that loses its masking (pgb source clear-mask) stops getting PR
+  # branches instead of quietly serving unmasked copies. Off by default only
+  # so an upgrade does not stop existing installs; turn it on unless every
+  # PR author may see the source's data unmasked.
+  requireMask: false
   # Post a schema/data diff comment on the PR after the branch is ready
   # (opt-in; requires GitHub credentials). The comment carries its own marker,
   # separate from the live connect-info comment.

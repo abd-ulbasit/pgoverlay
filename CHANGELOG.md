@@ -4,6 +4,52 @@ Notable changes to pgoverlay. Each release's GitHub page also lists every
 commit since the previous tag. Upgrading from a release candidate:
 [docs/upgrading.md](docs/upgrading.md).
 
+## Unreleased
+
+Security hardening from the October 2026 audit. Nothing changes for an
+existing install that does not opt in, except as noted.
+
+Added:
+
+- Helm: `image.digest` and `ghook.image.digest` pull images by digest;
+  `limits.maxBranches`, `limits.defaultTTL` and `limits.maxTTL` pass
+  branchd's limits; `namespaceLimitRange` gives the runtime-created branch
+  and helper pods CPU and memory defaults; `ghook.requireMask`; and
+  `values-production.yaml`, a commented starting point for shared clusters.
+- `GHOOK_REQUIRE_MASK`: ghook refuses to create or reset a pull request's
+  branch while its source has no masking scripts (fails closed).
+- Releases: both images are scanned with Trivy before anything (binaries or
+  images) is published; images are signed with cosign (keyless) and get a
+  provenance attestation in the registry; the publishing jobs run in the
+  `release` environment, whose protection rules still have to be set up
+  (SECURITY.md, "Release integrity").
+- CI: a gitleaks secret scan over the full history, and `trivy config` over
+  the chart and the Terraform with a reviewed, expiring exceptions file.
+- Terraform (the EKS demo): pinned Terraform, module and providers (the lock
+  files are committed), offline tests, a private API endpoint unless
+  `cluster_endpoint_public_access_cidrs` is set, and the node's 50 GiB
+  encrypted gp3 root volume set on its launch template (`disk_size` had been
+  ignored, leaving the AMI's 20 GiB). A new root, `deploy/terraform/account`,
+  holds an account-wide budget alarm that is not destroyed with the cluster;
+  it requires `budget_alert_emails`. Changing an existing cluster's root
+  volume replaces its node, and with it every hostpath branch.
+
+Changed:
+
+- Built with Go 1.26.10, now also the minimum for `go install`, and
+  golang.org/x/net v0.60.0. govulncheck found standard-library advisories
+  reachable from all three binaries (net/http, crypto/tls, net/textproto,
+  and GO-2026-6809, crypto/x509's distrust of compromised intermediate
+  certificates), and GO-2026-6610 in x/net's HTTP/2 transport in branchd.
+
+Documentation:
+
+- [What masking leaves behind](docs/security.md#what-masking-leaves-behind)
+  and how to close it; ADR-12 (masking, with a design for masking the seed)
+  and ADR-13 (the chart's first-run defaults).
+- The EKS, GitHub App, Kubernetes and HA guides keep secrets out of
+  `helm --set`, and the EKS upgrade no longer uses `-auto-approve`.
+
 ## v1.0.0 (2026-09-29)
 
 ### True copy-on-write ([#49](https://github.com/abd-ulbasit/pgoverlay/issues/49))

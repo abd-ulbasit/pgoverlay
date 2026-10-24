@@ -1,0 +1,19 @@
+# gitleaks configuration for the `secrets` CI job: gitleaks' default rules,
+# plus an allowlist for test placeholders that look like secrets. The
+# allowlist is attached to the two rules they trip (targetRules) and needs
+# BOTH a path and a pattern to match (condition AND), so a real secret in the
+# same test files, or any other rule's finding there, is still reported. A
+# global [[allowlists]] cannot do that: its paths skip whole files.
+[extend]
+useDefault = true
+
+[[allowlists]]
+targetRules = ["generic-api-key", "private-key"]
+description = "Test placeholders: sequential-hex keys and passwords, and a truncated PEM header"
+condition = "AND"
+paths = ['''^internal/(cli|ghook)/[^/]+_test\.go$''']
+regexTarget = "match"
+regexes = [
+  '''0123456789abcdef''',
+  '''-----BEGIN RSA PRIVATE KEY-----\\n\.\.\.''',
+]

@@ -64,7 +64,42 @@ commit, after the full CI suite passes at that commit:
 - The images `ghcr.io/abd-ulbasit/pgoverlay-branchd` and
   `ghcr.io/abd-ulbasit/pgoverlay-ghook` are multi-arch (linux/amd64,
   linux/arm64), tagged with the release tag, and carry an SBOM and build
-  provenance. Their base images are pinned by digest.
+  provenance. Their base images are pinned by digest. Before anything is
+  published, binaries or images, the `scan` job builds each image for each
+  platform and scans it with Trivy, and the release stops on a HIGH or
+  CRITICAL vulnerability in an OS package that has a fix (Go code is gated
+  by `govulncheck`, below). Once pushed, each image is signed
+  with cosign (keyless, through GitHub's OIDC identity) and gets a SLSA
+  provenance attestation stored in the registry next to it, both bound to
+  the digest. Verify an image, then pin the verified digest (the Helm
+  chart's `image.digest`):
+
+  ```bash
+  IMG=ghcr.io/abd-ulbasit/pgoverlay-branchd
+  DIGEST=$(docker buildx imagetools inspect "$IMG:<tag>" --format '{{.Manifest.Digest}}')
+  cosign verify "$IMG@$DIGEST" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity "https://github.com/abd-ulbasit/pgoverlay/.github/workflows/release.yml@refs/tags/<tag>"
+  gh attestation verify "oci://$IMG@$DIGEST" --repo abd-ulbasit/pgoverlay
+  ```
+
+  Images published before this was added (v1.0.0 and earlier) are not
+  signed and have no registry attestation.
+
+Every publishing job runs in the `release` GitHub environment, so that the
+environment's protection rules, not only who can push a tag, decide whether
+a release ships. **Those rules are repository settings and are not
+configured yet.** Until they are, GitHub creates `release` with no rules on
+the first tag push, and anyone who can push a `v*` tag can publish a release
+and move `v1`. The owner needs to:
+
+- create the `release` environment with a required reviewer and a
+  deployment-tag rule that admits only `v*` tags;
+- add a tag ruleset for `v*.*.*` that limits who can create those tags and
+  blocks updating and deleting them (`v1` itself must stay movable by the
+  release workflow, so it is not in the pattern);
+- then do a dry run with an `-rc` tag: the scan, signing, attestation and
+  environment steps have not run in a real release yet.
 
 ## Supply-chain scanning
 
@@ -93,6 +128,22 @@ The build toolchain is pinned by the `go` directive in `go.mod`, and
 bumping it is how standard-library advisories are cleared. The full unit suite
 also runs under the Go race detector.
 
+Two more gates run on every pull request and push, and the second weekly:
+
+- **Secrets** (the `secrets` job, `make secrets`): gitleaks over the whole git
+  history with its default rules, which include generic API keys, private
+  keys and high-entropy assignments, not only the provider token formats
+  GitHub's secret scanning recognises. Test placeholders are allowlisted in
+  [`.gitleaks.toml`](.gitleaks.toml), each by path and pattern together.
+- **Misconfiguration** (the `iac` job, `make misconfig` and `make tf-test`):
+  `trivy config` over the Helm chart, rendered with the default values, with
+  ghook enabled (it is off by default) and with the production values, and
+  over the Terraform (the EKS cluster and the account budget), failing on
+  HIGH and CRITICAL; accepted findings, each with a reason and an expiry,
+  are in [`.trivyignore.yaml`](.trivyignore.yaml). The Terraform is also
+  format-checked, validated and tested offline against a mocked AWS
+  provider.
+
 **Committed binaries.** Two small C programs ship prebuilt so that
 `go install` needs no C toolchain: the lazyrw `LD_PRELOAD` shim
 (`internal/cow/lazyrw/dist`, four builds: glibc and musl, x86_64 and aarch64)
@@ -103,11 +154,28 @@ each shim build's SHA-256 again after decoding it in the helper. The builds
 are reproducible: `make lazyrw` rebuilds them in digest-pinned Debian and
 Alpine images with `docker buildx`, and the `lazyrw` CI job (`make
 lazyrw-check`) rebuilds them from source on every pull request and fails on
-any byte of difference. The `pg-import-audit` job checks, for the `postgres`
+any byte of difference. Alpine's mirror keeps only the newest build of each
+package, so the musl toolchain's packages are held to their upstream versions
+rather than to one Alpine build: a new build that changes the output fails
+the check until `make lazyrw` is rerun and its result reviewed and committed.
+The `pg-import-audit` job checks, for the `postgres`
 binaries of `postgres:14` to `18` and `17-alpine` and weekly, that every
 write-class libc function they import is interposed by the shim or on a
 reviewed list, since a write the shim does not see would hit a read-only file
 descriptor.
+
+## What the automated checks cover, and what they do not
+
+| Layer | Check | Catches | Does not catch |
+|---|---|---|---|
+| Go code in `pgb`, `branchd`, `pgoverlay-github` | `vuln` (govulncheck, binary mode), every push, PR, release and weekly | known advisories in code reachable from the binaries, standard library included | advisories in unreachable code (deliberately), anything not yet in the Go vulnerability database |
+| The two release images | release `scan` job (Trivy, before anything is published) | HIGH and CRITICAL vulnerabilities with a fix in their Alpine packages | unfixed and lower-severity ones; anything published after the release (images are scanned when built, so a later CVE waits for the next release) |
+| Images branchd runs: `postgres:<major>` or a source's `--image`, a mirrored helper image | nothing in this repository | | everything: they are the operator's choice; scan and pin them where they are mirrored ([docs/security.md](docs/security.md#branch-instances)) |
+| Secrets in commits | `secrets` (gitleaks, full history) | provider tokens, private keys, high-entropy assignments | low-entropy passwords, and secrets outside git: CI logs, Helm release history, container environments |
+| Helm chart and Terraform | `iac` (`trivy config`, rendered chart and Terraform), `helm-test`, `tf-test` | known misconfiguration patterns at HIGH and CRITICAL, the chart's hardening fields, invalid Terraform inputs | the branch and helper pods branchd builds at runtime in Go (covered by unit tests in `internal/runtime` and `internal/deploy`), and anything about a live cluster or account |
+| Committed C binaries | `lazyrw` (byte-for-byte rebuild), `pg-import-audit` | any difference from the source; write paths the shim does not interpose | a compromised toolchain image (pinned by digest; the glibc one is Debian 11, past its LTS) |
+| Release integrity | checksums, provenance and cosign signatures | tampering after the build, and where an artifact came from | a bad change merged to `main` or a tag pushed by someone with write access: that is branch protection, tag rules and the `release` environment's reviewers, which are repository settings (the last two not configured yet) |
+| Data in branches | nothing automated | | whether masking covers every sensitive column, and what masking leaves behind ([docs/security.md](docs/security.md#what-masking-leaves-behind)) |
 
 ## Accepted advisories
 

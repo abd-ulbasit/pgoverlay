@@ -1,0 +1,79 @@
+# A starting point for a shared or production-like cluster. values.yaml keeps
+# the single-node, first-run defaults (hostpath, inherited credentials, no
+# NetworkPolicy, no limits); every value below is a deliberate departure from
+# them, explained in docs/security.md ("Hardening checklist").
+#
+#   kubectl create namespace pgoverlay
+#   kubectl label namespace pgoverlay pod-security.kubernetes.io/enforce=baseline
+#   # Secrets first, out of band, so no value lands in the Helm release
+#   # history (docs/kubernetes.md, docs/eks.md):
+#   printf '%s' "$(openssl rand -hex 32)" | \
+#     kubectl -n pgoverlay create secret generic pgoverlay-token --from-file=token=/dev/stdin
+#   # The router's certificate (proxy.tls.certSecret below). Without this
+#   # Secret the branchd pod stays in ContainerCreating. Either a
+#   # cert-manager Certificate with secretName pgoverlay-proxy-tls
+#   # (docs/eks.md, "TLS for the proxy"), or a key pair you already have:
+#   kubectl -n pgoverlay create secret tls pgoverlay-proxy-tls --cert=tls.crt --key=tls.key
+#   helm install pgoverlay deploy/helm/pgoverlay -n pgoverlay \
+#     -f deploy/helm/pgoverlay/values-production.yaml \
+#     --set storage.storageClass=<a StorageClass that supports PVC cloning>
+#
+# Pin the images by digest (image.digest, ghook.image.digest) once you have
+# verified the release (SECURITY.md, "Release integrity").
+
+# Branches as PVC clones: no added capabilities on branch pods, the namespace
+# can enforce Pod Security "baseline", and the registry lives on a PVC.
+storage:
+  mode: csi
+  # REQUIRED: set with --set storage.storageClass=... (rendering fails
+  # without it).
+  storageClass: ""
+
+# The API token comes from a Secret created out of band (see above).
+existingSecret: pgoverlay-token
+
+# Every branch gets its own generated password instead of accepting the
+# source's production password.
+rotateBranchCredentials: true
+
+# Wire-protocol TLS for the router: a Secret with tls.crt and tls.key, e.g.
+# from cert-manager (docs/kubernetes.md, "Proxy TLS").
+proxy:
+  tls:
+    certSecret: pgoverlay-proxy-tls
+
+# Needs a CNI that enforces NetworkPolicy. Add allowedClients, metricsFrom
+# and sourceEgress for your cluster (values.yaml networkPolicy).
+networkPolicy:
+  enabled: true
+
+limits:
+  maxBranches: 50
+  defaultTTL: 72h
+  maxTTL: 168h
+
+# Requests and a memory limit for the branch and helper pods branchd creates
+# (they set none of their own). Size default.memory for your source: a branch
+# seeded with --via basebackup runs the source's postgresql.conf (seed settle
+# lowers shared_buffers only while it settles), so it needs shared_buffers
+# plus work_mem and maintenance_work_mem headroom, or it is OOM-killed under
+# load. 1Gi (values.yaml) fits shared_buffers up to about 256MB.
+namespaceLimitRange:
+  enabled: true
+  default:
+    memory: 1Gi
+
+# Inert until ghook.enabled=true. Then its secrets come from Secrets created
+# out of band too, it uses an operator token, and it refuses to branch a
+# source with no masking scripts.
+ghook:
+  existingSecret: pgoverlay-ghook
+  apiTokenSecret: pgoverlay-ghook-api
+  requireMask: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

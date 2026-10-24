@@ -1,0 +1,22 @@
+# Accepted misconfiguration findings for the `misconfig` CI job
+# (`trivy config` over the Helm chart and the Terraform). The same rules
+# as hack/vuln-allowlist.txt: one check per entry, scoped to the file it is
+# reported in, a reason, and an expiry after which the job fails again until
+# someone re-reviews the entry. Targets are relative to the scanned directory.
+misconfigurations:
+  - id: KSV-0053
+    paths:
+      - templates/rbac.yaml
+    statement: >-
+      branchd execs into the branch pods it creates (readiness checks, masking
+      scripts, credential rotation). The Role is namespaced; docs/security.md
+      ("The container runtime") treats branchd's ServiceAccount as privileged.
+    expired_at: 2027-04-30
+  - id: AWS-0104
+    paths:
+      - terraform-aws-modules/eks/aws/node_groups.tf
+    statement: >-
+      The EKS module's node security group allows all egress. The demo node sits
+      in the default VPC and pulls images and reaches AWS APIs over the
+      internet; there is no NAT, proxy or VPC endpoint set to narrow it to.
+    expired_at: 2027-04-30

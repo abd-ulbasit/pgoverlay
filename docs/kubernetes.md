@@ -14,12 +14,18 @@ schedule on any node and need no extra capabilities:
 ```bash
 kubectl create namespace pgoverlay-system
 kubectl label namespace pgoverlay-system pod-security.kubernetes.io/enforce=baseline
+# the API token as a Secret of its own, so it never enters Helm values
+openssl rand -hex 32 | tr -d '\n' |
+  kubectl -n pgoverlay-system create secret generic pgoverlay-token --from-file=token=/dev/stdin
 helm install pgoverlay deploy/helm/pgoverlay \
   --namespace pgoverlay-system \
-  --set token=$(openssl rand -hex 16) \
+  --set existingSecret=pgoverlay-token \
   --set storage.mode=csi \
   --set storage.storageClass=<class-with-clone-support>
 ```
+
+For a shared cluster, start from `deploy/helm/pgoverlay/values-production.yaml`
+instead (see [Values that matter](#values-that-matter)).
 
 Nothing needs building first: the chart pulls a published image (see
 [Images](#images) below).
@@ -149,10 +155,20 @@ are the ghook equivalents. For a private registry, override
 `image.repository`/`ghook.image.repository` too and attach an
 `imagePullSecret` ([docs/eks.md](eks.md#images) shows the EKS version).
 
+To pin what runs rather than what a tag points at, set `image.digest` (and
+`ghook.image.digest`) to a `sha256:` digest. The chart then pulls
+`repository@digest` and ignores the tag. Release images published after
+v1.0.0 are signed with cosign and carry a provenance attestation in the
+registry, both bound to the digest, so verify the digest first and pin the
+one you verified
+([SECURITY.md](https://github.com/abd-ulbasit/pgoverlay/blob/main/SECURITY.md#release-integrity)).
+
 branchd itself starts two more kinds of image at runtime:
 
 - **postgres:&lt;major&gt;** for branch pods and the seeding helpers, following
-  each source's `pg_version`.
+  each source's `pg_version`, by tag. To pin it, register the source with
+  `--image postgres:<major>@sha256:<digest>` ([why it is a tag by
+  default](security.md#branch-instances)).
 - **the utility helper image** for file-level helper pods (seed-volume prep,
   entrypoint installs, disk usage, hostPath volume copies). It defaults to
   alpine **pinned by digest** — the same base the pgoverlay images build on
@@ -177,9 +193,12 @@ branchd itself starts two more kinds of image at runtime:
   for the branchd pod. Unpinned HA replicas (csi with persistence and
   `replicaCount > 1`) get a required `podAffinity` so they share the
   ReadWriteOnce state volume's node; setting `affinity` replaces it.
-- **`token` / `existingSecret`** — the REST API bearer token. Either let the
-  chart render a Secret from `token`, or point `existingSecret` at a
-  pre-created Secret with key `token`.
+- **`image.digest` / `ghook.image.digest`** — pull the image by content
+  digest (`repository@sha256:...`) instead of by tag (see [Images](#images)).
+- **`token` / `existingSecret`** — the REST API bearer token. Point
+  `existingSecret` at a pre-created Secret with key `token` (preferred), or
+  let the chart render a Secret from `token`, which leaves the value in
+  cleartext in the Helm release history.
 - **`proxy.service.type`** — set to `NodePort` (with
   `proxy.service.nodePort`) to reach branches from outside the cluster
   without a port-forward. With `LoadBalancer`, restrict who can connect with
@@ -205,6 +224,21 @@ branchd itself starts two more kinds of image at runtime:
   above).
 - **`ghook.apiTokenSecret` / `ghook.apiTokenKey`** — the operator-role token
   the webhook service uses (see [Branch per pull request](#branch-per-pull-request)).
+- **`limits.maxBranches` / `limits.defaultTTL` / `limits.maxTTL`** — branchd
+  `--max-branches`, `--default-ttl` and `--max-ttl`. Unset by default
+  (unlimited, branchd's own defaults); set them whenever something you do not
+  fully control creates branches, ghook on a repository that takes outside
+  pull requests above all. NOTES warn when ghook is on without a cap.
+- **`namespaceLimitRange.*`** — an optional LimitRange that gives default
+  CPU and memory requests and a memory limit to every container in the
+  namespace that sets none, which includes every branch and helper pod
+  branchd creates. Off by default (a memory limit turns an oversized branch
+  into an OOM kill); use it in a namespace dedicated to pgoverlay.
+
+The defaults above suit a single trusted node. `deploy/helm/pgoverlay/values-production.yaml`
+is the starting point for a shared cluster: csi storage, an out-of-band token
+Secret, rotated branch credentials, proxy TLS, NetworkPolicy, branch limits
+and the LimitRange, each commented with why.
 
 ## Proxy TLS (cert-manager)
 
@@ -488,9 +522,9 @@ operator-role token rather than branchd's admin token (which also manages
 sources, credentials and tokens):
 
 ```bash
-pgb token create ghook --role operator            # prints the token once
-kubectl -n pgoverlay-system create secret generic pgoverlay-ghook-api \
-  --from-literal=token=<the printed token>
+# straight from pgb into the Secret: not on screen, not in shell history
+pgb token create ghook --role operator | tr -d '\n' |
+  kubectl -n pgoverlay-system create secret generic pgoverlay-ghook-api --from-file=token=/dev/stdin
 helm upgrade pgoverlay deploy/helm/pgoverlay -n pgoverlay-system --reuse-values \
   --set ghook.apiTokenSecret=pgoverlay-ghook-api
 ```

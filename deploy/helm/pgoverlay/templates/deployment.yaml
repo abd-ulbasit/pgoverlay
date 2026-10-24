@@ -27,6 +27,13 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: {{ include "pgoverlay.fullname" . }}
+      # Pod-level baseline, so nothing in the pod falls back to the runtime's
+      # default profile. The branchd container below repeats it and adds the
+      # rest; runAsNonRoot is not set because branchd runs as runAsUser
+      # (root by default, see values.yaml).
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       {{- if eq (include "pgoverlay.pinNode" .) "true" }}
       # Pinned to the storage node: in hostpath mode the CoW volumes live on
       # its disk, and without persistence so does branchd's sqlite state.
@@ -61,7 +68,7 @@ spec:
       {{- end }}
       containers:
         - name: branchd
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "pgoverlay.imageRef" (dict "image" .Values.image "appVersion" .Chart.AppVersion "name" "image") | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if not (has .Values.storage.mode (list "hostpath" "csi")) }}
           {{- fail "storage.mode must be hostpath or csi" }}
@@ -107,6 +114,20 @@ spec:
             {{- fail "seedSettle must be freeze, recover or off" }}
             {{- end }}
             - --seed-settle={{ .Values.seedSettle }}
+            {{- $limits := .Values.limits | default dict }}
+            {{- $maxBranches := int (dig "maxBranches" 0 $limits) }}
+            {{- if lt $maxBranches 0 }}
+            {{- fail "limits.maxBranches must be >= 0 (0 = unlimited)" }}
+            {{- end }}
+            {{- if gt $maxBranches 0 }}
+            - --max-branches={{ $maxBranches }}
+            {{- end }}
+            {{- with dig "defaultTTL" "" $limits }}
+            - --default-ttl={{ . }}
+            {{- end }}
+            {{- with dig "maxTTL" "" $limits }}
+            - --max-ttl={{ . }}
+            {{- end }}
             {{- if eq (include "pgoverlay.leaderElectionEnabled" .) "true" }}
             # HA: contend for the pgoverlay-branchd Lease; only the leader
             # reconciles + accepts mutating /v1 requests (see docs/ha.md).

@@ -38,8 +38,8 @@ SECURITY — read before exposing pgoverlay beyond a single trusted node:
   [!] GHOOK USES THE ADMIN TOKEN: the webhook receiver was handed branchd's
       admin API token, which can also manage sources and mint tokens. It only
       needs an operator token:
-        pgb token create ghook --role operator
-        kubectl -n {{ .Release.Namespace }} create secret generic {{ include "pgoverlay.ghook.fullname" . }}-api --from-literal=token=<printed token>
+        pgb token create ghook --role operator | tr -d '\n' |
+          kubectl -n {{ .Release.Namespace }} create secret generic {{ include "pgoverlay.ghook.fullname" . }}-api --from-file=token=/dev/stdin
         helm upgrade {{ .Release.Name }} ... --reuse-values --set ghook.apiTokenSecret={{ include "pgoverlay.ghook.fullname" . }}-api
 {{- end }}
 
@@ -62,6 +62,19 @@ SECURITY — read before exposing pgoverlay beyond a single trusted node:
       (proxy.service.loadBalancerSourceRanges is empty). Restrict it to the
       client CIDRs that need it (CI egress, VPN), or make it internal with
       proxy.service.annotations.
+{{- end }}
+{{- if and .Values.ghook.enabled (not .Values.ghook.requireMask) }}
+
+  [!] ghook branches source "{{ .Values.ghook.source }}" for every pull request
+      whether or not it is masked. Set `ghook.requireMask: true` so a source
+      without masking scripts gets no PR branches (docs/security.md).
+{{- end }}
+{{- if and .Values.ghook.enabled (not (gt (int (dig "maxBranches" 0 (.Values.limits | default dict))) 0)) }}
+
+  [!] ghook creates a branch for every pull request in the allowed
+      repositories, fork pull requests included, and limits.maxBranches is 0
+      (unlimited). Set limits.maxBranches and limits.maxTTL so pull requests
+      cannot create Postgres pods without bound.
 {{- end }}
 {{- if not .Values.networkPolicy.enabled }}
 

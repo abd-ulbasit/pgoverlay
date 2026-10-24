@@ -65,6 +65,13 @@ hardened() { # render label
   has "$1" 'type: RuntimeDefault' "$2" # seccompProfile
   hasnt "$1" 'privileged: true' "$2"
   hasnt "$1" 'add:' "$2" # no capability is ever added back
+  # and a pod-level securityContext with RuntimeDefault seccomp, so a
+  # container that sets none (an injected sidecar) does not fall back to the
+  # runtime's defaults (trivy KSV-0118)
+  grep -qE -- '^      securityContext:$' <<<"$1" ||
+    { echo "FAIL: no pod-level securityContext in $2 render" >&2; exit 1; }
+  [ "$(grep -cF -- 'type: RuntimeDefault' <<<"$1")" -ge 2 ] ||
+    { echo "FAIL: RuntimeDefault seccomp not set on both pod and container in $2 render" >&2; exit 1; }
 }
 out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret \
   --show-only templates/deployment.yaml)
@@ -80,12 +87,70 @@ out=$(helm template rel "$CHART" --set node=n --set token=t \
 hardened "$out" ghook-deployment
 has "$out" 'runAsNonRoot: true' ghook-deployment
 has "$out" 'runAsUser: 65532' ghook-deployment # matches Dockerfile.ghook's USER
+has "$out" 'runAsGroup: 65532' ghook-deployment # pod level, the USER's group
 
 # The local-build path stays available: --set image.tag=dev must still reach
 # the image `make docker-build` produces and side-loads (README, docs).
 out=$(helm template pgoverlay "$CHART" --set node=n --set token=t --set image.tag=dev)
 has "$out" 'ghcr.io/abd-ulbasit/pgoverlay-branchd:dev' local-tag
 hasnt "$out" "pgoverlay-branchd:$APPVERSION" local-tag
+
+# image digests: repository@digest wins over the tag (nothing else names the
+# image), for both deployments; a malformed digest fails the render
+DIGEST=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set image.digest=$DIGEST --set image.tag=ignored \
+  --set ghook.enabled=true --set ghook.webhookSecret=w --set ghook.source=main \
+  --set ghook.image.digest=$DIGEST)
+has "$out" "image: \"ghcr.io/abd-ulbasit/pgoverlay-branchd@$DIGEST\"" digest
+has "$out" "image: \"ghcr.io/abd-ulbasit/pgoverlay-ghook@$DIGEST\"" digest
+hasnt "$out" 'pgoverlay-branchd:' digest
+hasnt "$out" 'pgoverlay-ghook:' digest
+if helm template "$CHART" --set node=n --set token=t --set image.digest=sha256:abc >/dev/null 2>&1; then
+  echo "FAIL: a malformed image.digest must fail" >&2; exit 1
+fi
+if helm template "$CHART" --set node=n --set token=t --set ghook.enabled=true \
+  --set ghook.webhookSecret=w --set ghook.source=main --set ghook.image.digest=latest >/dev/null 2>&1; then
+  echo "FAIL: a malformed ghook.image.digest must fail" >&2; exit 1
+fi
+
+# branch limits: unset by default (branchd's unlimited defaults), passed
+# through when set; a negative cap fails the render
+out=$(helm template pgoverlay "$CHART" --set node=storage-1 --set token=s3cret)
+hasnt "$out" '--max-branches' default
+hasnt "$out" '--default-ttl' default
+hasnt "$out" '--max-ttl' default
+hasnt "$out" 'kind: LimitRange' default
+out=$(helm template rel "$CHART" --set node=n --set token=t --set limits.maxBranches=25 \
+  --set limits.defaultTTL=24h --set limits.maxTTL=72h --set namespaceLimitRange.enabled=true)
+has "$out" '--max-branches=25' limits
+has "$out" '--default-ttl=24h' limits
+has "$out" '--max-ttl=72h' limits
+has "$out" 'kind: LimitRange' limits
+has "$out" 'memory: 1Gi' limits
+if helm template "$CHART" --set node=n --set token=t --set limits.maxBranches=-1 >/dev/null 2>&1; then
+  echo "FAIL: a negative limits.maxBranches must fail" >&2; exit 1
+fi
+
+# values-production.yaml stays a valid, hardened starting point
+out=$(helm template rel "$CHART" -f "$CHART/values-production.yaml" --set storage.storageClass=fast-clone)
+has "$out" '--kube-storage=csi' production
+has "$out" '--rotate-branch-credentials' production
+has "$out" '--pg-tls-cert=/etc/pgoverlay/proxy-tls/tls.crt' production
+has "$out" '--max-branches=50' production
+has "$out" 'kind: NetworkPolicy' production
+has "$out" 'kind: LimitRange' production
+has "$out" 'name: pgoverlay-token' production
+hasnt "$out" 'kind: Secret' production # existingSecret: no token in the release
+hasnt "$out" 'SYS_ADMIN' production
+out=$(helm template rel "$CHART" -f "$CHART/values-production.yaml" --set storage.storageClass=fast-clone \
+  --set ghook.enabled=true --set ghook.source=main)
+has "$out" 'name: GHOOK_REQUIRE_MASK' production-ghook
+has "$out" 'name: pgoverlay-ghook-api' production-ghook
+hasnt "$out" 'webhook-secret: ' production-ghook # no ghook Secret in the release
+if helm template rel "$CHART" -f "$CHART/values-production.yaml" >/dev/null 2>&1; then
+  echo "FAIL: values-production.yaml without storage.storageClass must fail" >&2; exit 1
+fi
 
 # custom values: existing secret, custom data root, NodePort proxy
 out=$(helm template rel "$CHART" --set node=worker-9 --set existingSecret=my-token \
@@ -175,6 +240,12 @@ has "$out" 'GHOOK_REPOS' ghook
 has "$out" 'GHOOK_PROXY_HOST' ghook
 has "$out" 'GHOOK_TTL' ghook
 hasnt "$out" 'SYS_ADMIN' ghook
+
+# ghook.requireMask: off by default, GHOOK_REQUIRE_MASK=true when on
+hasnt "$out" 'GHOOK_REQUIRE_MASK' ghook
+out=$(helm template rel "$CHART" --set node=n --set token=t \
+  --set ghook.enabled=true --set ghook.webhookSecret=w --set ghook.source=main --set ghook.requireMask=true)
+has "$out" 'name: GHOOK_REQUIRE_MASK' ghook-require-mask
 
 # ghook existingSecret suppresses the rendered ghook Secret
 out=$(helm template rel "$CHART" --set node=n --set token=t \

@@ -21,19 +21,73 @@ sources) dump-based seeding. In-cluster, all of that disappears:
 
 ## Provision
 
-`deploy/terraform/eks` holds a minimal single-node cluster (default VPC,
-one `t3.large`, managed node group):
+Two Terraform roots, applied in this order:
+
+- `deploy/terraform/account`: an AWS Budgets alarm for the whole account.
+  Apply it once and leave it. It is kept out of the cluster's root so that
+  destroying the cluster does not destroy it, and it can still alert on
+  whatever a teardown leaves behind.
+- `deploy/terraform/eks`: a minimal single-node cluster (default VPC, one
+  `t3.large` with a 50 GiB encrypted gp3 root volume, managed node group).
+
+Each root reads its inputs from a `terraform.tfvars` next to it, which is
+gitignored (it holds your email address and egress IP). Every later `plan`,
+upgrade and `destroy` then sees the same values with no `-var` flags to
+repeat. Leave an input out and Terraform plans its default instead: for the
+endpoint CIDRs, that is a private endpoint, which cuts off the `kubectl` you
+are using.
+
+Without `cluster_endpoint_public_access_cidrs` the API endpoint is private,
+so `kubectl` works only from inside the VPC; give your own egress address as
+a `/32` to run it from a laptop (`0.0.0.0/0` is refused):
 
 ```bash
-cd deploy/terraform/eks
-terraform init && terraform apply
+cd deploy/terraform/account
+cat > terraform.tfvars <<'EOF'
+budget_alert_emails = ["you@example.com"]
+EOF
+terraform init
+terraform plan -out tfplan
+terraform apply tfplan
+
+cd ../eks
+cat > terraform.tfvars <<EOF
+cluster_version                      = "1.36"
+cluster_endpoint_public_access_cidrs = ["$(curl -fsS https://checkip.amazonaws.com)/32"]
+EOF
+terraform init
+terraform plan -out tfplan
+terraform apply tfplan
 aws eks update-kubeconfig --name pgoverlay --region ap-south-1
 ```
 
+If your address changes, edit `terraform.tfvars` and plan again; the plan
+should change the endpoint's CIDRs and nothing else.
+
+The provider and Terraform versions are pinned (each root commits its
+`.terraform.lock.hcl`). State is local: this is a single-operator demo, and
+the `backend` comment in `eks/main.tf` shows the S3 set-up (with
+`use_lockfile`) to use for anything shared. Keep the account root's state
+for as long as the budget exists. `make tf-test` checks both roots offline.
+
+**What is not in Terraform.** Only the cluster and the budget are. The Helm
+release, the GHCR pull secret, cert-manager and the Secrets below are applied
+by hand from this page, and the load balancers and their security groups are
+created by Kubernetes for the `LoadBalancer` Services; none of it is in the
+state, so neither `plan` nor `destroy` sees it (see [Teardown](#teardown)).
+A deployment that has to be reproducible would manage the Helm release with
+Terraform's `helm` provider or a GitOps controller, in separate staging and
+production roots with remote state.
+
 **Cost while running:** control plane ~$0.10/h, node ~$0.09/h, plus ~$0.03/h
-per LoadBalancer Service (two here). Mind the Kubernetes version: clusters
-on versions past their standard-support window are billed AWS *extended
-support* (~6× the control-plane rate). Check what's current:
+per LoadBalancer Service (two here). The account root's AWS Budgets alert
+(`monthly_budget_usd`, default 50 USD) mails `budget_alert_emails` at 80% of
+actual and 100% of forecast monthly spend. It covers the whole account on
+purpose: what outlives a teardown (load balancers, EBS volumes) carries none
+of this project's tags, so a budget filtered on them would miss exactly that
+spend. Mind the Kubernetes version: clusters on versions past their
+standard-support window are billed AWS *extended support* (~6× the
+control-plane rate). Check what's current:
 
 ```bash
 aws eks describe-cluster-versions \
@@ -137,30 +191,67 @@ spec:
 EOF
 ```
 
+**Secrets, before the install.** Create them as Kubernetes Secrets from
+files, and give the chart only their names. A value passed with `--set` is
+stored in cleartext in the Helm release (itself a Secret in the namespace)
+and printed by `helm get values`; `kubectl create secret --from-literal`
+puts it in your shell history and the process list. The files below are
+created owner-only and contain no trailing newline, which an HTTP
+`Authorization` header would reject:
+
+```bash
+umask 077
+# branchd's admin API token: keep it in your password manager as well
+openssl rand -hex 32 | tr -d '\n' > api-token
+kubectl -n pgoverlay create secret generic pgoverlay-token --from-file=token=api-token
+# the webhook HMAC secret (you paste the same value into the GitHub webhook)
+# and the GitHub App's private key (downloaded from the App's settings)
+openssl rand -hex 32 | tr -d '\n' > webhook-secret
+kubectl -n pgoverlay create secret generic pgoverlay-ghook \
+  --from-file=webhook-secret=webhook-secret \
+  --from-file=app-private-key=<app-name>.private-key.pem
+rm api-token webhook-secret <app-name>.private-key.pem   # once stored safely
+```
+
+ghook authenticates to GitHub as a [GitHub App](github-app.md): its
+installation tokens expire within an hour and reach only the repositories
+the App is installed on. If you must use a token instead, make it a
+fine-grained personal access token for that one repository (Pull requests:
+read, Commit statuses: write, Issues: write), store it under the key
+`github-token` instead of `app-private-key`, and leave `ghook.appId` unset.
+Never hand it `gh auth token`: that is your CLI's OAuth token, with every
+scope your account granted it.
+
 **Install.** `proxy.service.loadBalancerSourceRanges` is the allow-list of
 client networks (your CI runners' egress, an office or VPN range);
 `ghook.service.loadBalancerSourceRanges` admits only GitHub's webhook
-senders (IPv4 ranges from `api.github.com/meta`):
+senders (IPv4 ranges from `api.github.com/meta`). To pin the images by
+content, use `image.digest` and `ghook.image.digest` instead of the tags
+([Images](kubernetes.md#images)).
 
 ```bash
 helm install pgoverlay deploy/helm/pgoverlay -n pgoverlay \
   --set node=<storage-node-name> \
   --set image.repository=ghcr.io/<user>/pgoverlay-branchd --set image.tag=<tag> \
-  --set token=$(openssl rand -hex 16) \
+  --set existingSecret=pgoverlay-token \
   --set rotateBranchCredentials=true \
+  --set limits.maxBranches=20 --set limits.maxTTL=168h \
   --set proxy.service.type=LoadBalancer \
   --set proxy.tls.certSecret=pgoverlay-proxy-tls \
   --set 'proxy.service.loadBalancerSourceRanges={<ci-egress-cidr>,<vpn-cidr>}' \
   --set ghook.enabled=true \
   --set ghook.image.repository=ghcr.io/<user>/pgoverlay-ghook --set ghook.image.tag=<tag> \
-  --set ghook.webhookSecret=$(openssl rand -hex 16) \
-  --set ghook.githubToken=<token-with-issues-write> \
-  --set ghook.source=prod --set ghook.resetOnPush=true \
+  --set ghook.existingSecret=pgoverlay-ghook --set ghook.appId=<app-id> \
+  --set ghook.source=prod --set ghook.resetOnPush=true --set ghook.requireMask=true \
   --set ghook.repos=<owner>/<repo> \
   --set ghook.service.type=LoadBalancer \
   --set "ghook.service.loadBalancerSourceRanges={$(curl -s https://api.github.com/meta \
     | jq -r '.hooks | map(select(contains(":") | not)) | join(",")')}"
 ```
+
+`ghook.requireMask` makes ghook refuse to branch `prod` for a pull request
+until it has masking scripts, so seed and mask the source (below) before the
+first PR.
 
 `type: LoadBalancer` on EKS provisions Classic ELBs out of the box (raw TCP
 — exactly what the wire-protocol proxy needs; no aws-load-balancer-controller
@@ -196,33 +287,48 @@ destroys branches, so swap in an operator-role token:
 
 ```bash
 kubectl -n pgoverlay port-forward svc/pgoverlay-api 7070 &
-PGOVERLAY_SERVER=http://localhost:7070 PGOVERLAY_TOKEN=<admin token> \
-  pgb token create ghook --role operator                # prints the token once
-kubectl -n pgoverlay create secret generic pgoverlay-ghook-api --from-literal=token=<it>
+export PGOVERLAY_SERVER=http://localhost:7070
+export PGOVERLAY_TOKEN="$(kubectl -n pgoverlay get secret pgoverlay-token -o jsonpath='{.data.token}' | base64 -d)"
+# the operator token goes straight from pgb into the Secret, never to the screen
+pgb token create ghook --role operator | tr -d '\n' |
+  kubectl -n pgoverlay create secret generic pgoverlay-ghook-api --from-file=token=/dev/stdin
 helm upgrade pgoverlay deploy/helm/pgoverlay -n pgoverlay --reuse-values \
   --set ghook.apiTokenSecret=pgoverlay-ghook-api
 ```
 
 Point the GitHub webhook at
-`http://<ghook-elb>:8080/webhook` (`pull_request` events, the same secret).
+`http://<ghook-elb>:8080/webhook` (`pull_request` events, the
+`webhook-secret` value from above).
 Deliveries are HMAC-verified, and the allow-list keeps everyone but GitHub
 off the endpoint; put an HTTPS ingress in front if the PR metadata in the
 payloads should not travel in cleartext. Seed the source the native way
 (`pgb source add` against the in-cluster service via the port-forward of
-`pgoverlay-api` above); if you enable `networkPolicy`, set
+`pgoverlay-api` above), then mask it (`pgb source set-mask prod mask.sql`,
+see [usage](usage.md)); if you enable `networkPolicy`, set
 `networkPolicy.sourceEgress` to the source so the seed helpers can reach it
 and nothing else.
 
 ## Upgrading Kubernetes
 
-EKS moves one minor version at a time. `cluster_version` is a Terraform
-variable for exactly this:
+EKS moves one minor version at a time. `cluster_version` in
+`deploy/terraform/eks/terraform.tfvars` records the cluster's version: raise
+it one step, plan, read the plan, apply that plan, then do the next version.
+The other inputs come from the same file, so the plan does not quietly reset
+them (a plan without your endpoint CIDRs would make the endpoint private and
+cut off `kubectl` in the middle of the upgrade).
 
 ```bash
-for v in 1.33 1.34 1.35 1.36; do
-  terraform apply -auto-approve -var cluster_version=$v
-done
+cd deploy/terraform/eks
+v=1.34   # then 1.35, then 1.36: one minor version per step
+sed -i.bak "s/^cluster_version *=.*/cluster_version = \"$v\"/" terraform.tfvars
+terraform plan -out "k8s-$v.tfplan"
+terraform apply "k8s-$v.tfplan"
 ```
+
+Do not script it with `-auto-approve`: each step replaces the node, and with
+it (below) every hostpath branch and the registry. The plan should change
+the control-plane version and the node group and nothing else; anything more
+means the configuration drifted and is worth stopping for.
 
 Each step upgrades the control plane (~10 min) and rolls the node group.
 pgoverlay itself is indifferent — it uses only stable v1 APIs — but
@@ -241,8 +347,44 @@ branchd is not pinned, so it comes back on a new node by itself.
 
 ```bash
 kubectl -n pgoverlay delete svc pgoverlay-proxy pgoverlay-ghook   # release the ELBs
-terraform -chdir=deploy/terraform/eks destroy
+kubectl -n pgoverlay delete pvc --all                              # csi mode: release the volumes
+terraform -chdir=deploy/terraform/eks destroy                      # reads eks/terraform.tfvars
 ```
+
+`destroy` removes only what is in the state. Check that nothing Kubernetes
+created outlived it. On EKS the load balancers for `LoadBalancer` Services
+come from the AWS cloud controller (cloud-provider-aws), which tags them and
+their security groups with the cluster name:
+
+```bash
+aws resourcegroupstaggingapi get-resources --region ap-south-1 \
+  --tag-filters Key=kubernetes.io/cluster/pgoverlay \
+  --query 'ResourceTagMappingList[].ResourceARN'
+```
+
+This Terraform installs no CSI driver, so csi mode runs on one you
+installed. The EBS CSI driver does not tag volumes with the cluster name; it
+tags them `ebs.csi.aws.com/cluster=true` (and, if its provisioner passes PVC
+metadata, `kubernetes.io/created-for/pvc/namespace`). List the unattached
+ones:
+
+```bash
+aws ec2 describe-volumes --region ap-south-1 \
+  --filters Name=tag:ebs.csi.aws.com/cluster,Values=true Name=status,Values=available \
+  --query 'Volumes[].[VolumeId,Size,Tags[?Key==`kubernetes.io/created-for/pvc/namespace`]|[0].Value]'
+```
+
+Both should print `[]`. The second lists unattached EBS CSI volumes from
+every cluster in the account and region; one tagged with the `pgoverlay`
+namespace is this cluster's. With another CSI driver, look for its volumes
+the same way. Then remove what pointed at the
+cluster from outside: the GitHub webhook to the ghook load balancer, CI
+variables and secrets holding its addresses or tokens, and preview-platform
+environment variables.
+
+The budget in `deploy/terraform/account` stays: it is what tells you if
+something was missed. Destroy it (`terraform -chdir=deploy/terraform/account
+destroy`) only when you are done with the account.
 
 ## What deploying here taught us (three real bugs)
 

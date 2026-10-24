@@ -12,7 +12,9 @@ service that gives every pull request its own Postgres branch:
 So anyone who can open a pull request in an allowed repository can cause a
 branch of your source to be created, with the router address and the
 branch's database name posted on the PR (never a password). On a public
-repository, mask the source and read [Security](security.md) first.
+repository, mask the source, set `GHOOK_REQUIRE_MASK=true` (Helm
+`ghook.requireMask`) so an unmasked source is never branched for a PR, and
+read [Security](security.md) first.
 
 With GitHub credentials configured, the service also reports back to the PR:
 
@@ -204,6 +206,7 @@ differ by the repository key.
 | `GHOOK_TTL` | no | none | branch TTL as a Go duration, e.g. `72h` |
 | `GHOOK_RESET_ON_PUSH` | no | `false` | reset the branch on every push (synchronize) |
 | `GHOOK_DIFF_ON_PUSH` | no | `false` | post the schema/data diff comment after opened/synchronize (needs GitHub credentials) |
+| `GHOOK_REQUIRE_MASK` | no | `false` | refuse to create or reset a branch while `GHOOK_SOURCE` has no masking scripts (fails closed if they cannot be read); the PR gets a `failure` status saying why |
 | `GHOOK_BRANCH_NAMING` | no | `pr-number` | `pr-number` or `git-branch`; see [Branch names](#branch-names) |
 | `GHOOK_REPOS` | no | allow all | comma-separated `owner/name` allow-list |
 | `GHOOK_GITHUB_API` | no | `https://api.github.com` | GitHub API base (GitHub Enterprise) |
@@ -219,20 +222,27 @@ The pgoverlay chart ships the service as an optional sub-deployment
 (`deploy/helm/pgoverlay`, image `ghcr.io/abd-ulbasit/pgoverlay-ghook` — `make docker-build-ghook`):
 
 ```sh
+# Secrets from files, so no value lands in the Helm release history
+# (`helm get values`) or in shell history; see docs/eks.md for creating them.
+kubectl create secret generic pgoverlay-token --from-file=token=api-token
+kubectl create secret generic pgoverlay-ghook \
+  --from-file=webhook-secret=webhook-secret --from-file=app-private-key=app.pem
 helm upgrade --install pgoverlay deploy/helm/pgoverlay \
-  --set node=storage-1 --set token=$PGOVERLAY_TOKEN \
+  --set node=storage-1 --set existingSecret=pgoverlay-token \
   --set ghook.enabled=true \
-  --set ghook.webhookSecret=$WEBHOOK_SECRET \
+  --set ghook.existingSecret=pgoverlay-ghook \
   --set ghook.appId=12345 \
-  --set-file ghook.appPrivateKey=app.pem \
-  --set ghook.source=main \
+  --set ghook.source=main --set ghook.requireMask=true \
   --set ghook.repos=acme/widgets \
   --set ghook.proxyHost=pg.example.com:30432
 ```
 
-(PAT mode: replace the two `app*` values with
-`--set ghook.githubToken=$GITHUB_TOKEN`. The chart refuses to render with
-both set.)
+(PAT mode: store a fine-grained token for the repository under the key
+`github-token` instead of `app-private-key`, and drop `ghook.appId`. The
+chart refuses to render with both. The `ghook.webhookSecret`,
+`ghook.githubToken` and `ghook.appPrivateKey` values exist for local
+experiments; anything set through them is kept in cleartext in the release
+history.)
 
 It talks to branchd over the in-cluster `…-api` Service (which, with leader
 election, routes to the leader). Give it an **operator-role token** rather

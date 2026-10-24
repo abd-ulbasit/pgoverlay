@@ -501,7 +501,11 @@ the parent row.
 When the shared base is production-shaped, branches would otherwise expose real customer data to
 CI and developers. **Masking** optionally runs SQL to scrub/anonymize that data — and it runs
 **when each branch is created**, inside the branch's own private layer, so the shared base is
-never mutated and the branch never serves unmasked data.
+never mutated and the router never serves the branch before masking has run. It does not erase
+the pre-mask values: an `UPDATE` leaves old row versions, index entries and WAL behind, the
+seed's statistics still hold sample values, and overlay branches mount the unmasked seed. Who can
+read each, and how to close them, is in
+[Security](security.md#what-masking-leaves-behind).
 
 Mechanism (`internal/engine/saga.go`, `applyMasking`, part of `awaitAndMark`):
 
@@ -518,7 +522,8 @@ Mechanism (`internal/engine/saga.go`, `applyMasking`, part of `awaitAndMark`):
   that **mask scripts must be idempotent**.
 
 Masking pairs naturally with **credential rotation** (`rotateBranchCredentials`): a fresh branch
-gets its own random password applied via the same in-socket `psql` path.
+gets its own random password applied via the same in-socket `psql` path. The ghook webhook can
+refuse to branch a source that has no masking scripts at all (`GHOOK_REQUIRE_MASK`).
 
 ---
 

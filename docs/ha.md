@@ -104,7 +104,7 @@ Set either knob in the chart:
 ```bash
 helm upgrade --install pgoverlay deploy/helm/pgoverlay \
   --set node=<storage-node> \
-  --set token=<api-token> \
+  --set existingSecret=<secret-with-key-token> \
   --set replicaCount=2          # ⇒ leader election turns on automatically
 # or, to keep one replica but still elect (e.g. before scaling up):
 #   --set leaderElection.enabled=true

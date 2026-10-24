@@ -7,13 +7,28 @@ name: release
 #     checksums.txt and build provenance, as a GitHub release (goreleaser);
 #   - multi-arch (linux/amd64, linux/arm64) images
 #     ghcr.io/abd-ulbasit/pgoverlay-branchd:<tag> and pgoverlay-ghook:<tag>,
-#     built from the repository's Dockerfiles with SBOM and provenance;
+#     built from the repository's Dockerfiles with SBOM and provenance,
+#     signed with cosign (keyless) and with a provenance attestation pushed
+#     to the registry, all by digest;
 #   - for a stable tag, `latest` on both images and the floating major tag
 #     (v1) that `uses: abd-ulbasit/pgoverlay/action@v1` resolves to.
+#
+# Order: preflight -> ci -> scan -> (binaries, images) -> action-major-tag.
+# `scan` builds both images for both platforms and gates on trivy; nothing
+# is published until every leg of it passes, so a finding stops the whole
+# release, not one image. A later build or push failure can still leave a
+# partial release (as before the scan existed); re-run the failed jobs.
 #
 # Before tagging, set deploy/helm/pgoverlay/Chart.yaml appVersion to the tag:
 # it is the image tag the chart pulls by default, and the preflight job
 # refuses a tag it does not match.
+#
+# Every job that publishes (binaries, images, the major tag) runs in the
+# `release` environment, so that environment's protection rules are what
+# should decide whether a pushed tag ships: a required reviewer and a
+# deployment rule admitting only v* tags. They are repository settings, not
+# code, and are NOT configured yet: GitHub creates the environment, with no
+# rules, on the first run that names it, and the jobs then run unprotected.
 on:
   push:
     tags:
@@ -48,9 +63,70 @@ jobs:
     permissions:
       contents: read
 
-  binaries:
+  # The vulnerability gate, before anything is published. Each image is built
+  # for each platform into the local daemon (the runtime stages have no RUN,
+  # so arm64 needs no emulation) and scanned. This job's token is read-only;
+  # it publishes nothing and holds no registry or signing credential.
+  #
+  # The `images` job rebuilds rather than pushing these builds. The runtime
+  # stages are a digest-pinned Alpine base plus a COPY of the Go binary, so
+  # the OS packages scanned here are the ones pushed there.
+  #
+  # The gate is the OS packages (Alpine) with a released fix, HIGH and
+  # CRITICAL. Go code is gated by the `vuln` job in ci (govulncheck:
+  # reachable code only, with a reviewed allowlist that expires); trivy's Go
+  # findings are by module version, reachable or not, so they are printed
+  # for the record but do not gate.
+  scan:
     needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - image: pgoverlay-branchd
+            dockerfile: Dockerfile
+          - image: pgoverlay-ghook
+            dockerfile: Dockerfile.ghook
+    env:
+      IMAGE: ${{ matrix.image }}
+      DOCKERFILE: ${{ matrix.dockerfile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # cosign verifies trivy's signed checksums (hack/install-trivy.sh says
+      # what is checked and the rule for bumping it). trivy is not installed
+      # through aquasecurity/trivy-action or setup-trivy: in March 2026 both
+      # had their tags force-pushed to credential-stealing code
+      # (GHSA-69fq-xp46-6x23).
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Install trivy
+        run: hack/install-trivy.sh
+      - name: Scan the images
+        run: |
+          date=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)
+          for platform in linux/amd64 linux/arm64; do
+            ref="scan/$IMAGE:${platform##*/}"
+            docker buildx build --platform "$platform" --load --provenance=false --sbom=false \
+              -f "$DOCKERFILE" -t "$ref" \
+              --build-arg VERSION="$GITHUB_REF_NAME" --build-arg COMMIT="$GITHUB_SHA" --build-arg DATE="$date" .
+            echo "::group::Go modules in $ref (informational; the vuln job gates Go)"
+            trivy image --quiet --scanners vuln --pkg-types library \
+              --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 "$ref"
+            echo "::endgroup::"
+            trivy image --quiet --scanners vuln --pkg-types os \
+              --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$ref"
+          done
+
+  binaries:
+    needs: [ci, scan]
+    runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write # create the GitHub release and upload its assets
       id-token: write # sign the build provenance attestation
@@ -76,11 +152,14 @@ jobs:
           subject-checksums: dist/checksums.txt
 
   images:
-    needs: ci
+    needs: [ci, scan]
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
-      packages: write # push to ghcr.io
+      packages: write # push to ghcr.io, including the signature and attestation
+      id-token: write # keyless cosign signature and provenance (Sigstore via OIDC)
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -89,14 +168,14 @@ jobs:
             dockerfile: Dockerfile
           - image: pgoverlay-ghook
             dockerfile: Dockerfile.ghook
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: tags and build args
         id: meta
-        env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
         run: |
           # The image tag is the git tag verbatim (v-prefixed), which is what
           # Chart.yaml appVersion names. `latest` only moves on a stable tag.
@@ -115,6 +194,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: push
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -130,6 +210,28 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
           sbom: true
+      # Keyless: the certificate names this workflow at this tag, and the
+      # signature goes to the registry next to the image, by digest. Verify
+      # with `cosign verify` as SECURITY.md shows.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      - name: Sign the image (cosign, keyless)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+      # The same SLSA provenance the binaries get, for the image digest, and
+      # pushed to the registry so `gh attestation verify oci://...` and
+      # registry-side policy (e.g. a Kubernetes admission controller) find it.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "$IMAGE@$DIGEST" >>"$GITHUB_STEP_SUMMARY"
 
   # Actions convention: `v1` names the newest stable v1.x.y. Only a stable tag
   # moves it, and only once its binaries and images are published.
@@ -137,6 +239,7 @@ jobs:
     needs: [binaries, images]
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write # move the tag
     steps:
